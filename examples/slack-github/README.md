@@ -83,11 +83,12 @@ credentials:
 
 `credentialsPath` below names this file. The broker injects its destination-bound Authorization
 header at the native HTTP boundary; the PAT is not passed to the gateway, model, or Wasm guest.
-The broker does **not** parse `.env`, expand `${GITHUB_TOKEN}`, or accept `secretEnv` here. Adding
-`GITHUB_TOKEN` to launchd's environment therefore does not configure this binding. The
-[runbook's gateway wrapper](../../docs/run-on-mac.md#check-before-installing-a-service) explicitly
-sources the gateway's private `credentials.env` for Slack and OpenRouter; the broker reads this
-separate YAML. To rotate the PAT, replace the secret in this file, keeping its owner and mode. The
+This file does **not** expand `${GITHUB_TOKEN}` or accept `secretEnv`, and the broker reads no
+credential from its environment or an `--env-file`. Adding `GITHUB_TOKEN` to launchd's environment
+therefore does not configure this binding. The gateway loads its private `credentials.env` for
+Slack and OpenRouter with the runbook's
+[`--env-file` launch](../../docs/run-on-mac.md#check-before-installing-a-service); the broker reads
+this separate YAML. To rotate the PAT, replace the secret in this file, keeping its owner and mode. The
 broker loads a valid replacement within seconds while the gateway is connected and logs
 `broker_reload_applied`; `broker_reload_refused` means it kept the old PAT, and the same file
 would fail the next start. The provider does not refresh PATs.

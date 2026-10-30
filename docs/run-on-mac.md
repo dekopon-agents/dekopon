@@ -3,7 +3,10 @@
 For an always-on Apple Silicon Mac, use the native release binaries and **launchd**, with a
 separate user for each daemon. Start with a Slack Agent app, one explicitly selected OpenRouter
 model, and a dedicated prepaid API key with an OpenRouter spending limit. This path needs no
-local model, Docker, Kubernetes, Linux VM, or Firecracker.
+local model, Docker, Kubernetes, Linux VM, or Firecracker. Both launchd jobs run the binaries
+directly: the gateway loads its Slack and OpenRouter secrets from a private file with
+[`--env-file`](gatewayd.md#environment-file), and the broker keeps the GitHub PAT in its own
+credentials file.
 
 **Status: released building blocks; manual setup.** The release and tap supply executables,
 not a configured Mac service. There is no native installer or account-provisioning command. The
@@ -102,7 +105,7 @@ separate `dekopon-console` formula is optional. Do not run Homebrew itself as ro
 
 Homebrew is an alternative to archive staging. To use its binaries with the service templates,
 run `brew --prefix dekopon` and substitute that literal prefix plus `/bin/` for every
-`/usr/local/lib/dekopon/current/` binary path, including the gateway wrapper. launchd does not
+`/usr/local/lib/dekopon/current/` binary path, including both plists. launchd does not
 expand `$(brew --prefix dekopon)` or `~` in a plist. Account, configuration and directory setup is
 still required, and the Homebrew prefix must not be writable by either daemon account. Homebrew's
 prefix is owned by your login user, so anything running as that user can replace the daemons; the
@@ -202,12 +205,16 @@ export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN='REPLACE_WITH_BOT_TOKEN'
 export OPENROUTER_API_KEY='REPLACE_WITH_DEDICATED_KEY'
 ```
 
-This is a shell file: keep the fixed variable names, quote values, and source only your own file.
-Save it with Unix (LF) line endings; a carriage return becomes part of the token. Do not put these
-values in gateway configuration YAML, plists, agent instructions, a repository, or `launchctl setenv`.
-launchd does not inherit your interactive shell's exports or automatically read `.env` files.
-The gateway wrapper below explicitly sources this private shell file; its filename is not a
-built-in dotenv feature. Provider credentials belong only to the broker.
+The gateway reads this file itself with **`--env-file`** (added in 0.74.0), so its launchd job
+runs the binary directly with no wrapper script. Before serving it refuses the file unless it is a
+single-link regular file owned by `_dekopon_gateway`, mode `0600`, in a `0700` directory whose
+ancestors are owned by root or that user and not group- or world-writable; a refusal names the
+path and line, never a value. Values are literal: keep the fixed variable names and single
+quotes, and expect no `$` expansion. The [environment file contract](gatewayd.md#environment-file)
+gives the full grammar and precedence. Save it with Unix (LF) line endings, because the
+`check --probe` command below sources it with `/bin/sh`. Do not put these values in gateway
+configuration YAML, plists, agent instructions, a repository, or `launchctl setenv`; launchd does
+not inherit your interactive shell's exports. Provider credentials belong only to the broker.
 
 ### GitHub PAT under launchd
 
@@ -223,7 +230,7 @@ This is intentionally a **private credentials YAML file containing the literal s
 by `_dekopon_broker`, mode `0600`, under its `0700` directory. It is separate from ordinary
 broker configuration, which contains references. You create and fill it with the accounts in
 [Prepare the broker and gateway](#prepare-the-broker-and-gateway). The broker launchd plist below
-runs the binary directly and needs no `EnvironmentVariables` entry or secret-loading wrapper.
+runs the binary directly and needs no `EnvironmentVariables` entry or `--env-file`.
 
 Setting `GITHUB_TOKEN` in a plist or sourcing a broker `.env` does not populate this credential:
 the broker reads no credential from its environment and this bearer-token field does not expand
@@ -271,7 +278,7 @@ sudo dseditgroup -o edit -a _dekopon_gateway -t user dekopon-ipc
 id _dekopon_broker
 id _dekopon_gateway
 
-sudo install -d -o root -g wheel -m 0755 /usr/local/etc/dekopon /usr/local/libexec \
+sudo install -d -o root -g wheel -m 0755 /usr/local/etc/dekopon \
   /usr/local/var/log/dekopon-broker /usr/local/var/log/dekopon-gateway
 sudo install -d -o _dekopon_broker -g dekopon-ipc -m 0700 /usr/local/etc/dekopon/broker
 sudo install -d -o _dekopon_gateway -g dekopon-ipc -m 0700 /usr/local/etc/dekopon/gateway
@@ -294,7 +301,7 @@ UIDs; do not copy Linux chart UIDs or assume the Mac login is UID 501.
 | `/usr/local/etc/dekopon/gateway/` and gateway state directory | Gateway-owned `0700`; gateway YAML, catalog and credential file `0600`. |
 | `/usr/local/var/run/dekopon/` | Broker-owned, group `dekopon-ipc`, mode `0710`; the broker creates its socket as `0660`. No group write permission. |
 | `/usr/local/var/log/dekopon-broker/` and `/usr/local/var/log/dekopon-gateway/` | Root-owned `0755`; each log file owned by its daemon, `0600`. |
-| Executables, wrappers and `/Library/LaunchDaemons/*.plist` | Administrator-controlled; not writable by either daemon. Plists `root:wheel`, `0644`. |
+| Executables and `/Library/LaunchDaemons/*.plist` | Administrator-controlled; not writable by either daemon. Plists `root:wheel`, `0644`. |
 
 Create each credential file empty with its owner and mode, then fill it as that owner; the PAT file
 is needed only for the review channel:
@@ -315,9 +322,11 @@ which shell history keeps.
 Use regular files, not symlinks or hard links, for configuration and provider artifacts. Every
 directory above the broker socket and provider files must be a real directory that is not group-
 or world-writable unless sticky: each line of the `ls -ld` above shows no `w` after the owner's
-permissions, or ends in `t`. A Homebrew once installed under `/usr/local` can leave
-`/usr/local/etc` and `/usr/local/var` group-writable, which the broker refuses. Keep the IPC
-directory separate from private data.
+permissions, or ends in `t`. The gateway's `--env-file` also requires every directory above
+`credentials.env` to be owned by root or `_dekopon_gateway`, so the `ls -ld` lines from `/` to
+`/usr/local/etc/dekopon` must show `root`. A Homebrew once installed under `/usr/local` can leave
+`/usr/local/etc` and `/usr/local/var` owned by your login or group-writable, which the daemons
+refuse. Keep the IPC directory separate from private data.
 The [broker file and socket contracts](../crates/dekopon-brokerd/README.md#ipc-directory-and-distinct-peer-uids)
 are authoritative. Do not solve a permission failure with `chmod -R 777` or by running both
 daemons as root.
@@ -355,22 +364,6 @@ model and metering contracts live in [gatewayd](gatewayd.md#openrouter-model-set
 
 ## Check before installing a service
 
-Save this gateway wrapper as `dekopon-gateway` in your working directory and install it
-administrator-owned; the same entry point is used in the foreground and by launchd:
-
-```sh
-#!/bin/sh
-set -eu
-umask 077
-. /usr/local/etc/dekopon/gateway/credentials.env
-exec /usr/local/lib/dekopon/current/dekopon-gatewayd \
-  --config /usr/local/etc/dekopon/gateway/gateway.yaml
-```
-
-```console
-sudo install -o root -g wheel -m 0755 dekopon-gateway /usr/local/libexec/dekopon-gateway
-```
-
 Run each check **as that daemon's intended user**, with the same paths it will use under launchd:
 
 ```console
@@ -385,7 +378,7 @@ Checks validate authored input; they do not establish runtime credentials, socke
 Slack installation, or model reachability. Plain `check` also accepts the examples' Slack IDs and
 any nonblank model ID. A gateway `check --probe` makes one billable model request proving the model
 ID exists and returns a tool call, and has its own [probe contract](gatewayd.md#check-a-configuration).
-It needs the credentials file loaded:
+`check` refuses `--env-file`, so load the credentials file for the probe with the shell:
 
 ```console
 sudo -u _dekopon_gateway /bin/sh -c '. /usr/local/etc/dekopon/gateway/credentials.env &&
@@ -409,10 +402,12 @@ sudo -u _dekopon_broker /usr/local/lib/dekopon/current/dekopon-brokerd \
 
 The probe pins the server to its own effective UID; it is an owner health check, not a
 cross-UID gateway test. A successful probe invokes nothing and does not prove a Slack sender is
-permitted. Start the gateway in a third terminal:
+permitted. Start the gateway in a third terminal, with the same arguments its plist uses:
 
 ```console
-sudo -u _dekopon_gateway /usr/local/libexec/dekopon-gateway
+sudo -u _dekopon_gateway /usr/local/lib/dekopon/current/dekopon-gatewayd \
+  --config /usr/local/etc/dekopon/gateway/gateway.yaml \
+  --env-file /usr/local/etc/dekopon/gateway/credentials.env
 ```
 
 From a mapped sender, make the chosen example's first request: a DM for the harmless starter, an
@@ -459,7 +454,11 @@ increase the example's 150 seconds if either daemon needs more time to drain.
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>dev.dekopon.gateway</string>
-  <key>ProgramArguments</key><array><string>/usr/local/libexec/dekopon-gateway</string></array>
+  <key>ProgramArguments</key><array>
+    <string>/usr/local/lib/dekopon/current/dekopon-gatewayd</string>
+    <string>--config</string><string>/usr/local/etc/dekopon/gateway/gateway.yaml</string>
+    <string>--env-file</string><string>/usr/local/etc/dekopon/gateway/credentials.env</string>
+  </array>
   <key>UserName</key><string>_dekopon_gateway</string>
   <key>GroupName</key><string>dekopon-ipc</string>
   <key>RunAtLoad</key><true/>
@@ -526,7 +525,8 @@ Do not disable disk encryption to obtain unattended startup, and test a power cu
 
 When a job repeatedly exits, read `sudo launchctl print system/<label>`, the broker's `stderr.log`
 (its `broker_exit` record) and the gateway's `stdout.log` (its `gateway_exit` record); the
-gateway's `stderr.log` holds only wrapper errors and failures before logging starts. JSON stdout
+gateway's `stderr.log` holds failures before logging starts, such as a refused `--env-file`
+naming its path and line. JSON stdout
 carries broker audit and gateway diagnostics; prompts and outputs may reach logs/telemetry, so
 keep them private. launchd's file redirection does not bound log growth. Before leaving it
 unattended, choose a size/retention policy. The broker's `stdout.log` is its only local audit
@@ -572,8 +572,12 @@ upgrade deletes the previous keg, so keep the previous release archive as the ro
 For rollback, stop both jobs, restore the configuration and provider state saved for the old
 release, run `sudo ln -sfh /usr/local/lib/dekopon/0.74.0 /usr/local/lib/dekopon/current`, and start
 them again. Use the retained binary **pair and matching configuration/provider state**, not an
-old binary against a newly migrated store. There is no universal reverse data migration. Do not
-run both releases concurrently, and inspect uncertain external effects before retrying.
+old binary against a newly migrated store. A release before 0.74.0 refuses `--env-file`
+([upgrading](upgrading.md)); rolling back past it means removing that option from the gateway
+plist and starting the gateway through a root-owned script that sources `credentials.env` and
+`exec`s the binary.
+There is no universal reverse data migration. Do not run both releases concurrently, and inspect
+uncertain external effects before retrying.
 
 If OpenRouter refuses a request (key limit reached, credit exhausted or key revoked), Slack shows
 only "The agent could not complete this request." and the gateway's `stdout.log` has
