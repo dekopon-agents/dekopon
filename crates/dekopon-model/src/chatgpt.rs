@@ -220,9 +220,8 @@ impl CredentialFile {
         let permit = Arc::new(permit);
         let lock = tokio::time::timeout(self.timeout, self.acquire_lock(&permit))
             .await
-            .map_err(|source| ChatGptError::LockAuth {
-                path: self.path.clone(),
-                source: io::Error::new(io::ErrorKind::TimedOut, source),
+            .map_err(|source| {
+                ChatGptError::RefreshTask(io::Error::new(io::ErrorKind::TimedOut, source))
             })??;
         let (reply, wait) = oneshot::channel();
         {
