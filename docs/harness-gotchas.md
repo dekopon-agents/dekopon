@@ -1,8 +1,8 @@
 # Harness gotchas
 
 **Status: Current.** How the gateway's turn loop hands a running turn's mailbox over to the next
-turn, and the race that handoff is built to rule out. The turn loop itself is described in
-[Sessions](gateway-conversations.md#sessions); the steering modes are below its numbered steps.
+turn, and the race that handoff is built to rule out. The turn loop is in [Sessions](gateway-conversations.md#sessions) and
+the steering modes in [Steering, text and shutdown](gateway-conversations.md#steering-text-and-shutdown).
 
 ## Vocabulary
 

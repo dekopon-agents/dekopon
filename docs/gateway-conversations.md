@@ -28,7 +28,7 @@ A route picks the agent that answers a message. It grants no authority.
 - **`ids` is optional.** Without it a route matches every conversation the bot is invited to, so a
   new channel needs no configuration change.
 - **`subjects:`** narrows a direct-message route to named canonical subjects and is refused beside
-  any other kind. Other senders match no route and are ignored. Authority stays with the broker's
+  any other kind. Other senders skip this route and fall through to later routes. Authority stays with the broker's
   subject mapping and Cedar.
 - **Unmatched messages** are ignored with debug `gateway_message_ignored` (`reason = unrouted`,
   `conversation.kind`, `conversation.container`).
@@ -103,6 +103,8 @@ Each admitted turn runs one session through five steps. On a `oneShot` route
      [liveness](gateway-liveness.md#liveness-progress-and-stopping-a-run), or the `failed` template:
      appended to a streamed partial answer, otherwise as a fresh reply after removing any progress
      message. Failure detail goes to `gateway_session_failed` (`category`), never to chat.
+   - A stop finalizes the progress message in place.
+   - Empty output, with no text and no images, is sent and recorded as `[empty response]`.
    - A follow turn posts no failure line or partial answer. When capability work went unreported,
      every turn posts `The agent attempted capability work but could not report the result. Check the audit before retrying.`
    - A follow batch or an inherited Slack Agent continuation may call `decline_chat_reply` before
@@ -145,11 +147,12 @@ Each admitted turn runs one session through five steps. On a `oneShot` route
 - **Shutdown.** Transport readers stop and in-flight sessions, with their queued follow-ups, get
   `shutdownGraceMs` to finish. When the grace expires the gateway logs `gateway_sessions_abandoned`
   and aborts them: no later model or capability call starts, queued receipts become `abandoned`
-  and queued wakes are lost. A model request or provider effect already in progress may still
+  and queued wakes are lost; admitted ticks still deliver their completed fires. A model request or provider effect already in progress may still
   finish. Native work then drains on the blocking pool ([runtime threads](gatewayd.md#runtime-threads));
   the chart's termination grace covers both daemon drains plus `drainBudget.bufferSeconds`
   ([Kubernetes](kubernetes.md#draining-takes-both-graces-in-sequence)). A transport that exhausts
-  [connection recovery](gatewayd.md#connection-recovery) stops the gateway through the same drain.
+  [connection recovery](gatewayd.md#connection-recovery), or whose reader task panics, stops the
+  gateway through the same drain.
 
 ## Conversations
 
@@ -167,9 +170,10 @@ the next prompt, so a follow-up can say "and the second one?". `memory: { mode: 
 The live window is in `dekopon-gatewayd`'s memory and never reaches the broker
 ([where the text goes](security-model.md#where-the-text-goes)). `idleTimeoutMs` bounds how long a
 window stays in memory, not how long it is remembered: when a message finds no window, the route's
-`recall` rebuilds one before the model runs.
+`recall` rebuilds one before the model runs, and a `journal` route recalls on every turn, resident
+or not.
 
-| `recall` | Rebuilds a missing window from |
+| `recall` | Recalls from |
 |---|---|
 | `none` | nothing; the window starts empty |
 | `journal` | the gateway's own transcript under `sessions.journal` |
@@ -303,7 +307,8 @@ A journal-recall route projects its recalled records before the model call:
   else verbatim. Summary and metadata rungs are envelopes (`[memory #41 · time · summary 3/3]`, the
   summary, one line per tool call) in one leading `[gateway: earlier conversation]` message, never
   executable tool calls.
-- A repack runs when the projection exceeds `maxBytes` or holds more than `2 × maxTurns` records.
+- A repack runs when the projection exceeds `maxBytes`, holds more than `2 × maxTurns` records, or
+  is absent while at least `2 × maxTurns` records exist.
   It keeps the newest `maxTurns` records, then steps the oldest down a rung (summary, metadata,
   counted omission), hot records last and whole, until the projection fits three quarters of
   `maxBytes`. Rungs change only at a repack, when a record leaves the hot window, or when its pin
@@ -315,7 +320,7 @@ A journal-recall route projects its recalled records before the model call:
   provider's `decide.choose` request with the configured `backend`, `model` and
   `requireProbabilities` and one `{tool, outcome, exitStatus?, ageMs, bytes, pinned}` evidence row
   per recalled record (newest 256), never historical text. The choice is written after the reply
-  and applies at the next repack; a refused, invalid or failed decision leaves the record on the
+  and applies at the next repack; a refused, ungranted, invalid or failed decision leaves the record on the
   ladder.
 
 After the reply, the summary engine fills a journal-recall record's slots in the background, part
@@ -358,7 +363,8 @@ summaries are kept and removed together. The broker audit log stores no conversa
 A mapped channel is one shared stream: each script runs on one current participant's broker leg,
 the asker's by default.
 
-- A native chat message reaching admission is authorized before it joins the turn; this does not
+- A retained participant's later messages and the asker's steers reuse that participant's leg for
+  the turn; an overflow participant is authorized on every message before it joins. This does not
   widen which unmentioned messages a transport admits. An unauthorized or empty leg drops the
   message with one `gateway.admission` refusal record.
 - Each newly authorized participant gets the [labelled first line](#scope-selects-the-replay-audience),
@@ -473,8 +479,11 @@ memory search --query TEXT
 - The assistant text is exactly what the transport accepted. No response, denial, timeout, EOF,
   partial delivery or `outcome-unaudited` is retried, and none changes the delivered `answered`
   outcome; failures log `gateway_memory_record_failed`.
-- Acceptance means the service accepted every part of the answer, never that a person read it; the
-  local transport accepts after `write_all` and `flush`.
+- Acceptance means the service accepted every part of the answer, never that a person read it.
+  Slack and Telegram need an HTTP success status before `ok: true`, and Telegram also checks the
+  topic ([Slack](gateway-transports.md#slack-socket-mode),
+  [Telegram](gateway-transports.md#telegram-long-polling)); the local transport accepts after
+  `write_all` and `flush`.
 - The request carries a service-specific inbound delivery identity, which the broker checks against
   the attested scope before creating the namespace, so one transport cannot alias another. Local
   identities hold a 128-bit OS-random boot nonce, the connection and a sequence, so restarts do not
