@@ -139,15 +139,19 @@ impl RoutingTable {
                     .memory_knobs
                     .as_ref()
                     .and_then(|knobs| knobs.summaries.as_ref())
-                && let crate::config::memory::SummaryModel::Route = &summaries.model
             {
-                for problem in
-                    summaries.validate_attachments(Some(model), config.memory.summaries.queue)
-                {
-                    problems.push(RouteProblem::MemoryPolicy {
-                        route: route_index,
-                        problem,
-                    });
+                match &summaries.model {
+                    crate::config::memory::SummaryModel::Named(_) => {}
+                    crate::config::memory::SummaryModel::Route => {
+                        for problem in summaries
+                            .validate_attachments(Some(model), config.memory.summaries.queue)
+                        {
+                            problems.push(RouteProblem::MemoryPolicy {
+                                route: route_index,
+                                problem,
+                            });
+                        }
+                    }
                 }
             }
             routes.push(BoundRoute {

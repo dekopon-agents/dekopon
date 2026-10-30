@@ -2198,21 +2198,7 @@ mod retention_tests {
             .unwrap();
             let messages = model.last.lock();
             for (index, (mime, kind)) in cases.iter().enumerate() {
-                let id = format!("fetch-{index}");
-                let text = messages
-                    .iter()
-                    .find_map(|message| match message {
-                        ModelMessage::ToolResults {
-                            tool_call_id,
-                            content,
-                        } if tool_call_id.as_str() == id => Some(content.as_str()),
-                        ModelMessage::ToolResults { .. }
-                        | ModelMessage::User { .. }
-                        | ModelMessage::Assistant { .. }
-                        | ModelMessage::System { .. }
-                        | ModelMessage::Journal { .. } => None,
-                    })
-                    .unwrap();
+                let text = fetch_result(&messages, index);
                 assert_eq!(text == "file contents", *kind == TextDocument, "{mime}");
                 let parts = messages.iter().filter_map(ModelMessage::parts).flatten();
                 let native = parts
@@ -2234,6 +2220,25 @@ mod retention_tests {
         })
         .await
         .unwrap();
+    }
+
+    fn fetch_result(messages: &[dekopon_model::model::ModelMessage], index: usize) -> &str {
+        use dekopon_model::model::ModelMessage;
+        let id = format!("fetch-{index}");
+        messages
+            .iter()
+            .find_map(|message| match message {
+                ModelMessage::ToolResults {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == id => Some(content.as_str()),
+                ModelMessage::ToolResults { .. }
+                | ModelMessage::User { .. }
+                | ModelMessage::Assistant { .. }
+                | ModelMessage::System { .. }
+                | ModelMessage::Journal { .. } => None,
+            })
+            .unwrap()
     }
 
     struct OneByteFetcher;

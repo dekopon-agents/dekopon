@@ -111,6 +111,7 @@ async fn append_freezes_attachment_slots_only_for_enabled_inbound_kinds() {
         AttachmentSummaries,
         Toggle::{Off, Summarize},
     };
+    use crate::journal::Keep::{Everything, ExchangesOnly};
     use dekopon_core::asset::AssetKind;
     let (capture, _guard) = capture_spans();
     let (dir, journal) = crate::memory::journal::records::tests::journal();
@@ -149,63 +150,33 @@ async fn append_freezes_attachment_slots_only_for_enabled_inbound_kinds() {
     ];
     let plan = crate::memory::generation::plan(&summarized_route(2)).unwrap();
     let stem = key.journal_stem();
-    for (attachments, plan, keep, expected) in [
+    for (images, documents, plan, keep, expected) in [
+        (Off, Off, Some(plan.clone()), Everything, vec![0, 0, 0, 0]),
         (
-            AttachmentSummaries {
-                images: Off,
-                documents: Off,
-            },
+            Summarize,
+            Off,
             Some(plan.clone()),
-            crate::journal::Keep::Everything,
-            vec![0, 0, 0, 0],
-        ),
-        (
-            AttachmentSummaries {
-                images: Summarize,
-                documents: Off,
-            },
-            Some(plan.clone()),
-            crate::journal::Keep::Everything,
+            Everything,
             vec![2, 0, 0, 0],
         ),
         (
-            AttachmentSummaries {
-                images: Off,
-                documents: Summarize,
-            },
+            Off,
+            Summarize,
             Some(plan.clone()),
-            crate::journal::Keep::Everything,
+            Everything,
             vec![0, 2, 2, 0],
         ),
         (
-            AttachmentSummaries {
-                images: Summarize,
-                documents: Summarize,
-            },
+            Summarize,
+            Summarize,
             Some(plan.clone()),
-            crate::journal::Keep::Everything,
+            Everything,
             vec![2, 2, 2, 0],
         ),
-        (
-            AttachmentSummaries {
-                images: Summarize,
-                documents: Summarize,
-            },
-            None,
-            crate::journal::Keep::Everything,
-            vec![0, 0, 0, 0],
-        ),
-        (
-            AttachmentSummaries {
-                images: Summarize,
-                documents: Summarize,
-            },
-            Some(plan),
-            crate::journal::Keep::ExchangesOnly,
-            vec![],
-        ),
+        (Summarize, Summarize, None, Everything, vec![0, 0, 0, 0]),
+        (Summarize, Summarize, Some(plan), ExchangesOnly, vec![]),
     ] {
-        let planned = plan.is_some() && keep == crate::journal::Keep::Everything;
+        let planned = plan.is_some() && keep == Everything;
         journal
             .append(
                 &stem,
@@ -215,7 +186,7 @@ async fn append_freezes_attachment_slots_only_for_enabled_inbound_kinds() {
                     captured: &turn,
                     keep,
                     plan,
-                    attachments,
+                    attachments: AttachmentSummaries { images, documents },
                     arrivals: &arrivals,
                     inventory: &registered.inventory,
                     next_asset_id: 7,
@@ -235,7 +206,7 @@ async fn append_freezes_attachment_slots_only_for_enabled_inbound_kinds() {
         for asset in &head.arrived {
             assert!(asset.summaries.iter().all(|slot| *slot == Slot::Queued));
         }
-        if keep == crate::journal::Keep::Everything {
+        if keep == Everything {
             assert_eq!(
                 head.arrived
                     .iter()
@@ -265,8 +236,7 @@ async fn append_freezes_attachment_slots_only_for_enabled_inbound_kinds() {
         let records = capture.records();
         let published = records
             .iter()
-            .filter(|record| record.field("event") == Some("gateway_memory_published"))
-            .next_back()
+            .rfind(|record| record.field("event") == Some("gateway_memory_published"))
             .unwrap();
         assert_eq!(
             published.field("memory.assets.arrived"),
