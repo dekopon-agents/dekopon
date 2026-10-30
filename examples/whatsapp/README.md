@@ -90,9 +90,9 @@ The download policy permits only exact HTTPS `lookaside.fbsbx.com:443` at
 Other CDN hosts fail closed; this is deliberately not an exhaustive Meta compatibility claim.
 The request shapes are pinned by loopback tests, not live Meta validation. The example pins v25.0;
 a dashboard webhook version does not by itself establish Graph version compatibility. See the
-[transport contract](../../docs/gatewayd.md#meta-whatsapp-cloud-api) for bounds and limitations.
+[transport contract](../../docs/gateway-transports.md#meta-whatsapp-cloud-api) for bounds and limitations.
 
 The example uses a 5000ms media-first quiet interval (`debounceMs`) and a 15000ms hard maximum
 from the first receipt (`debounceMaxWaitMs`). Set `debounceMs: 0` for immediate admission; when
 enabled, the maximum must be at least the quiet interval. Collection does not wait for active
-sessions or fetch media. See the [collection contract](../../docs/gatewayd.md#multi-message-media-inputs).
+sessions or fetch media. See the [collection contract](../../docs/gateway-assets.md#multi-message-media-inputs).

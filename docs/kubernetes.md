@@ -231,7 +231,7 @@ does not rewrite configuration.
 budget plus `brokerAssets.maxInFlightBytes` (64 MiB), because unlinked broker outputs stay on it until
 the gateway closes them. Raise each with its budgets. The chart refuses `gateway.journal.enabled`
 without `gateway.assets.enabled`, and the reverse; with a journal, attachments survive restarts on
-the claim, and without one they stay in gateway `/tmp` ([Chat assets](gatewayd.md#chat-assets)).
+the claim, and without one they stay in gateway `/tmp` ([Chat assets](gateway-assets.md#chat-assets)).
 Kubelet enforces `emptyDir.sizeLimit` by evicting the pod; it reserves nothing.
 
 ## Probes

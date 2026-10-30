@@ -79,7 +79,7 @@ proposal and its result; repeated references share a row and descriptor. Quoted 
 text stays text. Gateway-built proposals retain `Invoke`; no proposal JSON walk discovers files.
 `attachment.rs` owns the gateway-facing registration/send traits; `dekopon-gatewayd::asset` owns scoped
 numbering, retention and output sniffing. Update the descriptor, lifetime, queue, transport and
-failure-note tests together. See [asset handles](gatewayd.md#asset-handles-and-delivery).
+failure-note tests together. See [asset handles](gateway-assets.md#asset-handles-and-delivery).
 
 Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered on every session, and its record carries model-authored text same as every other model-authored record (goal 2). The contract is in [`improvement.md`](improvement.md).
 
@@ -328,7 +328,7 @@ fixtures under `crates/dekopon-gatewayd/tests/gateway/` cover sequential asker â
 refused participants, bot suppression, membership, server isolation, files and config refusal.
 The shared fixture owns model shutdown and joins its worker even when scripted replies remain.
 The feature adds no dependencies and is not enabled for release builds. See the
-[fauxlack transport contract](gatewayd.md#fauxlack-tests-only).
+[fauxlack transport contract](gateway-transports.md#fauxlack-tests-only).
 
 ## Validation
 
@@ -458,7 +458,7 @@ HTTP responses from
 no upstream request; replay ignores `Authorization`, so an HTTP fixture in front of it checks the
 broker's bearer credential. The real Slack Agent adapter speaks Socket Mode to the loopback
 [`slack_socket_fixture.py`](../ci/slack_socket_fixture.py), not
-[Fauxlack](gatewayd.md#fauxlack-tests-only) or a real workspace.
+[Fauxlack](gateway-transports.md#fauxlack-tests-only) or a real workspace.
 
 **A green run proves:**
 

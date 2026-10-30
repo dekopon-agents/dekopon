@@ -28,7 +28,7 @@ Then work in order:
 
 Out of scope: Docker Desktop ([container guide](container-image.md)),
 [subscription authentication](cli.md) and the same-user
-[local transport](gatewayd.md#local-development-transport), which trusts the caller's declared subject.
+[local transport](gateway-transports.md#local-development-transport), which trusts the caller's declared subject.
 
 ## Install
 
@@ -161,7 +161,7 @@ Spending limits:
   overshoot it: leave headroom and watch the usage page.
 - Dekopon's optional local meter counts raw input plus output tokens, not dollars. It can settle
   above its reservation, starts empty after a restart without telemetry restore, and never refuses
-  background memory summaries ([token budgets](gatewayd.md#token-budgets)).
+  background memory summaries ([token budgets](gateway-models.md#token-budgets)).
 
 Keep the three values for the gateway's `credentials.env`, created in
 [Credential files](#credential-files):

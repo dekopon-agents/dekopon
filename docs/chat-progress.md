@@ -196,7 +196,7 @@ Rendering, for whichever capability objects the driver returns, at the route's d
 4. Keep-alive at 15 s, 45 s, then every 60 s, always an edit and never a new post.
 5. With streaming on and a `TextStream` present, the stream is the surface.
 6. Slack Agent `statusText: true` can hand over to custom status text on the first note, sharing
-   the same line selection, coalescing and edit budget. See the [Slack transport contract](gatewayd.md#slack-socket-mode)
+   the same line selection, coalescing and edit budget. See the [Slack transport contract](gateway-transports.md#slack-socket-mode)
    for the hidden native Stop, refresh lease, fallback and terminal ordering.
 
 Detail levels are per route: `off` suppresses progress prose but not explicitly requested answer
@@ -213,7 +213,7 @@ Default templates are operator strings overridable per transport: `Working on it
 `Stopped.` for person/operator stops, and `The agent could not complete this request.` for
 failures without a fixed cause line. Session time limits, model deadlines, empty answers, step
 limits and lost tasks each have a fixed non-template sentence naming the cause; see
-[stop causes and conversation seals](gatewayd.md#liveness-progress-and-stopping-a-run).
+[stop causes and conversation seals](gateway-liveness.md#liveness-progress-and-stopping-a-run).
 
 A live note has priority over both tool/status and keep-alive lines, even through individual tool
 completions. A later note replaces it; a new model turn, steering, or any terminal outcome clears

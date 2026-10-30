@@ -29,7 +29,7 @@ limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
   with existing follow and journal configuration: a PR link starts a threaded review turn using
   only the poster’s broker leg, downscoped by a mapped channel. Other speakers wait for separate
   turns. Unmapped or denied posters' ambient links are silently refused, with a trace record
-  and no thread reply or reaction. See [Slack pull-request links](../../docs/gatewayd.md#slack-pull-request-links).
+  and no thread reply or reaction. See [Slack pull-request links](../../docs/gateway-transports.md#slack-pull-request-links).
 - **Chat assets** — Slack, Discord, and Telegram photos/files plus WhatsApp PNG/JPEG photos become bounded references
   that a model opens on demand. Feature-only fauxlack also reads manifest files from its world. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
@@ -44,7 +44,7 @@ limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
   Successful typed outputs join the scoped disk LRU; attaching does not send. Broker-authorized
   `asset.send` queues at most four files per turn, with persistent sent flags and bounded failure
   notices. Slack/Discord/local and feature-only fauxlack accept concrete valid media types; Telegram/WhatsApp send PNG/JPEG.
-  WhatsApp retains its 5,000,000-byte ceiling. See the [asset contract](../../docs/gatewayd.md#asset-handles-and-delivery).
+  WhatsApp retains its 5,000,000-byte ceiling. See the [asset contract](../../docs/gateway-assets.md#asset-handles-and-delivery).
 - **Indicators** — layered `sessions`/transport/conversation-kind/route settings default off;
   after fresh authorization, `progress: auto` prefers native status, then typing. Working
   and steer reactions default off. `working: on` adds to status or typing;
@@ -54,7 +54,7 @@ limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
   that surface for an explicit Stop button or when no indicator works. `progressDetail` controls
   prose only: explicitly requested `stream` remains independent of progress/detail Off.
   Best-effort steer/queue 👀 is separate and requires `reaction.seen: on`; it defaults off.
-  See [presentation limits](../../docs/gatewayd.md#liveness-progress-and-stopping-a-run).
+  See [presentation limits](../../docs/gateway-liveness.md#liveness-progress-and-stopping-a-run).
   A stop word, a cancel button, or
   `limits.maxDurationMs` ends a run early. Cosmetic failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
@@ -146,7 +146,7 @@ and the distinct-UID deployment boundary are documented in
 WhatsApp media-first collection uses `debounceMs` (5000ms quiet by default) and
 `debounceMaxWaitMs` (15000ms maximum from the first receipt). Zero quiet time bypasses collection;
 an enabled maximum must be at least the quiet interval. See the
-[multi-message contract](../../docs/gatewayd.md#multi-message-media-inputs) for bounds and isolation.
+[multi-message contract](../../docs/gateway-assets.md#multi-message-media-inputs) for bounds and isolation.
 
 ## Run
 
@@ -180,5 +180,5 @@ journal, files use private temporary disk and die with the process. Generated fi
 session-only in both modes. Zero disables asset retention and attachment delivery, not the bound;
 text-only sessions remain usable. Weak model references cannot prevent LRU reclamation. Generated
 PNG results publish gateway-owned `chat-asset:<N>` markers for successive edits; availability is
-not delivery confirmation. See [chat assets](../../docs/gatewayd.md#chat-assets) for lifecycle,
+not delivery confirmation. See [chat assets](../../docs/gateway-assets.md#chat-assets) for lifecycle,
 limits, explicit release notices and no-refetch/no-blind-retry behavior.

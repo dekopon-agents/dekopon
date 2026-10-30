@@ -2,7 +2,7 @@
 
 **Status: Current.** How the gateway's turn loop hands a running turn's mailbox over to the next
 turn, and the race that handoff is built to rule out. The turn loop itself is described in
-[Sessions](gatewayd.md#sessions); the steering modes are below its numbered steps.
+[Sessions](gateway-conversations.md#sessions); the steering modes are below its numbered steps.
 
 ## Vocabulary
 

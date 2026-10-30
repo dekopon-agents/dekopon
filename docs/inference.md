@@ -197,7 +197,7 @@ credential-refresh resends; without a key, it sends neither field nor header. De
 enumerate cache contents, or delete provider state. It is an HMAC of the agent, transport and
 conversation or route under a gateway-held secret, so it carries no subject, channel, phone number,
 or account ID in a form the provider can recover, and it survives evictions, and restarts when a
-journal holds the secret. [`gatewayd.md`](gatewayd.md#the-prompt-cache-key) owns
+journal holds the secret. [`gateway-conversations.md`](gateway-conversations.md#the-prompt-cache-key) owns
 its scope and derivation.
 
 Sharing a one-shot route's key does not share answers: two requests reuse only their identical
@@ -272,7 +272,7 @@ One long-lived optimization is in place: `dekopon-gatewayd` shares one model cli
 
 ## How scoped conversation memory works
 
-A route selects replay behavior with a `memory:` block, and [`gatewayd.md`](gatewayd.md#conversations) owns its
+A route selects replay behavior with a `memory:` block, and [`gateway-conversations.md`](gateway-conversations.md#conversations) owns its
 keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
 `persistent` is the route default; `oneShot` disables history replay. A journal-recall route
@@ -339,7 +339,7 @@ storage is decoded by the native codec on consumption. Model wire serialization 
 streaming model request bodies is a separate change, not claimed by descriptor integration.
 
 For adapter types, storage ceilings and transport paths, see
-[asset handles and delivery](gatewayd.md#asset-handles-and-delivery). Memory retains text and scoped
+[asset handles and delivery](gateway-assets.md#asset-handles-and-delivery). Memory retains text and scoped
 reference notes, never provider payload bytes. A partial native delivery suppresses durable recording.
 
 
@@ -369,7 +369,7 @@ message becomes a second stored turn. Malformed complete records remain `memory-
 Parsing, search, and compaction run inside provider Wasm; the broker owns only opaque namespace-bound
 files, quotas, and commit. Conversation content therefore lives under the privileged broker's storage
 root and never in its audit, spans, metrics, public errors, or provider metadata.
-[`gatewayd.md`](gatewayd.md#durable-memory-after-transport-acceptance) owns when a turn is recorded.
+[`gateway-conversations.md`](gateway-conversations.md#durable-memory-after-transport-acceptance) owns when a turn is recorded.
 Retrieval is explicit: a durable turn never enters a later prompt on its own, and what comes back is
 untrusted model context.
 
