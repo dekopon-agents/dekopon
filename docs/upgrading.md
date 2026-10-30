@@ -8,6 +8,29 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## --env-file and Wasmtime 49.0.5 (0.74.0)
+
+No configuration change is required. Both serving daemons accept an optional
+`--env-file PATH`: a private literal `KEY=VALUE` file loaded before serving, below
+options and inherited variables. Unsafe files, malformed lines, reserved keys and
+helper modes are refused without echoing values. See the gateway's
+[environment-file contract](gatewayd.md#environment-file). The Helm chart passes
+no `--env-file` option. A 0.73.0 daemon rejects the option; remove it from launch
+arguments before downgrading.
+
+OTLP CA certificate errors now name `OTEL_EXPORTER_OTLP_CERTIFICATE`, rather than
+the path it names.
+
+An unchanged broker reload poll no longer rebuilds the broker and policy. No
+operator action is required.
+
+Both Wasmtime builds move to 49.0.5 for RUSTSEC-2026-0422, RUSTSEC-2026-0423 and
+RUSTSEC-2026-0424; the memory-optimized overlay is pinned at `1d165f99`.
+
+Downgrading to 0.73.0 is revert-safe once `--env-file` is removed from launch
+arguments: there is no configuration, persisted-format or wire change. A downgrade
+reopens RUSTSEC-2026-0422, RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
+
 ## PR subscriptions, space digests and rustix 1.1.6 (0.73.0)
 
 No configuration change is required. `sessions.wakes` gains two optional keys:
