@@ -268,8 +268,8 @@ cargo --config .cargo/wasmtime-optimization.toml build --release --locked -p dek
 cargo --config .cargo/wasmtime-optimization.toml test --locked -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd --all-features
 ```
 
-The overlay pins [C12 at `6e850d9e`](https://github.com/dekopon-agents/wasmtime/commit/6e850d9e9df96b0eacd6867e8ffb8a813200e42f),
-based on Wasmtime 49.0.4. Wasmtime's workspace path dependencies keep its compiler
+The overlay pins [C12 at `1d165f99`](https://github.com/dekopon-agents/wasmtime/commit/1d165f99768bd679497cf3dd1de6c89f6861a1c3),
+based on Wasmtime 49.0.5. Wasmtime's workspace path dependencies keep its compiler
 and internal crates on that revision. The memory changes compact finalized machine-code buffers
 and release source locations after preserving the address map; they do not include the separate
 experimental unwind/linking changes. The RPi deploys this build on ARM64; it is a dogfood
