@@ -157,7 +157,7 @@ What consumes a loaded skill:
   that route: a second system message after `instructions` lists each skill by name and
   description, and the `read_skill` tool returns a skill's body, or one resource's text, when the
   model asks. Bodies and resources are never in a prompt until read; each read is recorded as
-  `agent.skill.read`. See [`gatewayd.md`](gateway-conversations.md#sessions) and
+  `agent.skill.read`. See [`gateway-conversations.md`](gateway-conversations.md#sessions) and
   [`observability.md`](observability.md).
 - `inspect_agent_config` lists mounted skills by name, description, and resource paths — never the
   text.

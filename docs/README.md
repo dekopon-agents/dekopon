@@ -73,11 +73,11 @@ Keep the host, SDK, HTTP and storage facades, provider WIT, HTTP WIT, storage WI
 | Getting a ChatGPT subscription credential into a cluster | [`chatgpt-credential.md`](chatgpt-credential.md) | Records why an interactive login cannot run in a pod, and the seed-once lifecycle that follows from a rotating refresh token. |
 | Model request types, ChatGPT wire JSON, prompt caching, provider retention, chat memory, or memory frameworks | [`inference.md`](inference.md) | Separates request and cache hints, bounded replay, and durable on-demand turns from undocumented subscription behavior and exploratory memory. |
 | Prompt tools and sandboxed scripts | [`dekopon-agent`](../crates/dekopon-agent/README.md) and [`dekopon-shell`](../crates/dekopon-shell/README.md) | Shared orchestration, language, limits, and authority-free dispatch. |
-| Gateway configuration, running and checking the daemon | [`gatewayd.md`](gatewayd.md) | Records the daemon's command line, environment file, `gatewayd.yaml` keys and telemetry. |
-| Chat transports | [`gateway-transports.md`](gateway-transports.md) | Records each chat service's transport semantics and the GitHub webhook. |
+| Gateway configuration, running and checking the daemon | [`gatewayd.md`](gatewayd.md) | Records the daemon's command line, environment file, `gatewayd.yaml` keys, the GitHub webhook transport and telemetry. |
+| Chat transports | [`gateway-transports.md`](gateway-transports.md) | Records each chat service's transport semantics. |
 | Chat media and assets | [`gateway-assets.md`](gateway-assets.md) | Records media collection, asset handles and delivery. |
 | Routing, agent sessions, conversation history or the authorization flow | [`gateway-conversations.md`](gateway-conversations.md) | Records routing, session bounds, the conversation contract, durable memory and attested authorization. |
-| Run liveness, progress or stopping | [`gateway-liveness.md`](gateway-liveness.md) | Records what the gateway shows while a run works and how it stops. |
+| Gateway liveness keys, refusals and stop handling | [`gateway-liveness.md`](gateway-liveness.md) | Records the gateway's liveness configuration and behaviour; [`chat-progress.md`](chat-progress.md) holds the design. |
 | Wakes, PR subscriptions or detached jobs | [`gateway-wakes.md`](gateway-wakes.md) | Records turns the gateway starts without a new message. |
 | Token budgets, the guest model proxy or model authentication | [`gateway-models.md`](gateway-models.md) | Records gateway-side model budgets and the guest proxy. |
 | Steers, the mailbox, or how a turn hands off to the next | [`harness-gotchas.md`](harness-gotchas.md) | Records the sealed handoff, the check-then-act race it rules out, and the invariant that every steer is staged or runs next. |

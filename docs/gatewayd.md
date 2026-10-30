@@ -17,7 +17,7 @@ broker-injected GitHub token, and an audited PR review comment. Read it beside t
 This reference covers running and checking the daemon, the `gatewayd.yaml` keys, agent
 self-inspection and telemetry. Each subject has its own reference:
 
-- [transports](gateway-transports.md): Slack, Discord, Telegram, WhatsApp, GitHub and local;
+- [transports](gateway-transports.md): Slack, Discord, Telegram, WhatsApp and local;
 - [assets and media](gateway-assets.md): media inputs, asset handles and chat assets;
 - [routing, sessions and conversations](gateway-conversations.md), durable memory and authorization;
 - [liveness, progress and stopping a run](gateway-liveness.md);

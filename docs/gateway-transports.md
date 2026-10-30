@@ -1,6 +1,6 @@
 # Gateway transports
 
-How `dekopon-gatewayd` connects to each chat service and the GitHub webhook. Configure the keys in [`gatewayd.md`](gatewayd.md#configuration).
+How `dekopon-gatewayd` connects to each chat service. Configure the keys in [`gatewayd.md`](gatewayd.md#configuration).
 
 ## Transports
 

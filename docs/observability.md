@@ -777,7 +777,7 @@ carries a phone number, a WABA identifier, a message ID, or message text.
 
 ### What conversation history changes
 
-A route set to `mode: persistent` — the contract is in [`gatewayd.md`](gateway-conversations.md#conversations) —
+A route set to `mode: persistent` — the contract is in [`gateway-conversations.md`](gateway-conversations.md#conversations) —
 is the default and changes the meaning of a field that already exists. A route explicitly set to
 `oneShot` replays no history.
 
@@ -856,7 +856,7 @@ of every person-originated prompt sent to the selected model provider independen
 Every model request declares the key (`prompt_cache_key`; `session_id` on OpenRouter) — one per
 conversation on a `persistent` route, one per bound route on a `oneShot` one. OpenRouter can
 additionally mark an explicit system prefix.
-[`gatewayd.md`](gateway-conversations.md#the-prompt-cache-key) has the local key contract; two things follow for telemetry.
+[`gateway-conversations.md`](gateway-conversations.md#the-prompt-cache-key) has the local key contract; two things follow for telemetry.
 
 **`usage.cached_input_tokens` is how you find out whether it works.** Plot its ratio to
 `usage.input_tokens` on a conversation's second and later turns, the requests that repeat a prefix
