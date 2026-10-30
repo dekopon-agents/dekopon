@@ -26,7 +26,7 @@ clap.workspace = true
 dekopon-agent.workspace = true
 dekopon-broker-protocol.workspace = true
 dekopon-config.workspace = true
-dekopon-core.workspace = true
+dekopon-core = { workspace = true, features = ["cli"] }
 dekopon-model.workspace = true
 dekopon-model-proxy.workspace = true
 dekopon-model-token-governor.workspace = true

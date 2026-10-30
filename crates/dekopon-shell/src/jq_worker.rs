@@ -6,7 +6,7 @@ use std::{
 
 use jaq_json::Val;
 
-pub const JQ_WORKER_MARKER: &str = "DEKOPON_SHELL_JQ_WORKER";
+pub(crate) use dekopon_core::env_file::JQ_WORKER_MARKER;
 static EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn set_jq_worker_executable(path: PathBuf) -> Result<(), PathBuf> {

@@ -1,7 +1,7 @@
 use std::{
     fmt,
     fs::{self, Metadata},
-    io::Read as _,
+    io::Read,
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
 };
@@ -74,6 +74,8 @@ pub enum FileHygieneError {
         mode: u32,
         observed: &'static str,
     },
+    #[error("{} is owned by uid {owner}; an ancestor must be owned by root or this user", path.display())]
+    UntrustedAncestorOwner { path: PathBuf, owner: u32 },
     #[error("could not read {}", path.display())]
     Io {
         path: PathBuf,
@@ -92,6 +94,7 @@ impl FileHygieneError {
             Self::HardLinked { .. } => "hard-linked",
             Self::TooLarge { .. } => "too-large",
             Self::UnsafeAncestor { .. } => "unsafe-ancestor",
+            Self::UntrustedAncestorOwner { .. } => "untrusted-ancestor-owner",
             Self::Io { .. } => "io",
         }
     }
@@ -105,6 +108,7 @@ impl FileHygieneError {
             | Self::HardLinked { path, .. }
             | Self::TooLarge { path, .. }
             | Self::UnsafeAncestor { path, .. }
+            | Self::UntrustedAncestorOwner { path, .. }
             | Self::Io { path, .. } => path,
         }
     }
@@ -153,6 +157,22 @@ pub fn check_trusted_metadata(
 pub struct AncestorPolicy {
     pub canonicalize: bool,
     pub include_self: bool,
+    pub owners: AncestorOwners,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AncestorOwners {
+    Any,
+    RootOr(u32),
+}
+
+impl AncestorOwners {
+    const fn permits(self, owner: u32) -> bool {
+        match self {
+            Self::Any => true,
+            Self::RootOr(uid) => owner == 0 || owner == uid,
+        }
+    }
 }
 
 pub fn check_trusted_ancestors(
@@ -180,12 +200,19 @@ pub fn check_trusted_ancestors(
                 observed: describe(&metadata),
             });
         }
+        if !policy.owners.permits(metadata.uid()) {
+            return Err(FileHygieneError::UntrustedAncestorOwner {
+                path: ancestor.to_path_buf(),
+                owner: metadata.uid(),
+            });
+        }
     }
     Ok(())
 }
 
 /// This blocks and must be wrapped in spawn_blocking from async code; the length is checked twice
-/// because the file can grow between the metadata check and the read.
+/// because the file can grow between the metadata check and the read. `O_NONBLOCK` lets a FIFO
+/// open at once so the descriptor check refuses it.
 pub fn read_trusted_file(
     path: &Path,
     expected_uid: u32,
@@ -197,22 +224,37 @@ pub fn read_trusted_file(
         source,
     };
     let mut options = fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options.open(path).map_err(io_error)?;
     let metadata = file.metadata().map_err(io_error)?;
     check_trusted_metadata(path, &metadata, expected_uid, tier)?;
+    read_bounded(path, file, metadata.len(), max_bytes)
+}
+
+fn read_bounded(
+    path: &Path,
+    reader: impl Read,
+    metadata_len: u64,
+    max_bytes: usize,
+) -> Result<Vec<u8>, FileHygieneError> {
     let too_large = |length| FileHygieneError::TooLarge {
         path: path.to_path_buf(),
         length,
         maximum: max_bytes,
     };
-    if metadata.len() > max_bytes as u64 {
-        return Err(too_large(metadata.len()));
+    if metadata_len > max_bytes as u64 {
+        return Err(too_large(metadata_len));
     }
     let mut bytes = Vec::new();
-    file.take(max_bytes as u64 + 1)
+    reader
+        .take(max_bytes as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(io_error)?;
+        .map_err(|source| FileHygieneError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
     if bytes.len() > max_bytes {
         return Err(too_large(bytes.len() as u64));
     }
@@ -255,20 +297,24 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AncestorPolicy, FileHygieneError, FileTier, check_trusted_ancestors, read_trusted_file,
+        AncestorOwners, AncestorPolicy, FileHygieneError, FileTier, check_trusted_ancestors,
+        read_bounded, read_trusted_file,
     };
 
     const AS_WRITTEN_ABOVE: AncestorPolicy = AncestorPolicy {
         canonicalize: false,
         include_self: false,
+        owners: AncestorOwners::Any,
     };
     const AS_WRITTEN_SELF: AncestorPolicy = AncestorPolicy {
         canonicalize: false,
         include_self: true,
+        owners: AncestorOwners::Any,
     };
     const CANONICAL_SELF: AncestorPolicy = AncestorPolicy {
         canonicalize: true,
         include_self: true,
+        owners: AncestorOwners::Any,
     };
 
     struct Fixture {
@@ -470,5 +516,27 @@ mod tests {
         assert_eq!(error.category(), "unsafe-ancestor");
         assert_eq!(error.path(), file);
         assert!(error.to_string().contains("regular file"), "{error}");
+    }
+
+    #[test]
+    fn growth_past_the_bound_during_the_read_is_refused() {
+        let path = PathBuf::from("growing");
+        let error = read_bounded(&path, &b"123456789"[..], 4, 8)
+            .expect_err("the reader yields more than the descriptor reported");
+        assert!(
+            matches!(
+                error,
+                FileHygieneError::TooLarge {
+                    length: 9,
+                    maximum: 8,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            read_bounded(&path, &b"12345678"[..], 4, 8).unwrap(),
+            b"12345678"
+        );
     }
 }

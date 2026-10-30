@@ -49,8 +49,26 @@ fn main() -> ExitCode {
     if let Some(code) = dekopon_shell::run_jq_worker_if_requested() {
         return code;
     }
-    let cli = Cli::parse();
-    let builder = runtime_builder(&cli).unwrap_or_else(|error| error.exit());
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return dekopon_core::render_cli_error(error, Cli::command()),
+    };
+    if let Some(env_file) = &cli.env_file {
+        match &cli.command {
+            None => {}
+            Some(cli::Command::Auth(_) | cli::Command::Check(_)) => {
+                eprintln!("dekopon-gatewayd: --env-file is accepted only when serving");
+                return ExitCode::from(2);
+            }
+        }
+        let error = dekopon_core::env_file::reexec(env_file, dekopon_gatewayd::current_uid());
+        eprintln!("dekopon-gatewayd: {}", error_chain(&error));
+        return ExitCode::FAILURE;
+    }
+    let builder = match runtime_builder(&cli) {
+        Ok(builder) => builder,
+        Err(error) => return dekopon_core::render_cli_error(error, Cli::command()),
+    };
     match &cli.command {
         Some(cli::Command::Auth(options)) => {
             return match bounded_runtime(builder, BLOCKING_EXIT_TIMEOUT, auth_output::run(options))

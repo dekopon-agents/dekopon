@@ -38,30 +38,30 @@ unreleased changes even when `--version` still prints the release number.
 ### Prebuilt archives
 
 This is the service path used below. Stage a verified archive in a versioned,
-operator-controlled directory so upgrades and rollback are deliberate. Release [0.72.0](https://github.com/dekopon-agents/dekopon/releases/tag/v0.72.0)
+operator-controlled directory so upgrades and rollback are deliberate. Release [0.73.0](https://github.com/dekopon-agents/dekopon/releases/tag/v0.73.0)
 provides macOS ARM64 and Linux ARM64/x86-64 archives; the optimized-Wasmtime variants are Linux-only.
 The standard archive also contains the optional console and reference documents, but no providers.
 
 ```console
-gh release download v0.72.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.72.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.72.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.73.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.73.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.73.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.72.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.72.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.73.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.73.0-aarch64-apple-darwin.tar.gz
 ```
 
 For the first installation, create the exact paths the service templates use:
 
 ```console
-sudo install -d -o root -g wheel -m 0755 /usr/local/lib/dekopon/0.72.0
+sudo install -d -o root -g wheel -m 0755 /usr/local/lib/dekopon/0.73.0
 sudo install -o root -g wheel -m 0755 \
-  dekopon-0.72.0-aarch64-apple-darwin/dekopon-brokerd \
-  dekopon-0.72.0-aarch64-apple-darwin/dekopon-gatewayd \
-  /usr/local/lib/dekopon/0.72.0/
+  dekopon-0.73.0-aarch64-apple-darwin/dekopon-brokerd \
+  dekopon-0.73.0-aarch64-apple-darwin/dekopon-gatewayd \
+  /usr/local/lib/dekopon/0.73.0/
 test ! -e /usr/local/lib/dekopon/current && \
   test ! -L /usr/local/lib/dekopon/current && \
-  sudo ln -s /usr/local/lib/dekopon/0.72.0 /usr/local/lib/dekopon/current
+  sudo ln -s /usr/local/lib/dekopon/0.73.0 /usr/local/lib/dekopon/current
 /usr/local/lib/dekopon/current/dekopon-brokerd --version
 /usr/local/lib/dekopon/current/dekopon-gatewayd --version
 ```
@@ -107,7 +107,9 @@ responses, and a local Socket Mode fixture drives the released Slack Agent adapt
 
 The check requires owner/colleague PR reads and threaded replies, sender and room denials,
 native Working/Stop, secret-free logs and responses, and clean job removal. It uses no live
-Slack, OpenRouter or GitHub credentials and does not build replacement daemon binaries. See the
+Slack, OpenRouter or GitHub credentials. By default it builds no replacement daemon binaries; its
+`daemons: checkout` input builds candidate binaries from the dispatched commit, which is not
+release evidence. See the
 [development instructions](development.md#macos-homebrew-compatibility) for exact coverage,
 fixture pins and a local command.
 
@@ -140,18 +142,18 @@ pinned in [`rust-toolchain.toml`](../rust-toolchain.toml), and check out the rel
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
 cd dekopon
-git checkout v0.72.0
+git checkout v0.73.0
 cargo install --locked --path crates/dekopon-brokerd
 cargo install --locked --path crates/dekopon-gatewayd
 ```
 
-Alternatively, `cargo install --locked --version 0.72.0 <daemon-name>` uses crates.io, if both
+Alternatively, `cargo install --locked --version 0.73.0 <daemon-name>` uses crates.io, if both
 crates have finished publishing. Neither method installs providers or a service. The
 [development guide](development.md) owns build and provider-fixture checks.
 
 ## Prepare Slack and the model
 
-Use the [Slack Agent manifest from the release](https://github.com/dekopon-agents/dekopon/blob/v0.72.0/examples/slack/manifest-agent.yaml).
+Use the [Slack Agent manifest from the release](https://github.com/dekopon-agents/dekopon/blob/v0.73.0/examples/slack/manifest-agent.yaml).
 It enables Slack's Agent view and native Working/Stop session UI. The workspace plan and admin
 policy must allow those features. It still uses **Socket Mode**, with the same two credentials;
 Agent API support does not introduce a public listener or webhook URL.
@@ -233,7 +235,8 @@ command line containing the token. The broker launchd plist below runs the binar
 needs no `EnvironmentVariables` entry or secret-loading wrapper.
 
 Setting `GITHUB_TOKEN` in a plist or sourcing a broker `.env` does not populate this credential:
-the released broker has no dotenv loader and this bearer-token field does not expand `${...}`.
+the broker reads no credential from its environment and this bearer-token field does not expand
+`${...}`.
 Do not add the PAT to the gateway's `credentials.env`; that would give the wrong process the
 secret. Keep the file out of Git and ordinary logs/backups. Rotate it privately, stop the gateway
 then the broker, and restart broker then gateway to load the replacement. The review guide
