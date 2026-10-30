@@ -7,6 +7,26 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.74.0] - 2026-10-30
+
+### Added
+
+- `--env-file PATH` on dekopon-gatewayd and dekopon-brokerd loads a private literal KEY=VALUE file before serving, below options and inherited variables, and refuses unsafe files, malformed lines, reserved keys and helper modes without echoing values.
+
+### Fixed
+
+- An unchanged broker reload poll no longer rebuilds the broker and policy every two seconds before answering that nothing changed.
+
+### Security
+
+- Wasmtime moves to 49.0.5 in both builds for RUSTSEC-2026-0422, RUSTSEC-2026-0423 and RUSTSEC-2026-0424.
+
+## [dekopon-chart-0.61.0] - 2026-10-30
+
+### Changed
+
+- Chart 0.61.0 targets core v0.74.0 and renders the `v0.74.0` image tag.
+
 ## [0.73.0] - 2026-10-30
 
 ### Added
