@@ -2706,6 +2706,15 @@ fn private_socket(path: &std::path::Path) {
 }
 
 #[cfg(unix)]
+fn bind_private_socket(path: &std::path::Path) -> std::os::unix::net::UnixListener {
+    let pending = path.with_extension("pending");
+    let listener = std::os::unix::net::UnixListener::bind(&pending).expect("bind fixture socket");
+    private_socket(&pending);
+    std::fs::rename(&pending, path).expect("publish fixture socket");
+    listener
+}
+
+#[cfg(unix)]
 fn owner(path: &std::path::Path) -> u32 {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -2732,12 +2741,14 @@ async fn open_waits_through_an_absent_then_refusing_broker_until_one_accepts() {
         let socket = socket.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
-            drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket"));
-            private_socket(&socket);
+            drop(bind_private_socket(&socket));
             tokio::time::sleep(Duration::from_millis(150)).await;
             std::fs::remove_file(&socket).expect("remove stale socket");
-            let listener = UnixListener::bind(&socket).expect("bind restarted broker");
-            private_socket(&socket);
+            let listener = bind_private_socket(&socket);
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let listener = UnixListener::from_std(listener).expect("adopt restarted broker");
             let (mut stream, _) = listener.accept().await.expect("accept the waiting client");
             read_frame::<_, RequestEnvelope>(&mut stream, RETRY_LIMITS)
                 .await
