@@ -14,6 +14,7 @@ jobs:
     env:
       HOMEBREW_NO_ANALYTICS: "1"
       DEKOPON_EXPECTED_VERSION: "0.72.0"
+      DEKOPON_TAP_COMMIT: cdc0e83e0294d12bbcdc258e21acd92ee37f2b9d
     steps:
       - name: Check out the smoke helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,8 +28,6 @@ jobs:
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
           brew update
-          brew tap dekopon-agents/tap
-          brew trust dekopon-agents/tap
           brew install dekopon-agents/tap/dekopon dekopon-agents/tap/cassette
           prefix=$(brew --prefix dekopon)
           cassette_prefix=$(brew --prefix cassette)
@@ -36,7 +35,9 @@ jobs:
           {
             printf '### Homebrew installation\n\n'
             printf 'Runner: %s, architecture: %s\n\n' "$RUNNER_OS" "$(uname -m)"
+            printf 'Homebrew: %s, macOS: %s\n\n' "$(brew --version | head -n 1)" "$(sw_vers -productVersion)"
             printf 'Tap commit: %s\n\n' "$tap_commit"
+            test "$tap_commit" = "$DEKOPON_TAP_COMMIT"
             printf 'Installed prefix: %s\n\n' "$prefix"
             brew list --versions dekopon
             for binary in dekopon-brokerd dekopon-gatewayd; do

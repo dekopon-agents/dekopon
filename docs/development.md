@@ -437,11 +437,14 @@ therefore means adding it, backticked, to that document in the same change. Grep
 
 The manual [`macos-compat.yml`](../.github/workflows/macos-compat.yml) lane uses an ARM64
 `macos-15` runner and installs Dekopon and `cassette` from the real Homebrew tap. It records the
-tap revision and installed binaries, requires the pinned versions and ARM64 Mach-O architecture,
-and runs [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py) with `--launchd`. It does not
-build the checkout or substitute downloaded executables for the Homebrew installation.
+Homebrew and macOS versions, tap revision and installed binaries, requires the pinned tap commit,
+versions and ARM64 Mach-O architecture, and runs [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py)
+with `--launchd`. It does not build the checkout or substitute downloaded executables for the
+Homebrew installation.
 
-The helper loads checksum-pinned JSONPlaceholder and GitHub components. Actual
+The helper writes its own broker, gateway, catalog, Cedar and credential files for the loopback
+fixtures; it does not load the configuration blocks in the example READMEs. It loads
+checksum-pinned JSONPlaceholder and GitHub components. Actual
 [`cassette` replay](https://github.com/dekopon-agents/cassette/blob/v0.1.0/README.md) supplies authored
 synthetic HTTP responses; it makes no upstream requests. An HTTP fixture independently
 verifies the broker's synthetic bearer credential before forwarding only the request's Accept
@@ -456,17 +459,23 @@ The fixture's WebSocket dependency is pinned by version, wheel URL and SHA-256 i
 The test requires these observable results:
 
 - The gateway shell wrapper loads fake model/app/bot values from a private `credentials.env`;
-  the broker separately loads its literal private `credentialsPath` YAML. No daemon dotenv
-  feature or environment substitution is assumed.
+  the broker separately loads its private `credentialsPath` YAML. The fake PAT contains
+  `${GITHUB_TOKEN}`, the broker's environment sets `GITHUB_TOKEN`, and the provider fixture
+  requires the unexpanded value. No daemon dotenv feature is assumed.
 - Owner and colleague channel mentions reach real broker policy and read-only GitHub execution,
-  then produce threaded Slack replies. Unmapped and denied senders, and a mapped room without a
-  grant, produce no model or provider requests.
-- A local transport turn completes a provider read; an out-of-scope HTTP request is refused.
+  then produce threaded Slack replies; an owner follow-up without a mention in the owner's thread
+  is answered the same way. Unmapped and denied senders, and a mapped room without a grant,
+  produce no model or provider requests. The owner's direct message matches no channel-only route:
+  the gateway logs it as an unrouted `gateway_message_ignored` debug record, with no model or
+  provider request and no Slack reply or status.
+- A local transport turn completes a provider read; an out-of-scope HTTP request is refused; local
+  unmapped and denied senders are refused as exactly `unmapped-subject` and `agent-denied`.
 - Working status identifies the initiating member and clears to active; native Stop cancels a held model
-  request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged.
-- The four fake credentials are absent from checks, logs, model inputs, tool results and replies;
-  each endpoint receives only its expected credential. Exact call counts and broker execution
-  records identify the loaded provider artifacts.
+  request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged
+  on a single connection.
+- The four fake credentials, and any text with their shared `synthetic-` prefix, are absent from
+  checks, logs, model inputs, tool results and replies; each endpoint receives only its expected
+  credential. Exact call counts and broker execution records identify the loaded provider artifacts.
 
 With `--launchd`, the helper discovers an existing `gui/<uid>` or `user/<uid>` domain, starts two
 uniquely named jobs, observes clean daemon exits and confirms their removal. It never uses sudo,
@@ -477,8 +486,6 @@ files only after complete success; a failure retains them and reports their path
 To run the same helper from a checkout on an Apple Silicon Mac with Homebrew installed:
 
 ```console
-brew tap dekopon-agents/tap
-brew trust dekopon-agents/tap
 brew install dekopon-agents/tap/dekopon dekopon-agents/tap/cassette
 fixture_dir="$(mktemp -d)"
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
@@ -497,8 +504,9 @@ python3 -m venv "$fixture_dir/venv"
   --cassette-bin "$(brew --prefix cassette)/bin/cassette"
 ```
 
-The helper refuses a mismatched daemon version or component checksum. A tap update therefore
-needs an explicit compatibility review and pin update, not an automatic skip. Validate changes
+The workflow refuses any tap commit other than its `DEKOPON_TAP_COMMIT`, and the helper refuses a
+mismatched daemon version or component checksum. A tap update therefore needs an explicit
+compatibility review and pin update, not an automatic skip. Validate changes
 with `python3 -m py_compile ci/macos-compat-smoke.py ci/slack_socket_fixture.py` and
 `actionlint .github/workflows/macos-compat.yml`; execute the helper with the selected release.
 
