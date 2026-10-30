@@ -759,7 +759,7 @@ WhatsApp events at `info` or above include:
 
 | Event | Level | Fields |
 |---|---|---|
-| `gateway_whatsapp_webhook_refused` | warn | `transport`, `reason` (`unsigned`, `signature`, `oversize`, `malformed`, `saturated`, `timeout`, `verification`, `unavailable`), `status`, `suppressed` |
+| `gateway_whatsapp_webhook_refused` | warn | `transport`, `reason` (`unsigned`, `signature`, `oversize`, `malformed`, `saturated`, `timeout`, `verification`), `status`, `suppressed` |
 | `gateway_whatsapp_accept_failed` | debug for `kind=connection`, warn for `kind=exhausted` | `transport`, `kind`, `error` |
 | `gateway_whatsapp_listener_stopped` | error | `transport`, `error` |
 | `gateway_github_webhook_refused` | warn, rate-limited | `transport`, `reason` (`headers`, `unsigned`, `signature`, `oversize`, `malformed`, `saturated`, `timeout`), `status`, `suppressed` |

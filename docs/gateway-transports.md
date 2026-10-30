@@ -96,7 +96,8 @@ there, under the same coalescing and 60-edit budget.
 - Slack hides its native Stop while status text shows; configured stop words still work.
 - Only keep-alive ticks refresh the text, and Slack drops it after two minutes without one.
 - Running out of keep-alives or edits, tripping the status-text breaker, or a permanent error
-  (`surface = assistant-status`) restores native Working once.
+  (`surface = assistant-status`) restores native Working once; a permanent error also turns status
+  text off for the transport.
 - At the end the gateway clears the text before delivering the answer or stopped reply, then
   returns the session to `active`.
 - `assistant.threads.setStatus` belongs to Slack's assistant bridge, which Slack retires in
@@ -144,7 +145,8 @@ claim and the optional `decline_chat_reply`.
 **Attachments and forwards.**
 
 - Up to ten files per message become [chat assets](gateway-assets.md#chat-assets): named in the
-  prompt, fetched on demand. Names (cut to 128 bytes) and media types come from the event and are
+  prompt, fetched on demand; more than ten refuses the message
+  ([multi-message media inputs](gateway-assets.md#multi-message-media-inputs)). Names (cut to 128 bytes) and media types come from the event and are
   as untrusted as the text. An upload with no comment is a request.
 - An admitted message that forwards another adds a quoted block: the original text (or its rich
   text), author, channel and time labels, and its files within the same ten-file allowance. The
@@ -159,8 +161,8 @@ claim and the optional `decline_chat_reply`.
 - The answer is a Block Kit [`markdown` block](https://docs.slack.dev/reference/block-kit/blocks/markdown-block/),
   which Slack renders as CommonMark; `text` is mrkdwn, so it repeats the answer only as the
   notification fallback. The block holds the answer as written, except that a line holding only an
-  ordered-list marker (`1.` or `1)`) outside a code fence is escaped as `1\.`.
-- A 429 on `chat.postMessage` logs `gateway_reply_rate_limited` and delays the same post once; a
+  ordered-list marker (`1.` or `1)`) outside a code fence is escaped (`1\.`, `1\)`).
+- A 429 on the answer's `chat.postMessage` logs `gateway_reply_rate_limited` and delays the same post once; a
   second 429 fails the reply. A post counts only when Slack returns the same channel and a
   canonical timestamp.
 - Files upload through `files.getUploadURLExternal` and `files.completeUploadExternal`, with the
@@ -241,7 +243,8 @@ uses the stored `untilMs`, not file mtime. If the marker cannot be written the c
 **Authorize and answer.**
 
 - Each turn opens a fresh broker leg as the newest speaker: the broker maps that subject, checks
-  `agent.prompt` and returns only that speaker's current capabilities. An unmapped, forbidden,
+  `agent.prompt` and returns only that speaker's current capabilities, downscoped by the channel
+  when mapped. An unmapped, forbidden,
   empty-grant or revoked speaker gets no model call, capability call or reply; the inviter's grants
   are never reused.
 - Follow turns stream nothing and show no progress. A successful final reply posts once; a seal,
@@ -453,8 +456,8 @@ supported; see [non-goals](design.md#non-goals).
 - Text and PNG/JPEG image messages are admitted. The signed `messages[].from` is both the reply
   target and the only identity source; profile names, display phone numbers, text, WABA and
   phone-number IDs never name the sender.
-- Subject: `whatsapp.<wa_id>`. The conversation is a direct message in container
-  `<waba>:<phone-number-id>`.
+- Subject: `whatsapp.<wa_id>`. The conversation is a direct message whose id is the sender's
+  `wa_id`, in container `<waba>:<phone-number-id>`.
 - A message is answered only when the delivery's own `contacts[]` names its sender in `wa_id` and
   it carries no `group_id` or `participant`. A group payload names the group in `from` and matches
   no contact, so it, and any shape that fails these checks, is dropped rather than answered as if
@@ -490,7 +493,8 @@ supported; see [non-goals](design.md#non-goals).
   `/whatsapp_business/attachments/`. Userinfo, a fragment, and any other host, port or path are
   refused, so a Meta CDN host outside that one fails closed.
 - The client resolves only `graph.facebook.com` and `lookaside.fbsbx.com`, with a 5-second DNS
-  deadline and at most 32 public addresses, and connects to exactly those. Each Graph or download
+  deadline and at most 32 public addresses, and connects to exactly those, with no proxy and no
+  redirects. Each Graph or download
   request has a 15-second deadline.
 - A download stops at the smaller of the caller's bound and 5,000,000 bytes, then checks the length
   and the PNG/JPEG signature. There is no decoding, transcoding, URL caching or retry.
@@ -509,7 +513,9 @@ supported; see [non-goals](design.md#non-goals).
 - Nothing is retried: a timeout after the request is sent leaves the outcome unknown, and resending
   could duplicate a visible answer. A failure after any accepted part is `partial-delivery` and
   logs `gateway_whatsapp_reply_partial` once with the failure's category. Upload acceptance is not
-  message acceptance, and a message ID is not proof a person read it
+  message acceptance, and a message ID is not proof a person read it. A part counts as delivered
+  when Graph returns `messaging_product: whatsapp` and a message ID; the signed inbound message ID
+  is the delivery identity
   ([durable memory](gateway-conversations.md#durable-memory-after-transport-acceptance)).
 - Free-form replies are subject to Meta's customer-service window; there is no template fallback.
   Uploaded media is never deleted; Meta's retention applies.
