@@ -1396,7 +1396,8 @@ mod generation_tests {
 
         let fixture = ManagedBroker::gateway();
         fixture.publish_lock('1');
-        let (active, report) = crate::load_candidate(&fixture.config(), Mode::Boot).await;
+        let (active, report) =
+            crate::tests::candidate_or_refusal(&fixture.config(), Mode::Boot).await;
         assert!(report.problems.is_empty(), "{report:?}");
         let active = active.unwrap();
         for operation in ["runCommand", "unknownOperation"] {
@@ -1439,7 +1440,8 @@ mod generation_tests {
     async fn only_gateway_attestor_peer_can_coordinate_generation_frames() {
         let fixture = ManagedBroker::gateway();
         fixture.publish_lock('1');
-        let (active, report) = crate::load_candidate(&fixture.config(), Mode::Boot).await;
+        let (active, report) =
+            crate::tests::candidate_or_refusal(&fixture.config(), Mode::Boot).await;
         assert!(report.problems.is_empty(), "{report:?}");
         let coordination = Coordination::new(fixture.config(), active.unwrap());
         let old = coordination.active().digest.clone();
@@ -1454,8 +1456,11 @@ mod generation_tests {
             )
             .as_bytes(),
         );
-        let (next, report) =
-            crate::load_candidate(&fixture.config(), Mode::Reload(&coordination.active())).await;
+        let (next, report) = crate::tests::candidate_or_refusal(
+            &fixture.config(),
+            Mode::Reload(&coordination.active()),
+        )
+        .await;
         assert!(report.problems.is_empty(), "{report:?}");
         let next = next.unwrap().digest;
         let owner = coordination.active().ready.identities[&crate::current_uid()].clone();
@@ -1519,7 +1524,8 @@ mod generation_tests {
     async fn held_owner_sockets_lose_coordination_but_keep_captured_invocation() {
         let fixture = ManagedBroker::gateway();
         fixture.publish_lock('1');
-        let (active, report) = crate::load_candidate(&fixture.config(), Mode::Boot).await;
+        let (active, report) =
+            crate::tests::candidate_or_refusal(&fixture.config(), Mode::Boot).await;
         assert!(report.problems.is_empty(), "{report:?}");
         let coordination = Coordination::new(fixture.config(), active.unwrap());
         let pinned = coordination.active();
@@ -1552,7 +1558,7 @@ mod generation_tests {
                 .as_bytes(),
         );
         let (candidate, report) =
-            crate::load_candidate(&fixture.config(), Mode::Reload(&pinned)).await;
+            crate::tests::candidate_or_refusal(&fixture.config(), Mode::Reload(&pinned)).await;
         assert!(report.problems.is_empty(), "{report:?}");
         let next = candidate.unwrap().digest;
         let owner = pinned.ready.identities[&uid].clone();
