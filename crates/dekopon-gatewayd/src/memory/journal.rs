@@ -16,16 +16,18 @@ use std::{
 };
 
 use dekopon_agent::memory::{CapturedTurn, Item};
-use dekopon_core::AgentId;
+use dekopon_core::{AgentId, AssetNumber, asset::AssetKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use self::records::{Boot, Snapshot, admits, walk};
-use super::record::{AssetRow, GrantDigest, RecordId, Slot, SummaryPlan, TurnId, TurnRecord};
+use super::record::{
+    ArrivedAsset, AssetRow, GrantDigest, RecordId, Slot, SummaryPlan, TurnId, TurnRecord,
+};
 use crate::{
     asset::{AssetRef, AssetSourceRef, PendingAsset, RecalledAsset},
-    config::MemoryWindow,
+    config::{MemoryWindow, memory::AttachmentSummaries},
     conversation::SealedConversation,
 };
 
@@ -111,8 +113,112 @@ pub(crate) struct Entry<'a> {
     pub captured: &'a CapturedTurn,
     pub keep: Keep,
     pub plan: Option<SummaryPlan>,
+    pub attachments: AttachmentSummaries,
+    pub arrivals: &'a [Vec<u64>],
     pub inventory: &'a [AssetRef],
     pub next_asset_id: u64,
+}
+
+impl Entry<'_> {
+    fn record(&self, id: RecordId) -> Result<(TurnRecord, Vec<ArrivedAsset>), JournalError> {
+        let inbound: HashMap<_, _> = self
+            .inventory
+            .iter()
+            .filter(|asset| asset.is_inbound())
+            .map(|asset| (asset.id, asset))
+            .collect();
+        let mut registrations = self.arrivals.iter();
+        let mut original = Vec::new();
+        for item in &self.captured.original {
+            let arrivals = match item {
+                Item::User(_) | Item::Steer(_) => registrations.next(),
+                Item::Assistant(_) | Item::Reasoning(_) | Item::Exchange(_) | Item::Asset(_) => {
+                    None
+                }
+            };
+            let kept = match self.keep {
+                Keep::Everything => true,
+                Keep::ExchangesOnly => match item {
+                    Item::Exchange(_) => true,
+                    Item::User(_)
+                    | Item::Steer(_)
+                    | Item::Assistant(_)
+                    | Item::Reasoning(_)
+                    | Item::Asset(_) => false,
+                },
+            };
+            if !kept {
+                continue;
+            }
+            original.push(item.clone());
+            for id in arrivals
+                .into_iter()
+                .flatten()
+                .filter(|id| inbound.contains_key(id))
+            {
+                let number =
+                    AssetNumber::try_from(*id).map_err(|_invalid| JournalError::Corrupt)?;
+                original.push(Item::Asset(number));
+            }
+        }
+        let plan = match self.keep {
+            Keep::Everything => self.plan.clone(),
+            Keep::ExchangesOnly => None,
+        };
+        let record = TurnRecord {
+            id,
+            turn: TurnId(mint_turn_id()),
+            at_ms: millis(self.at),
+            grant: self.grant.clone(),
+            model: self.captured.model.clone(),
+            original,
+            summaries: plan
+                .as_ref()
+                .map_or_else(Vec::new, |plan| vec![Slot::Queued; plan.parts.len()]),
+            plan,
+            assets: self
+                .inventory
+                .iter()
+                .filter(|asset| !matches!(&asset.source, Some(AssetSourceRef::Generated { .. })))
+                .map(|asset| AssetRow {
+                    id: asset.id,
+                    at_ms: millis(asset.arrived),
+                    name: asset.name.clone(),
+                    mime: asset.mime.clone(),
+                    size: asset.size,
+                    source: asset.source.clone(),
+                })
+                .collect(),
+            next_asset_id: self.next_asset_id,
+        };
+        let mut arrived = Vec::new();
+        for (item, original) in record.original.iter().enumerate() {
+            let number = match original {
+                Item::Asset(number) => *number,
+                Item::User(_)
+                | Item::Steer(_)
+                | Item::Assistant(_)
+                | Item::Reasoning(_)
+                | Item::Exchange(_) => continue,
+            };
+            let Some(asset) = inbound.get(&u64::from(number)) else {
+                continue;
+            };
+            let kind = AssetKind::of(&asset.mime);
+            arrived.push(ArrivedAsset {
+                item: u32::try_from(item).map_err(|_invalid| JournalError::Corrupt)?,
+                number,
+                kind,
+                bytes: asset.size,
+                summaries: record
+                    .plan
+                    .as_ref()
+                    .filter(|_| self.attachments.summarizes(kind))
+                    .map_or_else(Vec::new, |plan| vec![Slot::Queued; plan.parts.len()]),
+            });
+        }
+        Ok((record, arrived))
+    }
 }
 
 // Writers hold `lock`; readers open their own descriptor and never take it, because every rewrite
@@ -540,55 +646,9 @@ impl Journal {
             Err(error) if error.kind() == io::ErrorKind::NotFound => NonZeroU64::MIN,
             Err(error) => return Err(error.into()),
         };
-        let original: Vec<Item> = entry
-            .captured
-            .original
-            .iter()
-            .filter(|item| match entry.keep {
-                Keep::Everything => true,
-                Keep::ExchangesOnly => match item {
-                    Item::Exchange(_) => true,
-                    Item::User(_)
-                    | Item::Steer(_)
-                    | Item::Assistant(_)
-                    | Item::Reasoning(_)
-                    | Item::Asset(_) => false,
-                },
-            })
-            .cloned()
-            .collect();
-        let plan = match entry.keep {
-            Keep::Everything => entry.plan.clone(),
-            Keep::ExchangesOnly => None,
-        };
-        let record = TurnRecord {
-            id: RecordId(next_record_id),
-            turn: TurnId(mint_turn_id()),
-            at_ms: millis(entry.at),
-            grant: entry.grant.clone(),
-            model: entry.captured.model.clone(),
-            original,
-            summaries: plan
-                .as_ref()
-                .map_or_else(Vec::new, |plan| vec![Slot::Queued; plan.parts.len()]),
-            plan,
-            assets: entry
-                .inventory
-                .iter()
-                .filter(|asset| !matches!(&asset.source, Some(AssetSourceRef::Generated { .. })))
-                .map(|asset| AssetRow {
-                    id: asset.id,
-                    at_ms: millis(asset.arrived),
-                    name: asset.name.clone(),
-                    mime: asset.mime.clone(),
-                    size: asset.size,
-                    source: asset.source.clone(),
-                })
-                .collect(),
-            next_asset_id: entry.next_asset_id,
-        };
+        let (record, arrived) = entry.record(RecordId(next_record_id))?;
         let mut size = records::Counted(0);
-        records::encode_record(&mut size, &record, Vec::new())?;
+        records::encode_record(&mut size, &record, arrived.clone())?;
         let agent = stem.split_once('/').map(|(agent, _)| agent);
         if agent.is_some_and(|agent| size.0 > self.agent_cap(agent)) {
             tracing::warn!(
@@ -611,7 +671,13 @@ impl Journal {
             .mode(0o600)
             .open(&path)?;
         let mut buffered = io::BufWriter::with_capacity(64 * 1024, &mut file);
-        records::encode_record(&mut buffered, &record, Vec::new())?;
+        let assets_arrived = arrived.len();
+        let slots_queued = record.summaries.len()
+            + arrived
+                .iter()
+                .map(|asset| asset.summaries.len())
+                .sum::<usize>();
+        records::encode_record(&mut buffered, &record, arrived)?;
         buffered.flush()?;
         drop(buffered);
         // Ownership transfers before fallible scans can encounter another corrupt journal file.
@@ -644,7 +710,8 @@ impl Journal {
             memory.generation = record.turn.0,
             memory.record.bytes = size.0,
             memory.record.items = record.original.len(),
-            memory.slots.queued = record.summaries.len(),
+            memory.slots.queued = slots_queued,
+            memory.assets.arrived = assets_arrived,
             "gateway.memory.published"
         );
         Ok(Some(record.id))

@@ -11,6 +11,23 @@ pub enum AssetKind {
     Other,
 }
 
+impl AssetKind {
+    pub fn of(mime: &str) -> Self {
+        match mime {
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif" => Self::Image,
+            "text/plain" | "text/markdown" | "text/csv" | "text/html" | "text/xml"
+            | "application/json" | "application/xml" => Self::TextDocument,
+            "application/pdf"
+            | "application/msword"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/rtf" => Self::BinaryDocument,
+            _ => Self::Other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod number_encoding_tests {
     use crate::AssetNumber;

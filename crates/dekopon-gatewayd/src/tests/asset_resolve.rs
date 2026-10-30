@@ -378,6 +378,7 @@ async fn five_generated_base64_images_spend_their_decoded_length_against_the_mod
             .set_default();
         let model = FetchScript {
             calls: AtomicUsize::new(0),
+            fetches: 9,
             last: Mutex::new(vec![]),
         };
         run_prompt_session(

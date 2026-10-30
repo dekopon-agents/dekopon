@@ -611,8 +611,6 @@ pub(crate) struct RecalledAsset {
     pub arrived: SystemTime,
 }
 
-const READABLE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-
 // Mirrors dekopon-provider-asset v0.3.0 operations::cat (a1da68db:183-190).
 fn cat_reads(content_type: &str) -> bool {
     let Ok(parsed) = content_type.parse::<mime::Mime>() else {
@@ -628,28 +626,22 @@ fn cat_reads(content_type: &str) -> bool {
                 .is_some_and(|suffix| matches!(suffix.as_str(), "json" | "xml"))))
 }
 
-const READABLE_DOCUMENT_TYPES: [&str; 13] = [
-    "application/pdf",
-    "text/plain",
-    "text/markdown",
-    "text/csv",
-    "text/html",
-    "text/xml",
-    "application/json",
-    "application/xml",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/rtf",
-];
-
 pub(crate) fn is_readable(mime: &str) -> bool {
-    is_image(mime) || READABLE_DOCUMENT_TYPES.contains(&mime)
+    match dekopon_core::asset::AssetKind::of(mime) {
+        dekopon_core::asset::AssetKind::Image
+        | dekopon_core::asset::AssetKind::TextDocument
+        | dekopon_core::asset::AssetKind::BinaryDocument => true,
+        dekopon_core::asset::AssetKind::Other => false,
+    }
 }
 
 pub(crate) fn is_image(mime: &str) -> bool {
-    READABLE_IMAGE_TYPES.contains(&mime)
+    match dekopon_core::asset::AssetKind::of(mime) {
+        dekopon_core::asset::AssetKind::Image => true,
+        dekopon_core::asset::AssetKind::TextDocument
+        | dekopon_core::asset::AssetKind::BinaryDocument
+        | dekopon_core::asset::AssetKind::Other => false,
+    }
 }
 
 pub(crate) fn attached_marker(id: u64, name: &str) -> String {
@@ -872,6 +864,19 @@ pub(crate) fn reference_note(
 }
 
 impl AssetRef {
+    pub(crate) fn is_inbound(&self) -> bool {
+        match &self.source {
+            Some(
+                AssetSourceRef::Fauxlack { .. }
+                | AssetSourceRef::Slack { .. }
+                | AssetSourceRef::Discord { .. }
+                | AssetSourceRef::WhatsApp { .. }
+                | AssetSourceRef::Telegram { .. },
+            ) => true,
+            Some(AssetSourceRef::Generated { .. }) | None => false,
+        }
+    }
+
     pub fn is_fetchable(&self, images_supported: bool) -> bool {
         self.source.is_some()
             && is_readable(&self.mime)
@@ -2073,6 +2078,169 @@ mod retention_tests {
         ))
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn asset_kind_agrees_with_the_allowlist() {
+        use crate::memory::journal::{Entry, Keep, records::tests::journal};
+        use dekopon_agent::prompt::{PromptLimits, SessionInputs, run_prompt_session};
+        use dekopon_core::asset::AssetKind::{self, BinaryDocument, Image, Other, TextDocument};
+        use dekopon_model::model::{ContentPart, ModelMessage};
+
+        let cases = [
+            ("image/png", Image),
+            ("image/jpeg", Image),
+            ("image/webp", Image),
+            ("image/gif", Image),
+            ("text/plain", TextDocument),
+            ("text/markdown", TextDocument),
+            ("text/csv", TextDocument),
+            ("text/html", TextDocument),
+            ("text/xml", TextDocument),
+            ("application/json", TextDocument),
+            ("application/xml", TextDocument),
+            ("application/pdf", BinaryDocument),
+            ("application/msword", BinaryDocument),
+            (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                BinaryDocument,
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                BinaryDocument,
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                BinaryDocument,
+            ),
+            ("application/rtf", BinaryDocument),
+            ("video/quicktime", Other),
+            ("application/zip", Other),
+            ("text/x-python", Other),
+            ("application/yaml", Other),
+            ("image/svg+xml", Other),
+            ("image/heic", Other),
+            ("audio/mpeg", Other),
+            ("application/octet-stream", Other),
+        ];
+        let store = store(1024 * 1024);
+        let access = access("kinds");
+        let registered = store.assets_for_access(
+            &access,
+            cases
+                .iter()
+                .map(|(mime, _)| PendingAsset {
+                    name: "input".into(),
+                    mime: (*mime).into(),
+                    size: Some(13),
+                    source: Some(AssetSourceRef::Telegram {
+                        file_id: (*mime).into(),
+                    }),
+                })
+                .collect(),
+            Instant::now(),
+        );
+        for id in &registered.arrived {
+            drop(store.admit(&access, *id, b"file contents").unwrap());
+        }
+        let (_dir, journal) = journal();
+        store.attach_journal(&journal).unwrap();
+        let stem = access.key.conversation.journal_stem();
+        journal
+            .append(
+                &stem,
+                &Entry {
+                    at: SystemTime::now(),
+                    grant: &test_grant(),
+                    captured: &crate::tests::captured("files", None),
+                    keep: Keep::Everything,
+                    plan: None,
+                    attachments: Default::default(),
+                    arrivals: &[registered.arrived],
+                    inventory: &registered.inventory,
+                    next_asset_id: access.next_asset_id(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let snapshot = journal.record_snapshot(&stem, true).unwrap().unwrap();
+        assert_eq!(snapshot.records[0].header.arrived.len(), cases.len());
+        for (asset, (mime, expected)) in snapshot.records[0].header.arrived.iter().zip(cases) {
+            assert_eq!(AssetKind::of(mime), expected, "{mime}");
+            assert_eq!(asset.kind, expected, "{mime}");
+            let (readable, image) = match expected {
+                Image => (true, true),
+                TextDocument | BinaryDocument => (true, false),
+                Other => (false, false),
+            };
+            assert_eq!(is_readable(mime), readable, "{mime}");
+            assert_eq!(is_image(mime), image, "{mime}");
+        }
+        let session = SessionAssets::new(store, access, None, Handle::current(), true);
+        tokio::task::spawn_blocking(move || {
+            let model = FetchScript {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fetches: cases.len(),
+                last: Mutex::new(vec![]),
+            };
+            run_prompt_session(
+                &model,
+                &NoScripts,
+                SessionInputs::new(
+                    "read the files",
+                    PromptLimits {
+                        max_steps: cases.len() as u32 + 1,
+                        max_capability_calls: 0,
+                    },
+                )
+                .with_assets(&session),
+                &[],
+            )
+            .0
+            .unwrap();
+            let messages = model.last.lock();
+            for (index, (mime, kind)) in cases.iter().enumerate() {
+                let text = fetch_result(&messages, index);
+                assert_eq!(text == "file contents", *kind == TextDocument, "{mime}");
+                let parts = messages.iter().filter_map(ModelMessage::parts).flatten();
+                let native = parts
+                    .filter(|part| match part {
+                        ContentPart::Image { mime: shown, .. }
+                        | ContentPart::File { mime: shown, .. } => shown == mime,
+                        ContentPart::Text(_) => false,
+                    })
+                    .count();
+                assert_eq!(
+                    native,
+                    match kind {
+                        Image | BinaryDocument => 1,
+                        TextDocument | Other => 0,
+                    },
+                    "{mime}"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn fetch_result(messages: &[dekopon_model::model::ModelMessage], index: usize) -> &str {
+        use dekopon_model::model::ModelMessage;
+        let id = format!("fetch-{index}");
+        messages
+            .iter()
+            .find_map(|message| match message {
+                ModelMessage::ToolResults {
+                    tool_call_id,
+                    content,
+                } if tool_call_id.as_str() == id => Some(content.as_str()),
+                ModelMessage::ToolResults { .. }
+                | ModelMessage::User { .. }
+                | ModelMessage::Assistant { .. }
+                | ModelMessage::System { .. }
+                | ModelMessage::Journal { .. } => None,
+            })
+            .unwrap()
+    }
+
     struct OneByteFetcher;
 
     impl AssetFetcher for OneByteFetcher {
@@ -2088,6 +2256,7 @@ mod retention_tests {
 
     pub(super) struct FetchScript {
         pub(super) calls: std::sync::atomic::AtomicUsize,
+        pub(super) fetches: usize,
         pub(super) last: Mutex<Vec<dekopon_model::model::ModelMessage>>,
     }
 
@@ -2103,7 +2272,7 @@ mod retention_tests {
         ) -> Result<dekopon_model::model::AssistantTurn, dekopon_model::error::InferenceError>
         {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
-            if call == 9 {
+            if call == self.fetches {
                 *self.last.lock() = messages.to_vec();
                 Ok(dekopon_model::model::AssistantTurn::new(
                     Some("seen".into()),
@@ -2184,6 +2353,7 @@ mod retention_tests {
                     .set_default();
                 let model = FetchScript {
                     calls: std::sync::atomic::AtomicUsize::new(0),
+                    fetches: 9,
                     last: Mutex::new(vec![]),
                 };
                 run_prompt_session(
@@ -2292,6 +2462,7 @@ mod retention_tests {
                 .set_default();
             let model = FetchScript {
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                fetches: 9,
                 last: Mutex::new(vec![]),
             };
             run_prompt_session(
@@ -2396,6 +2567,8 @@ mod retention_tests {
                     captured: &crate::tests::captured("file", Some("seen")),
                     keep: crate::memory::journal::Keep::Everything,
                     plan: None,
+                    attachments: Default::default(),
+                    arrivals: &[],
                     inventory,
                     next_asset_id: access.next_asset_id(),
                 },
@@ -2578,6 +2751,8 @@ mod retention_tests {
                     captured: &crate::tests::captured("file", Some("seen")),
                     keep: crate::memory::journal::Keep::Everything,
                     plan: None,
+                    attachments: Default::default(),
+                    arrivals: &[],
                     inventory: &store.inventory(&access),
                     next_asset_id: access.next_asset_id(),
                 },

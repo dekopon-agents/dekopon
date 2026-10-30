@@ -1958,6 +1958,11 @@ impl Turn {
     }
 }
 
+struct TakenSteer {
+    text: String,
+    arrived: Vec<u64>,
+}
+
 struct SessionSteers {
     gate: SessionGate,
     key: AdmissionKey,
@@ -1972,7 +1977,7 @@ struct SessionSteers {
     participants: Option<participants::Drain>,
     received_at: tokio::time::Instant,
     inventory: Arc<Mutex<asset::InventoryUsage>>,
-    raw_texts: Mutex<Vec<String>>,
+    raw_texts: Mutex<Vec<TakenSteer>>,
     taken: Mutex<Vec<String>>,
 }
 
@@ -2073,7 +2078,10 @@ impl SessionSteers {
                         attributed_prompt(principal.as_ref(), &recorded),
                         handle,
                     );
-                    self.raw_texts.lock().push(std::mem::take(&mut steer.text));
+                    self.raw_texts.lock().push(TakenSteer {
+                        text: std::mem::take(&mut steer.text),
+                        arrived: registered.arrived,
+                    });
                     Steer::Person { prompt, recorded }
                 },
             )
@@ -2084,7 +2092,7 @@ impl SessionSteers {
         let mut text = prompt.to_owned();
         for steer in self.raw_texts.lock().iter() {
             text.push_str("\n\n");
-            text.push_str(steer);
+            text.push_str(&steer.text);
         }
         text
     }
@@ -3252,6 +3260,20 @@ async fn session_turn(
                 access: journal_access,
                 publication: publication.take().map(asset::Publication::seal),
                 captured,
+                arrivals: std::iter::once(registered.arrived)
+                    .chain(
+                        steers
+                            .raw_texts
+                            .lock()
+                            .iter()
+                            .map(|steer| steer.arrived.clone()),
+                    )
+                    .collect(),
+                attachments: route
+                    .memory_knobs
+                    .as_ref()
+                    .and_then(|knobs| knobs.summaries.as_ref())
+                    .map_or_default(|summaries| summaries.attachments),
                 keep: crate::memory::generation::keep(window.recall),
                 plan: crate::memory::generation::plan(route),
             });
