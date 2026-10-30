@@ -113,6 +113,8 @@ pub struct SummaryParts {
     pub parts: Vec<NonZeroU32>,
     #[serde(default = "default_max_input_bytes")]
     pub max_input_bytes: NonZeroU32,
+    #[serde(default)]
+    pub attachments: AttachmentSummaries,
 }
 
 impl Default for SummaryParts {
@@ -121,6 +123,38 @@ impl Default for SummaryParts {
             model: None,
             parts: default_parts(),
             max_input_bytes: default_max_input_bytes(),
+            attachments: AttachmentSummaries::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentSummaries {
+    #[serde(default)]
+    pub images: Toggle,
+    #[serde(default)]
+    pub documents: Toggle,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Toggle {
+    #[default]
+    Off,
+    Summarize,
+}
+
+impl AttachmentSummaries {
+    pub(crate) fn summarizes(self, kind: dekopon_core::asset::AssetKind) -> bool {
+        use dekopon_core::asset::AssetKind;
+        match match kind {
+            AssetKind::Image => self.images,
+            AssetKind::TextDocument | AssetKind::BinaryDocument => self.documents,
+            AssetKind::Other => Toggle::Off,
+        } {
+            Toggle::Off => false,
+            Toggle::Summarize => true,
         }
     }
 }
@@ -189,6 +223,38 @@ pub struct ResolvedSummaries {
     pub model: SummaryModel,
     pub parts: Vec<NonZeroU32>,
     pub max_input_bytes: NonZeroU32,
+    pub attachments: AttachmentSummaries,
+}
+
+impl ResolvedSummaries {
+    pub(crate) fn validate_attachments(
+        &self,
+        model: Option<&super::ModelConfig>,
+        queue: NonZeroUsize,
+    ) -> Vec<PolicyProblem> {
+        let mut problems = Vec::new();
+        let enabled = match (self.attachments.images, self.attachments.documents) {
+            (Toggle::Off, Toggle::Off) => false,
+            (Toggle::Summarize, Toggle::Off | Toggle::Summarize)
+            | (Toggle::Off, Toggle::Summarize) => true,
+        };
+        if enabled && queue.get() < 2 {
+            problems.push(PolicyProblem::AttachmentSummariesNeedQueue { queue: queue.get() });
+        }
+        match self.attachments.images {
+            Toggle::Off => {}
+            Toggle::Summarize => {
+                if let Some(model) = model
+                    && !model.accepts_images()
+                {
+                    problems.push(PolicyProblem::ImageSummariesNeedImageModel {
+                        model: model.name().to_owned(),
+                    });
+                }
+            }
+        }
+        problems
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -238,6 +304,10 @@ pub enum PolicyProblem {
     UnknownModel,
     #[error("summaries.model {0} is proxy-only")]
     ProxyOnlyModel(String),
+    #[error("image attachment summaries need an image-capable summaries model: {model}")]
+    ImageSummariesNeedImageModel { model: String },
+    #[error("attachment summaries need a summary queue of at least two, got {queue}")]
+    AttachmentSummariesNeedQueue { queue: usize },
     #[error("selection.decider has an empty {0}")]
     Decider(&'static str),
 }
@@ -351,6 +421,7 @@ pub fn resolve_knobs(inputs: &KnobInputs<'_>) -> Result<MemoryKnobs, PolicyProbl
                 model,
                 parts: parts.parts,
                 max_input_bytes: parts.max_input_bytes,
+                attachments: parts.attachments,
             })
         }
     };

@@ -134,6 +134,22 @@ impl RoutingTable {
                     continue;
                 }
             };
+            if route.model.is_none()
+                && let Some(summaries) = route
+                    .memory_knobs
+                    .as_ref()
+                    .and_then(|knobs| knobs.summaries.as_ref())
+                && let crate::config::memory::SummaryModel::Route = &summaries.model
+            {
+                for problem in
+                    summaries.validate_attachments(Some(model), config.memory.summaries.queue)
+                {
+                    problems.push(RouteProblem::MemoryPolicy {
+                        route: route_index,
+                        problem,
+                    });
+                }
+            }
             routes.push(BoundRoute {
                 route_index,
                 transport: route.transport.clone(),
@@ -277,6 +293,11 @@ pub struct RouteError {
 
 #[derive(Debug, Error)]
 pub enum RouteProblem {
+    #[error("routes[{route}]: {problem}")]
+    MemoryPolicy {
+        route: usize,
+        problem: crate::config::memory::PolicyProblem,
+    },
     #[error("routes[{route}] names an agent which is not in the catalog")]
     UnknownAgent { route: usize },
     #[error("routes[{route}] names agent {agent:?}, which the catalog disables")]

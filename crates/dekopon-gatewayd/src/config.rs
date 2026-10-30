@@ -2659,7 +2659,27 @@ fn resolve_with_service(
                         models: &model_names,
                         proxy_only: &proxy_only,
                     }) {
-                        Ok(knobs) => memory_knobs = Some(knobs),
+                        Ok(knobs) => {
+                            if let Some(summaries) = &knobs.summaries {
+                                let name = match &summaries.model {
+                                    memory::SummaryModel::Named(name) => Some(name.as_str()),
+                                    memory::SummaryModel::Route => route.model.as_deref(),
+                                };
+                                let model = name.and_then(|name| {
+                                    config.models.iter().find(|model| model.name() == name)
+                                });
+                                for problem in summaries.validate_attachments(
+                                    model,
+                                    config.sessions.memory.summaries.queue,
+                                ) {
+                                    problems.push(ConfigProblem::MemoryPolicy {
+                                        route: Some(index),
+                                        problem,
+                                    });
+                                }
+                            }
+                            memory_knobs = Some(knobs);
+                        }
                         Err(problem) => problems.push(ConfigProblem::MemoryPolicy {
                             route: Some(index),
                             problem,

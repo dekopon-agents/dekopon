@@ -23,6 +23,8 @@ pub(crate) struct PostReply {
     pub access: AssetAccess,
     pub publication: Option<crate::asset::Publication>,
     pub captured: CapturedTurn,
+    pub arrivals: Vec<Vec<u64>>,
+    pub attachments: crate::config::memory::AttachmentSummaries,
     pub keep: Keep,
     pub plan: Option<SummaryPlan>,
 }
@@ -130,6 +132,8 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
                 access,
                 publication,
                 captured,
+                arrivals,
+                attachments,
                 keep,
                 plan,
             } = reply;
@@ -144,6 +148,8 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
                     at: SystemTime::now(),
                     grant: &grant,
                     captured: &captured,
+                    arrivals: &arrivals,
+                    attachments,
                     keep,
                     plan,
                     inventory: &inventory,

@@ -1031,6 +1031,95 @@ async fn memory_knobs_resolve_with_route_precedence_and_journal_defaults() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn attachment_summaries_with_a_queue_below_two_refuse_at_load() {
+    use crate::config::memory::PolicyProblem;
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["models"][0]["modalities"] = json!(["image"]);
+    input["routes"][0]["model"] = json!("local-qwen");
+    input["routes"][0]["memory"] = json!({"mode":"persistent"});
+    for attachments in [
+        json!({"images":"summarize"}),
+        json!({"documents":"summarize"}),
+    ] {
+        input["sessions"] = json!({"journal":{"path":"journal"},"assets":{"path":"assets"},
+            "memory":{"summaries":{"queue":1},"agents":{"reviewer":{"summaries":{"attachments":attachments}}}}});
+        let error = load(directory.path(), &input)
+            .await
+            .expect_err("attachment queue has no share");
+        assert!(reports(&error, |problem| matches!(
+            problem,
+            ConfigProblem::MemoryPolicy {
+                problem: PolicyProblem::AttachmentSummariesNeedQueue { queue: 1 },
+                ..
+            }
+        )));
+        input["sessions"]["memory"]["summaries"]["queue"] = json!(2);
+        load(directory.path(), &input)
+            .await
+            .expect("attachment queue has a share");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_image_summary_route_without_an_image_model_refuses_at_load() {
+    use crate::config::memory::{AttachmentSummaries, PolicyProblem};
+    let directory = temporary();
+    let mut input = document(directory.path());
+    input["sessions"] = json!({"journal":{"path":"journal"},"assets":{"path":"assets"},
+        "memory":{"summaries":{"queue":1}}});
+    input["routes"][0]["model"] = json!("local-qwen");
+    input["routes"][0]["memory"] = json!({"mode":"persistent",
+        "summaries":{"attachments":{"images":"summarize"}}});
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("both attachment conflicts");
+    assert!(reports(&error, |problem| matches!(problem,
+        ConfigProblem::MemoryPolicy { problem: PolicyProblem::ImageSummariesNeedImageModel { model }, .. } if model == "local-qwen")));
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::MemoryPolicy {
+            problem: PolicyProblem::AttachmentSummariesNeedQueue { queue: 1 },
+            ..
+        }
+    )));
+    input["sessions"]["memory"]["summaries"]["queue"] = json!(2);
+    input["routes"][0].as_object_mut().unwrap().remove("model");
+    let config = load(directory.path(), &input).await.unwrap();
+    let error = RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap_err();
+    assert!(error.problems.iter().any(|problem| matches!(problem,
+        crate::routes::RouteProblem::MemoryPolicy { problem: PolicyProblem::ImageSummariesNeedImageModel { model }, .. } if model == "local-qwen")));
+    input["models"].as_array_mut().unwrap().push(json!({
+        "name":"summary","kind":"openaiCompatible","endpoint":"http://127.0.0.1:9",
+        "model":"summary","modalities":["image"]}));
+    input["routes"][0]["memory"]["summaries"]["model"] = json!("summary");
+    let config = load(directory.path(), &input)
+        .await
+        .expect("only the summaries model needs images");
+    RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap();
+    input["models"][0]["modalities"] = json!(["image"]);
+    input["models"][1]["modalities"] = json!([]);
+    let error = load(directory.path(), &input)
+        .await
+        .expect_err("reply modality cannot substitute");
+    assert!(reports(&error, |problem| matches!(problem,
+        ConfigProblem::MemoryPolicy { problem: PolicyProblem::ImageSummariesNeedImageModel { model }, .. } if model == "summary")));
+    input["routes"][0]["memory"]["summaries"] = json!({});
+    let config = load(directory.path(), &input).await.unwrap();
+    assert_eq!(
+        config.routes[0]
+            .memory_knobs
+            .as_ref()
+            .unwrap()
+            .summaries
+            .as_ref()
+            .unwrap()
+            .attachments,
+        AttachmentSummaries::default()
+    );
+}
+
 #[tokio::test]
 async fn summaries_refuse_unknown_and_proxy_only_models_and_parts_past_a_rung() {
     let directory = temporary();
@@ -4492,6 +4581,8 @@ pub(crate) fn append_captured(
                 captured,
                 keep: crate::journal::Keep::Everything,
                 plan: None,
+                attachments: Default::default(),
+                arrivals: &[],
                 inventory: &[],
                 next_asset_id: 1,
             },
