@@ -56,8 +56,8 @@ There is no catalog operator CLI and no general invocation CLI. Secret sources n
 
 ## Install
 
-- **Mac:** [Run Dekopon on a Mac](docs/run-on-mac.md) covers Homebrew, verified archives,
-  source builds, model authentication, and a read-only local session. No Kubernetes is required.
+- **Mac:** [Run Dekopon on a Mac](docs/run-on-mac.md) covers native installation,
+  the Slack/OpenRouter starter, spending limits, launchd, and update/recovery checks.
 - **Kubernetes:** [Deploy Dekopon on Kubernetes](docs/kubernetes.md) covers the Helm chart,
   ArgoCD, configuration and credentials, storage, upgrades, and shutdown ordering.
 
