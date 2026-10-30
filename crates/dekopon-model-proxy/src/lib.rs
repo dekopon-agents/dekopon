@@ -32,7 +32,7 @@ use axum::{
 use bytes::Bytes;
 use dekopon_core::{AgentId, Redacted};
 use dekopon_model::{
-    chatgpt::CredentialFile,
+    chatgpt::{CredentialFile, RefreshClient},
     wire::{Field, PeekError, RequestPeek},
 };
 use dekopon_model_token_governor::{
@@ -70,6 +70,7 @@ pub enum Upstream {
     Codex {
         endpoint: String,
         credential: Arc<CredentialFile>,
+        refresh: RefreshClient,
     },
     OpenRouter {
         endpoint: String,
@@ -431,7 +432,7 @@ async fn call(
         Err(error) => {
             tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = error.kind(), error = %error, "proxy.upstream_failed");
             let outcome = match error {
-                SendError::Credential(_) | SendError::CredentialTask(_) => Outcome::NotSent,
+                SendError::Credential(_) => Outcome::NotSent,
                 SendError::Request(_) => Outcome::Failed,
             };
             if let Some(admission) = admission {
@@ -448,8 +449,6 @@ async fn call(
 enum SendError {
     #[error("Codex credential is unavailable")]
     Credential(#[source] dekopon_model::chatgpt::ChatGptError),
-    #[error("Codex credential task failed")]
-    CredentialTask(#[source] tokio::task::JoinError),
     #[error("upstream request failed")]
     Request(#[source] reqwest::Error),
 }
@@ -457,7 +456,7 @@ enum SendError {
 impl SendError {
     const fn kind(&self) -> &'static str {
         match self {
-            Self::Credential(_) | Self::CredentialTask(_) => "credential",
+            Self::Credential(_) => "credential",
             Self::Request(_) => "request",
         }
     }
@@ -490,13 +489,17 @@ async fn send(
             .send()
             .await
             .map_err(SendError::Request),
-        Upstream::Codex { credential, .. } => {
+        Upstream::Codex {
+            credential,
+            refresh,
+            ..
+        } => {
             let request = request
                 .header("originator", "dekopon")
                 .header("openai-beta", "responses=experimental")
                 .header(header::ACCEPT, "text/event-stream");
             let retry = request.try_clone();
-            let current = codex_credential(credential, None).await?;
+            let current = codex_credential(credential, refresh, None).await?;
             let response = request
                 .bearer_auth(current.access.expose())
                 .header("chatgpt-account-id", &current.account_id)
@@ -506,7 +509,8 @@ async fn send(
             match retry {
                 Some(retry) if response.status() == StatusCode::UNAUTHORIZED => {
                     drop(response);
-                    let refreshed = codex_credential(credential, Some(current.access)).await?;
+                    let refreshed =
+                        codex_credential(credential, refresh, Some(current.access)).await?;
                     retry
                         .bearer_auth(refreshed.access.expose())
                         .header("chatgpt-account-id", &refreshed.account_id)
@@ -520,18 +524,15 @@ async fn send(
     }
 }
 
-/// The credential file refreshes over blocking HTTP, so it runs on the blocking pool.
 async fn codex_credential(
     credential: &Arc<CredentialFile>,
+    refresh: &RefreshClient,
     rejected: Option<Redacted<String>>,
 ) -> Result<dekopon_model::chatgpt::ResolvedCredential, SendError> {
-    let credential = Arc::clone(credential);
-    tokio::task::spawn_blocking(move || match rejected {
-        Some(rejected) => credential.force_refresh(&rejected),
-        None => credential.current(),
-    })
-    .await
-    .map_err(SendError::CredentialTask)?
+    match rejected {
+        Some(rejected) => credential.force_refresh(refresh, &rejected).await,
+        None => credential.current(refresh).await,
+    }
     .map_err(SendError::Credential)
 }
 

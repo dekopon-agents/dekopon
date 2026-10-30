@@ -10,10 +10,10 @@ use std::{
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 #[must_use]
-pub(crate) fn run(cli: &AuthOptions) -> i32 {
+pub(crate) async fn run(cli: &AuthOptions) -> i32 {
     initialize_tracing(cli.verbose, cli.no_color);
 
-    match evaluate(cli) {
+    match evaluate(cli).await {
         Ok(output) => {
             if cli.quiet {
                 return 0;
@@ -34,8 +34,8 @@ pub(crate) fn run(cli: &AuthOptions) -> i32 {
     }
 }
 
-fn evaluate(cli: &AuthOptions) -> Result<String, AppError> {
-    let result = auth::execute(&cli.account)?;
+async fn evaluate(cli: &AuthOptions) -> Result<String, AppError> {
+    let result = auth::execute(&cli.account).await?;
     render(&result, cli.output).map_err(AppError::Render)
 }
 

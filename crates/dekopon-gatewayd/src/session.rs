@@ -196,6 +196,13 @@ impl ConfiguredModels {
         self.chatgpt_credentials.lock().len()
     }
 
+    pub(crate) async fn drain_credentials(&self) {
+        let credentials: Vec<_> = self.chatgpt_credentials.lock().values().cloned().collect();
+        for credential in credentials {
+            credential.drain().await;
+        }
+    }
+
     pub(crate) fn retire(&self) {
         self.bound_clients
             .lock()
@@ -235,7 +242,6 @@ impl ConfiguredModels {
     pub(crate) fn chatgpt_credential(
         &self,
         auth_file: Option<&std::path::Path>,
-        timeout: std::time::Duration,
     ) -> Result<Arc<dekopon_model::chatgpt::CredentialFile>, InferenceError> {
         use dekopon_model::{chatgpt, error::AuthError};
         let path = chatgpt::resolve_auth_path(auth_file).map_err(AuthError::Credential)?;
@@ -245,8 +251,7 @@ impl ConfiguredModels {
         }
         // Opened outside the lock; if two models race to open the same file, the first instance
         // wins and is the one handed to every later model.
-        let opened =
-            Arc::new(chatgpt::CredentialFile::open(&path, timeout).map_err(AuthError::Credential)?);
+        let opened = Arc::new(chatgpt::CredentialFile::open(&path).map_err(AuthError::Credential)?);
         let mut credentials = self.chatgpt_credentials.lock();
         Ok(Arc::clone(credentials.entry(path).or_insert(opened)))
     }
@@ -324,7 +329,7 @@ impl ConfiguredModels {
                 ..
             } => {
                 let timeout = std::time::Duration::from_millis(*timeout_ms);
-                let credential = self.chatgpt_credential(auth_file.as_deref(), timeout)?;
+                let credential = self.chatgpt_credential(auth_file.as_deref())?;
                 Ok(Arc::new(ModelClient::Codex(
                     CodexClient::with_credential(model, credential, timeout, ca_bundles)?
                         .with_name(name),
@@ -4169,9 +4174,7 @@ mod model_factory_tests {
         let first = config("old");
         let second = config("new");
         let third = config("newer");
-        let credential = factory
-            .chatgpt_credential(Some(&path), Duration::from_secs(2))
-            .unwrap();
+        let credential = factory.chatgpt_credential(Some(&path)).unwrap();
         for model in [&first, &second, &third, &first] {
             factory
                 .build_bound(
@@ -4185,23 +4188,27 @@ mod model_factory_tests {
         assert_eq!(factory.chatgpt_credentials.lock().len(), 1);
         assert!(Arc::ptr_eq(
             &credential,
-            &factory
-                .chatgpt_credential(Some(&path), Duration::from_secs(2))
-                .unwrap()
+            &factory.chatgpt_credential(Some(&path)).unwrap()
         ));
         std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"version":1,"access":"rotated-synthetic","refresh":"rotated-synthetic","expiresAt":u64::MAX,"accountId":"synthetic"})).unwrap()).unwrap();
-        let adopted = credential
-            .force_refresh(&dekopon_core::Redacted::new("synthetic".to_owned()))
+        let adopted = runtime
+            .block_on(credential.force_refresh(
+                &dekopon_model::chatgpt::RefreshClient::new(Duration::from_secs(2), &[]).unwrap(),
+                &dekopon_core::Redacted::new("synthetic".to_owned()),
+            ))
             .unwrap();
         assert_eq!(
             adopted.refresh,
             Some(dekopon_model::chatgpt::RefreshOutcome::Adopted)
         );
         assert_eq!(
-            factory
-                .chatgpt_credential(Some(&path), Duration::from_secs(2))
-                .unwrap()
-                .current()
+            runtime
+                .block_on(
+                    factory.chatgpt_credential(Some(&path)).unwrap().current(
+                        &dekopon_model::chatgpt::RefreshClient::new(Duration::from_secs(2), &[])
+                            .unwrap()
+                    )
+                )
                 .unwrap()
                 .refresh,
             None

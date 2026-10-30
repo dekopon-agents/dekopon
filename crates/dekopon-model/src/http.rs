@@ -22,6 +22,7 @@ pub(crate) fn record_phase(phase: FailurePhase) {
     tracing::Span::current().record("error.phase", phase.as_str());
 }
 
+#[derive(Clone)]
 pub(crate) struct InferenceHttp {
     client: reqwest::Client,
 }
@@ -31,10 +32,18 @@ impl InferenceHttp {
         timeout: Duration,
         extra_ca_bundles: &[dekopon_core::Redacted<String>],
     ) -> Result<Self, InferenceError> {
+        Self::from_builder(reqwest::Client::builder(), timeout, extra_ca_bundles)
+    }
+
+    fn from_builder(
+        builder: reqwest::ClientBuilder,
+        timeout: Duration,
+        extra_ca_bundles: &[dekopon_core::Redacted<String>],
+    ) -> Result<Self, InferenceError> {
         if timeout.is_zero() {
             return Err(RequestError::ZeroTimeout.into());
         }
-        let mut builder = reqwest::Client::builder()
+        let mut builder = builder
             .use_rustls_tls()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -516,6 +525,50 @@ fn millis(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use crate::mock::{MockResponse, MockServer};
+
+    #[tokio::test]
+    async fn the_shared_client_ignores_ambient_proxy_configuration() {
+        let server = MockServer::start(vec![MockResponse::json(serde_json::json!({}))]);
+        let http = InferenceHttp::from_builder(
+            reqwest::Client::builder().proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap()),
+            Duration::from_secs(2),
+            &[],
+        )
+        .unwrap();
+        let endpoint = format!("{}/prefix/proxy", server.base_url());
+        assert_eq!(
+            http.post(&endpoint)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(server.request_uris(), [endpoint]);
+    }
+
+    #[tokio::test]
+    async fn the_shared_client_keeps_redirects_off_and_statuses_readable() {
+        let server = MockServer::start(vec![
+            MockResponse::failure(302, serde_json::json!({"redirect": true}))
+                .header("Location", "/escaped"),
+        ]);
+        let http = InferenceHttp::new(Duration::from_secs(2), &[]).unwrap();
+        let endpoint = format!("{}/prefix/redirect", server.base_url());
+        let response = http
+            .post(&endpoint)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(
+            response.bytes().await.unwrap().as_ref(),
+            br#"{"redirect":true}"#
+        );
+        assert_eq!(server.request_uris(), [endpoint]);
+    }
 
     async fn refusal_with_body(bytes: usize) -> ProviderFailure {
         let server = MockServer::start(vec![MockResponse::failure(

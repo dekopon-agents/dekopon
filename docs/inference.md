@@ -82,7 +82,11 @@ Each `complete` creates a fresh `TurnControl` with the session's watch receiver 
 `timeoutMs` deadline. Preparation, credential work, send, read and Codex's one pre-body 401
 refresh/resend share that deadline; it is not reset for the resend. Connect time is additionally
 capped at ten seconds. A deadline is `InferenceError::DeadlineExceeded`, not a zero-token success.
-Credential login/refresh remains blocking `ureq` on blocking tasks; generation uses async reqwest.
+ChatGPT login, token exchange, refresh, and generation use async reqwest. Refresh lock contention
+is cancellable; after the refresh task starts, dropping its waiter leaves the rotation owned until
+persistence and in-memory publication finish. Each authentication request has its own deadline
+through response-body consumption, and lifecycle owners drain refresh tasks before runtime shutdown.
+Credential file operations use the blocking pool.
 Dropping an HTTP future does not roll back remote work or preempt credential/file blocking IO.
 
 Per backend:

@@ -167,6 +167,8 @@ where
     )
     .await;
 
+    coordination.drain_credentials().await;
+
     // Checking result before cleanup here is deliberate: propagating cleanup's error first would
     // mask the real failure and skip logging broker_stopped.
     let cleanup = socket_guard.cleanup();
@@ -309,6 +311,7 @@ struct GenerationState {
     active: Arc<Candidate>,
     prepared: Option<(u32, Arc<Candidate>, Arc<Candidate>)>,
     reported: Option<RawCandidate>,
+    retired_credentials: Vec<std::sync::Weak<dekopon_model::chatgpt::CredentialFile>>,
 }
 
 impl GenerationState {
@@ -334,7 +337,25 @@ impl Coordination {
                 active: Arc::new(active),
                 prepared: None,
                 reported: None,
+                retired_credentials: Vec::new(),
             }),
+        }
+    }
+
+    async fn drain_credentials(&self) {
+        let credentials = {
+            let state = self.state.lock();
+            let mut credentials = state.active.ready.chatgpt.clone();
+            credentials.extend(
+                state
+                    .retired_credentials
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade),
+            );
+            credentials
+        };
+        for credential in credentials {
+            credential.drain().await;
         }
     }
 
@@ -447,6 +468,17 @@ impl Coordination {
             return GenerationOutcome::Refused;
         }
         let categories = state.active.snapshot.changed_categories(&next.snapshot);
+        state
+            .retired_credentials
+            .retain(|credential| credential.strong_count() > 0);
+        let retired: Vec<_> = state
+            .active
+            .ready
+            .chatgpt
+            .iter()
+            .map(Arc::downgrade)
+            .collect();
+        state.retired_credentials.extend(retired);
         state.active = next;
         state.active.ready.policy_loaded();
         tracing::info!(
@@ -631,6 +663,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                         None => Credentials::Loaded(CredentialStore::empty()),
                     },
                     secrets,
+                    chatgpt: Vec::new(),
                     fingerprint: None,
                     storage,
                     assets: None,
@@ -793,6 +826,7 @@ async fn boot_runtime(
     let (private, storage, assets) = (private?, storage?, assets?);
     Some(Runtime {
         credentials: Credentials::Loaded(private.credentials),
+        chatgpt: private.chatgpt,
         secrets: Secrets::Loaded(private.secrets, private.scheduled),
         fingerprint: Some(private.fingerprint),
         storage,
@@ -823,6 +857,7 @@ async fn reload_runtime(
     let private = private?;
     Some(Runtime {
         credentials: Credentials::Loaded(private.credentials),
+        chatgpt: private.chatgpt,
         secrets: Secrets::Loaded(private.secrets, private.scheduled),
         fingerprint: Some(private.fingerprint),
         storage,
@@ -913,8 +948,13 @@ async fn private_inputs(
         },
         |(catalog, _, scheduled)| (catalog, scheduled),
     );
+    let (credentials, chatgpt) = credentials.map_or_else(
+        || (CredentialStore::empty(), Vec::new()),
+        |loaded| (loaded.store, loaded.chatgpt),
+    );
     Some(PrivateInputs {
-        credentials: credentials.map_or_else(CredentialStore::empty, |loaded| loaded.store),
+        credentials,
+        chatgpt,
         secrets: catalog,
         scheduled,
         fingerprint,
@@ -923,6 +963,7 @@ async fn private_inputs(
 
 struct PrivateInputs {
     credentials: CredentialStore,
+    chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
     secrets: dekopon_broker::SecretCatalog,
     scheduled: secrets::ScheduledCatalog,
     fingerprint: PrivateFingerprint,
@@ -1090,6 +1131,7 @@ enum Secrets {
 
 struct Runtime {
     credentials: Credentials,
+    chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
     secrets: Secrets,
     fingerprint: Option<PrivateFingerprint>,
     storage: Option<dekopon_storage_host::StorageHost>,
@@ -1100,6 +1142,7 @@ struct Ready {
     identity_digest: String,
     broker: Arc<Broker<TraceOnlyAuditLog>>,
     scheduled: secrets::ScheduledCatalog,
+    chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
     identities: BTreeMap<u32, MappedPeer>,
     registry: BrokerProviderRegistry,
 }
@@ -1353,6 +1396,7 @@ async fn prepare(
         identity_digest: identity_digest.expect("a ready policy has an identity world"),
         broker: Arc::new(broker),
         scheduled: scheduled.unwrap_or_default(),
+        chatgpt: runtime.chatgpt,
         identities,
         registry: shared_registry,
     })

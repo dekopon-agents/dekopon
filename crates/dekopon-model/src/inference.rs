@@ -30,6 +30,13 @@ pub enum ModelClient {
 }
 
 impl ModelClient {
+    pub async fn drain_credentials(&self) {
+        match self {
+            Self::Codex(client) => client.drain_credentials().await,
+            Self::OpenAiCompatible(_) | Self::OpenRouter(_) => {}
+        }
+    }
+
     pub fn model_key(&self) -> crate::model::ModelKey {
         match self {
             Self::Codex(client) => client.model_key(),

@@ -344,8 +344,10 @@ generation; sessions already running retain their original client trust.
 These roots supplement public roots without granting network access. A listed CA lets
 whoever holds its private key impersonate model endpoints to this gateway. No ambient
 `SSL_CERT_FILE`, `SSL_CERT_DIR`, system trust store or proxy is consulted; redirects
-and existing timeouts are unchanged. This setting covers inference, not subscription
-OAuth refresh, OTLP export or the OCI provider manager.
+and existing timeouts are unchanged. This setting covers inference and gateway
+subscription OAuth refresh. Each generation keeps its own HTTP client trust, including
+refreshes already in flight. OTLP export and the OCI provider manager have separate
+CA configuration.
 
 Mount the public PEM file read-only into the gateway at the configured absolute path
 using an operator-supplied volume mount in the rendered Deployment; the chart has no
