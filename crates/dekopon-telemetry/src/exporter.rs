@@ -1,8 +1,4 @@
-use std::{
-    path::Path,
-    sync::OnceLock,
-    time::Duration,
-};
+use std::{path::Path, sync::OnceLock, time::Duration};
 
 use async_trait::async_trait;
 use opentelemetry::KeyValue;

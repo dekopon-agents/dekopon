@@ -436,10 +436,14 @@ therefore means adding it, backticked, to that document in the same change. Grep
 ### macOS Homebrew compatibility
 
 The manual [`macos-compat.yml`](../.github/workflows/macos-compat.yml) lane uses an ARM64
-`macos-15` runner and installs Dekopon and `cassette` from the real Homebrew tap. It records the
-tap revision and installed binaries, requires the pinned versions and ARM64 Mach-O architecture,
-and runs [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py) with `--launchd`. It does not
-build the checkout or substitute downloaded executables for the Homebrew installation.
+`macos-15` runner and installs `cassette` from the real Homebrew tap. With its default `daemons:
+tap` input it also installs Dekopon from the tap, records the tap revision and installed
+binaries, and requires the pinned versions and ARM64 Mach-O architecture; `daemons: checkout`
+instead builds both daemons from the dispatched commit in release mode, which is candidate
+evidence, not a released installation. It runs
+[`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py) with `--launchd` and the `mode` input:
+`legacy-wrapper` (the default, and the only mode a release before 0.73.0 supports) or `env-file`.
+It never substitutes downloaded executables for the Homebrew installation.
 
 The helper loads checksum-pinned JSONPlaceholder and GitHub components. Actual
 [`cassette` replay](https://github.com/dekopon-agents/cassette/blob/v0.1.0/README.md) supplies authored
@@ -455,23 +459,30 @@ The fixture's WebSocket dependency is pinned by version, wheel URL and SHA-256 i
 
 The test requires these observable results:
 
-- The gateway shell wrapper loads fake model/app/bot values from a private `credentials.env`;
-  the broker separately loads its literal private `credentialsPath` YAML. No daemon dotenv
-  feature or environment substitution is assumed.
+- In `--legacy-wrapper` mode the gateway shell wrapper loads fake model/app/bot values from a
+  private `credentials.env`. In `--env-file` mode both daemons start directly with
+  [`--env-file`](gatewayd.md#environment-file) (launchd `ProgramArguments` name the binary), are
+  restarted (`launchctl kickstart -k` under launchd) and serve again, and forced runs with
+  malformed lines and an invalid tuning value must exit without echoing a synthetic value. In
+  both modes the broker loads its literal private `credentialsPath` YAML; the daemons' own
+  environment-file loader is literal and the YAML takes no environment substitution.
 - Owner and colleague channel mentions reach real broker policy and read-only GitHub execution,
   then produce threaded Slack replies. Unmapped and denied senders, and a mapped room without a
   grant, produce no model or provider requests.
 - A local transport turn completes a provider read; an out-of-scope HTTP request is refused.
 - Working status identifies the initiating member and clears to active; native Stop cancels a held model
   request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged.
-- The four fake credentials are absent from checks, logs, model inputs, tool results and replies;
+- The four fake credentials are absent from checks, logs, model inputs, tool results, replies
+  and every fixture file other than the private credential files;
   each endpoint receives only its expected credential. Exact call counts and broker execution
   records identify the loaded provider artifacts.
 
 With `--launchd`, the helper discovers an existing `gui/<uid>` or `user/<uid>` domain, starts two
 uniquely named jobs, observes clean daemon exits and confirms their removal. It never uses sudo,
-creates accounts or falls back silently to foreground execution. Each job clears inherited
-environment variables before starting its binary or wrapper. Cleanup removes private temporary
+creates accounts or falls back silently to foreground execution. A legacy-wrapper job clears
+inherited environment variables with `env -i` before starting its binary or wrapper; an
+env-file job names the binary directly and sets only `PATH`, `TMPDIR` and `RUST_LOG` through
+`EnvironmentVariables`. Cleanup removes private temporary
 files only after complete success; a failure retains them and reports their path for diagnosis.
 
 To run the same helper from a checkout on an Apple Silicon Mac with Homebrew installed:
@@ -497,7 +508,10 @@ python3 -m venv "$fixture_dir/venv"
   --cassette-bin "$(brew --prefix cassette)/bin/cassette"
 ```
 
-The helper refuses a mismatched daemon version or component checksum. A tap update therefore
+Add `--env-file` to start both daemons with their environment files instead of the wrapper; it
+needs a daemon that has the option, such as a source build passed as `--bin-dir target/release`
+with `--expected-version` set to the version it reports. The helper refuses a mismatched daemon
+version or component checksum. A tap update therefore
 needs an explicit compatibility review and pin update, not an automatic skip. Validate changes
 with `python3 -m py_compile ci/macos-compat-smoke.py ci/slack_socket_fixture.py` and
 `actionlint .github/workflows/macos-compat.yml`; execute the helper with the selected release.

@@ -133,7 +133,6 @@ impl fmt::Debug for EnvFile {
 }
 
 impl EnvFile {
-    /// A relative path resolves against the working directory once, before exec.
     pub fn load(path: &Path, euid: u32) -> Result<Self, EnvFileError> {
         let path = std::env::current_dir()
             .map_err(|error| EnvFileError::WorkingDirectory { kind: error.kind() })?
@@ -159,7 +158,6 @@ impl EnvFile {
         Ok(Self { pairs })
     }
 
-    /// Inherited variables win, an empty one included.
     pub fn merged_with(
         self,
         inherited: impl IntoIterator<Item = (OsString, OsString)>,

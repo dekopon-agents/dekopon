@@ -107,7 +107,9 @@ responses, and a local Socket Mode fixture drives the released Slack Agent adapt
 
 The check requires owner/colleague PR reads and threaded replies, sender and room denials,
 native Working/Stop, secret-free logs and responses, and clean job removal. It uses no live
-Slack, OpenRouter or GitHub credentials and does not build replacement daemon binaries. See the
+Slack, OpenRouter or GitHub credentials. By default it builds no replacement daemon binaries; its
+`daemons: checkout` input builds candidate binaries from the dispatched commit, which is not
+release evidence. See the
 [development instructions](development.md#macos-homebrew-compatibility) for exact coverage,
 fixture pins and a local command.
 
@@ -233,7 +235,8 @@ command line containing the token. The broker launchd plist below runs the binar
 needs no `EnvironmentVariables` entry or secret-loading wrapper.
 
 Setting `GITHUB_TOKEN` in a plist or sourcing a broker `.env` does not populate this credential:
-the released broker has no dotenv loader and this bearer-token field does not expand `${...}`.
+the broker reads no credential from its environment and this bearer-token field does not expand
+`${...}`.
 Do not add the PAT to the gateway's `credentials.env`; that would give the wrong process the
 secret. Keep the file out of Git and ordinary logs/backups. Rotate it privately, stop the gateway
 then the broker, and restart broker then gateway to load the replacement. The review guide

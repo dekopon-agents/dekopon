@@ -653,7 +653,10 @@ fn a_jq_worker_starts_with_an_empty_environment() {
             .env(SYNTHETIC, "synthetic-parent-value")
             .status()
             .unwrap();
-        assert!(status.success(), "the child run with a synthetic parent value failed");
+        assert!(
+            status.success(),
+            "the child run with a synthetic parent value failed"
+        );
         return;
     }
     let parent = std::fs::read("/proc/self/environ").unwrap();
