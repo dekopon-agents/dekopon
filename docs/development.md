@@ -455,8 +455,9 @@ brew tap dekopon-agents/tap
 brew trust dekopon-agents/tap
 brew install dekopon-agents/tap/dekopon
 fixture_dir="$(mktemp -d)"
-gh release download v0.7.0 --repo dekopon-agents/dekopon-provider-jsonplaceholder \
-  --pattern jsonplaceholder-provider.wasm --dir "$fixture_dir"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder/releases/download/v0.7.0/jsonplaceholder-provider.wasm \
+  --output "$fixture_dir/jsonplaceholder-provider.wasm"
 python3 ci/macos-compat-smoke.py --bin-dir "$(brew --prefix dekopon)/bin" \
   --provider "$fixture_dir/jsonplaceholder-provider.wasm"
 ```
