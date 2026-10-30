@@ -4,6 +4,24 @@ Dekopon is an extensible runtime for self-hosted AI agents. Providers are WebAss
 
 > **Status:** pre-1.0 and in active production use. The one known production deployment is the maintainer's Raspberry Pi homelab: Kubernetes on a home fiber connection, serving Discord, Slack, and WhatsApp. This is not a general production-readiness guarantee. Both daemons are Unix-only. `dekopon-brokerd` maps configured peer UIDs to trusted context under the [current local process boundary](docs/security-model.md#current-local-process-boundary); `dekopon-gatewayd` holds chat and model credentials and no broker authority.
 
+## Install
+
+- **Kubernetes (preferred):** [Run Dekopon on Kubernetes](docs/kubernetes.md) covers the Helm
+  chart, Argo CD, configuration and credentials, storage and shutdown ordering.
+- **Mac, for people moving from OpenClaw or Hermes:** [Run Dekopon on a Mac](docs/run-on-mac.md)
+  covers native installation, Slack Agent setup, the
+  [GitHub review channel](examples/slack-github/README.md), broker-held PATs, spending limits,
+  launchd and recovery.
+
+[Upgrade](docs/upgrading.md) both daemons together from one release.
+
+The [Homebrew tap](https://github.com/dekopon-agents/homebrew-tap) and
+[release archives](https://github.com/dekopon-agents/dekopon/releases) also support Linux on ARM64
+and x86-64. See the [native installation methods](docs/run-on-mac.md#install) for the daemon pair;
+select the Linux archive for your architecture. The archives contain no provider components. Both daemons are Unix-only and must come from the
+same release. [Container image details](docs/container-image.md) cover image contents, provenance,
+and local image builds; [development](docs/development.md) covers building and checking a checkout.
+
 ## Design documentation
 
 Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/inference.md`](docs/inference.md) traces Slack model calls through prompt caching and bounded memory down to literal Rust and wire JSON. [`docs/README.md`](docs/README.md) provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md). See [`CHANGELOG.md`](CHANGELOG.md) for the history of every application and chart tag.
@@ -53,21 +71,6 @@ The operator surface on top:
 Semantic or vector memory, cross-agent sharing, task memory, deletion and export UX, and encryption at rest do not exist. Durable chat turns carry across broker and gateway restarts only inside one provider/agent/sender/transport/channel/conversation scope, and are read on demand with `memory recent` or `memory search`; recording never deduplicates, so a redelivered message becomes a second stored turn. SQL reaches providers only as the optional out-of-tree component, and no shipped memory path uses it.
 
 There is no catalog operator CLI and no general invocation CLI. Secret sources need explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains and IRSA, GCP ADC and WIF, Azure managed identity, kubeconfig exec plugins, custom CAs for sources other than `kubernetesTokenRequest`, and caching or stale fallback do not exist. Catalog provider and status resources are declarations only. The broker's provider manager has exact-reference `sync`, `list`, `verify`, `precompile`, and `skills` only: no SemVer ranges, private-registry credentials, publisher-provenance verification, install/update/remove/prune lifecycle, revocation response, or container-staging integration. `DEKOPON_REGISTRY_CA_BUNDLE` adds registry roots beside WebPKI. A digest proves bytes rather than publisher identity, so archive staging verifies release provenance separately; operators verify any provider artifacts they deploy. Only the broker can execute the provider effects the catalog example represents.
-
-## Install
-
-- **Mac:** [Run Dekopon on a Mac](docs/run-on-mac.md) covers native installation,
-  Slack Agent setup, [GitHub review-channel profiles](examples/slack-github/README.md),
-  broker-held PATs, spending limits, launchd, and update/recovery checks.
-- **Kubernetes:** [Deploy Dekopon on Kubernetes](docs/kubernetes.md) covers the Helm chart,
-  ArgoCD, configuration and credentials, storage, upgrades, and shutdown ordering.
-
-The [Homebrew tap](https://github.com/dekopon-agents/homebrew-tap) and
-[release archives](https://github.com/dekopon-agents/dekopon/releases) also support Linux on ARM64
-and x86-64. See the [native installation methods](docs/run-on-mac.md#install) for the daemon pair;
-select the Linux archive for your architecture. The archives contain no provider components. Both daemons are Unix-only and must come from the
-same release. [Container image details](docs/container-image.md) cover image contents, provenance,
-and local image builds; [development](docs/development.md) covers building and checking a checkout.
 
 ## Run the flagship example
 
