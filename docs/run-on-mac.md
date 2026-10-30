@@ -293,9 +293,9 @@ owns the file's contents, the PAT's permissions and its rotation.
 - The broker reads no credential from its environment, and the file expands no `${...}`. Its plist
   needs no `EnvironmentVariables` or `--env-file`; `GITHUB_TOKEN` in a plist or a sourced `.env`
   does nothing.
-- Rotate without a restart: with the gateway running, edit the file with the `sudo -u _dekopon_broker -e` line above. The
-  broker's `stdout.log` shows `broker_reload_applied`, or `broker_reload_refused` if it kept the
-  old PAT; then fix the file before the next restart.
+- Rotate without a restart: with the gateway running, edit the file with the `sudo -u
+  _dekopon_broker -e` line above. The broker's `stdout.log` shows `broker_reload_applied`, or
+  `broker_reload_refused` if it kept the old PAT; then fix the file before the next restart.
 - A broader PAT alone grants no extra Dekopon capability; broker capabilities and Cedar grants
   decide what runs.
 
