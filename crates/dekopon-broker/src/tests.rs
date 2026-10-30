@@ -1167,37 +1167,37 @@ fn a_provider_exit_keeps_its_classification_and_carries_its_status_and_stderr() 
     }
 }
 
+fn hex(data: &[u8]) -> String {
+    data.iter().map(|byte| format!("\\{byte:02x}")).collect()
+}
+
+fn stdio_probe_manifest() -> String {
+    serde_json::to_string(&serde_json::json!({
+        "apiVersion": "dekopon.dev/provider/v1alpha1",
+        "id": "stdio-probe",
+        "description": "Inline standard-stream probe",
+        "commandWords": ["stdioprobe"],
+        "capabilities": [{
+            "id": "stdio-probe.run",
+            "description": "Runs the inline body",
+            "effect": dekopon_capability::EffectKind::ReadOnly,
+            "risk": dekopon_core::RiskLevel::Low,
+            "inputSchema": {"type": "object"}
+        }]
+    }))
+    .unwrap()
+}
+
+fn manifest_descriptor(offset: u32, length: usize) -> String {
+    hex(&[
+        offset.to_le_bytes(),
+        u32::try_from(length).unwrap().to_le_bytes(),
+    ]
+    .concat())
+}
+
 fn stdout_provider_exiting_eight() -> tempfile::NamedTempFile {
-    fn hex(data: &[u8]) -> String {
-        data.iter().map(|byte| format!("\\{byte:02x}")).collect()
-    }
-
-    fn manifest() -> String {
-        serde_json::to_string(&serde_json::json!({
-            "apiVersion": "dekopon.dev/provider/v1alpha1",
-            "id": "stdio-probe",
-            "description": "Inline standard-stream probe",
-            "commandWords": ["stdioprobe"],
-            "capabilities": [{
-                "id": "stdio-probe.run",
-                "description": "Runs the inline body",
-                "effect": dekopon_capability::EffectKind::ReadOnly,
-                "risk": dekopon_core::RiskLevel::Low,
-                "inputSchema": {"type": "object"}
-            }]
-        }))
-        .unwrap()
-    }
-
-    fn descriptor(offset: u32, length: usize) -> String {
-        hex(&[
-            offset.to_le_bytes(),
-            u32::try_from(length).unwrap().to_le_bytes(),
-        ]
-        .concat())
-    }
-
-    let manifest = manifest();
+    let manifest = stdio_probe_manifest();
     let wat = format!(
         r#"(component
         (import "dekopon:stdio/streams@0.1.0" (instance $streams
@@ -1234,7 +1234,50 @@ fn stdout_provider_exiting_eight() -> tempfile::NamedTempFile {
             (canon lift (core func $provider "invoke") (memory $mem) (realloc (core func $memory "realloc"))))
         (func (export "run-command") (param "argv" (list string)) (param "stdin-piped" bool) (result string)
             (canon lift (core func $provider "command") (memory $mem) (realloc (core func $memory "realloc")))))"#,
-        descriptor = descriptor(64, manifest.len()),
+        descriptor = manifest_descriptor(64, manifest.len()),
+        manifest = hex(manifest.as_bytes()),
+    );
+    let mut provider = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut provider, wat.as_bytes()).unwrap();
+    provider
+}
+
+fn provider_succeeding_after_writing_stderr() -> tempfile::NamedTempFile {
+    inline_provider_declaring(&stdio_probe_manifest())
+}
+
+fn inline_provider_declaring(manifest: &str) -> tempfile::NamedTempFile {
+    let wat = format!(
+        r#"(component
+        (import "dekopon:stdio/streams@0.1.0" (instance $streams
+            (export "write-stderr" (func (param "text" string)))))
+        (core module $memory
+            (memory (export "memory") 1)
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
+        (core instance $memory (instantiate $memory))
+        (alias core export $memory "memory" (core memory $mem))
+        (core func $stderr (canon lower (func $streams "write-stderr") (memory $mem)))
+        (core module $provider
+            (import "memory" "memory" (memory 1))
+            (import "streams" "stderr" (func $stderr (param i32 i32)))
+            (data (i32.const 0) "{descriptor}")
+            (data (i32.const 64) "{manifest}")
+            (data (i32.const 2048) "warn\0a")
+            (data (i32.const 16) "\00\00")
+            (func (export "describe") (result i32) i32.const 0)
+            (func (export "command") (param i32 i32 i32) (result i32) i32.const 0)
+            (func (export "invoke") (param i32 i32 i32 i32) (result i32)
+                i32.const 2048 i32.const 5 call $stderr
+                i32.const 16))
+        (core instance $provider (instantiate $provider
+            (with "memory" (instance $memory))
+            (with "streams" (instance (export "stderr" (func $stderr))))))
+        (func (export "describe") (result string) (canon lift (core func $provider "describe") (memory $mem)))
+        (func (export "invoke") (param "capability" string) (param "input-json" string) (result (result (error u8)))
+            (canon lift (core func $provider "invoke") (memory $mem) (realloc (core func $memory "realloc"))))
+        (func (export "run-command") (param "argv" (list string)) (param "stdin-piped" bool) (result string)
+            (canon lift (core func $provider "command") (memory $mem) (realloc (core func $memory "realloc")))))"#,
+        descriptor = manifest_descriptor(64, manifest.len()),
         manifest = hex(manifest.as_bytes()),
     );
     let mut provider = tempfile::NamedTempFile::new().unwrap();
@@ -2199,4 +2242,1820 @@ fn a_chat_route_needs_each_storage_attribute_to_match() {
             "{what}"
         );
     }
+}
+
+fn chat_scope(
+    kind: dekopon_broker_protocol::ChatTransportKind,
+    conversation_kind: dekopon_broker_protocol::ConversationKind,
+    trigger: dekopon_broker_protocol::Trigger,
+) -> dekopon_broker_protocol::ChatScopeClaim {
+    dekopon_broker_protocol::ChatScopeClaim {
+        participant: None,
+        github: None,
+        transport: "scientist-slack".parse().expect("transport"),
+        kind,
+        conversation: dekopon_broker_protocol::Conversation {
+            kind: conversation_kind,
+            container: Some("t0123abc".to_owned()),
+            id: "c0123abc".to_owned(),
+            thread: None,
+        },
+        delivery: None,
+        trigger,
+    }
+}
+
+fn attested_agent_context(
+    subject: &str,
+    scope: dekopon_broker_protocol::ChatScopeClaim,
+) -> AuthenticatedContext {
+    AuthenticatedContext::attested_chat(
+        "maintainer".parse().expect("principal"),
+        Actor::Agent {
+            agent: "reviewer".parse().expect("agent"),
+        },
+        "gateway".parse().expect("via"),
+        subject.parse().expect("subject"),
+        scope,
+    )
+    .expect("attested context")
+}
+
+#[test]
+fn each_effect_and_risk_level_encodes_to_its_own_authority_tag() {
+    use dekopon_capability::EffectKind;
+    use dekopon_core::RiskLevel;
+
+    let effects = [
+        EffectKind::ReadOnly,
+        EffectKind::LocalWrite,
+        EffectKind::ExternalWrite,
+    ]
+    .map(super::effect_tag);
+    let risks = [
+        RiskLevel::Low,
+        RiskLevel::Medium,
+        RiskLevel::High,
+        RiskLevel::Critical,
+    ]
+    .map(super::risk_tag);
+    assert_eq!(
+        effects
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        effects.len()
+    );
+    assert_eq!(
+        risks
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        risks.len()
+    );
+}
+
+#[test]
+fn a_secret_map_revision_must_be_nonempty_unpadded_control_free_and_bounded() {
+    use super::{BrokerBuildError, SecretCatalog};
+
+    let overlong = "r".repeat(1_000);
+    for revision in [
+        "",
+        overlong.as_str(),
+        " padded",
+        "padded ",
+        "bell\u{7}inside",
+        "tab\tinside",
+    ] {
+        assert!(
+            matches!(
+                SecretCatalog::empty().with_authority_revision(revision.to_owned()),
+                Err(BrokerBuildError::InvalidSecretMapRevision)
+            ),
+            "{revision:?}"
+        );
+    }
+    let longest_accepted = "r".repeat(128);
+    for revision in ["rev-1", longest_accepted.as_str()] {
+        let catalog = SecretCatalog::empty()
+            .with_authority_revision(revision.to_owned())
+            .unwrap_or_else(|error| panic!("{revision:?}: {error}"));
+        assert_eq!(catalog.authority_revision(), Some(revision));
+    }
+}
+
+#[test]
+fn an_attestor_grant_needs_each_field_valid() {
+    use super::{AttestorGrant, BrokerBuildError};
+
+    let too_many = AttestorGrant {
+        namespaces: Some(vec![
+            "slack.t0123abc".to_owned();
+            super::MAX_POLICY_SCOPE_ENTRIES + 5
+        ]),
+    };
+    let one_segment_too_deep = AttestorGrant {
+        namespaces: Some(vec!["slack.t0123abc.u9xyz.u9xyz".to_owned()]),
+    };
+    for grant in [too_many, one_segment_too_deep] {
+        assert!(
+            matches!(
+                grant.validate(),
+                Err(BrokerBuildError::InvalidAttestorScope { .. })
+            ),
+            "{grant:?}"
+        );
+    }
+
+    let long_repository = format!("github.dekopon-agents.{}", "r".repeat(60));
+    for namespace in [
+        "slack.t0123abc.u9xyz",
+        "tel.16034700182",
+        long_repository.as_str(),
+    ] {
+        AttestorGrant {
+            namespaces: Some(vec![namespace.to_owned()]),
+        }
+        .validate()
+        .unwrap_or_else(|error| panic!("{namespace}: {error}"));
+    }
+}
+
+#[test]
+fn an_audit_error_names_its_category() {
+    assert_eq!(AuditError::Full { maximum: 1 }.category(), "full");
+}
+
+#[test]
+fn each_storage_host_error_maps_to_its_public_category() {
+    use dekopon_storage_host::StorageHostError;
+
+    for (source, expected) in [
+        (StorageHostError::QuotaExceeded, "storage-quota"),
+        (StorageHostError::Busy, "storage-busy"),
+        (StorageHostError::Timeout, "storage-timeout"),
+        (StorageHostError::corrupt("test"), "storage-corrupt"),
+        (
+            StorageHostError::CorruptLayout {
+                path: "layout".into(),
+            },
+            "storage-corrupt",
+        ),
+        (StorageHostError::Io, "storage-io"),
+    ] {
+        assert_eq!(
+            public_host_error(&BrokerHostError::Storage { source }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn a_rendered_evidence_value_is_absent_when_it_is_an_empty_list_or_null() {
+    assert_eq!(super::rendered(&Vec::<String>::new()), None);
+    assert_eq!(super::rendered(&None::<u8>), None);
+}
+
+#[test]
+fn the_outcome_evidence_digest_is_the_digest_of_the_outcome() {
+    let invocation: InvocationId = "invoke-digest".parse().expect("invocation");
+    let digest = super::outcome_evidence_digest(&invocation, "outcome", &"ok").expect("digest");
+    assert!(digest.starts_with("sha256:") && digest.len() == "sha256:".len() + 64);
+    assert_ne!(
+        digest,
+        super::outcome_evidence_digest(&invocation, "outcome", &"other").expect("digest")
+    );
+}
+
+fn permit(principal: &str, action: &str, kind: &str, resource: &str) -> String {
+    format!(
+        r#"@id("{principal}-{action}") permit(principal == Dekopon::Principal::"{principal}",
+            action == Dekopon::Action::"{action}", resource == Dekopon::{kind}::"{resource}");"#
+    )
+}
+
+const SECRET_DRN: &str = "drn:com.xrl:secret:test:http-probe/token";
+
+fn capability_policy(permitted: &[(&str, &str)]) -> String {
+    permitted
+        .iter()
+        .map(|(capability, provider)| permit("maintainer", capability, "Provider", provider))
+        .collect()
+}
+
+fn memory_route_sets() -> Vec<(CapabilityId, ConstraintSet)> {
+    use dekopon_capability::EffectKind;
+    use dekopon_core::RiskLevel;
+
+    [
+        (
+            "memory.chat.record",
+            CapabilityRoute::ChatMemoryRecord,
+            EffectKind::LocalWrite,
+            RiskLevel::Medium,
+            StorageAccess::ReadWrite,
+        ),
+        (
+            "memory.chat.recent",
+            CapabilityRoute::ChatMemoryRecent,
+            EffectKind::ReadOnly,
+            RiskLevel::High,
+            StorageAccess::ReadOnly,
+        ),
+        (
+            "memory.chat.search",
+            CapabilityRoute::ChatMemorySearch,
+            EffectKind::ReadOnly,
+            RiskLevel::High,
+            StorageAccess::ReadOnly,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, route, effect, risk, access)| {
+        (
+            name.parse().expect("capability"),
+            ConstraintSet {
+                route,
+                provider: "memory".parse().expect("provider"),
+                effect,
+                risk,
+                ..storage_set(
+                    "memory",
+                    StorageInterface::Jsonl,
+                    access,
+                    StorageScope::PrivateConversation,
+                    Default::default(),
+                    None,
+                )
+            },
+        )
+    })
+    .collect()
+}
+
+fn http_probe_set() -> ConstraintSet {
+    ConstraintSet {
+        default_secret_use: None,
+        route: CapabilityRoute::Generic,
+        provider: "http-probe".parse().expect("provider"),
+        effect: dekopon_capability::EffectKind::ReadOnly,
+        risk: dekopon_core::RiskLevel::Low,
+        credential: None,
+        constraints: ExecutionConstraints {
+            http: Some(HttpConstraints {
+                allowed_hosts: vec!["127.0.0.1:1".to_owned()],
+                allowed_methods: vec!["GET".to_owned()],
+                max_requests: 1,
+                max_request_bytes: 4_096,
+                max_response_bytes: 4_096,
+                allow_plaintext_loopback: true,
+                propagate_trace: false,
+                request_templates: Vec::new(),
+                signed_download: None,
+            }),
+            ..ExecutionConstraints::default()
+        },
+    }
+}
+
+fn cli_probe_set(
+    effect: dekopon_capability::EffectKind,
+    risk: dekopon_core::RiskLevel,
+) -> ConstraintSet {
+    ConstraintSet {
+        default_secret_use: None,
+        route: CapabilityRoute::Generic,
+        provider: "cli-probe".parse().expect("provider"),
+        effect,
+        risk,
+        credential: None,
+        constraints: ExecutionConstraints::default(),
+    }
+}
+
+fn http_probe_binding() -> super::SecretUseBinding {
+    super::SecretUseBinding {
+        binding_id: "http-probe-token".to_owned(),
+        secret: SECRET_DRN.parse().expect("secret"),
+        capability: "http-probe.fetch".parse().expect("capability"),
+        sink: dekopon_core::SecretSinkKind::HttpBearer,
+        basic_username: None,
+        allowed_hosts: vec!["127.0.0.1:1".to_owned()],
+        allowed_methods: vec!["GET".to_owned()],
+        allowed_paths: vec![dekopon_capability::HttpPathRule::Exact {
+            path: "/api/v1/thing".to_owned(),
+        }],
+        allow_query: false,
+        max_injections: 1,
+    }
+}
+
+struct SurfaceBroker<'a> {
+    root: &'a std::path::Path,
+    policy: String,
+    constraints: Vec<(CapabilityId, ConstraintSet)>,
+    memory: bool,
+    secret_binding: Option<Option<&'a str>>,
+    identities: Vec<(&'a str, &'a str)>,
+    storage: bool,
+}
+
+impl<'a> SurfaceBroker<'a> {
+    fn new(root: &'a std::path::Path, permitted: &[(&str, &str)]) -> Self {
+        Self {
+            root,
+            policy: capability_policy(permitted),
+            constraints: vec![
+                (
+                    "cli-probe.upper".parse().expect("capability"),
+                    cli_probe_set(
+                        dekopon_capability::EffectKind::ReadOnly,
+                        dekopon_core::RiskLevel::Low,
+                    ),
+                ),
+                (
+                    "cli-probe.count".parse().expect("capability"),
+                    cli_probe_set(
+                        dekopon_capability::EffectKind::ReadOnly,
+                        dekopon_core::RiskLevel::Low,
+                    ),
+                ),
+                (
+                    "http-probe.fetch".parse().expect("capability"),
+                    http_probe_set(),
+                ),
+                (
+                    "storage-probe.run".parse().expect("capability"),
+                    ConstraintSet {
+                        risk: dekopon_core::RiskLevel::Medium,
+                        ..storage_set(
+                            "storage-probe",
+                            StorageInterface::DurableFiles,
+                            StorageAccess::ReadWrite,
+                            StorageScope::PrivateConversation,
+                            Default::default(),
+                            None,
+                        )
+                    },
+                ),
+            ],
+            memory: false,
+            secret_binding: None,
+            identities: Vec::new(),
+            storage: true,
+        }
+    }
+
+    fn with_identities(mut self, identities: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        self.identities = identities.into_iter().collect();
+        self
+    }
+
+    fn with_memory(mut self) -> Self {
+        self.constraints.extend(memory_route_sets());
+        self.memory = true;
+        self
+    }
+
+    fn with_secret(mut self, permitted: bool, revision: Option<&'a str>) -> Self {
+        if permitted {
+            self.policy
+                .push_str(&permit("maintainer", "secret.use", "Secret", SECRET_DRN));
+        }
+        self.secret_binding = Some(revision);
+        self
+    }
+
+    async fn build(self) -> Broker<InMemoryAuditLog> {
+        self.try_build().await.expect("broker")
+    }
+
+    async fn try_build(self) -> Result<Broker<InMemoryAuditLog>, super::BrokerBuildError> {
+        let _memoization = dekopon_broker_host::enable_test_component_memoization();
+        let storage = self.storage.then(|| {
+            dekopon_storage_host::StorageHost::open(
+                self.root
+                    .canonicalize()
+                    .expect("canonical tempdir")
+                    .join("storage"),
+                dekopon_storage_host::StorageLimits::default(),
+            )
+            .expect("storage")
+        });
+        let registry = dekopon_broker_host::BrokerProviderRegistry::load_with_storage(
+            [
+                dekopon_test_support::provider_fixture("cli-probe-provider.wasm"),
+                dekopon_test_support::provider_fixture("http-probe-provider.wasm"),
+                dekopon_test_support::provider_fixture("storage-probe-provider.wasm"),
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixture/memory-smoke-probe-provider.wasm"),
+            ],
+            BrokerHostLimits::default(),
+            storage,
+        )
+        .await
+        .expect("fixtures load");
+        let world = PolicyWorld::new(
+            ["maintainer".parse().expect("principal")],
+            registry
+                .capabilities()
+                .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+        )
+        .expect("world")
+        .with_secrets([SECRET_DRN.parse().expect("secret")]);
+        let mut broker = Broker::new(
+            registry,
+            "broker".parse().expect("principal"),
+            PolicyEngine::new(&self.policy, &world).expect("policy"),
+            ConstraintCatalog::new(self.constraints).expect("constraints"),
+            CredentialStore::empty(),
+            IdentityDirectory::new(self.identities.iter().map(|(subject, principal)| {
+                (
+                    subject.parse().expect("subject"),
+                    principal.parse().expect("principal"),
+                )
+            }))
+            .expect("identities"),
+            Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+            BrokerLimits::default(),
+        )?;
+        if self.memory {
+            broker = broker.with_chat_memory(valid_memory_config())?;
+        }
+        if let Some(revision) = self.secret_binding {
+            let mut secrets = super::SecretCatalog::new(
+                vec![http_probe_binding()],
+                Arc::new(super::EmptySecretResolver),
+            )
+            .expect("binding");
+            if let Some(revision) = revision {
+                secrets = secrets
+                    .with_authority_revision(revision.to_owned())
+                    .expect("revision");
+            }
+            broker = broker.with_secret_catalog(secrets)?;
+        }
+        Ok(broker)
+    }
+}
+
+fn surface(broker: &Broker<InMemoryAuditLog>, memory_route: bool) -> Vec<u8> {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let context = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        ),
+    );
+    broker
+        .canonical_authority_surface(&context, StorageInterface::Jsonl, memory_route)
+        .expect("surface")
+}
+
+#[tokio::test]
+async fn the_authority_generation_covers_exactly_the_effective_capabilities_and_changes_when_any_is_added_or_denied()
+ {
+    let dirs = [(); 6].map(|()| tempfile::tempdir().expect("tempdir"));
+    let upper = [("cli-probe.upper", "cli-probe")];
+    let broker = |index: usize, permitted: &[(&str, &str)]| {
+        SurfaceBroker::new(dirs[index].path(), permitted)
+    };
+
+    let only_upper = surface(&broker(0, &upper).build().await, false);
+    assert!(only_upper.len() > 1);
+
+    let upper_and_count = surface(
+        &broker(1, &[upper[0], ("cli-probe.count", "cli-probe")])
+            .build()
+            .await,
+        false,
+    );
+    assert_ne!(
+        upper_and_count, only_upper,
+        "an added capability rotates the generation"
+    );
+
+    let mut wrong_provider = broker(2, &upper);
+    wrong_provider.policy.push_str(&permit(
+        "maintainer",
+        "cli-probe.count",
+        "Provider",
+        "http-probe",
+    ));
+    assert_eq!(
+        surface(&wrong_provider.build().await, false),
+        only_upper,
+        "a permit that does not name the capability's provider does not make it effective"
+    );
+
+    let memory = broker(
+        3,
+        &[
+            upper[0],
+            ("memory.chat.record", "memory"),
+            ("memory.chat.recent", "memory"),
+            ("memory.chat.search", "memory"),
+        ],
+    )
+    .with_memory()
+    .build()
+    .await;
+    assert_eq!(
+        surface(&memory, false),
+        only_upper,
+        "memory routes stay out of a surface that does not serve them"
+    );
+    assert_ne!(surface(&memory, true), only_upper);
+
+    let mut space_scoped = broker(4, &[upper[0], ("cli-probe.count", "cli-probe")]);
+    space_scoped.constraints[1].1 = ConstraintSet {
+        constraints: ExecutionConstraints {
+            storage: Some(StorageConstraints {
+                interface: StorageInterface::Jsonl,
+                access: StorageAccess::ReadOnly,
+                scope: StorageScope::Space,
+                retention: Default::default(),
+                namespace: None,
+            }),
+            ..ExecutionConstraints::default()
+        },
+        ..space_scoped.constraints[1].1.clone()
+    };
+    assert_eq!(
+        surface(&space_scoped.build().await, false),
+        only_upper,
+        "a space-scoped capability is not effective without a space"
+    );
+}
+
+#[tokio::test]
+async fn the_authority_generation_changes_with_the_secret_bindings_and_map_revision() {
+    let dirs = [(); 7].map(|()| tempfile::tempdir().expect("tempdir"));
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let broker = |index: usize| SurfaceBroker::new(dirs[index].path(), &fetch);
+
+    let unbound = surface(&broker(0).build().await, false);
+    let first = surface(
+        &broker(1).with_secret(true, Some("r1")).build().await,
+        false,
+    );
+    let second = surface(
+        &broker(2).with_secret(true, Some("r2")).build().await,
+        false,
+    );
+    let unrevised = surface(&broker(3).with_secret(true, None).build().await, false);
+    let denied = surface(
+        &broker(4).with_secret(false, Some("r1")).build().await,
+        false,
+    );
+
+    assert_ne!(
+        first, unbound,
+        "a usable secret binding is part of the authority"
+    );
+    assert_ne!(first, second, "the map revision is part of the authority");
+    assert_ne!(first, unrevised);
+    assert_eq!(
+        denied, unbound,
+        "a binding the policy does not permit changes no authority"
+    );
+
+    let none_effective = SurfaceBroker::new(dirs[5].path(), &[("cli-probe.upper", "cli-probe")])
+        .with_secret(true, Some("r1"))
+        .build()
+        .await;
+    assert_eq!(
+        surface(&none_effective, false),
+        surface(
+            &SurfaceBroker::new(dirs[6].path(), &[("cli-probe.upper", "cli-probe")])
+                .build()
+                .await,
+            false
+        ),
+        "a binding for a capability that is not effective changes no authority"
+    );
+}
+
+#[test]
+fn a_secret_binding_with_an_invalid_grant_is_refused_by_its_own_validation() {
+    use dekopon_capability::SecretUseGrantError;
+
+    http_probe_binding()
+        .validate()
+        .expect("the baseline binding is valid");
+    let empty_scope = super::SecretUseBinding {
+        allowed_hosts: Vec::new(),
+        ..http_probe_binding()
+    };
+    assert_eq!(empty_scope.validate(), Err(SecretUseGrantError::EmptyScope));
+}
+
+#[test]
+fn a_secret_catalog_lists_the_secrets_its_bindings_name() {
+    let catalog = super::SecretCatalog::new(
+        vec![http_probe_binding()],
+        Arc::new(super::EmptySecretResolver),
+    )
+    .expect("catalog");
+    assert_eq!(
+        catalog.drns().map(|drn| drn.as_str()).collect::<Vec<_>>(),
+        [SECRET_DRN]
+    );
+}
+
+#[test]
+fn secret_catalog_refuses_each_binding_that_exceeds_its_capability_http_constraint() {
+    use super::{BrokerBuildError, SecretCatalog, SecretUseBinding};
+
+    fn broker_error(binding: SecretUseBinding) -> Option<BrokerBuildError> {
+        let constraints = ConstraintCatalog::new([
+            (
+                "http-probe.fetch".parse().expect("capability"),
+                http_probe_set(),
+            ),
+            (
+                "cli-probe.upper".parse().expect("capability"),
+                cli_probe_set(
+                    dekopon_capability::EffectKind::ReadOnly,
+                    dekopon_core::RiskLevel::Low,
+                ),
+            ),
+        ])
+        .expect("constraints");
+        SecretCatalog::new(vec![binding], Arc::new(super::EmptySecretResolver))
+            .expect("a well-formed binding builds")
+            .validate(&constraints)
+            .err()
+    }
+
+    assert!(broker_error(http_probe_binding()).is_none());
+    assert!(matches!(
+        broker_error(SecretUseBinding {
+            capability: "missing.capability".parse().expect("capability"),
+            ..http_probe_binding()
+        }),
+        Some(BrokerBuildError::SecretBindingUnknownCapability { .. })
+    ));
+    assert!(matches!(
+        broker_error(SecretUseBinding {
+            capability: "cli-probe.upper".parse().expect("capability"),
+            ..http_probe_binding()
+        }),
+        Some(BrokerBuildError::SecretBindingWithoutHttp { .. })
+    ));
+    for (name, binding) in [
+        (
+            "more injections than the capability may send requests",
+            SecretUseBinding {
+                max_injections: 2,
+                ..http_probe_binding()
+            },
+        ),
+        (
+            "a host the capability does not allow",
+            SecretUseBinding {
+                allowed_hosts: vec!["127.0.0.1:2".to_owned()],
+                ..http_probe_binding()
+            },
+        ),
+        (
+            "a method the capability does not allow",
+            SecretUseBinding {
+                allowed_methods: vec!["POST".to_owned()],
+                ..http_probe_binding()
+            },
+        ),
+    ] {
+        assert!(
+            matches!(
+                broker_error(binding),
+                Some(BrokerBuildError::SecretBindingExceedsCapability { .. })
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn validate_set_constraints_refuses_each_inconsistent_constraint_set() {
+    use super::{BrokerBuildError, validate_set_constraints};
+    use dekopon_capability::{AssetConstraints, EffectKind, SecretUseGrant};
+
+    let valid = |set: &ConstraintSet| validate_set_constraints(set);
+    let with = |constraints: ExecutionConstraints, effect| ConstraintSet {
+        effect,
+        constraints,
+        ..cli_probe_set(EffectKind::ReadOnly, dekopon_core::RiskLevel::Low)
+    };
+    let storage = |access| StorageConstraints {
+        interface: StorageInterface::Jsonl,
+        access,
+        scope: StorageScope::PrivateConversation,
+        retention: Default::default(),
+        namespace: None,
+    };
+    let asset = |attach, remove, send| {
+        Some(AssetConstraints {
+            attach,
+            remove,
+            send,
+        })
+    };
+    let secret_use = SecretUseGrant {
+        secret: SECRET_DRN.parse().expect("secret"),
+        sink: dekopon_core::SecretSinkKind::HttpBearer,
+        basic_username: None,
+        allowed_hosts: vec!["127.0.0.1:1".to_owned()],
+        allowed_methods: vec!["GET".to_owned()],
+        allowed_paths: vec![dekopon_capability::HttpPathRule::Exact {
+            path: "/".to_owned(),
+        }],
+        allow_query: false,
+        max_injections: 1,
+        binding_id: "binding".to_owned(),
+        map_revision: None,
+    };
+
+    valid(&with(
+        ExecutionConstraints {
+            storage: Some(storage(StorageAccess::ReadWrite)),
+            asset: asset(true, false, false),
+            ..ExecutionConstraints::default()
+        },
+        EffectKind::LocalWrite,
+    ))
+    .expect("a consistent set is valid");
+
+    let storage_and_http = ExecutionConstraints {
+        storage: Some(storage(StorageAccess::ReadOnly)),
+        ..http_probe_set().constraints
+    };
+    let rows: Vec<(&str, ConstraintSet)> = vec![
+        (
+            "a zero timeout",
+            with(
+                ExecutionConstraints {
+                    timeout_ms: 0,
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+        (
+            "a resolved secret use",
+            with(
+                ExecutionConstraints {
+                    secret_use: Some(secret_use),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+        (
+            "http beside storage",
+            with(storage_and_http, EffectKind::ReadOnly),
+        ),
+        (
+            "write access under a read-only effect",
+            with(
+                ExecutionConstraints {
+                    storage: Some(storage(StorageAccess::ReadWrite)),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+        (
+            "an external write over storage",
+            with(
+                ExecutionConstraints {
+                    storage: Some(storage(StorageAccess::ReadWrite)),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ExternalWrite,
+            ),
+        ),
+        (
+            "send without an external write",
+            with(
+                ExecutionConstraints {
+                    asset: asset(false, false, true),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::LocalWrite,
+            ),
+        ),
+        (
+            "attach under a read-only effect",
+            with(
+                ExecutionConstraints {
+                    asset: asset(true, false, false),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+        (
+            "remove under a read-only effect",
+            with(
+                ExecutionConstraints {
+                    asset: asset(false, true, false),
+                    ..ExecutionConstraints::default()
+                },
+                EffectKind::ReadOnly,
+            ),
+        ),
+    ];
+    for (name, set) in rows {
+        assert!(
+            matches!(valid(&set), Err(BrokerBuildError::InvalidPolicyConstraints)),
+            "{name}"
+        );
+    }
+}
+
+fn invocation_with_input(input: serde_json::Value) -> dekopon_broker_protocol::InvocationRequest {
+    dekopon_broker_protocol::InvocationRequest {
+        id: "invoke-memory-input".parse().expect("invocation"),
+        capability: "memory.chat.recent".parse().expect("capability"),
+        trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
+            .parse()
+            .expect("traceparent"),
+        input,
+        secret_use: None,
+    }
+}
+
+#[tokio::test]
+async fn memory_inputs_outside_their_limits_or_with_extra_keys_are_refused() {
+    use serde_json::json;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[])
+        .with_memory()
+        .build()
+        .await;
+    let curate = |route, input| {
+        let mut request = invocation_with_input(input);
+        let outcome = broker.curate_memory_input(route, &mut request);
+        (outcome, request.input)
+    };
+    let config = valid_memory_config();
+
+    let (outcome, input) = curate(CapabilityRoute::ChatMemoryRecent, json!({"last": 3}));
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(
+        input,
+        json!({
+            "operation": "recent", "last": 3,
+            "maxLookbackTurns": config.max_lookback_turns,
+            "maxRecentTurns": config.max_recent_turns,
+            "maxResultBytes": config.max_result_bytes,
+        })
+    );
+    let (outcome, input) = curate(
+        CapabilityRoute::ChatMemorySearch,
+        json!({"query": "needle"}),
+    );
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(
+        input,
+        json!({
+            "operation": "search", "query": "needle",
+            "maxLookbackTurns": config.max_lookback_turns,
+            "maxSearchResults": config.max_search_results,
+            "maxResultBytes": config.max_result_bytes,
+        })
+    );
+
+    let too_long = "q".repeat(usize::try_from(config.max_query_bytes).expect("query bytes") + 100);
+    for (name, route, input) in [
+        (
+            "zero turns",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({"last": 0}),
+        ),
+        (
+            "more turns than the recent limit",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({"last": u64::from(config.max_recent_turns) + 100}),
+        ),
+        (
+            "a negative count",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({"last": -1}),
+        ),
+        (
+            "a missing count",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({}),
+        ),
+        (
+            "an extra key beside the count",
+            CapabilityRoute::ChatMemoryRecent,
+            json!({"last": 1, "extra": true}),
+        ),
+        (
+            "an empty query",
+            CapabilityRoute::ChatMemorySearch,
+            json!({"query": ""}),
+        ),
+        (
+            "a query beyond the byte limit",
+            CapabilityRoute::ChatMemorySearch,
+            json!({"query": too_long}),
+        ),
+        (
+            "a non-text query",
+            CapabilityRoute::ChatMemorySearch,
+            json!({"query": 5}),
+        ),
+        (
+            "an extra key beside the query",
+            CapabilityRoute::ChatMemorySearch,
+            json!({"query": "needle", "extra": true}),
+        ),
+        (
+            "a generic route",
+            CapabilityRoute::Generic,
+            json!({"query": "needle"}),
+        ),
+        (
+            "the record route",
+            CapabilityRoute::ChatMemoryRecord,
+            json!({"last": 1}),
+        ),
+    ] {
+        assert_eq!(
+            curate(route, input).0,
+            Err("invalid-memory-input"),
+            "{name}"
+        );
+    }
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let without_memory = SurfaceBroker::new(root.path(), &[]).build().await;
+    let mut request = invocation_with_input(json!({"last": 1}));
+    assert_eq!(
+        without_memory.curate_memory_input(CapabilityRoute::ChatMemoryRecent, &mut request),
+        Err("memory-unavailable")
+    );
+}
+
+#[test]
+fn merge_space_decision_ands_each_verdict_and_unions_policy_ids() {
+    use super::{DenyingPrincipal, SpaceDecision, merge_space_decision};
+
+    let decision = |asker: bool, space: bool, ids: &[&str]| SpaceDecision {
+        id: "space".parse().expect("principal"),
+        asker_allowed: Some(asker),
+        allowed: Some(space),
+        policy_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+        denied_by: None,
+    };
+    for (previous, next, asker, space, denied_by) in [
+        ((true, true), (true, true), true, true, None),
+        (
+            (true, true),
+            (false, true),
+            false,
+            true,
+            Some(DenyingPrincipal::Asker),
+        ),
+        (
+            (true, true),
+            (true, false),
+            true,
+            false,
+            Some(DenyingPrincipal::Space),
+        ),
+        (
+            (false, true),
+            (true, true),
+            false,
+            true,
+            Some(DenyingPrincipal::Asker),
+        ),
+        (
+            (true, false),
+            (true, true),
+            true,
+            false,
+            Some(DenyingPrincipal::Space),
+        ),
+        (
+            (false, false),
+            (true, true),
+            false,
+            false,
+            Some(DenyingPrincipal::Both),
+        ),
+    ] {
+        let mut merged = Some(decision(previous.0, previous.1, &["b", "a"]));
+        merge_space_decision(&mut merged, Some(decision(next.0, next.1, &["c", "a"])));
+        let merged = merged.expect("a decision");
+        assert_eq!(
+            (merged.asker_allowed, merged.allowed, merged.denied_by),
+            (Some(asker), Some(space), denied_by),
+            "{previous:?} then {next:?}"
+        );
+        assert_eq!(merged.policy_ids, ["a", "b", "c"]);
+    }
+
+    let mut kept = Some(decision(true, true, &["a"]));
+    merge_space_decision(&mut kept, None);
+    assert_eq!(kept, Some(decision(true, true, &["a"])));
+}
+
+#[test]
+fn an_identity_directory_lists_its_principals_and_the_ceiling_is_the_longest() {
+    let directory = IdentityDirectory::new([
+        (
+            "slack.t0123abc.u1".parse().expect("subject"),
+            "ann".parse().expect("principal"),
+        ),
+        (
+            "slack.t0123abc.u2".parse().expect("subject"),
+            "maintainer".parse().expect("principal"),
+        ),
+    ])
+    .expect("directory");
+    let mut principals = directory
+        .principals()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    principals.sort();
+    assert_eq!(principals, ["ann", "maintainer"]);
+}
+
+#[tokio::test]
+async fn the_capability_ceiling_lists_each_available_capability_with_its_words_and_help() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[])
+        .with_memory()
+        .with_identities([
+            ("slack.t0123abc.u1", "ann"),
+            ("slack.t0123abc.u2", "maintainer"),
+        ])
+        .build()
+        .await;
+
+    let (capabilities, words, help) = broker.capability_ceiling();
+    let ids = capabilities
+        .iter()
+        .map(|available| available.capability.id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        [
+            "cli-probe.count",
+            "cli-probe.upper",
+            "http-probe.fetch",
+            "memory.chat.recent",
+            "memory.chat.record",
+            "memory.chat.search",
+            "storage-probe.run",
+        ]
+    );
+    for available in &capabilities {
+        let set = broker
+            .constraints
+            .get(&available.capability.id)
+            .expect("constrained");
+        assert_eq!(available.provider, set.provider);
+        assert_eq!(available.capability.effect, set.effect);
+        assert_eq!(available.capability.risk, set.risk);
+    }
+    assert!(words.iter().any(|word| word == "smokerecent"), "{words:?}");
+    assert_eq!(
+        help.keys().collect::<std::collections::BTreeSet<_>>(),
+        words.iter().collect::<std::collections::BTreeSet<_>>()
+    );
+    assert!(help.values().all(|page| !page.is_empty()));
+
+    assert_eq!(
+        broker.principal_ceiling(),
+        Some("maintainer".parse().expect("principal"))
+    );
+    assert_eq!(
+        broker.display_principal(&"slack.t0123abc.u1".parse().expect("subject")),
+        Some("ann".parse().expect("principal"))
+    );
+    let memory = broker.chat_memory_ceiling().expect("memory is configured");
+    assert_eq!(
+        memory.max_lookback_turns,
+        valid_memory_config().max_lookback_turns
+    );
+    assert_eq!(memory.prompt_note, super::MEMORY_PROMPT_NOTE);
+}
+
+#[tokio::test]
+async fn without_memory_or_identities_the_ceilings_are_absent() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[]).build().await;
+    assert_eq!(broker.principal_ceiling(), None);
+    assert_eq!(
+        broker.display_principal(&"slack.t0123abc.u1".parse().expect("subject")),
+        None
+    );
+    assert!(broker.chat_memory_ceiling().is_none());
+}
+
+#[tokio::test]
+async fn a_chat_route_and_a_storage_constrained_capability_each_use_storage() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[])
+        .with_memory()
+        .build()
+        .await;
+    for (capability, uses_storage) in [
+        ("memory.chat.recent", true),
+        ("storage-probe.run", true),
+        ("cli-probe.upper", false),
+        ("http-probe.fetch", false),
+        ("unconstrained.capability", false),
+    ] {
+        assert_eq!(
+            broker.capability_uses_storage(&capability.parse().expect("capability")),
+            uses_storage,
+            "{capability}"
+        );
+    }
+}
+
+fn memory_policy() -> [(&'static str, &'static str); 3] {
+    [
+        ("memory.chat.record", "memory"),
+        ("memory.chat.recent", "memory"),
+        ("memory.chat.search", "memory"),
+    ]
+}
+
+#[tokio::test]
+async fn memory_surface_requires_each_of_its_conditions() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+    let scope = || {
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        )
+    };
+    let broker = SurfaceBroker::new(dirs[0].path(), &memory_policy())
+        .with_memory()
+        .build()
+        .await;
+    let reviewer: AgentId = "reviewer".parse().expect("agent");
+    let stranger: AgentId = "stranger".parse().expect("agent");
+    let with_scope = attested_agent_context("slack.t0123abc.u9xyz", scope());
+    let without_scope = AuthenticatedContext::new(
+        "maintainer".parse().expect("principal"),
+        Actor::Agent {
+            agent: reviewer.clone(),
+        },
+    )
+    .expect("context");
+
+    let surface = broker
+        .memory_surface(&with_scope, &reviewer)
+        .expect("an enabled agent in a chat scope with every route permitted");
+    assert_eq!(
+        surface.max_lookback_turns,
+        valid_memory_config().max_lookback_turns
+    );
+    assert!(broker.memory_surface(&with_scope, &stranger).is_none());
+    assert!(broker.memory_surface(&without_scope, &reviewer).is_none());
+
+    let partial = SurfaceBroker::new(
+        dirs[1].path(),
+        &[
+            ("memory.chat.record", "memory"),
+            ("memory.chat.recent", "memory"),
+        ],
+    )
+    .with_memory()
+    .build()
+    .await;
+    assert!(
+        partial.memory_surface(&with_scope, &reviewer).is_none(),
+        "a surface needs all three routes permitted"
+    );
+}
+
+#[tokio::test]
+async fn reachable_providers_hides_storage_providers_outside_a_chat_scope() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = SurfaceBroker::new(root.path(), &[])
+        .with_memory()
+        .build()
+        .await;
+    let authorized = broker.constraints.iter().collect::<Vec<_>>();
+    let providers = |context: &AuthenticatedContext| {
+        broker
+            .reachable_providers(context, &authorized)
+            .into_iter()
+            .map(|provider| provider.to_string())
+            .collect::<Vec<_>>()
+    };
+    let chat = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        ),
+    );
+    let direct = AuthenticatedContext::new(
+        "maintainer".parse().expect("principal"),
+        Actor::Service {
+            principal: "maintainer".parse().expect("principal"),
+        },
+    )
+    .expect("context");
+
+    assert_eq!(
+        providers(&chat),
+        ["cli-probe", "http-probe", "storage-probe"]
+    );
+    assert_eq!(providers(&direct), ["cli-probe", "http-probe"]);
+}
+
+fn entry_count(path: &std::path::Path) -> usize {
+    std::fs::read_dir(path)
+        .expect("directory")
+        .map(|entry| {
+            let path = entry.expect("entry").path();
+            1 + if path.is_dir() { entry_count(&path) } else { 0 }
+        })
+        .sum()
+}
+
+#[tokio::test]
+async fn a_private_conversation_namespace_rotates_with_authority_and_other_scopes_do_not() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let context = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        ),
+    );
+    let request = dekopon_broker_protocol::InvocationRequest {
+        capability: "storage-probe.run".parse().expect("capability"),
+        ..invocation_with_input(serde_json::json!({}))
+    };
+    for (scope, rotates) in [
+        (StorageScope::PrivateConversation, true),
+        (StorageScope::Agent, false),
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut sizes = Vec::new();
+        for permitted in [
+            vec![("storage-probe.run", "storage-probe")],
+            vec![
+                ("storage-probe.run", "storage-probe"),
+                ("cli-probe.upper", "cli-probe"),
+            ],
+        ] {
+            let mut broker = SurfaceBroker::new(root.path(), &permitted);
+            let run = broker
+                .constraints
+                .iter_mut()
+                .find(|(capability, _)| capability.as_str() == "storage-probe.run")
+                .expect("storage route");
+            run.1.constraints.storage.as_mut().expect("storage").scope = scope;
+            let broker = broker.build().await;
+            let set = broker
+                .constraints
+                .get(&request.capability)
+                .expect("constrained")
+                .clone();
+            let grant = broker
+                .prepare_storage_grant(&context, &request, &set)
+                .expect("grant")
+                .expect("a storage capability prepares a grant")
+                .materialize()
+                .expect("materialized");
+            drop(grant);
+            drop(broker);
+            sizes.push(entry_count(
+                &root.path().canonicalize().expect("root").join("storage"),
+            ));
+        }
+        assert_eq!(sizes[0] != sizes[1], rotates, "{scope:?}");
+    }
+}
+
+fn secret_proposal() -> super::SecretUseProposal {
+    super::SecretUseProposal::HttpBearer {
+        secret: SECRET_DRN.parse().expect("secret"),
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_from_authorization_carries_its_policy_evaluation() {
+    use super::AttestorGrant;
+    use dekopon_broker_protocol::Attestation;
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+    let scope = || {
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        )
+    };
+    let context = attested_agent_context("slack.t0123abc.u9xyz", scope());
+
+    let erroring_secret_policy = permit("maintainer", "secret.use", "Secret", SECRET_DRN)
+        .replace(");", ") when { 9223372036854775807 + 1 > 0 };");
+    let mut secret_broker =
+        SurfaceBroker::new(dirs[0].path(), &[("http-probe.fetch", "http-probe")])
+            .with_secret(false, None);
+    secret_broker.policy.push_str(&erroring_secret_policy);
+    let secret_broker = secret_broker.build().await;
+    let capability = "http-probe.fetch".parse().expect("capability");
+    let mut decision = secret_broker
+        .authorize_invocation(&context, &capability)
+        .ok()
+        .expect("the capability is permitted");
+    assert!(!decision.errors_present);
+    let refusal = secret_broker
+        .bind_secret_use(
+            &context,
+            &capability,
+            &mut decision,
+            Some(&secret_proposal()),
+        )
+        .expect_err("the secret policy errors, so the use is denied");
+    assert_eq!(refusal.reason, "secret-denied");
+    let evaluation = refusal
+        .evaluation
+        .expect("a secret denial carries its evaluation");
+    assert!(evaluation.errors_present);
+    assert!(
+        decision.errors_present,
+        "a secret policy error is remembered on the capability decision"
+    );
+
+    let identities = [("slack.t0123abc.u9xyz", "maintainer")];
+    let agents = SurfaceBroker::new(dirs[1].path(), &[])
+        .with_identities(identities)
+        .build()
+        .await;
+    let gateway = AuthenticatedContext::new(
+        "gateway".parse().expect("principal"),
+        Actor::Service {
+            principal: "gateway".parse().expect("principal"),
+        },
+    )
+    .expect("gateway");
+    let grant = AttestorGrant { namespaces: None };
+    let mut thread_scope = scope();
+    thread_scope.conversation.kind = ConversationKind::Thread;
+    thread_scope.conversation.thread = Some("1712345678.000100".to_owned());
+    let claim = Attestation::for_chat(
+        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "reviewer".parse().expect("agent"),
+        thread_scope,
+    );
+    let (_, refusal) = agents.resolve_context(&gateway, Some(&grant), &claim);
+    let refusal = refusal.expect("no policy lets the maintainer prompt the agent");
+    assert_eq!(refusal.reason, "agent-denied");
+    assert!(refusal.evaluation.is_some());
+}
+
+fn only_cli_probe(mut broker: SurfaceBroker<'_>) -> SurfaceBroker<'_> {
+    broker
+        .constraints
+        .retain(|(capability, _)| capability.as_str().starts_with("cli-probe."));
+    broker
+}
+
+#[tokio::test]
+async fn a_denial_digests_the_same_with_or_without_a_storage_host_unless_the_capability_stores() {
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+    let context = AuthenticatedContext::new(
+        "maintainer".parse().expect("principal"),
+        Actor::Service {
+            principal: "maintainer".parse().expect("principal"),
+        },
+    )
+    .expect("context");
+    let request = dekopon_broker_protocol::InvocationRequest {
+        capability: "cli-probe.upper".parse().expect("capability"),
+        ..invocation_with_input(serde_json::json!({"text": "hi"}))
+    };
+    let mut digests = Vec::new();
+    for with_storage in [true, false] {
+        let mut broker = only_cli_probe(SurfaceBroker::new(
+            dirs[usize::from(with_storage)].path(),
+            &[],
+        ));
+        broker.storage = with_storage;
+        let broker = broker.build().await;
+        let result = broker
+            .deny(
+                &context,
+                &request,
+                super::unevaluated_refusal("policy-denied"),
+            )
+            .await
+            .expect("a denial is recorded");
+        assert_eq!(
+            result.outcome,
+            dekopon_capability::InvocationOutcome::Denied
+        );
+        digests.push(result.evidence[0].digest.clone());
+    }
+    assert_eq!(digests[0], digests[1]);
+}
+
+#[tokio::test]
+async fn an_authorized_failure_before_the_provider_names_the_loaded_artifact() {
+    use dekopon_capability::{Evidence, InvocationOutcome};
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let broker = only_cli_probe(SurfaceBroker::new(
+        root.path(),
+        &[("cli-probe.upper", "cli-probe")],
+    ))
+    .build()
+    .await;
+    let context = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            dekopon_broker_protocol::ChatTransportKind::Slack,
+            dekopon_broker_protocol::ConversationKind::Channel,
+            dekopon_broker_protocol::Trigger::Message,
+        ),
+    );
+    let provider: ProviderId = "cli-probe".parse().expect("provider");
+    let artifact = broker
+        .registry
+        .loaded_provider_metadata()
+        .find(|metadata| metadata.manifest.id == provider)
+        .map(|metadata| metadata.artifact_sha256)
+        .expect("the cli-probe artifact is loaded");
+    let artifacts = |broker: &Broker<InMemoryAuditLog>| {
+        broker
+            .audit
+            .records()
+            .into_iter()
+            .filter_map(|event| match event {
+                AuditEvent::Execution {
+                    provider_artifact_sha256,
+                    outcome,
+                    ..
+                } => Some((outcome, provider_artifact_sha256)),
+                AuditEvent::Decision { .. } => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let capability: CapabilityId = "cli-probe.upper".parse().expect("capability");
+    let set = broker
+        .constraints
+        .get(&capability)
+        .expect("constrained")
+        .clone();
+    let invocation: InvocationId = "invoke-failed-early".parse().expect("invocation");
+    broker
+        .fail_authorized_before_provider(
+            &context,
+            &invocation,
+            "0000000000000000000000000000f1c7".parse().expect("trace"),
+            &capability,
+            "decision-early",
+            broker.decision_reference("decision-early"),
+            &set,
+            None,
+            &[],
+            Evidence {
+                kind: "policy-decision".to_owned(),
+                digest: "sha256:early".to_owned(),
+                media_type: "application/json".to_owned(),
+                uri: None,
+            },
+            "storage-io",
+        )
+        .await
+        .expect("the failure is recorded");
+    assert_eq!(
+        artifacts(&broker),
+        [(InvocationOutcome::Failed, Some(artifact))]
+    );
+}
+
+#[tokio::test]
+async fn a_successful_provider_that_wrote_stderr_carries_it_as_detail() {
+    use dekopon_broker_host::BrokerProviderRegistry;
+    use dekopon_capability::{EffectKind, InvocationOutcome};
+    use dekopon_core::RiskLevel;
+
+    let provider = provider_succeeding_after_writing_stderr();
+    let registry = BrokerProviderRegistry::load([provider.path()], BrokerHostLimits::default())
+        .await
+        .expect("stderr-writing provider loads");
+    let principal: PrincipalId = "caller".parse().unwrap();
+    let capability: CapabilityId = "stdio-probe.run".parse().unwrap();
+    let provider_id: ProviderId = "stdio-probe".parse().unwrap();
+    let world = PolicyWorld::new(
+        [principal.clone()],
+        [(capability.clone(), provider_id.clone())],
+    )
+    .unwrap();
+    let broker = Broker::new(
+        registry,
+        "broker".parse().unwrap(),
+        PolicyEngine::new(
+            r#"@id("stderr") permit(principal, action, resource);"#,
+            &world,
+        )
+        .unwrap(),
+        ConstraintCatalog::new([(
+            capability.clone(),
+            ConstraintSet {
+                default_secret_use: None,
+                route: CapabilityRoute::Generic,
+                provider: provider_id,
+                effect: EffectKind::ReadOnly,
+                risk: RiskLevel::Low,
+                credential: None,
+                constraints: ExecutionConstraints::default(),
+            },
+        )])
+        .unwrap(),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(4).unwrap()),
+        BrokerLimits::default(),
+    )
+    .unwrap();
+    let context = AuthenticatedContext::attested(
+        principal,
+        Actor::Agent {
+            agent: "provider-test".parse().unwrap(),
+        },
+        "gateway".parse().unwrap(),
+        "slack.team.user".parse().unwrap(),
+    )
+    .unwrap();
+    let result = broker
+        .invoke(
+            &context,
+            None,
+            None,
+            invocation_with_capability("invoke-stderr", capability),
+            Default::default(),
+        )
+        .await
+        .unwrap()
+        .result;
+    assert_eq!(result.outcome, InvocationOutcome::Succeeded, "{result:?}");
+    let detail = result.detail.expect("stderr is kept as detail");
+    assert_eq!(detail.code, "provider-stderr");
+    assert_eq!(detail.message, "warn\n");
+}
+
+fn invocation_with_capability(
+    id: &str,
+    capability: CapabilityId,
+) -> dekopon_broker_protocol::InvocationRequest {
+    dekopon_broker_protocol::InvocationRequest {
+        id: id.parse().expect("invocation"),
+        capability,
+        ..invocation_with_input(serde_json::json!({}))
+    }
+}
+
+fn stdout_assets() -> (
+    dekopon_broker_host::asset::AssetInputs,
+    std::thread::JoinHandle<Vec<u8>>,
+) {
+    let (host, mut reader) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let captured = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).expect("stdout");
+        bytes
+    });
+    (
+        dekopon_broker_host::asset::AssetInputs {
+            streams: Some(dekopon_broker_host::Streams {
+                stdin: None,
+                stdout: host.into(),
+            }),
+            ..Default::default()
+        },
+        captured,
+    )
+}
+
+#[tokio::test]
+async fn an_http_request_decision_digests_its_own_verdict_and_denial_reason() {
+    use super::{AuditEvent, DecisionMaterial};
+    use dekopon_test_support::LoopbackServer;
+
+    let server = LoopbackServer::once(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+    );
+    let authority = server.authority().to_owned();
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut builder = SurfaceBroker::new(root.path(), &[("http-probe.fetch", "http-probe")]);
+    builder.policy.push_str(
+        r#"@id("only-ok-path") forbid(principal, action == Dekopon::Action::"http-probe.fetch", resource)
+            when { context has request } unless { context.request.url.path == "/ok" };"#,
+    );
+    builder
+        .constraints
+        .iter_mut()
+        .find(|(capability, _)| capability.as_str() == "http-probe.fetch")
+        .expect("http route")
+        .1
+        .constraints
+        .http
+        .as_mut()
+        .expect("http constraints")
+        .allowed_hosts = vec![authority.clone(), "127.0.0.1:1".to_owned()];
+    let broker = builder.build().await;
+    let context = attested_agent_context(
+        "slack.t0123abc.u9xyz",
+        chat_scope(
+            dekopon_broker_protocol::ChatTransportKind::Slack,
+            dekopon_broker_protocol::ConversationKind::Channel,
+            dekopon_broker_protocol::Trigger::Message,
+        ),
+    );
+    for (id, uri) in [
+        ("invoke-http-ok", format!("http://{authority}/ok")),
+        ("invoke-http-denied", "http://127.0.0.1:1/denied".to_owned()),
+    ] {
+        let (assets, captured) = stdout_assets();
+        broker
+            .invoke(
+                &context,
+                None,
+                None,
+                dekopon_broker_protocol::InvocationRequest {
+                    input: serde_json::json!({"uri": uri, "method": "GET"}),
+                    ..invocation_with_capability(
+                        id,
+                        "http-probe.fetch".parse().expect("capability"),
+                    )
+                },
+                assets,
+            )
+            .await
+            .expect("the invocation is accounted");
+        captured.join().expect("stdout reader");
+    }
+
+    let decisions = broker
+        .audit
+        .records()
+        .into_iter()
+        .filter_map(|event| match event {
+            AuditEvent::Decision {
+                invocation,
+                trace,
+                principal: Some(principal),
+                actor: Some(actor),
+                via,
+                attested_subject,
+                capability,
+                provider,
+                authorized_by: Some(authorized_by),
+                policy_ids,
+                decision_point,
+                policy_digest: Some(policy_digest),
+                allowed,
+                reason,
+                decision_digest,
+                ..
+            } if decision_point == "http.request" => {
+                let material = DecisionMaterial {
+                    invocation: &invocation,
+                    trace,
+                    principal: &principal,
+                    actor: &actor,
+                    via: via.as_ref(),
+                    attested_subject: attested_subject.as_ref(),
+                    capability: &capability,
+                    secret_use: None,
+                    provider: provider.as_ref(),
+                    authorized_by: &authorized_by,
+                    policy_ids: &policy_ids,
+                    policy_digest: &policy_digest,
+                    constraints: None,
+                    allowed,
+                    reason: reason.as_deref(),
+                    space: None,
+                };
+                let expected =
+                    super::decision_evidence_digest("policy-decision", &material).expect("digest");
+                Some((
+                    invocation.to_string(),
+                    allowed,
+                    reason,
+                    decision_digest == expected,
+                ))
+            }
+            AuditEvent::Decision { .. } | AuditEvent::Execution { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decisions,
+        [
+            ("invoke-http-ok".to_owned(), true, None, true),
+            (
+                "invoke-http-denied".to_owned(),
+                false,
+                Some("policy-denied".to_owned()),
+                true
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn with_chat_memory_refuses_routes_whose_matching_risk_is_not_the_fixed_risk() {
+    use super::BrokerBuildError;
+    use dekopon_capability::EffectKind;
+    use dekopon_core::RiskLevel;
+
+    let capability = |id: &str, effect: EffectKind, risk: RiskLevel| {
+        serde_json::json!({
+            "id": id,
+            "description": "Declared memory route",
+            "effect": effect,
+            "risk": risk,
+            "inputSchema": {"type": "object"}
+        })
+    };
+    let manifest = serde_json::to_string(&serde_json::json!({
+        "apiVersion": "dekopon.dev/provider/v1alpha1",
+        "id": "memory",
+        "description": "Memory routes declaring a risk the broker does not accept",
+        "commandWords": ["memrisk"],
+        "capabilities": [
+            capability("memory.chat.record", EffectKind::LocalWrite, RiskLevel::Medium),
+            capability("memory.chat.recent", EffectKind::ReadOnly, RiskLevel::Low),
+            capability("memory.chat.search", EffectKind::ReadOnly, RiskLevel::High),
+        ]
+    }))
+    .unwrap();
+    let provider = inline_provider_declaring(&manifest);
+    let root = tempfile::tempdir().expect("tempdir");
+    let storage = dekopon_storage_host::StorageHost::open(
+        root.path().canonicalize().expect("root").join("storage"),
+        dekopon_storage_host::StorageLimits::default(),
+    )
+    .expect("storage");
+    let registry = dekopon_broker_host::BrokerProviderRegistry::load_with_storage(
+        [provider.path()],
+        BrokerHostLimits::default(),
+        Some(storage),
+    )
+    .await
+    .expect("the component loads");
+    let world = PolicyWorld::new(
+        ["maintainer".parse().expect("principal")],
+        registry
+            .capabilities()
+            .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )
+    .expect("world");
+    let mut routes = memory_route_sets();
+    let recent = routes
+        .iter_mut()
+        .find(|(capability, _)| capability.as_str() == "memory.chat.recent")
+        .expect("recent route");
+    recent.1.risk = RiskLevel::Low;
+    let broker = Broker::new(
+        registry,
+        "broker".parse().expect("principal"),
+        PolicyEngine::new("", &world).expect("policy"),
+        ConstraintCatalog::new(routes).expect("constraints"),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::new(InMemoryAuditLog::new(4).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("constraints that match the declared risk start");
+
+    assert!(matches!(
+        broker.with_chat_memory(valid_memory_config()),
+        Err(BrokerBuildError::InvalidChatMemory)
+    ));
 }
