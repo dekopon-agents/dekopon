@@ -30,6 +30,9 @@ pub struct Cli {
     /// Strict owner-controlled gateway YAML/JSON configuration; unused by auth.
     #[arg(long, value_name = "PATH", required = true)]
     pub config: Option<PathBuf>,
+    /// Private KEY=VALUE file loaded before serving; options and inherited variables win.
+    #[arg(long, value_name = "PATH")]
+    pub env_file: Option<PathBuf>,
     /// Operator command; absent means serve the gateway.
     #[command(subcommand)]
     pub command: Option<Command>,

@@ -284,7 +284,8 @@ fn read_record(path: &Path, uid: u32) -> Result<OAuth2Record, SourceError> {
             | FileHygieneError::InsecureMode { .. }
             | FileHygieneError::WrongOwner { .. }
             | FileHygieneError::HardLinked { .. }
-            | FileHygieneError::UnsafeAncestor { .. } => SourceError::Insecure,
+            | FileHygieneError::UnsafeAncestor { .. }
+            | FileHygieneError::UntrustedAncestorOwner { .. } => SourceError::Insecure,
         };
         classified(mapped, &error)
     })?;

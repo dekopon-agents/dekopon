@@ -16,7 +16,11 @@ pub mod base64;
 
 mod accept;
 mod attribute;
+#[cfg(feature = "cli")]
+mod cli_error;
 mod diagnostics;
+#[cfg(unix)]
+pub mod env_file;
 mod failure;
 #[cfg(unix)]
 pub mod fragments;
@@ -37,6 +41,8 @@ use thiserror::Error;
 
 pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error};
 pub use attribute::{BoundedDisplay, MAX_ATTRIBUTE_BYTES, bounded_attribute, bounded_display};
+#[cfg(feature = "cli")]
+pub use cli_error::render_cli_error;
 pub use diagnostics::{MAX_PROBLEM_BYTES, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
 pub use failure::{MAX_FAILURE_CODE_BYTES, MAX_FAILURE_MESSAGE_BYTES, ProviderFailureDetail};
 pub use redaction::{REDACTION_MARKER, Redacted, redaction_marker, serialize_exposed};
@@ -50,8 +56,8 @@ pub use subject::{ExternalSubject, PrincipalKind, SubjectError, SubjectSegment, 
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
 pub use trusted_file::{
-    AncestorPolicy, FileHygieneError, FileTier, check_trusted_ancestors, check_trusted_metadata,
-    read_trusted_file,
+    AncestorOwners, AncestorPolicy, FileHygieneError, FileTier, check_trusted_ancestors,
+    check_trusted_metadata, read_trusted_file,
 };
 
 pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 253;

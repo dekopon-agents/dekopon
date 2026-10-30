@@ -213,6 +213,7 @@ struct SpawnedModel {
     endpoint: String,
     requests: Arc<AtomicUsize>,
     prompts: Arc<Mutex<Vec<Value>>>,
+    authorizations: Arc<Mutex<Vec<Option<String>>>>,
     worker: ModelWorker,
 }
 
@@ -256,6 +257,8 @@ fn spawn_model(
     let counted = Arc::clone(&requests);
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&bodies);
+    let authorizations = Arc::new(Mutex::new(Vec::new()));
+    let authorized = Arc::clone(&authorizations);
     let worker = thread::spawn(move || {
         for (index, response) in responses.into_iter().enumerate() {
             let mut stream = loop {
@@ -271,10 +274,11 @@ fn spawn_model(
                 }
             };
             counted.fetch_add(1, Ordering::SeqCst);
-            let Some(request) = read_request(&mut stream) else {
+            let Some((request, authorization)) = read_request(&mut stream) else {
                 return;
             };
             recorded.lock().push(request);
+            authorized.lock().push(authorization);
             if index == 0 {
                 thread::sleep(first_answer_delay);
                 if let Some(hold) = &first_answer_hold {
@@ -300,6 +304,7 @@ fn spawn_model(
         endpoint: format!("http://{address}/v1"),
         requests,
         prompts: bodies,
+        authorizations,
         worker: ModelWorker {
             stop,
             thread: Some(worker),
@@ -308,7 +313,7 @@ fn spawn_model(
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<Value> {
+fn read_request(stream: &mut TcpStream) -> Option<(Value, Option<String>)> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("mock read timeout configures");
@@ -334,6 +339,11 @@ fn read_request(stream: &mut TcpStream) -> Option<Value> {
                 .flatten()
         })
         .unwrap_or(0);
+    let authorization = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().to_owned())
+    });
     while bytes.len() - header_end < content_length {
         let count = stream.read(&mut buffer).ok()?;
         if count == 0 {
@@ -341,7 +351,10 @@ fn read_request(stream: &mut TcpStream) -> Option<Value> {
         }
         bytes.extend_from_slice(&buffer[..count]);
     }
-    serde_json::from_slice(&bytes[header_end..]).ok()
+    Some((
+        serde_json::from_slice(&bytes[header_end..]).ok()?,
+        authorization,
+    ))
 }
 
 fn respond(
@@ -596,6 +609,7 @@ struct Fixture {
     stop_gateway: oneshot::Sender<()>,
     model_requests: Arc<AtomicUsize>,
     model_prompts: Arc<Mutex<Vec<Value>>>,
+    model_authorizations: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl Fixture {
@@ -873,6 +887,7 @@ async fn boot_with(
         endpoint,
         requests: model_requests,
         prompts: model_prompts,
+        authorizations: model_authorizations,
         worker: model,
     } = spawn_model(
         responses,
@@ -958,6 +973,7 @@ async fn boot_with(
         stop_gateway,
         model_requests,
         model_prompts,
+        model_authorizations,
     }
 }
 
@@ -1020,6 +1036,7 @@ async fn an_unsent_gateway_job_leg_survives_a_broker_restart_and_a_fresh_connect
         stop_gateway,
         model_requests,
         model_prompts,
+        model_authorizations: _,
     } = fixture;
     let socket = directory.path().join("dev.sock");
     let asking = tokio::task::spawn_blocking({
@@ -2077,6 +2094,9 @@ async fn a_healthy_chat_serves_during_peer_recovery_then_fatal_failure_exits_non
     );
     fixture.shutdown().await;
 }
+
+#[path = "gateway/env_file.rs"]
+mod env_file;
 
 #[cfg(feature = "fauxlack")]
 #[path = "gateway/fauxlack.rs"]

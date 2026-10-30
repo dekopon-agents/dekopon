@@ -19,8 +19,8 @@ use dekopon_broker_host::{
     CompiledCacheMode, LoadedProviderMetadata, LockedProviderSource,
 };
 use dekopon_core::{
-    AncestorPolicy, FileHygieneError, FileTier, ProviderId, check_trusted_ancestors,
-    check_trusted_metadata, read_trusted_file,
+    AncestorOwners, AncestorPolicy, FileHygieneError, FileTier, ProviderId,
+    check_trusted_ancestors, check_trusted_metadata, read_trusted_file,
 };
 use futures_util::StreamExt as _;
 use http_auth::parser::ChallengeParser;
@@ -2044,6 +2044,7 @@ fn validate_ancestors(path: &Path) -> Result<(), ProviderManagerError> {
     let policy = AncestorPolicy {
         canonicalize: true,
         include_self: true,
+        owners: AncestorOwners::Any,
     };
     check_trusted_ancestors(path, policy).map_err(|error| match error {
         FileHygieneError::Io { path, source } => {
