@@ -9,10 +9,10 @@ on:
         options: [tap, checkout]
         default: tap
       mode:
-        description: Start the gateway through the legacy shell wrapper, or both daemons with --env-file
+        description: Start both daemons with --env-file, or the gateway through the legacy shell wrapper
         type: choice
-        options: [legacy-wrapper, env-file]
-        default: legacy-wrapper
+        options: [env-file, legacy-wrapper]
+        default: env-file
 
 permissions:
   contents: read
@@ -24,7 +24,8 @@ jobs:
     timeout-minutes: 60
     env:
       HOMEBREW_NO_ANALYTICS: "1"
-      DEKOPON_EXPECTED_VERSION: "0.72.0"
+      DEKOPON_EXPECTED_VERSION: "0.74.0"
+      DEKOPON_TAP_COMMIT: ad54c51917e50aeb59193940d12315775f6c05c6
     steps:
       - name: Check out the smoke helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,8 +40,6 @@ jobs:
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
           brew update
-          brew tap dekopon-agents/tap
-          brew trust dekopon-agents/tap
           brew install dekopon-agents/tap/dekopon dekopon-agents/tap/cassette
           printf 'DEKOPON_BIN_DIR=%s\n' "$(brew --prefix dekopon)/bin" >> "$GITHUB_ENV"
           prefix=$(brew --prefix dekopon)
@@ -49,7 +48,9 @@ jobs:
           {
             printf '### Homebrew installation\n\n'
             printf 'Runner: %s, architecture: %s\n\n' "$RUNNER_OS" "$(uname -m)"
+            printf 'Homebrew: %s, macOS: %s\n\n' "$(brew --version | head -n 1)" "$(sw_vers -productVersion)"
             printf 'Tap commit: %s\n\n' "$tap_commit"
+            test "$tap_commit" = "$DEKOPON_TAP_COMMIT"
             printf 'Installed prefix: %s\n\n' "$prefix"
             brew list --versions dekopon
             for binary in dekopon-brokerd dekopon-gatewayd; do
@@ -72,8 +73,6 @@ jobs:
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
           brew update
-          brew tap dekopon-agents/tap
-          brew trust dekopon-agents/tap
           brew install dekopon-agents/tap/cassette
           cargo build --release --locked -p dekopon-gatewayd -p dekopon-brokerd
           version=$(target/release/dekopon-gatewayd --version | cut -d' ' -f2)

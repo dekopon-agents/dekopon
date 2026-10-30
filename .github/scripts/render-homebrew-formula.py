@@ -107,8 +107,8 @@ class Dekopon < Formula
       The broker holds provider credentials and the only authorization path;
       read BROKER.md before enabling it.
 
-      The end-to-end walkthrough is examples/conditional-write in the source tree:
-      https://github.com/{repository}/tree/{tag}/examples/conditional-write/README.md
+      Installation, service accounts and first configuration start at:
+      https://github.com/{repository}/blob/{tag}/README.md#install
     EOS
   end
 
@@ -118,7 +118,8 @@ class Dekopon < Formula
     assert_match "--expose-credential",
                  shell_output("#{{bin}}/dekopon-gatewayd auth chatgpt export --help")
     assert_match '"signedIn": false',
-                 shell_output("#{{bin}}/dekopon-gatewayd auth chatgpt status --auth-file #{{testpath}}/missing-auth.json -o json")
+                 shell_output("#{{bin}}/dekopon-gatewayd auth chatgpt status " \\
+                              "--auth-file #{{testpath}}/missing-auth.json -o json")
   end
 end
 '''

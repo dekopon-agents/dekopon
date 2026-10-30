@@ -22,18 +22,20 @@ from urllib.parse import urlsplit
 from slack_socket_fixture import SlackSocketFixture
 
 
-VERSION = "0.72.0"
+VERSION = "0.74.0"
 PROVIDER_SHA256 = "64914f342a367129f69f857c78871e37c967dfb8eff8215c047899007e326462"
 GH_PROVIDER_SHA256 = "b2abb6a8a2dec689cb345b2b394b41a291d66196b2672a8fd86a014fe5cdee32"
 SUBJECT = "slack.t0123abc.u0123abc"
 COLLEAGUE_SUBJECT = "slack.t0123abc.u456def"
 DENIED_SUBJECT = "slack.t0123abc.udenied"
 UNMAPPED_SUBJECT = "slack.t0123abc.uunknown"
-BROKER_PAT = "synthetic-broker-pat-$literal-only"
+BROKER_PAT = "synthetic-broker-pat-${GITHUB_TOKEN}-literal"
+BROKER_GITHUB_TOKEN = "broker-environment-value-must-not-expand"
 MODEL_KEY = "synthetic-model-key-$literal-only"
 SLACK_APP_TOKEN = "xapp-synthetic-app-token-only"
 SLACK_BOT_TOKEN = "xoxb-synthetic-bot-token-only"
 SECRETS = (BROKER_PAT, MODEL_KEY, SLACK_APP_TOKEN, SLACK_BOT_TOKEN)
+DIRECT_CHANNEL = "D0123ABC"
 REPLY = "Read-only provider call passed."
 PR_REPLY = "PR metadata read passed."
 HTTP_DENIED_REPLY = "The broker refused the out-of-scope HTTP request."
@@ -47,8 +49,12 @@ def private_json(path, value):
     path.chmod(0o600)
 
 
+def contains_credential(text):
+    return "synthetic-" in text or any(secret in text for secret in SECRETS)
+
+
 def assert_no_credentials(text, source):
-    if any(secret in text for secret in SECRETS):
+    if contains_credential(text):
         raise RuntimeError(f"Synthetic credential appeared in {source}")
 
 
@@ -56,6 +62,10 @@ def redacted(text):
     for secret in SECRETS:
         text = text.replace(secret, "[redacted synthetic credential]")
     return text
+
+
+def failure_text(error):
+    return redacted(f"{error.__cause__}; {error}" if error.__cause__ else str(error))
 
 
 def assert_no_credentials_in_directory(root):
@@ -245,7 +255,7 @@ def cassette_fixtures(root):
             "head": {"ref": "fixture-branch", "sha": "a" * 40},
             "base": {"ref": "main", "sha": "b" * 40},
             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
-        }, 2),
+        }, 3),
     }
     for provider, (path, accept, body, count) in responses.items():
         directory = root / "cassettes" / provider
@@ -304,7 +314,7 @@ def fixture_handler(requests, failures, tool_commands, replay, stop_started, sto
                 self.respond({"error": failures[-1]}, 400)
                 return
             other_headers = json.dumps([(key, value) for key, value in self.headers.items() if key.lower() != "authorization"])
-            if any(secret in other_headers for secret in SECRETS):
+            if contains_credential(other_headers):
                 failures.append("Gateway credential reached the provider API")
                 self.respond({"error": failures[-1]}, 400)
                 return
@@ -330,7 +340,7 @@ def fixture_handler(requests, failures, tool_commands, replay, stop_started, sto
                 self.respond({"error": failures[-1]}, 400)
                 return
             other_headers = json.dumps([(key, value) for key, value in self.headers.items() if key.lower() != "authorization"])
-            if any(secret in other_headers + json.dumps(data) for secret in SECRETS):
+            if contains_credential(other_headers + json.dumps(data)):
                 failures.append("A credential reached model input or the wrong HTTP client")
                 self.respond({"error": failures[-1]}, 400)
                 return
@@ -478,6 +488,7 @@ class Daemon:
             return
         if self.target is None:
             return
+        failure = None
         try:
             pid, self.returncode = self.status()
             if pid is not None:
@@ -495,12 +506,15 @@ class Daemon:
                     raise RuntimeError(f"Owned launchd job needed forced termination: {self.target}")
                 if self.returncode is None:
                     raise RuntimeError(f"No recorded exit status after stopping owned launchd job: {self.target}")
+        except BaseException as error:
+            failure = error
+            raise
         finally:
             if not self.absent:
                 result = command(["/bin/launchctl", "bootout", self.target], self.env, check=False)
                 self.status()
                 if not self.absent:
-                    raise RuntimeError(f"Owned launchd job remains loaded after bootout ({result.returncode}): {self.target}")
+                    raise RuntimeError(f"Owned launchd job remains loaded after bootout ({result.returncode}): {self.target}") from failure
                 if self.returncode == 0:
                     print(f"Stopped with exit 0 and confirmed unloaded: {self.target}", flush=True)
 
@@ -554,6 +568,8 @@ def event_in_thread(event, thread):
 
 
 def slack_turns(root, slack, requests, stop_started, stop_release, stop_finished):
+    owner = SUBJECT.rsplit(".", 1)[1]
+    threads = {}
     for subject in (SUBJECT, COLLEAGUE_SUBJECT):
         user = subject.rsplit(".", 1)[1]
         before = list(requests)
@@ -572,6 +588,13 @@ def slack_turns(root, slack, requests, stop_started, stop_release, stop_finished
                            "completed Slack PR reply delivery")
         if requests != before + ["model", "gh", "model"]:
             raise RuntimeError("Slack PR review did not make exactly two model calls and one GH read")
+        threads[subject] = thread
+    before, answered = list(requests), len(slack.replies)
+    envelope, _ = slack.emit_message(owner, "Review PR 7.", slack.CHANNEL, "channel", threads[SUBJECT])
+    slack.wait_ack(envelope)
+    slack.wait_reply(PR_REPLY, threads[SUBJECT], after=answered)
+    if requests != before + ["model", "gh", "model"]:
+        raise RuntimeError("The owner's unmentioned thread follow-up did not make two model calls and one GH read")
     for subject, channel, reason in ((UNMAPPED_SUBJECT, "c0123abc", "unmapped-subject"),
                                      (DENIED_SUBJECT, "c0123abc", "agent-denied"),
                                      (SUBJECT, "cdenied", "attestation-refused")):
@@ -595,6 +618,15 @@ def slack_turns(root, slack, requests, stop_started, stop_release, stop_finished
                 raise RuntimeError("Missing the broker policy refusal for the mapped room")
         if requests != before or any(reply.get("thread_ts") == thread and reply.get("text") == PR_REPLY for reply in slack.replies):
             raise RuntimeError("Denied Slack sender or room reached downstream inference/provider work")
+    before = list(requests)
+    envelope, direct = slack.emit_message(owner, "Review PR 7.", DIRECT_CHANNEL, "im")
+    slack.wait_ack(envelope)
+    wait_gateway_event(root, lambda event: event.get("event") == "gateway_message_ignored"
+                       and event.get("reason") == "unrouted" and event.get("transport") == "review-slack"
+                       and event_in_thread(event, direct), "direct message ignored by the channel-only route")
+    if requests != before or any(DIRECT_CHANNEL in (call["body"].get("channel"), call["body"].get("channel_id"))
+                                 for call in slack.calls):
+        raise RuntimeError("A direct message on the channel-only Slack route reached the agent or got a reply")
     before = list(requests)
     envelope, thread = slack.emit_mention(SUBJECT.rsplit(".", 1)[1], "Wait for Stop.")
     slack.wait_ack(envelope)
@@ -679,11 +711,11 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mo
     print(f"Replay binary: {cassette_binary} (cassette 0.1.0)", flush=True)
     requests, failures, daemons, tool_commands = [], [], [], []
     stop_started, stop_release, stop_finished = threading.Event(), threading.Event(), threading.Event()
-    slack = SlackSocketFixture(SLACK_APP_TOKEN, SLACK_BOT_TOKEN, (BROKER_PAT, MODEL_KEY))
+    slack = SlackSocketFixture(SLACK_APP_TOKEN, SLACK_BOT_TOKEN, (BROKER_PAT, MODEL_KEY), failures)
     server = thread = None
     http_started = False
     stop_thread = None
-    completed = False
+    failure = None
     try:
         cassette_fixtures(root)
         cassette = Daemon("cassette", [str(cassette_binary), "replay", "--dir", str(root / "cassettes"),
@@ -712,7 +744,9 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mo
                         "--cpu-threads", "2", "--config", str(root / "broker.yaml")]
             else:
                 args = [str(root / "gateway-wrapper")]
-            daemon = Daemon(name, args, root, env, domain, direct=mode == ENV_FILE)
+            daemon_env = ({**env, "GITHUB_TOKEN": BROKER_GITHUB_TOKEN} if name == "broker"
+                          else {**env, "RUST_LOG": "info,dekopon_gatewayd::gateway=debug"})
+            daemon = Daemon(name, args, root, daemon_env, domain, direct=mode == ENV_FILE)
             daemons.append(daemon)
             daemon.start()
             wait_for_socket(root / f"{name}.sock", daemon)
@@ -738,12 +772,15 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mo
             broker, gateway = daemons[1], daemons[2]
             broker.restart(root / "broker.sock")
             command([str(binaries["broker"]), "probe", "--socket", str(root / "broker.sock")], env, timeout=10)
+            slack.expect_reconnect()
             gateway.restart(root / "gateway.sock")
             slack.wait_connected()
             serves_again(root, requests)
             print("Restarted both --env-file daemons" + (" with launchctl kickstart -k" if domain else "")
                   + "; the broker probe and a gateway turn succeeded again.", flush=True)
-        completed = True
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         stop_release.set()
         cleanup_errors = []
@@ -751,7 +788,7 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mo
             try:
                 daemon.stop()
             except Exception as error:
-                cleanup_errors.append(redacted(str(error)))
+                cleanup_errors.append(failure_text(error))
         if server is not None:
             if http_started:
                 server.shutdown()
@@ -764,13 +801,13 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mo
             slack.close()
         except Exception as error:
             cleanup_errors.append(redacted(str(error)))
-        if not completed or cleanup_errors or any(daemon.returncode != 0 for daemon in daemons):
+        if failure is not None or cleanup_errors or any(daemon.returncode != 0 for daemon in daemons):
             for name in ("broker", "gateway", "cassette"):
                 path = root / f"{name}.log"
                 if path.exists():
                     print(f"--- {name} log ---\n{redacted(path.read_text())}", flush=True)
         if cleanup_errors:
-            raise RuntimeError("Cleanup failed: " + "; ".join(cleanup_errors))
+            raise RuntimeError("Cleanup failed: " + "; ".join(cleanup_errors)) from failure
     if [daemon.returncode for daemon in daemons] != [0, 0, 0]:
         raise RuntimeError(f"Daemons did not shut down cleanly: {[d.returncode for d in daemons]}")
     for name in ("broker", "gateway", "cassette"):
@@ -789,34 +826,33 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mo
         raise RuntimeError("Missing the broker execution failure for the denied HTTP request")
     reviews = [event for event in executions if event.get("audit.event") == "broker.execution"
                and event.get("outcome") == "Succeeded" and event.get("capability.id") == "gh.pull-request.read"]
-    if len(reviews) != 2 or {event.get("principal") for event in reviews} != {"owner", "colleague"} or any(
+    if len(reviews) != 3 or {event.get("principal") for event in reviews} != {"owner", "colleague"} or any(
         event.get("provider.artifact_sha256") != GH_PROVIDER_SHA256 or event.get("effect") != "ReadOnly" for event in reviews
     ):
         raise RuntimeError("Missing owner-and-colleague read-only executions of the pinned GH provider")
-    if requests.count("model") != 9 or requests.count("jsonplaceholder") != 1 or requests.count("gh") != 2 or failures:
+    if requests.count("model") != 11 or requests.count("jsonplaceholder") != 1 or requests.count("gh") != 3 or failures:
         raise RuntimeError("Unexpected cumulative downstream activity after authorization and Stop checks")
     if tool_commands != ["placeholder posts get --post-id 7", "placeholder posts get --post-id 8",
-                         "gh pr view 7 -R fixture-owner/fixture-repo --json title,state",
-                         "gh pr view 7 -R fixture-owner/fixture-repo --json title,state"]:
+                         *["gh pr view 7 -R fixture-owner/fixture-repo --json title,state"] * 3]:
         raise RuntimeError("Unexpected cumulative tool work after native Stop")
     slack.assert_clean()
     if slack.sent != slack.acks:
         raise RuntimeError("Some Slack envelopes were not acknowledged")
     assert_no_credentials(json.dumps(slack.calls + slack.replies), "Slack captured requests and replies")
-    if sum(reply.get("text") == PR_REPLY for reply in slack.replies) != 2 or any(
+    if sum(reply.get("text") == PR_REPLY for reply in slack.replies) != 3 or any(
         reply.get("thread_ts") == stop_thread and reply.get("text") != "Stopped." for reply in slack.replies
     ):
         raise RuntimeError("A denied or cancelled Slack turn delivered an unexpected answer")
     gateway_log_events = gateway_events(root)
     rejections = {(event.get("subject"), event.get("reason")) for event in gateway_log_events
-                  if event.get("event") == "gateway_session_rejected"}
-    if not {(UNMAPPED_SUBJECT, "unmapped-subject"), (DENIED_SUBJECT, "agent-denied")} <= rejections:
-        raise RuntimeError("Missing the distinct unmapped and policy-denied gateway rejection records")
-    print("PASS: private broker credential file, " + ("--env-file daemon environments with forced-failure scans and restart"
+                  if event.get("event") == "gateway_session_rejected" and event.get("transport") == "local"}
+    if rejections != {(UNMAPPED_SUBJECT, "unmapped-subject"), (DENIED_SUBJECT, "agent-denied")}:
+        raise RuntimeError("Local refusals did not record exactly the unmapped and policy-denied gateway reasons")
+    print("PASS: private broker credential file kept ${GITHUB_TOKEN} literal; " + ("--env-file daemon environments with forced-failure scans and restart"
           if mode == ENV_FILE else "shell-sourced gateway environment") + ", configuration checks and broker probe.")
-    print("PASS: actual cassette replay served three credential-bound provider GETs; nine model calls include one cancelled request.")
-    print("PASS: out-of-scope HTTP request refused without reaching the provider fixture; credentials absent from checks, logs, model inputs, tool results and replies.")
-    print("PASS: real Slack Agent adapter acknowledged all envelopes; owner and colleague received threaded PR reads; unmapped/denied senders and missing room grant made no downstream calls.")
+    print("PASS: actual cassette replay served four credential-bound provider GETs; eleven model calls include one cancelled request.")
+    print("PASS: out-of-scope HTTP request refused without reaching the provider fixture; credentials and their synthetic- prefix absent from checks, logs, model inputs, tool results and replies.")
+    print("PASS: real Slack Agent adapter acknowledged all envelopes on one connection per gateway process; owner and colleague received threaded PR reads; the owner's unmentioned thread follow-up was answered; unmapped/denied senders and missing room grant made no downstream calls; the owner's direct message matched no channel-only route.")
     print("PASS: processing status identified the initiator and active status omitted it; native Stop cancelled a held model request without provider work or a normal answer.")
     print("PASS: clean daemon shutdown" + (" and owned launchd jobs unloaded." if domain else "."))
     print("Scope: fixture concurrency 4, same-UID " + ("user launchd jobs" if domain else "foreground processes")
@@ -833,10 +869,10 @@ def main():
     parser.add_argument("--expected-version", default=VERSION, help="Daemon version both binaries must report.")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--legacy-wrapper", dest="mode", action="store_const", const=LEGACY_WRAPPER,
-                       help="Start the gateway through a shell wrapper that sources credentials.env (default).")
+                       help="Start the gateway through a shell wrapper that sources credentials.env; releases before 0.74.0.")
     modes.add_argument("--env-file", dest="mode", action="store_const", const=ENV_FILE,
-                       help="Start both daemons directly with --env-file, restart them and force refused files.")
-    parser.set_defaults(mode=LEGACY_WRAPPER)
+                       help="Start both daemons directly with --env-file, restart them and force refused files (default).")
+    parser.set_defaults(mode=ENV_FILE)
     args = parser.parse_args()
     # macOS TMPDIR paths can exceed sockaddr_un; resolve /tmp's symlink before protected-file checks.
     root = Path(tempfile.mkdtemp(prefix="deko-mac-", dir=Path("/tmp").resolve()))
@@ -847,7 +883,7 @@ def main():
               args.mode, args.expected_version)
         remove = True
     except Exception as error:
-        raise SystemExit(redacted(str(error))) from None
+        raise SystemExit(failure_text(error)) from None
     finally:
         if remove:
             shutil.rmtree(root)

@@ -1,6 +1,6 @@
 # A Slack Agent for owner-and-colleague PR reviews
 
-This starter runs **Dekopon 0.72.0** with **GitHub provider 0.11.1** on the
+This starter runs **Dekopon 0.74.0** with **GitHub provider 0.11.1** on the
 [native Mac installation](../../docs/run-on-mac.md). One owner and one colleague can ask the
 agent to read GitHub pull requests, diffs, checks, and files in one Slack channel. Both start
 read-only: the agent explains findings and drafts review text in Slack. Neither can publish a
@@ -14,14 +14,23 @@ sender; GitHub sees the PAT's account. Choose a private Slack channel whose memb
 repository code and findings. Invocation permissions do not hide replies from other channel
 members, and code sent to the model goes to the configured OpenRouter model/provider.
 
+This guide supplies the configuration files for the [Mac runbook](../../docs/run-on-mac.md) and
+needs no Docker or local Rust build. In order:
+
+1. In the runbook, [install](../../docs/run-on-mac.md#install) the release, create the accounts and
+   directories in [Prepare the broker and gateway](../../docs/run-on-mac.md#prepare-the-broker-and-gateway),
+   then the Slack app, OpenRouter key and `credentials.env` in
+   [Prepare Slack and the model](../../docs/run-on-mac.md#prepare-slack-and-the-model).
+2. In this guide, install the provider, the PAT file and the configuration files, and run the
+   [checks](#validate-and-accept).
+3. In the runbook, [check in the foreground](../../docs/run-on-mac.md#check-before-installing-a-service)
+   and [run with launchd](../../docs/run-on-mac.md#run-with-launchd); then complete this guide's
+   acceptance checks and the runbook's [acceptance](../../docs/run-on-mac.md#acceptance-before-switching).
+
 ## Install the released provider
 
-First follow the [Mac runbook](../../docs/run-on-mac.md) through the installation, distinct
-`_dekopon_broker` and `_dekopon_gateway` accounts, private configuration directories, and shared
-IPC directory. This guide supplies the configuration files for that runbook; it does not require
-Docker or a local Rust build. The Homebrew application formula does not include this component.
-
-Download in a private working directory with a recent GitHub CLI that has `gh attestation`:
+The Homebrew application formula does not include this component. Download in a private working
+directory with a recent GitHub CLI that has `gh attestation`:
 
 ```console
 gh release download v0.11.1 --repo dekopon-agents/dekopon-provider-gh \
@@ -41,12 +50,17 @@ five. It supports `gh pr checks` but does not fetch Actions job logs or run the 
 ## Keep the GitHub PAT in the broker
 
 Create a fine-grained PAT with an expiration, the intended resource owner, and only the intended
-repositories. Complete any required organization approval. For this starter, the released
-provider's [permission map](https://github.com/dekopon-agents/dekopon-provider-gh/blob/v0.11.1/README.md)
-requires repository **Pull requests: Read**, **Contents: Read**, **Checks: Read**,
-**Actions: Read**, and **Commit statuses: Read**, plus the automatic metadata access. A failed
-checks endpoint is an error, not evidence that a PR passed. If your token cannot receive these
-permissions, remove the corresponding capability from both the broker and Cedar rules.
+repositories. Complete any required organization approval. For this starter, grant repository
+**Pull requests: Read**, **Contents: Read**, **Actions: Read**, and **Commit statuses: Read**, plus
+the automatic metadata access, from the released provider's
+[permission map](https://github.com/dekopon-agents/dekopon-provider-gh/blob/v0.11.1/README.md).
+Fine-grained PATs have no Checks permission and GitHub does not offer them its check-runs
+endpoint, so `gh.pull-request.status` (`gh pr checks`) fails with an error on a private
+repository. A failed checks endpoint is an error, not evidence that a PR passed. For checks on a
+private repository, use a broker [`githubApp` credential](../../docs/secrets.md#githubapp) whose App
+has **Checks: Read**; do not substitute a classic PAT, whose `repo` scope reaches every repository
+the account can access. If your credential cannot receive a permission, remove the corresponding
+capability from both the broker and Cedar rules.
 
 The PAT's selected repositories limit private repository access. These read capabilities can
 still read other public repositories. Neither a repository named in the agent instructions nor
@@ -69,12 +83,15 @@ credentials:
 
 `credentialsPath` below names this file. The broker injects its destination-bound Authorization
 header at the native HTTP boundary; the PAT is not passed to the gateway, model, or Wasm guest.
-The broker does **not** parse `.env`, expand `${GITHUB_TOKEN}`, or accept `secretEnv` here. Adding
-`GITHUB_TOKEN` to launchd's environment therefore does not configure this binding. The
-[Mac launchd wrappers](../../docs/run-on-mac.md) explicitly source the gateway's private
-`credentials.env` for Slack and OpenRouter; the broker reads this separate YAML. Rotate the PAT
-by replacing this private file and restarting the broker using the runbook. The provider does
-not refresh PATs.
+This file does **not** expand `${GITHUB_TOKEN}` or accept `secretEnv`, and the broker reads no
+credential from its environment or an `--env-file`. Adding `GITHUB_TOKEN` to launchd's environment
+therefore does not configure this binding. The gateway loads its private `credentials.env` for
+Slack and OpenRouter with the runbook's
+[`--env-file` launch](../../docs/run-on-mac.md#check-before-installing-a-service); the broker reads
+this separate YAML. To rotate the PAT, replace the secret in this file, keeping its owner and mode. The
+broker loads a valid replacement within seconds while the gateway is connected and logs
+`broker_reload_applied`; `broker_reload_refused` means it kept the old PAT, and the same file
+would fail the next start. The provider does not refresh PATs.
 
 ## Broker identities and read-only grants
 
@@ -86,6 +103,11 @@ Replace these placeholders consistently in all files:
 | `t0123abc` | Lowercased Slack workspace ID |
 | `c0123abc` | Lowercased ID of the one review channel, including a private channel's actual ID |
 | `uownerid`, `ucolleagueid` | Lowercased Slack member IDs; names and email addresses are not IDs |
+
+[Allow a sender](../slack/README.md#allow-a-sender) shows where Slack displays these IDs. Both
+`check` commands accept these sample IDs and the model placeholder in `gateway.yaml` as valid
+values, so confirm none remain before starting; only the gateway's
+[`check --probe`](../../docs/run-on-mac.md#check-before-installing-a-service) proves the model ID.
 
 Save `/usr/local/etc/dekopon/broker/broker.yaml`:
 
@@ -196,12 +218,13 @@ There are no write constraints or write permits in this default configuration.
 ## Gateway and Slack Agent setup
 
 Create the Slack app from the
-[released Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.72.0/examples/slack/manifest-agent.yaml),
+[released Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml),
 following the [Slack setup steps](../slack/README.md). The workspace plan and admin policy must
 support Slack's Agent experience. Install/reinstall the app after applying its bot scopes,
 generate an `xapp-…` app-level token with `connections:write`, obtain the installed `xoxb-…` bot
-token, and invite the bot to the review channel. It still uses outbound Socket Mode; no public
-callback listener is needed. The manifest also enables DMs, but this configuration routes none.
+token, and invite the bot to the review channel (`/invite @dekopon` there). It still uses
+outbound Socket Mode; no public callback listener is needed. The manifest also enables DMs, but
+this configuration routes none.
 
 Save `/usr/local/etc/dekopon/gateway/agents.yaml`:
 
@@ -280,8 +303,11 @@ shutdownGraceMs: 120000
 
 Choose one exact OpenRouter model ID supporting tools and set a spending limit on its API key.
 The local rolling token limit counts raw input plus output, can settle above an estimate, and
-resets on restart here; it is not a dollar cap. See the [Mac budget checks](../../docs/run-on-mac.md).
-Store the two Slack tokens and `OPENROUTER_API_KEY` in the gateway's private environment source
+resets on restart here; it is not a dollar cap. Each model step resends the turn's earlier tool
+output, up to 256 KiB per script, so one diff-heavy review can use most of the daily limit or be
+refused outright; ask for a narrower diff or file. See the
+[Mac budget checks](../../docs/run-on-mac.md#prepare-slack-and-the-model).
+Store the two Slack tokens and `OPENROUTER_API_KEY` in the gateway's private `credentials.env`
 using exactly the variable names above. That file contains no GitHub PAT.
 
 `experience: agent` requests native Working/Stop. `reaction.working: auto` permits the working
@@ -297,6 +323,9 @@ mention; the owner's earlier mention does not admit the colleague's unmentioned 
 visible to the channel. The six-turn window expires after 15 minutes idle and is lost on restart.
 No journal, cross-user replay, attachment retention, or background summaries are configured.
 Do not add route-level `subjects`: that field is accepted only for DM routes, not channels.
+One concurrent session is configured: while either person's run is active, a new mention gets
+`I'm busy — try again shortly.` and is dropped, not queued. In the running thread, a message from
+the person who started the run joins it, and the other person's mention queues behind it.
 
 ## Optional owner review comments
 
@@ -358,13 +387,8 @@ disabled if every submission needs an independent operator approval.
 
 ## Validate and accept
 
-The full snippets passed configuration checks with the released Linux 0.72.0 daemons and the
-checksum-verified 0.11.1 Wasm. A real broker loaded a synthetic private credential and executed
-read-only requests against a loopback GitHub fixture. Its authenticated Slack-scope requests
-verified both users' read grants, exact-channel restrictions, mapped-room denial, and the optional
-owner/colleague comment split without changing the Cedar conditions. The fixture used one OS
-UID; these checks did not verify distinct macOS service UIDs, launchd, a real Slack installation,
-a real PAT, or OpenRouter. No live GitHub write was tested.
+These files pass `check` with the released Linux 0.74.0 daemons and the pinned 0.11.1 component;
+that proves nothing about macOS services, Slack, the PAT or OpenRouter.
 
 Set the broker YAML, credentials, and Cedar files to owner `_dekopon_broker`, mode `0600`; set the
 gateway YAML and catalog to owner `_dekopon_gateway`, mode `0600`. Keep each configuration
@@ -376,9 +400,11 @@ sudo -u _dekopon_gateway /usr/local/lib/dekopon/current/dekopon-gatewayd check /
 ```
 
 The broker checker loads the Wasm and validates the policy and configuration, but skips the
-runtime credentials file and cannot verify PAT validity or permissions. The persistent-history
-warning is expected because this starter has no journal. Start the broker and gateway through
-the [Mac runbook](../../docs/run-on-mac.md), then probe as the broker's own account:
+runtime credentials file and cannot verify PAT validity or permissions. Expected warnings: the
+broker's note that boot requires `github-pat`, and the gateway's notes on persistent memory
+without a journal and on the three variables it reads at boot. Start the broker and gateway through
+the [Mac runbook](../../docs/run-on-mac.md#check-before-installing-a-service), then probe as the
+broker's own account:
 
 ```console
 sudo -u _dekopon_broker /usr/local/lib/dekopon/current/dekopon-brokerd probe --socket /usr/local/var/run/dekopon/broker.sock
@@ -388,12 +414,15 @@ Exit status 0 with no output is healthy. This proves neither cross-UID gateway a
 authorization. Complete these acceptance checks in your installation before migration:
 
 1. Have each mapped member mention the bot in the configured channel with a PR they may disclose.
-   Ask for metadata, a diff, and check results. Expect a threaded answer and matching broker read
-   execution records. `gh pr view 7 -R OWNER/REPO --json title,state` is a small initial request;
+   Ask for metadata, a diff, and check results (an error with a fine-grained PAT on a private
+   repository). Expect a threaded answer and matching broker read execution records.
+   `gh pr view 7 -R OWNER/REPO --json title,state` is a small initial request;
    JSON states use values such as `OPEN`.
 2. Confirm an unmapped member in that channel cannot start a model-backed turn, and that DMs and
-   other channels receive no routed answer. Temporarily removing the room's permit must deny both
-   mapped members; restore the checked policy afterward.
+   other channels receive no routed answer. Here an unmapped member's mention gets the gateway's
+   fixed reply, "I only talk to the Lange family. I've let my owner know you stopped by.", with no
+   model call; the owner notice is only an audit record. Temporarily removing the room's permit
+   must deny both mapped members; restore the checked policy afterward.
 3. In the default configuration, requests to publish, approve, or merge must produce no successful
    write execution. If the optional comment overlay is enabled, separately confirm the colleague
    still has no comment grant. Do not test approval or merging against a real PR.

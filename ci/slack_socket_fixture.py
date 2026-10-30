@@ -16,16 +16,18 @@ class SlackSocketFixture:
     MAX_REQUESTS = 256
     MAX_EVENTS = 64
 
-    def __init__(self, app_token, bot_token, forbidden_tokens=()):
+    def __init__(self, app_token, bot_token, forbidden_tokens=(), downstream_failures=()):
         if not app_token or not bot_token or app_token == bot_token:
             raise ValueError("Slack fixture needs distinct nonempty synthetic app and bot credentials")
         self.app_token, self.bot_token = app_token, bot_token
         self.forbidden = tuple(token for token in forbidden_tokens if token)
         self.body_forbidden = self.forbidden + (app_token, bot_token)
+        self.downstream_failures = downstream_failures
         self.condition = threading.Condition()
         self.closing = threading.Event()
         self.connection = None
         self.connections = []
+        self.allowed_connections = 1
         self.handlers = []
         self._calls, self._replies, self._statuses, self._failures = [], [], [], []
         self._acks, self._sent = set(), set()
@@ -176,7 +178,7 @@ class SlackSocketFixture:
     def _socket(self, connection):
         with self.condition:
             self.handlers.append(threading.current_thread())
-            if self.connection is not None or len(self.connections) >= 4:
+            if self.connection is not None or len(self.connections) >= self.allowed_connections:
                 self._fail("Unexpected concurrent or repeated Slack socket")
                 return
             self.connections.append(connection)
@@ -230,8 +232,14 @@ class SlackSocketFixture:
                     return result
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RuntimeError(f"Timed out waiting for Slack fixture {description}")
+                    downstream = "; ".join(self.downstream_failures)
+                    raise RuntimeError(f"Timed out waiting for Slack fixture {description}"
+                                       + (f"; downstream failures: {downstream}" if downstream else ""))
                 self.condition.wait(remaining)
+
+    def expect_reconnect(self):
+        with self.condition:
+            self.allowed_connections += 1
 
     def wait_connected(self, timeout=15):
         return self._wait(lambda: self.connection, "connection", timeout)
@@ -260,6 +268,13 @@ class SlackSocketFixture:
             event["thread_ts"] = thread_ts
         return self._emit(event)
 
+    def emit_message(self, user, text, channel, channel_type, thread_ts=None):
+        event = {"type": "message", "channel": channel.upper(), "channel_type": channel_type,
+                 "user": user.upper(), "text": text}
+        if thread_ts is not None:
+            event["thread_ts"] = thread_ts
+        return self._emit(event)
+
     def send_stop(self, user, thread_ts, channel=CHANNEL):
         return self._emit({"type": "agent_session_stopped", "channel": channel.upper(),
                            "thread_ts": thread_ts, "user": user.upper()})
@@ -270,26 +285,14 @@ class SlackSocketFixture:
     def wait_all_acks(self, timeout=15):
         self._wait(lambda: self._sent == self._acks, "all envelope acknowledgements", timeout)
 
-    def wait_reply(self, text=None, thread_ts=None, timeout=15):
-        return self._wait(lambda: next((reply for reply in self._replies
+    def wait_reply(self, text=None, thread_ts=None, timeout=15, after=0):
+        return self._wait(lambda: next((reply for reply in self._replies[after:]
                          if (text is None or reply.get("text") == text)
                          and (thread_ts is None or reply.get("thread_ts") == thread_ts)), None), "reply", timeout)
 
     def wait_status(self, status, thread_ts, timeout=15):
         return self._wait(lambda: next((body for body in self._statuses
                          if body.get("status") == status and body.get("thread_ts") == thread_ts), None), "Agent status", timeout)
-
-    def assert_no_reply(self, thread_ts, seconds=0.3):
-        with self.condition:
-            deadline = time.monotonic() + seconds
-            while True:
-                self.assert_clean()
-                if any(reply.get("thread_ts") == thread_ts for reply in self._replies):
-                    raise RuntimeError("Unexpected Slack reply in the refused thread")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return
-                self.condition.wait(remaining)
 
     @property
     def replies(self):

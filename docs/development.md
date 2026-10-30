@@ -439,15 +439,18 @@ therefore means adding it, backticked, to that document in the same change. Grep
 
 The manual [`macos-compat.yml`](../.github/workflows/macos-compat.yml) lane uses an ARM64
 `macos-15` runner and installs `cassette` from the real Homebrew tap. With its default `daemons:
-tap` input it also installs Dekopon from the tap, records the tap revision and installed
-binaries, and requires the pinned versions and ARM64 Mach-O architecture; `daemons: checkout`
-instead builds both daemons from the dispatched commit in release mode, which is candidate
-evidence, not a released installation. It runs
+tap` input it also installs Dekopon from the tap, records the Homebrew and macOS versions, tap
+revision and installed binaries, and requires the pinned tap commit, versions and ARM64 Mach-O
+architecture; `daemons: checkout` instead builds both daemons from the dispatched commit in
+release mode, which is candidate evidence, not a released installation. It runs
 [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py) with `--launchd` and the `mode` input:
-`legacy-wrapper` (the default, and the only mode a release before 0.74.0 supports) or `env-file`.
+`env-file` (the default, as the Mac runbook installs) or `legacy-wrapper` (the only mode a release
+before 0.74.0 supports).
 It never substitutes downloaded executables for the Homebrew installation.
 
-The helper loads checksum-pinned JSONPlaceholder and GitHub components. Actual
+The helper writes its own broker, gateway, catalog, Cedar and credential files for the loopback
+fixtures; it does not load the configuration blocks in the example READMEs. It loads
+checksum-pinned JSONPlaceholder and GitHub components. Actual
 [`cassette` replay](https://github.com/dekopon-agents/cassette/blob/v0.1.0/README.md) supplies authored
 synthetic HTTP responses; it makes no upstream requests. An HTTP fixture independently
 verifies the broker's synthetic bearer credential before forwarding only the request's Accept
@@ -467,17 +470,24 @@ The test requires these observable results:
   restarted (`launchctl kickstart -k` under launchd) and serve again, and forced runs with
   malformed lines and an invalid tuning value must exit without echoing a synthetic value. In
   both modes the broker loads its literal private `credentialsPath` YAML; the daemons' own
-  environment-file loader is literal and the YAML takes no environment substitution.
+  environment-file loader is literal and the YAML takes no environment substitution. The fake
+  PAT contains `${GITHUB_TOKEN}`, the broker's environment sets `GITHUB_TOKEN`, and the provider
+  fixture requires the unexpanded value.
 - Owner and colleague channel mentions reach real broker policy and read-only GitHub execution,
-  then produce threaded Slack replies. Unmapped and denied senders, and a mapped room without a
-  grant, produce no model or provider requests.
-- A local transport turn completes a provider read; an out-of-scope HTTP request is refused.
+  then produce threaded Slack replies; an owner follow-up without a mention in the owner's thread
+  is answered the same way. Unmapped and denied senders, and a mapped room without a grant,
+  produce no model or provider requests. The owner's direct message matches no channel-only route:
+  the gateway logs it as an unrouted `gateway_message_ignored` debug record, with no model or
+  provider request and no Slack reply or status.
+- A local transport turn completes a provider read; an out-of-scope HTTP request is refused; local
+  unmapped and denied senders are refused as exactly `unmapped-subject` and `agent-denied`.
 - Working status identifies the initiating member and clears to active; native Stop cancels a held model
-  request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged.
-- The four fake credentials are absent from checks, logs, model inputs, tool results, replies
-  and every fixture file other than the private credential files;
-  each endpoint receives only its expected credential. Exact call counts and broker execution
-  records identify the loaded provider artifacts.
+  request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged,
+  on one connection per gateway process.
+- The four fake credentials, and any text with their shared `synthetic-` prefix, are absent from
+  checks, logs, model inputs, tool results and replies, and the four are absent from every fixture
+  file other than the private credential files; each endpoint receives only its expected
+  credential. Exact call counts and broker execution records identify the loaded provider artifacts.
 
 With `--launchd`, the helper discovers an existing `gui/<uid>` or `user/<uid>` domain, starts two
 uniquely named jobs, observes clean daemon exits and confirms their removal. It never uses sudo,
@@ -490,8 +500,6 @@ files only after complete success; a failure retains them and reports their path
 To run the same helper from a checkout on an Apple Silicon Mac with Homebrew installed:
 
 ```console
-brew tap dekopon-agents/tap
-brew trust dekopon-agents/tap
 brew install dekopon-agents/tap/dekopon dekopon-agents/tap/cassette
 fixture_dir="$(mktemp -d)"
 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
@@ -510,11 +518,12 @@ python3 -m venv "$fixture_dir/venv"
   --cassette-bin "$(brew --prefix cassette)/bin/cassette"
 ```
 
-Add `--env-file` to start both daemons with their environment files instead of the wrapper; it
-needs a daemon that has the option, such as a source build passed as `--bin-dir target/release`
-with `--expected-version` set to the version it reports. The helper refuses a mismatched daemon
-version or component checksum. A tap update therefore
-needs an explicit compatibility review and pin update, not an automatic skip. Validate changes
+The helper starts both daemons with `--env-file` by default; pass `--legacy-wrapper` for a release
+before 0.74.0, and `--expected-version` for a binary that reports another version, such as a source
+build passed as `--bin-dir target/release`. The workflow refuses any tap commit other
+than its `DEKOPON_TAP_COMMIT`, and the helper refuses a mismatched daemon version or component
+checksum. A tap update therefore needs an explicit compatibility review and pin update, not an
+automatic skip. Validate changes
 with `python3 -m py_compile ci/macos-compat-smoke.py ci/slack_socket_fixture.py` and
 `actionlint .github/workflows/macos-compat.yml`; execute the helper with the selected release.
 
