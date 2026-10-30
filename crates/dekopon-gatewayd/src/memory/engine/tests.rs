@@ -149,6 +149,7 @@ fn resources(
     }
     (
         Resources {
+            assets: Arc::new(AssetStore::new(16, Duration::from_secs(3600))),
             journal,
             current: CurrentGeneration::boot(Arc::new(routes), Arc::default()),
             models: Arc::new(ModelCache::new(Arc::new(Factory(Arc::clone(&script))))),
@@ -164,6 +165,8 @@ fn task() -> SlotTask {
         stem: STEM.to_owned(),
         record: fixture().id,
         part: NonZeroU8::new(1).unwrap(),
+        subject: Subject::Record,
+        access: None,
     }
 }
 fn slots(journal: &Journal) -> Vec<Slot> {
@@ -384,6 +387,9 @@ async fn an_overflowed_part_marks_its_later_parts() {
         queue: tx,
         journal: Arc::clone(&journal),
         counts: Arc::default(),
+        assets: Arc::new(AssetStore::new(16, Duration::from_secs(3600))),
+        in_flight: Arc::default(),
+        asset_limit: 0,
     };
     sender.enqueue(task()).await;
     sender.enqueue(task()).await;
@@ -730,6 +736,7 @@ fn live_resources(journal: Arc<Journal>, endpoint: &str, timeout_ms: u64) -> Res
     let mut routes = RoutingTable::default();
     routes.models.insert("summary".to_owned(), Arc::new(serde_json::from_value(serde_json::json!({"kind":"openaiCompatible","name":"summary","endpoint":endpoint,"model":"fixture","timeoutMs":timeout_ms})).unwrap()));
     Resources {
+        assets: Arc::new(AssetStore::new(16, Duration::from_secs(3600))),
         journal,
         current: CurrentGeneration::boot(Arc::new(routes), Arc::default()),
         models: Arc::new(ModelCache::new(Arc::new(
@@ -1492,6 +1499,9 @@ async fn an_overflowed_part_logs_one_drop_per_later_part() {
         queue: tx,
         journal: Arc::clone(&journal),
         counts: Arc::default(),
+        assets: Arc::new(AssetStore::new(16, Duration::from_secs(3600))),
+        in_flight: Arc::default(),
+        asset_limit: 0,
     };
     sender.enqueue(task()).await;
     sender.enqueue(task()).await;

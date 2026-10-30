@@ -1642,6 +1642,121 @@ impl AssetFailure {
 const MAX_RELEASE_TOMBSTONES: usize = 1024;
 type RetentionKey = (AssetStateKey, u64);
 
+pub(crate) enum SummaryInput {
+    Image { mime: String, blob: DiskBlob },
+    Text(String),
+    Binary { mime: String, blob: DiskBlob },
+}
+
+pub(crate) enum NotReadable {
+    Revoked,
+    NotResident,
+}
+
+impl NotReadable {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Revoked => "revoked",
+            Self::NotResident => "not-resident",
+        }
+    }
+}
+
+impl AssetStore {
+    pub(crate) fn is_resident(
+        &self,
+        access: &AssetAccess,
+        number: dekopon_core::AssetNumber,
+    ) -> bool {
+        access
+            .with_active(|key| {
+                let entries = self.entries.lock();
+                let retention = self.retention.lock();
+                match entries.get(key).and_then(|entry| {
+                    entry
+                        .assets
+                        .iter()
+                        .find(|row| row.asset.id == u64::from(number))
+                }) {
+                    Some(Row {
+                        asset,
+                        state: Attachment::Resident(digest),
+                    }) => retention.is_bound(key, asset, digest),
+                    Some(Row {
+                        state:
+                            Attachment::Registered
+                            | Attachment::Downloading(_)
+                            | Attachment::NotStored(_)
+                            | Attachment::Evicted
+                            | Attachment::PlatformGone,
+                        ..
+                    })
+                    | None => false,
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn summary_input(
+        &self,
+        access: &AssetAccess,
+        number: dekopon_core::AssetNumber,
+        kind: dekopon_core::asset::AssetKind,
+    ) -> Result<SummaryInput, NotReadable> {
+        use dekopon_core::asset::AssetKind;
+        match kind {
+            AssetKind::Other => return Err(NotReadable::NotResident),
+            AssetKind::Image | AssetKind::TextDocument | AssetKind::BinaryDocument => {}
+        }
+        let blob = self
+            .pin(access, u64::from(number), Recency::Keep)
+            .map_err(summary_unreadable)?
+            .ok_or(NotReadable::NotResident)?;
+        let mime = access
+            .with_active(|key| {
+                self.entries
+                    .lock()
+                    .get(key)
+                    .and_then(|entry| {
+                        entry
+                            .assets
+                            .iter()
+                            .find(|row| row.asset.id == u64::from(number))
+                    })
+                    .map(|row| row.asset.mime.clone())
+            })
+            .ok_or(NotReadable::Revoked)?
+            .ok_or(NotReadable::NotResident)?;
+        match kind {
+            AssetKind::Image => Ok(SummaryInput::Image { mime, blob }),
+            AssetKind::BinaryDocument => Ok(SummaryInput::Binary { mime, blob }),
+            AssetKind::TextDocument => {
+                let mut bytes =
+                    Vec::with_capacity(blob.len().min(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES));
+                std::fs::File::from(blob.descriptor().map_err(summary_unreadable)?)
+                    .take(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES as u64)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| summary_unreadable(BlobError::Io(error.kind())))?;
+                Ok(SummaryInput::Text(
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ))
+            }
+            AssetKind::Other => Err(NotReadable::NotResident),
+        }
+    }
+}
+
+fn summary_unreadable(error: BlobError) -> NotReadable {
+    match error {
+        BlobError::Unauthorized => NotReadable::Revoked,
+        BlobError::Unknown | BlobError::Reclaimed | BlobError::Disabled => NotReadable::NotResident,
+        BlobError::TooLarge | BlobError::Capacity | BlobError::Io(_) | BlobError::LengthChanged => {
+            tracing::warn!(event = "gateway_memory_summary_refused", error = %error, "resident summary input unavailable");
+            NotReadable::NotResident
+        }
+    }
+}
+
 impl AssetStore {
     fn get_inventory(&self, access: &AssetAccess) -> Vec<AssetRef> {
         self.assets_for_access(access, Vec::new(), Instant::now())

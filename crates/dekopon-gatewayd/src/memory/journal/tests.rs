@@ -88,6 +88,7 @@ fn append_turn(
         )
         .unwrap()
         .expect("within the agent cap")
+        .id
 }
 
 fn append_user(journal: &Journal, stem: &str, at: SystemTime, user: &str) -> RecordId {

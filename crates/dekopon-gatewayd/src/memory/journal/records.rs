@@ -134,10 +134,24 @@ pub(crate) struct Head {
     arrived_raw: Option<Box<serde_json::value::RawValue>>,
 }
 
+impl Head {
+    pub(crate) fn slots(&self, subject: Subject) -> Option<std::borrow::Cow<'_, [Slot]>> {
+        match subject {
+            Subject::Record => Some(std::borrow::Cow::Borrowed(&self.header.summaries)),
+            Subject::Asset(number) => self
+                .header
+                .arrived
+                .iter()
+                .find(|asset| asset.number == number)
+                .map(|asset| std::borrow::Cow::Owned(asset.join(&self.asset_lines).summaries)),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HeaderLine {
-    h: Header,
+struct HeaderLine<T = Header> {
+    h: T,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -418,7 +432,7 @@ pub(super) fn encode_record(
     out: &mut impl Write,
     record: &TurnRecord,
     arrived: Vec<ArrivedAsset>,
-) -> Result<(), JournalError> {
+) -> Result<Header, JournalError> {
     let next_record_id = NonZeroU64::new(
         record
             .id
@@ -462,9 +476,9 @@ pub(super) fn encode_record(
         pin: None,
         choice: None,
     };
-    serde_json::to_writer(&mut *out, &HeaderLine { h: header }).map_err(corrupt)?;
+    serde_json::to_writer(&mut *out, &HeaderLine { h: &header }).map_err(corrupt)?;
     out.write_all(b"\n")?;
-    Ok(())
+    Ok(header)
 }
 
 impl Journal {
@@ -487,7 +501,7 @@ impl Journal {
             .append(true)
             .mode(0o600)
             .open(self.path(stem))?;
-        encode_record(&mut file, record, arrived)
+        encode_record(&mut file, record, arrived).map(|_header| ())
     }
 
     pub(crate) fn record_snapshot(
@@ -549,7 +563,7 @@ impl Journal {
             stem,
             line.record,
             Some(turn),
-            Some(line.part),
+            Some((line.subject, line.part)),
             &SummaryLine { s: line },
         )
     }
@@ -567,7 +581,7 @@ impl Journal {
         stem: &str,
         record: RecordId,
         turn: Option<TurnId>,
-        pending: Option<NonZeroU8>,
+        pending: Option<(Subject, NonZeroU8)>,
         line: &impl Serialize,
     ) -> Result<bool, JournalError> {
         let mut bytes = serde_json::to_vec(line).map_err(corrupt)?;
@@ -581,12 +595,11 @@ impl Journal {
         }) else {
             return Ok(false);
         };
-        if pending.is_some_and(|part| {
+        if pending.is_some_and(|(subject, part)| {
             !head
-                .header
-                .summaries
-                .get(usize::from(part.get() - 1))
-                .is_some_and(Slot::is_pending)
+                .slots(subject)
+                .and_then(|slots| slots.get(usize::from(part.get() - 1)).map(Slot::is_pending))
+                .unwrap_or(false)
         }) {
             return Ok(false);
         }
@@ -1424,12 +1437,39 @@ fn boot_record(
             Slot::Generated(_) | Slot::Error(_) => {}
         }
     }
+    for asset in &head.header.arrived {
+        let state = asset.join(&head.asset_lines);
+        for (index, slot) in state.summaries.iter().enumerate() {
+            match slot {
+                Slot::Running => {
+                    let part = NonZeroU8::new(
+                        u8::try_from(index + 1).map_err(|_invalid| JournalError::Corrupt)?,
+                    )
+                    .ok_or(JournalError::Corrupt)?;
+                    append_boot_slot(
+                        append,
+                        SlotLine {
+                            at_ms,
+                            record: head.header.id,
+                            subject: Subject::Asset(asset.number),
+                            part,
+                            slot: Slot::Queued,
+                        },
+                    )?;
+                    boot.requeued = boot.requeued.saturating_add(1);
+                }
+                Slot::Queued | Slot::Generated(_) | Slot::Error(_) => {}
+            }
+        }
+    }
     if let Some(part) = lowest {
         if boot.tasks.len() < queue.get() {
             boot.tasks.push(crate::memory::engine::SlotTask {
                 stem: stem.to_owned(),
                 record: head.header.id,
                 part,
+                subject: Subject::Record,
+                access: None,
             });
         } else {
             for index in usize::from(part.get() - 1)..head.header.summaries.len() {

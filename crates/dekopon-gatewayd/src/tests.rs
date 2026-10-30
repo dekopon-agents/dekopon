@@ -4592,6 +4592,7 @@ pub(crate) fn append_captured(
         )
         .expect("append")
         .expect("within the agent cap")
+        .id
 }
 
 /// Splits a v3 journal file into its tagged lines, parsing each as JSON.

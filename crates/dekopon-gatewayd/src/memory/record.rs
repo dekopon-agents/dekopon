@@ -266,14 +266,39 @@ pub(crate) struct ChoiceLine {
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "07 reads asset lines; this build only carries them"
-    )
-)]
 pub(crate) enum AssetSideLine {
     Slot(SlotLine),
     Pin(PinLine),
+}
+
+pub(crate) struct AssetState {
+    pub summaries: Vec<Slot>,
+    pub pin: Option<dekopon_agent::memory_tools::Rung>,
+}
+
+impl ArrivedAsset {
+    pub(crate) fn join(&self, lines: &[AssetSideLine]) -> AssetState {
+        let mut state = AssetState {
+            summaries: self.summaries.clone(),
+            pin: None,
+        };
+        for line in lines {
+            match line {
+                AssetSideLine::Slot(line) => {
+                    if line.subject == Subject::Asset(self.number)
+                        && let Some(slot) =
+                            state.summaries.get_mut(usize::from(line.part.get() - 1))
+                    {
+                        *slot = line.slot.clone();
+                    }
+                }
+                AssetSideLine::Pin(line) => {
+                    if line.subject == Subject::Asset(self.number) {
+                        state.pin = line.pin;
+                    }
+                }
+            }
+        }
+        state
+    }
 }

@@ -329,6 +329,7 @@ fn summarizing(
     let counts = Arc::<Counts>::default();
     let (sender, dispatcher) = crate::memory::engine::channel(
         Arc::clone(&journal),
+        Arc::clone(&runner.assets),
         Arc::clone(&counts),
         queue.try_into().unwrap(),
         concurrency.try_into().unwrap(),
@@ -527,7 +528,8 @@ async fn no_reply_waits_on_a_summary() {
             },
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .id;
     runner
         .summaries
         .as_ref()
@@ -536,6 +538,8 @@ async fn no_reply_waits_on_a_summary() {
             stem: stem.clone(),
             record,
             part: std::num::NonZeroU8::MIN,
+            subject: crate::memory::record::Subject::Record,
+            access: None,
         })
         .await;
     until("the engine is sending the 1 MiB original", || {
@@ -888,7 +892,8 @@ async fn large_reply_turn(limit: u64) -> LargeReply {
             },
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .id;
     let driver = Arc::new(RecordingDriver::default());
     let session = tokio::spawn(run_session(
         Arc::clone(&runner),
@@ -908,6 +913,8 @@ async fn large_reply_turn(limit: u64) -> LargeReply {
             stem: stem.clone(),
             record,
             part: std::num::NonZeroU8::MIN,
+            subject: crate::memory::record::Subject::Record,
+            access: None,
         })
         .await;
     session.await.unwrap();
@@ -961,7 +968,8 @@ async fn an_unloadable_journal_resets_with_one_startup_record() {
             },
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .id;
     journal
         .write_slot(
             &pending,
@@ -1005,6 +1013,7 @@ async fn an_unloadable_journal_resets_with_one_startup_record() {
     );
     let (sender, _dispatcher) = crate::memory::engine::channel(
         Arc::new(journal),
+        Arc::new(asset_store()),
         Arc::default(),
         4.try_into().unwrap(),
         1.try_into().unwrap(),
@@ -2337,6 +2346,7 @@ fn a_narrowed_grant_or_a_seal_stops_admission_past_side_lines() {
             )
             .unwrap()
             .unwrap()
+            .id
     };
     let side_lines = |record: crate::memory::record::RecordId| {
         journal

@@ -626,7 +626,11 @@ impl Journal {
 
     /// Builds the record from the captured turn and writes it; ids, the turn id, slots and assets
     /// exist only here, under the lock.
-    pub fn append(&self, stem: &str, entry: &Entry<'_>) -> Result<Option<RecordId>, JournalError> {
+    pub fn append(
+        &self,
+        stem: &str,
+        entry: &Entry<'_>,
+    ) -> Result<Option<records::Header>, JournalError> {
         let _lock = self.lock.lock();
         let _assets = AssetSync(self);
         let path = self.path(stem);
@@ -677,7 +681,7 @@ impl Journal {
                 .iter()
                 .map(|asset| asset.summaries.len())
                 .sum::<usize>();
-        records::encode_record(&mut buffered, &record, arrived)?;
+        let header = records::encode_record(&mut buffered, &record, arrived)?;
         buffered.flush()?;
         drop(buffered);
         // Ownership transfers before fallible scans can encounter another corrupt journal file.
@@ -714,7 +718,7 @@ impl Journal {
             memory.assets.arrived = assets_arrived,
             "gateway.memory.published"
         );
-        Ok(Some(record.id))
+        Ok(Some(header))
     }
 
     /// The directory sweep, this stem's horizon and its agent's byte cap: every rewrite here
