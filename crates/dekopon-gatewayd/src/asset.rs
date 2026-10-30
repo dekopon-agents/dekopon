@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     io::Read,
-    os::fd::OwnedFd,
+    os::{fd::OwnedFd, unix::fs::FileExt},
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -1663,6 +1663,19 @@ impl NotReadable {
     }
 }
 
+struct SummaryReader {
+    file: std::fs::File,
+    offset: u64,
+}
+
+impl Read for SummaryReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read_at(out, self.offset)?;
+        self.offset += read as u64;
+        Ok(read)
+    }
+}
+
 impl AssetStore {
     pub(crate) fn is_resident(
         &self,
@@ -1734,10 +1747,13 @@ impl AssetStore {
             AssetKind::TextDocument => {
                 let mut bytes =
                     Vec::with_capacity(blob.len().min(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES));
-                std::fs::File::from(blob.descriptor().map_err(summary_unreadable)?)
-                    .take(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES as u64)
-                    .read_to_end(&mut bytes)
-                    .map_err(|error| summary_unreadable(BlobError::Io(error.kind())))?;
+                SummaryReader {
+                    file: std::fs::File::from(blob.descriptor().map_err(summary_unreadable)?),
+                    offset: 0,
+                }
+                .take(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|error| summary_unreadable(BlobError::Io(error.kind())))?;
                 Ok(SummaryInput::Text(
                     String::from_utf8_lossy(&bytes).into_owned(),
                 ))

@@ -255,6 +255,33 @@ async fn a_part_in_flight_is_never_enqueued_twice() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn text_summary_reads_always_start_at_the_resident_prefix() {
+    let world = World::new();
+    let bound = dekopon_process::DEFAULT_MAX_OUTPUT_BYTES;
+    let mut bytes = vec![b'A'; bound];
+    bytes.extend(vec![b'B'; bound]);
+    let header = world.arrive(&["text/plain"], Some(&bytes), 2);
+    for read in 1..=2 {
+        match world
+            .store
+            .summary_input(
+                &world.access,
+                header.arrived[0].number,
+                AssetKind::TextDocument,
+            )
+            .unwrap()
+        {
+            crate::asset::SummaryInput::Text(text) => assert!(
+                text.as_bytes() == &bytes[..bound],
+                "summary read {read} must return the first 256 KiB",
+            ),
+            crate::asset::SummaryInput::Image { .. }
+            | crate::asset::SummaryInput::Binary { .. } => panic!("text input"),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_retired_generation_stops_a_queued_asset_task() {
     let (capture, _guard) = crate::tests::capture_spans();
     let world = World::new();
@@ -267,7 +294,19 @@ async fn a_retired_generation_stops_a_queued_asset_task() {
         std::fs::read(world.dir.path().join(format!("{}.jsonl", world.stem))).unwrap(),
         before
     );
-    assert!(capture.text().contains("revoked"), "{}", capture.text());
+    let records = capture.records();
+    let reads: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            dekopon_test_support::Record::Span {
+                name: "memory.summarize",
+                ..
+            } => record.field("asset.read"),
+            dekopon_test_support::Record::Span { .. }
+            | dekopon_test_support::Record::Event { .. } => None,
+        })
+        .collect();
+    assert_eq!(reads, ["revoked"]);
     assert_eq!(world.slots(&header, 0), [Slot::Queued]);
 }
 
@@ -297,9 +336,12 @@ async fn the_sweep_probe_never_audits() {
         before
     );
     assert!(
-        !capture.text().contains("gateway.asset.retention_miss"),
-        "{}",
-        capture.text()
+        capture
+            .events_where(
+                "dekopon_gatewayd::audit",
+                &[("audit.event", "gateway.asset.retention_miss")],
+            )
+            .is_empty()
     );
     assert_eq!(world.slots(&header, 0), [Slot::Queued]);
 }
