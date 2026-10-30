@@ -1,19 +1,23 @@
 # `dekopon-gatewayd` — the chat gateway and agent daemon
 
-`dekopon-gatewayd` is the unprivileged half of the deployment boundary in [`design.md`](design.md): it connects to chat services, waits for a wakeup, routes each authenticated message to a named agent from the catalog, runs one bounded model session with the sandboxed shell and safe on-demand meta tools, and replies with the answer.
+`dekopon-gatewayd` is the unprivileged half of the deployment boundary in [`design.md`](design.md). It connects to chat services, waits for a message or wakeup, routes each authenticated message to a named agent from the catalog, runs one bounded model session with the sandboxed shell and on-demand meta tools, and replies.
 
-It holds chat bot credentials and model credentials — the things it needs to hear a question and to ask a model. It holds no policy or authorization, and no provider credential except the shared DekoponVille Slack bot token named in [the security model](security-model.md#current-gateway-posture). Every provider effect a session drives is submitted to `dekopon-brokerd` as an on-behalf-of proposal naming the sender's canonical subject, and the broker alone maps that subject to a principal, decides what it may do, resolves credentials, and executes it.
+It holds chat bot and model credentials: what it needs to hear a question and ask a model. It holds no policy, no authorization and no provider credential except the shared DekoponVille Slack bot token named in [the security model](security-model.md#current-gateway-posture). Every provider effect a session drives is an on-behalf-of proposal to `dekopon-brokerd` naming the sender's canonical subject; the broker alone maps that subject to a principal, decides what it may do, resolves credentials and executes.
 
 **Status: Current.** A route is `persistent` unless configured otherwise; durable memory is a separate
-broker/agent opt-in and does not turn that default into automatic replay. The chart enforces the
-[current local process boundary](security-model.md#current-local-process-boundary).
+broker/agent opt-in and never turns that default into automatic replay. The chart enforces the
+[current local process boundary](security-model.md#current-local-process-boundary), and CI keeps
+broker, policy, host and console crates out of the gateway's dependency tree
+([dependency gates](development.md#runtime-facts-that-are-easy-to-miss)).
 
-Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, `dekopon-storage-host`, `dekopon-policy`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree.
+[`../examples/conditional-write/`](../examples/conditional-write/README.md) is the complete worked
+deployment: a Slack DM from an owner-mapped sender, two narrow `http-probe` capabilities, a
+broker-injected GitHub token, and an audited PR review comment. Read it beside this reference.
 
-[`../examples/conditional-write/`](../examples/conditional-write/README.md) is the complete
-worked deployment: a Slack DM from an owner-mapped sender, two narrow `http-probe` capabilities, a
-broker-injected GitHub token, and an audited PR review comment. Read it alongside this document —
-it is the configuration this one describes in the abstract.
+This reference covers running and checking the daemon, the `gatewayd.yaml` keys, agent
+self-inspection, media collection and assets, then transports, routing, liveness, jobs, sessions,
+conversations, wakes, durable memory, authorization, token budgets, the guest model proxy and
+telemetry.
 
 ## Run
 
@@ -21,7 +25,18 @@ it is the configuration this one describes in the abstract.
 dekopon-gatewayd --config /path/to/gatewayd.yaml
 ```
 
-The configuration file must be a regular non-symlink file owned by the daemon's UID, with a single link, not group- or world-writable, and no larger than 1 MiB. It is strictly decoded: an unknown field, an unknown transport kind, or an unknown route match is a startup failure, not a silently ignored setting.
+`--config` names one YAML file or a directory of fragments. Decoding is strict: an unknown field,
+transport kind or route match is a startup failure, not an ignored setting.
+
+- **File:** owned by the daemon's UID, one hard link, not group- or world-writable, at most 1 MiB,
+  and not a symlink. Root-owned files on a read-only mount and Kubernetes ConfigMap projections
+  are also accepted under [gateway source trust](security-model.md#current-gateway-posture).
+- **Directory:** every `*.yaml` directly inside it, in filename order, is a fragment of one
+  document under the same file rules. The directory is owned by the daemon's UID and not group- or
+  world-writable, unless it is a read-only Kubernetes projection. `transports`, `models` and
+  `routes` concatenate; any other key set in two fragments, or fragments that disagree on
+  `apiVersion`, refuse startup naming the files. A route sits in the fragment that defines its
+  transport, so renaming a file cannot reorder routes. A directory with no `*.yaml` is refused.
 
 ## Environment file
 
@@ -34,21 +49,20 @@ dekopon-gatewayd --config /path/to/gatewayd.yaml --env-file /path/to/gateway.env
 ```
 
 - **Precedence:** a command-line option, then an inherited variable (an empty one included),
-  then the file, then the default. YAML configuration sources are unaffected.
+  then the file, then the default. YAML configuration is unaffected.
 - **Grammar:** UTF-8, LF or CRLF. Blank lines and lines whose first non-blank character is `#` are
   ignored. Each other line is `KEY=VALUE` with an optional leading `export `; the key is
   `[A-Za-z_][A-Za-z0-9_]*` and `=` follows it directly. A value is unquoted (no whitespace or
   quote characters) or wrapped in `'…'` or `"…"`, which hold spaces. Values are literal: `$`, `\`
   and `#` are ordinary characters, nothing is expanded, and text after a value is an error, so
-  there are no inline comments. `K=`, `K=''` and `K=""` set an empty value. A shell-sourced file
-  that relied on expansion, escapes or command substitution must be converted to literal values.
+  there are no inline comments. `K=`, `K=''` and `K=""` set an empty value.
 - **Refused lines:** a duplicate key, a NUL, a byte-order mark, a stray carriage return, an
   unmatched quote, and the keys `DEKOPON_SHELL_JQ_WORKER`, `LD_*`, `DYLD_*`, `HOME`, `TMPDIR`,
   `PATH`, `APPDATA`, `XDG_*`, `DEKOPON_CHATGPT_AUTH_FILE`, `DEKOPON_BROKER_SOCKET` and
   `DEKOPON_CONFIG`. A refusal names the path and line, never a key or value.
 - **File policy:** at most 64 KiB, a regular file (not a symlink, FIFO or directory) owned by the
-  daemon's effective user, mode `0600` inside a `0700` directory, one hard link. Every ancestor
-  directory must be owned by root or that user and not group- or world-writable unless sticky.
+  daemon's effective user, mode `0600` (no group or other bits), one hard link. Its directory and
+  every ancestor must be owned by root or that user and not group- or world-writable unless sticky.
   A relative path resolves once against the working directory; launchd and systemd units should
   use absolute paths. On macOS an admin-owned Homebrew prefix such as `/usr/local/etc` or
   `/opt/homebrew` fails the ancestor rule for a separate daemon user; a root-owned chain such as
@@ -62,12 +76,11 @@ dekopon-gatewayd --config /path/to/gatewayd.yaml --env-file /path/to/gateway.env
 
 ## Runtime threads
 
-Thread sizing is parsed before configuration; flags override their environment fallbacks and
-no configuration key controls a pool. Counts must be positive. Omitted worker and keep-alive options retain Tokio's defaults; the blocking cap defaults to 8.
-
-Effective Tokio worker and blocking counts must each be at most 4096, including values from
-flags, `DEKOPON_WORKER_THREADS`, `DEKOPON_BLOCKING_THREADS`, `TOKIO_WORKER_THREADS`, or available
-CPUs; larger counts are command-line validation errors (exit 2) before any pool is constructed.
+Flags size the thread pools before configuration loads; no configuration key controls a pool.
+Counts must be positive. Effective worker and blocking counts, whether from flags,
+`DEKOPON_WORKER_THREADS`, `DEKOPON_BLOCKING_THREADS`, `TOKIO_WORKER_THREADS` or available CPUs,
+must each be at most 4096; a larger count is a command-line validation error (exit 2) before any
+pool exists.
 
 | Flag | Environment fallback | Default |
 |---|---|---|
@@ -76,17 +89,20 @@ CPUs; larger counts are command-line validation errors (exit 2) before any pool 
 | `--blocking-keep-alive` | `DEKOPON_BLOCKING_KEEP_ALIVE` | 10s; humantime duration |
 | `--shell-threads` | `DEKOPON_SHELL_THREADS` | 32 |
 
-With both OTel exporters enabled and idle blocking threads retired, gatewayd has `W + 4` idle threads (main, `W` workers named `gw-rt-N`, `gw-stdout`, and two SDK-owned export threads) and a process ceiling of `W + 4 + B + S`, where `B` is the blocking cap (8 by default) and `S` is the shared `ShellThreads` cap (32 by default); the Pi settings `W=2, B=8, S=32` give 6 idle and at most 46 threads.
-Without an exporter, subtract its thread from both counts. Blocking threads share the numbered
-`gw-rt-N` namespace and retire after the keep-alive. The stdout worker and OTel providers drain
-before runtime shutdown. The Pi settings are deployment values, not binary defaults.
-Turns (`sh-turn`), jobs (`sh-job`), wake ticks (`sh-tick`) and memory summaries (`sh-memory`)
-share that shell budget with pipeline stages and helpers. Admission refuses immediately with
-`LimitExceeded::ShellThreads` when capacity is exhausted. A turn holds one permit and each
-non-final pipeline stage adds one; the default retained-value budget permits at most sixteen
-producer stacks, or seventeen permits with the turn. Calls, feeders, jq pumps and upcalls
-also spend this same process budget. The blocking pool handles short I/O and final native joins
-after thread bodies finish; permits remain held through thread-local teardown and the join.
+With both OTel exporters enabled and idle blocking threads retired, gatewayd runs `W + 4` threads:
+main, `W` workers named `gw-rt-N`, `gw-stdout`, and two SDK-owned export threads. Its ceiling is
+`W + 4 + B + S`, where `B` is the blocking cap and `S` the shared `ShellThreads` cap. Each disabled
+exporter removes one thread from both counts. The Pi deployment sets `W=2, B=8, S=32`: 6 idle
+threads and at most 46. Blocking threads share the `gw-rt-N` names and retire after the
+keep-alive. The stdout worker and OTel providers drain before runtime shutdown.
+
+The shell cap is one process budget. Turns (`sh-turn`), jobs (`sh-job`), wake ticks (`sh-tick`),
+memory summaries (`sh-memory`), pipeline stages, helpers, calls, feeders, jq pumps and upcalls all
+spend it, and admission refuses at once with `LimitExceeded::ShellThreads` when it is exhausted. A
+turn holds one permit and each non-final pipeline stage one more; the default retained-value budget
+permits at most sixteen producer stacks, seventeen permits with the turn. The blocking pool runs
+short I/O and final native joins after thread bodies finish; permits stay held through thread-local
+teardown and the join.
 
 ## Check a configuration
 
@@ -97,42 +113,47 @@ dekopon-gatewayd check candidate.d --catalog agents.d --probe --against live.d
 ```
 
 `check` runs the validation startup runs, through the same function, and stops before the broker
-is contacted. Every stage whose inputs loaded runs, so it prints every configuration, catalog and
-route problem at once, and a stage that could not run (routes when the catalog failed, say) is a
-warning naming it. Output is one line per problem or warning, or
-`{ "ok", "problems", "warnings" }`; it exits 0 with no problems, 1 with problems and 2 on a usage
-error. `--catalog` replaces `catalogPath`, which usually names a deployment path. Files may be the
-invoking user's own 0644 files; symlinks and group/world-writable files are still refused. Plain
-`check` touches nothing runtime: the broker socket is never contacted, no transport or model
-credential variable is read (each one boot will read is listed as a warning), no ChatGPT login is
-opened and no journal directory is created. Transport clients are not built, so checks that live
-in their constructors run only at boot.
+is contacted. Every stage whose inputs loaded runs, so it reports every configuration, catalog and
+route problem at once; a stage that could not run (routes when the catalog failed, say) is a
+warning naming it.
 
-`--probe` adds the one online stage, and with it the one credential read: for each changed
-`openrouter` model it reads the model's `apiKeyEnv` and sends a single image-and-tool canary
-request capped at 16 output tokens, through the same client and routing settings the gateway uses,
-with a 30-second bound (or the model's `timeoutMs`, if shorter). Models declaring
-`modalities: [image]` receive a built-in one-pixel PNG; text-only models receive a text turn.
-Both declare one fixed `canary` tool with empty object arguments and must return exactly one
-well-formed call to that tool; no tool result or
-second request is sent. A refusal, malformed call or deadline is a problem naming the model, its
-vendor model id, the file that defines it and the routes it serves. Vendor failures retain
-status and a redacted diagnostic when available; a deadline reports that the turn expired;
-the key never appears, because the client redacts it from the body. A model is changed when its
-name is absent from the `--against` configuration, its parsed settings differ there (defaults
-filled in, so formatting alone is no change), or a route newly binds it. Route bindings compare
-transport, conversation selector, subjects, agent and selected model. Without `--against` every
-model is probed, and an `--against` that does not load is a warning and probes every model.
-The baseline binds against its own `catalogPath`; `--catalog` applies only to the candidate.
-An unloadable baseline catalog also warns and probes every model. `chatgptSubscription` models
-are never probed, since reading the login can refresh and rotate it under the running gateway;
-each changed one is a `not probed: subscription auth` warning, as is each changed `anthropic`
-(`proxy-only model`) and `openaiCompatible` model.
+- **Output:** one `problem` or `warning` line each (`ok` when there is no problem), or with
+  `--output json` `{ "ok", "problems", "warnings" }`. Exit 0 with no problems, 1 with problems,
+  2 on a usage error.
+- **Inputs:** `--catalog` replaces `catalogPath`, which usually names a deployment path. Files
+  follow the [Run](#run) rules with the invoking user as owner, so the user's own `0644` files pass.
+- **Side effects:** plain `check` never contacts the broker socket, reads no transport or model
+  credential variable (each one boot will read is listed as a warning), opens no ChatGPT login and
+  creates no journal directory. It builds no transport client, so checks that live in client
+  constructors run only at boot.
 
-Reload uses the same canary against the active configuration and refuses a failed candidate while
-the running configuration keeps serving. Boot behaviour is unchanged: it does not run this vendor
-canary. Run `check --probe --against <live config>` before deploying a candidate that will restart
-the gateway.
+**`--probe`** adds the one online stage and its one credential read. For each changed `openrouter`
+model it reads the model's `apiKeyEnv` and sends one canary request through the gateway's own
+client and routing settings, capped at 16 output tokens and bounded by 30 seconds or the model's
+`timeoutMs`, whichever is shorter.
+
+- A model declaring `modalities: [image]` receives a built-in one-pixel PNG; a text-only model
+  receives a text turn. Both requests declare one fixed `canary` tool with empty-object arguments
+  and must return exactly one well-formed call to it. No tool result or second request is sent.
+- A refusal, malformed call or deadline is a problem naming the model, its vendor model ID, the
+  file that defines it and the routes it serves. A vendor failure keeps its status and a redacted
+  diagnostic when available; a deadline reports that the turn expired. The key never appears,
+  because the client redacts it from the body.
+- A model is changed when its name is absent from the `--against` configuration, its parsed
+  settings differ there (defaults filled in, so formatting alone is no change), or a route newly
+  binds it. A binding compares transport, conversation selector, subjects, agent and selected
+  model. `--against` requires `--probe`. The baseline binds against its own `catalogPath`;
+  `--catalog` applies only to the candidate.
+- Without `--against`, every model is probed. A baseline configuration or catalog that does not
+  load is a warning, and every model is then probed.
+- `chatgptSubscription` models are never probed, because reading the login can refresh and rotate
+  it under the running gateway. Each changed one warns `not probed: subscription auth`; a changed
+  `anthropic` model warns `not probed: proxy-only model` and a changed `openaiCompatible` model
+  `not probed: openaiCompatible endpoint`.
+
+Reload runs the same canary against the active configuration and refuses a failed candidate while
+the running configuration keeps serving. Boot does not run it, so run
+`check --probe --against <live config>` before deploying a candidate that restarts the gateway.
 
 ## Configuration
 
@@ -297,71 +318,158 @@ telemetry:                                    # optional, identical in shape to 
   exportTimeoutMs: 10000
 ```
 
-The route's `conversation:` block is the **match**: `kind` is the word `any` or a list of `directMessage`, `groupDirectMessage`, `channel`, and `thread`, with an optional `container` (Slack team, Discord guild, WhatsApp `waba:phoneNumberId`, or a test-only fauxlack server) and an optional `ids` list. A bare `kind: channel` is a decode failure naming the list form, because it reads as though it claimed the threads under the channel too. `subjects:` restricts a route to named canonical subjects and is accepted only beside `kind: [directMessage]`; it is routing, never authority, and a per-person channel route would read as an access-control list and be trusted as one.
+**Route match.** The route's `conversation:` block is the match: `kind` is the word `any` or a list
+of `directMessage`, `groupDirectMessage`, `channel` and `thread`, with an optional `container`
+(Slack team, Discord guild, WhatsApp `waba:phoneNumberId`, or a test-only fauxlack server) and an
+optional `ids` list. A bare `kind: channel` is a decode failure naming the list form, because it
+reads as though it claimed the threads under the channel too. `subjects:` restricts a route to
+named canonical subjects and is accepted only beside `kind: [directMessage]`; it is routing, never
+authority, and a per-person channel route would read as an access-control list and be trusted as
+one.
 
-`inspectAgentConfig: true` offers the `inspect_agent_config` tool on that route's sessions; without it the tool is not offered. Leaving it off removes the structured dump — the description, model class, limits, and the agent's `instructions` verbatim — and nothing else: the instructions are still the system prompt, so this is not secrecy from a determined user, only the removal of a one-call transcript of them.
+**Script deadline.** `limits.scriptTimeoutMs` (default 30000) bounds one script, not the session.
+At the deadline the shell ends the run with `dekopon-shell: script exceeded its <N>ms deadline` and
+abandons any provider call still in flight; the broker drops that call with the script, so an
+effect that had already reached the provider leaves a decision record and no execution record. A
+slow capability such as `gpt-image.edit` can need more than 30 seconds. `maxDurationMs` bounds the
+session; a `scriptTimeoutMs` above it is refused, naming both numbers, because the session would be
+cancelled first.
 
-`limits.scriptTimeoutMs` bounds one script rather than the whole session: the shell ends the run at that deadline with `dekopon-shell: script exceeded its <N>ms deadline`, and a provider call still in flight is abandoned with it — the broker's call is dropped along with the script, so an effect that had already reached the provider leaves a decision record and no execution record. It defaults to 30000, which is the deadline every route ran under before the field existed, and 30 seconds is not enough for a genuinely slow capability: `gpt-image.edit` routinely takes longer, while a generate finishes in about 24 seconds. `maxDurationMs` is still the session bound, and a `scriptTimeoutMs` above it is refused at startup because the session would be cancelled first.
+**Memory mode.** The `memory:` block is tagged on `mode`, and both modes are strict: an unknown
+mode, an unknown, null or wrong-case `scope`, and any persistent-only field beside `mode: oneShot`
+are decode failures. `scope` accepts only `privateConversation` (the default) and
+`sharedConversation`, and only beside `mode: persistent`. A setting that can never take effect is
+far more likely a typo than an intention, and accepting it would leave a file claiming a memory or
+audience the daemon does not have.
 
-`sessions.memory` accepts `retention: {maxAgeMs, maxBytesPerAgent}` (defaults: 604800000 ms, 67108864 bytes), `summaries: {concurrency, queue}` for the one gateway summary engine (defaults: 1 and 64), and `agents.<agentId>` entries with optional `retention: {maxAgeMs?, maxBytes?}`, `hotTurns`, `summaries`, `capture` and `selection`. Per-agent ceilings may only narrow the global limits; IDs must name a routed agent. A persistent route may set the same four keys under `routes[].memory`, and a route's value replaces its agent's. `hotTurns` (default `min(10, maxTurns)`) is how many newest records replay verbatim; an explicit value above `maxTurns` refuses. `summaries` is `off` or `{model?, parts?, maxInputBytes?}` (defaults: the route's own model, `[200, 1024, 4096]` bytes per part, 131072 input bytes); `parts` holds 1 to 255 entries, and an unknown or proxy-only `model` refuses. Summaries are on by default and resolve to `off` on a route whose `recall` is not `journal`, because those records never replay. `capture: {maxItemBytes}` (default 262144) caps each stored text item; opaque reasoning has its own fixed 64 KiB cap, and tool arguments are stored as sent. `selection` is `ladder` (the default) or `{decider: {capability, backend, model, requireProbabilities}}`, all four required and nonempty. Unknown names refuse at load, including the deleted `policy`, `routine`, `routines`, `retain` and `arena` keys. For journal-recall routes `maxBytes` defaults to 524288; other routes keep 65536. Without a journal, persistent routes remain window-only and config-check prints one warning; explicit `recall: journal` still refuses without storage. On journal-backed persistent routes, `read_memory_record`, `set_memory_pin`, and `clear_memory_pin` use the full scoped conversation key and current grant; one-shot and journal-less routes offer none of them. Representation IDs are `native` (the original turn), `summary-<n>` (generated summary part `n`) and `metadata` (the record's envelope); an ID that does not parse, or names a part the plan does not have, is refused with the record's available IDs, and a part whose summary is queued, running or failed is refused the same way without returning its error or any original text. Reads return at most 16 KiB of UTF-8 (or a typed refusal naming why) and persist nothing. A pin is queued during the turn and written after the reply, only if the turn's own record is written; it chooses the rung a record replays at when it is older than the hot window, not whether it replays.
-
-GitHub configuration: a transport of `kind: githubWebhook` requires `name`, `bind` (nonzero socket port), and `secretEnv` (an environment variable name, never the secret). The path is fixed at `/webhooks/github`; `callbackPath` is not accepted for GitHub. When sharing a listener with WhatsApp, binds must agree and callback paths cannot collide. `check` validates structure and warns about the credential without reading it; boot requires a present nonblank credential. GitHub POST bounds headers and the 256 KiB body and verifies the exact raw-body HMAC-SHA256 before parsing. Unknown event headers and repository-less events, including `ping`, are acknowledged and ignored. A repository name outside the subject grammar, including a name with a dot, is also acknowledged and ignored. A GitHub route requires a nonempty, unique `githubEvents` list of typed family names (for example, `[issues, issue_comment, push]`), `memory: { mode: oneShot }`, and a canonical selector such as `conversation: { kind: [thread], container: owner, ids: [owner.repo] }`. `githubEvents: [pull_request, workflow_run]` retains its existing filters: opened/reopened/synchronize PR events and completed success/failure runs. Other listed families wake on every action. `githubEvents` is forbidden on other transports; `null`, unknown family names and dotted repo IDs fail. Declaration-order selection happens before the selected route's event filter: a later overlapping route cannot receive an event the first route omits.
-
-A GitHub delivery enters the session admission gate as an addressed `message` with `github.<owner>.<repo>` as its attested subject. Conversations key by `owner.repo:<n>` for a local issue, PR or discussion number, or `owner.repo:repository` for repository-level events. A run or check keys by its one local associated PR, otherwise by the repository. A dependency keys by its local blocked issue; a foreign blocked issue uses the repository bucket, and a foreign blocking issue supplies no number or fact. Deliveries never steer or interrupt: consecutive queued deliveries from one actor coalesce into batches of at most 16. Another actor starts a new batch. The mailbox remains 100 slots and the session permit remains the global concurrency bound. Notes render from the batch at turn start, contain no titles, bodies or other prose from the payload, and direct the agent to read current state through a broker-granted capability.
-
-A 200 acknowledges session admission, queueing, an ignored delivery, or a committed recent duplicate, not completion. Busy admission, a full transport queue or mailbox, an unanswered reserved duplicate, a closed channel and the webhook deadline return 503. A timed-out request may still be admitted later; a late admission commits its GUID. Dedupe retains 1,024 committed GUIDs in memory, while reservations remain pending until answered or dropped. Busy or dropped tickets release their GUID for redelivery. GitHub does not automatically redeliver failed webhook deliveries; the 503 is visible in its delivery log for manual redelivery. Restart, eviction or signed-body replay may open another freshly authorized turn. The delivery GUID is unsigned and GitHub signs no timestamp.
-
-No GitHub API client, outbound reply, repository registration list or automatic post target exists in the gateway. Each turn opens a fresh broker leg and receives fresh capabilities under `agent.prompt` before calling the model. Unmapped subjects, denied grants, busy sessions and model failures produce no GitHub transport post; final answers remain in the session trace. A signed run claim, including one with no PR association, grants no fix authority: an agent needs a broker-granted current-check read and a separate narrow write grant. A route may opt into the existing silent wakes; a delivery never resumes a chat watch or a previous repo session.
-
-The `memory:` block — which was called `conversation:` before 0.14.0 — is tagged on `mode`, and both halves are strict: an unknown mode, an unknown or wrong-case `scope`, and any persistent-only field written next to `mode: oneShot` are decode failures. `scope` is strict camelCase, accepts only `privateConversation` and `sharedConversation`, and is valid only beside `mode: persistent`; omission defaults to `privateConversation`. A setting that can never take effect is far more likely a mode typo than an intention, and a decoder that ignored it would leave a configuration file claiming a memory or audience the daemon does not have.
-
-`progressNotes: true` offers the shell's `progress` builtin in the bash tool description and
-admits its bounded, model-authored notes to `gateway.progress` telemetry. It defaults to false:
-turning it on is consent for this text to reach telemetry and chat under the
+**Progress notes.** `progressNotes: true` offers the shell's `progress` builtin in the bash tool
+description and admits its bounded, model-authored notes to `gateway.progress` telemetry. It
+defaults to false: turning it on is consent for this text to reach telemetry and chat under the
 [security model's liveness rule](security-model.md#current-gateway-posture). A live note owns an
 active progress message until another note replaces it, the next model turn or steering clears it,
 or the session ends; individual tool completions do not clear it. At a keep-alive tick, a note older
-than twice its ETA (or 120 seconds without an ETA) is cleared before rendering; the ETA never counts down.
-A transport with liveness off or no active progress message still records an opted-in note.
+than twice its ETA (or 120 seconds without an ETA) is cleared before rendering; the ETA never counts
+down. A transport with liveness off or no active progress message still records an opted-in note.
+
+### Memory settings
+
+`sessions.memory` holds journal retention, the one gateway summary engine, and per-agent
+`agents.<agentId>` entries. An agent ID must name a routed agent, and its `retention` may only
+narrow the global limits. A persistent route may set the four knobs under `routes[].memory`; a
+route's value replaces its agent's. Unknown keys refuse at load.
+
+| Key | Default | Rule |
+|---|---|---|
+| `retention.maxAgeMs` | 604800000 (7 days) | global ceiling; agent override `retention.maxAgeMs` |
+| `retention.maxBytesPerAgent` | 67108864 (64 MiB) | global ceiling; agent override `retention.maxBytes` |
+| `summaries.concurrency` | 1 | summary engine workers |
+| `summaries.queue` | 64 | summary engine queue |
+| `hotTurns` (agent or route) | `min(10, maxTurns)` | newest records replayed verbatim; above `maxTurns` refuses |
+| `summaries` (agent or route) | on: the route's model, `parts: [200, 1024, 4096]` bytes, `maxInputBytes: 131072` | `off` or `{model?, parts?, maxInputBytes?}`; `parts` holds 1 to 255 entries; an unknown or proxy-only `model` refuses |
+| `capture` (agent or route) | `{maxItemBytes: 262144}` | caps each stored text item; opaque reasoning has a fixed 64 KiB cap, and tool arguments are stored as sent |
+| `selection` (agent or route) | `ladder` | or `{decider: {capability, backend, model, requireProbabilities}}`, all four required and nonempty |
+
+- Summaries resolve to `off` on a route whose `recall` is not `journal`, because those records
+  never replay.
+- `maxBytes` defaults to 524288 on journal-recall routes and 65536 elsewhere.
+- Without a journal, persistent routes are window-only and `check` prints one warning; an explicit
+  `recall: journal` still refuses without storage.
+- On journal-backed persistent routes, `read_memory_record`, `set_memory_pin` and
+  `clear_memory_pin` use the full scoped conversation key and current grant; one-shot and
+  journal-less routes offer none of them.
+- Representation IDs are `native` (the original turn), `summary-<n>` (generated summary part `n`)
+  and `metadata` (the record's envelope). An ID that does not parse, or names a part the plan does
+  not have, is refused with the record's available IDs; a part whose summary is queued, running or
+  failed is refused the same way, without its error or any original text.
+- A read returns at most 16 KiB of UTF-8, or a typed refusal naming why, and persists nothing.
+- A pin is queued during the turn and written after the reply, only if the turn's own record is
+  written. It chooses the rung a record replays at once it is older than the hot window, not
+  whether it replays.
+
+### GitHub webhook transport
+
+A transport of `kind: githubWebhook` requires `name`, `bind` (a nonzero port) and `secretEnv` (an
+environment variable name, never the secret). Its path is fixed at `/webhooks/github`;
+`callbackPath` is not accepted. When a `whatsappCloudApi` transport exists, the GitHub `bind` must
+equal a WhatsApp `bind`, sharing its listener, and callback paths must not collide. `check`
+validates structure and warns about the credential without reading it; boot requires a present,
+nonblank credential.
+
+- **Requests:** a POST has bounded headers and a 256 KiB body, and its exact raw-body HMAC-SHA256
+  is verified before parsing. Unknown event headers and repository-less events, including `ping`,
+  are acknowledged and ignored, as is a repository name outside the subject grammar, including a
+  name with a dot.
+- **Routes:** a GitHub route requires a nonempty, unique `githubEvents` list of typed family names
+  (for example `[issues, issue_comment, push]`), `memory: { mode: oneShot }`, and a canonical
+  selector such as `conversation: { kind: [thread], container: owner, ids: [owner.repo] }`.
+  `pull_request` wakes only on opened, reopened and synchronize (closed only removes
+  [PR subscriptions](#pr-subscriptions)); `workflow_run` only on completed runs that succeeded or
+  failed; other listed families wake on every action.
+  `githubEvents` is refused on other transports, and `null`, unknown family names and dotted repo
+  IDs fail. Declaration-order selection happens before the selected route's event filter, so a
+  later overlapping route never receives an event the first route omits.
+- **Sessions:** a delivery enters the session admission gate as an addressed `message` with
+  `github.<owner>.<repo>` as its attested subject. Conversations key by `owner.repo:<n>` for a
+  local issue, PR or discussion number, or `owner.repo:repository` for repository-level events. A
+  run or check keys by its one local associated PR, otherwise by the repository. A dependency keys
+  by its local blocked issue; a foreign blocked issue uses the repository bucket, and a foreign
+  blocking issue supplies no number or fact.
+- **Batches:** deliveries never steer or interrupt. Consecutive queued deliveries from one actor
+  coalesce into batches of at most 16; another actor starts a new batch. The mailbox stays 100
+  slots and the session permit stays the global concurrency bound. Notes render from the batch at
+  turn start, contain no titles, bodies or other prose from the payload, and direct the agent to
+  read current state through a broker-granted capability.
+- **Acknowledgement:** a 200 acknowledges session admission, queueing, an ignored delivery or a
+  committed recent duplicate, not completion. Busy admission, a full transport queue or mailbox,
+  an unanswered reserved duplicate, a closed channel and the webhook deadline return 503. A
+  timed-out request may still be admitted later, and a late admission commits its GUID. Dedupe
+  keeps 1,024 committed GUIDs in memory; reservations stay pending until answered or dropped, and
+  busy or dropped tickets release their GUID for redelivery. GitHub does not redeliver failed
+  deliveries automatically; the 503 shows in its delivery log for manual redelivery. Restart,
+  eviction or a replayed signed body may open another freshly authorized turn: the delivery GUID
+  is unsigned and GitHub signs no timestamp.
+- **Authority:** the gateway has no GitHub API client, outbound reply, repository registration
+  list or automatic post target. Each turn opens a fresh broker leg and receives fresh
+  capabilities under `agent.prompt` before calling the model. Unmapped subjects, denied grants,
+  busy sessions and model failures post nothing to GitHub; final answers stay in the session
+  trace. A signed run claim, even one with no PR association, grants no fix authority: an agent
+  needs a broker-granted current-check read and a separate narrow write grant. A route may set
+  `wakes: true` for silent wakes. A delivery resumes no chat watch or earlier repository session;
+  only a [PR subscription](#pr-subscriptions) resumes its anchored Slack thread.
 
 ### Extra model CA bundles
 
-The optional top-level `extraCABundles` list applies to OpenRouter, OpenAI-compatible
-and ChatGPT subscription inference clients together:
+The optional top-level `extraCABundles` list applies to the OpenRouter, OpenAI-compatible and
+ChatGPT subscription inference clients together:
 
 ```yaml
 extraCABundles:
   - /var/run/dekopon-trust/model-roots.pem
 ```
 
-Omitting it or setting `[]` preserves public WebPKI trust alone. Each entry must be an
-absolute path to a regular file containing a valid, nonempty PEM certificate bundle;
-at most eight files, each 1–65,536 bytes, are accepted. Boot and reload read the files;
-`check` checks only path shape and count, while explicit `check --probe` also reads them
-for its model request. Replacing a bundle at the same path activates a new serving
-generation; sessions already running retain their original client trust.
-
-These roots supplement public roots without granting network access. A listed CA lets
-whoever holds its private key impersonate model endpoints to this gateway. No ambient
-`SSL_CERT_FILE`, `SSL_CERT_DIR`, system trust store or proxy is consulted; redirects
-and existing timeouts are unchanged. This setting covers inference and gateway
-subscription OAuth refresh. Each generation keeps its own HTTP client trust, including
-refreshes already in flight. OTLP export and the OCI provider manager have separate
-CA configuration.
-
-Mount the public PEM file read-only into the gateway at the configured absolute path
-using an operator-supplied volume mount in the rendered Deployment; the chart has no
-generic gateway extra-mount value. Deploy a gateway binary supporting this key before
-adding it to configuration: older binaries reject the unknown field. Existing broker
-CA configuration remains independent.
+- Omitting it or setting `[]` keeps public WebPKI trust alone.
+- Each entry is an absolute path to a regular file of 1–65,536 bytes holding a valid, nonempty PEM
+  certificate bundle; at most eight entries are accepted.
+- Boot and reload read the files. Plain `check` checks only path shape and count; `check --probe`
+  also reads them for its model request. Replacing a bundle at the same path activates a new
+  serving generation; sessions already running keep their original client trust.
+- The roots supplement public roots and grant no network access. A listed CA lets whoever holds its
+  private key impersonate model endpoints to this gateway.
+- No ambient `SSL_CERT_FILE`, `SSL_CERT_DIR`, system trust store or proxy is consulted; redirects
+  and timeouts are unchanged.
+- The list covers inference and gateway subscription OAuth refresh. Each generation keeps its own
+  HTTP client trust, including refreshes already in flight. OTLP export, the OCI provider manager
+  and the broker have separate CA configuration.
+- Mount the public PEM file read-only at the configured absolute path with an operator-supplied
+  volume mount in the rendered Deployment; the chart has no generic gateway extra-mount value.
 
 ### OpenRouter model settings
 
 The tag is exactly `kind: openrouter`, not `openRouter`. `name`, nonblank `model`, `apiKeyEnv`
 and positive `timeoutMs` are required. Any nonblank model ID is accepted locally; there is no
 catalog. `classes` and `modalities` default to `[]`; `modalities: [image]` means image input only.
-The production URL is fixed at `https://openrouter.ai/api/v1/chat/completions`, with streaming
-always on. `endpoint`, `stream` and `authFile` are not accepted for this kind.
+`endpoint`, `stream` and `authFile` are not accepted: the URL is fixed and streaming is always on
+([wire behavior](inference.md#streaming-and-interruption)).
 
 Each optional block is strict, as is the model entry:
 
@@ -370,95 +478,113 @@ Each optional block is strict, as is the model entry:
 | `generation` | optional `maxOutputTokens` positive integer, finite `temperature` 0–2 inclusive, finite `topP` >0 and ≤1 | `max_tokens`, `temperature`, `top_p` |
 | `reasoning` | required `effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | `reasoning: {effort}` |
 | `routing` | optional `allowFallbacks`, `requireParameters` booleans; optional nonempty `only` list of nonblank strings | `provider: {allow_fallbacks, require_parameters, only}` |
-| `cache` | required `style`: `automatic` or `explicitPrefix`; optional `ttl`: `5m` or `1h`, only with `explicitPrefix` | `cache_control: {type: ephemeral, ttl?}` on the last leading system part and the last replayed history user/tool text; `{type: ephemeral}` on the newest user/tool text |
+| `cache` | required `style`: `automatic` or `explicitPrefix`; optional `ttl`: `5m` or `1h`, only with `explicitPrefix` | `cache_control` markers, placed as in [cache anchors](inference.md#openrouter-controls-and-cache-anchors) |
 
-Omitted members are absent on the wire, not sent as default values. No cache block means automatic
-mode (no marker); an omitted TTL is not invented. Explicit caching marks the last content part of
-the last leading system message, including optional-reply guidance, plus the end of the replayed
-history and the newest user or tool text ([inference](inference.md)); no leading system message is
-an `InvalidRequest` before sending. Reasoning fragments remain private continuation state, never
-chat progress. The response-cache header `X-OpenRouter-Cache: false` is always sent; there is no
-`usage.include`, `stream_options` or `reasoning.exclude`; OpenRouter reports usage, cost and
-`cost_details` on every response without them. The prompt cache key is
-sent as `session_id` for sticky provider routing. Forwarded controls are requests, not guarantees
-that an upstream provider honored them. A provider change mid-conversation is accepted; pin
-`routing.only` when cost or cache locality matters. `allowFallbacks: false` disables failover but
-does not pin routing.
-
-Unknown fields and bad enum spellings are decode refusals. Semantic numeric bounds (including
-non-finite values), empty routing lists/entries and automatic-cache TTLs join the existing
-`ConfigProblem` collection rather than being clamped. Missing/blank credential variables are
-separate `StartupProblem`s at startup. These blocks are refused on
-`chatgptSubscription` and `openaiCompatible`.
-
-Each call has one total `timeoutMs` deadline; see [`inference.md`](inference.md).
+- Omitted members are absent on the wire, not sent as default values. No `cache` block means
+  automatic mode (no marker); an omitted TTL is not invented.
+- Explicit caching with no leading system message is an `InvalidRequest` before sending.
+- `allowFallbacks: false` disables failover but does not pin routing; pin `routing.only` when cost
+  or cache locality matters.
+- Unknown fields and bad enum spellings are decode refusals. Out-of-range or non-finite numbers,
+  an empty `routing.only` list or blank entry, and a TTL in automatic mode are reported with every
+  other configuration problem, never clamped. A missing or blank credential variable is a separate
+  startup problem. These blocks are refused on `chatgptSubscription` and `openaiCompatible`.
+- Each call has one total `timeoutMs` deadline; see [`inference.md`](inference.md).
 
 ### No secrets in this file
 
-Transports and chat models name **environment variables**, never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials. A variable name is validated as a name (`[A-Za-z_][A-Za-z0-9_]*`), so pasting a token where a variable name belongs is a startup failure rather than a token sitting in plain text while the daemon reports a missing credential. Missing required variables are reported at startup **by variable name and never by value**, and all three read them through one definition, so a model credential fails exactly the way a chat credential does. A variable exported with a blank value is refused the same way: an empty app secret is an HMAC key anyone can compute, and an empty bearer token is still sent as a header, so presence has to mean a credential rather than an export.
+Transports and models name **environment variables**, never values. A variable name must match
+`[A-Za-z_][A-Za-z0-9_]*`, so a token pasted where a name belongs is a startup failure rather than
+plaintext in the file. Transports and models read variables through one definition: a missing
+required variable is a startup failure reported **by variable name, never by value**. A blank
+value counts as missing, because an empty app secret is an HMAC key anyone can compute and an empty
+bearer token is still sent as a header.
 
 ### Startup fails closed
 
-A gateway that starts and then refuses everything is worse than one that does not start. These are all startup failures:
+Startup refuses each of the following, as well as strict decoding failures ([Run](#run)) and the
+refusals stated beside each key above:
 
 - a route naming an agent the catalog does not contain, or one the catalog disables;
-- an agent with no resolvable model — no `model` override and no configured model offering its `modelClass`, or no `modelClass` at all;
-- duplicate transport names, duplicate model names, a route naming an unknown transport or an unknown model;
-- a zero step budget, a zero capability budget, or zero concurrency;
-- a transport `endpoint` override (`graphEndpoint` on `whatsappCloudApi`) that is neither its pinned production origin (Slack, Discord, Telegram, or the Meta Graph API) nor a literal loopback `http://` URL. Literal means `127.0.0.1` or `::1`: the name `localhost` is resolved by whatever the host's resolver says today, which is not the same promise;
-- a route still written with the retired `match` key, or a `mode`/`scope`/`idleTimeoutMs`/`maxTurns`/`maxBytes` key under `conversation:`. Both name their replacement: the route match is `conversation:`, and the memory window is `memory:`;
-- a selector that can never name a conversation: an empty or duplicated `kind` list, an empty `ids` list, an id or `container` the transport would never mint, a `container` on Telegram (which has nothing above a chat), a kind the transport never produces (`groupDirectMessage` on Discord, `channel` on WhatsApp), or an `ids` entry in `id:thread` form — a selector names the parent, and the kind list decides whether its threads come with it;
-- `subjects:` beside anything but `kind: [directMessage]`, an empty `subjects:` list, or `memory.scope: sharedConversation` on a `[directMessage]`-only route, where the direct message already is the subject;
+- an agent with no resolvable model — no `model` override and no configured model offering its
+  `modelClass`, or no `modelClass` at all;
+- duplicate transport or model names; a route naming an unknown transport, an unknown model, or an
+  `anthropic` model, which only the [guest model proxy](#guest-model-proxy) serves;
+- an empty `transports:`, `models:` or `routes:` list;
+- a zero step budget, capability budget or `sessions.maxConcurrent`; a model with `timeoutMs: 0`;
+  `shutdownGraceMs: 0`;
+- a persistent route with a zero idle timeout, turn window or byte window, or a zero
+  `sessions.maxConversations`, which would make every history immediately evictable;
+- a transport `endpoint` override (`graphEndpoint` on `whatsappCloudApi`) that is neither its pinned
+  production origin (Slack, Discord, Telegram, or the Meta Graph API) nor a literal loopback
+  `http://` URL. Literal means `127.0.0.1` or `::1`: the name `localhost` resolves to whatever the
+  host's resolver says today;
+- a selector that can never name a conversation: an empty or duplicated `kind` list, an empty `ids`
+  list, an id or `container` the transport would never mint, a `container` on Telegram (which has
+  nothing above a chat), a kind the transport never produces (`groupDirectMessage` on Discord,
+  `channel` on WhatsApp), or an `ids` entry in `id:thread` form — a selector names the parent, and
+  the kind list decides whether its threads come with it;
+- `subjects:` beside anything but `kind: [directMessage]`, an empty `subjects:` list, or
+  `memory.scope: sharedConversation` on a `[directMessage]`-only route, where the direct message
+  already is the subject;
 - an `indicators.conversations.<kind>` key for a kind the transport never produces;
-- a missing or blank chat or bound-route model credential environment variable. An `openaiCompatible` model's `apiKeyEnv` is optional (OpenRouter requires it), and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
-- an unknown Slack experience, indicator key or enum value; the former `liveness` and
-  `classicFallback` keys are unknown and refused rather than silently migrated;
-- fully resolved `indicators.stream` or `indicators.cancelButton` on `whatsappCloudApi`, which
-  can neither edit a message nor carry an interactive component; `reaction.working: on|auto`
-  on WhatsApp is also refused until a verified working-reaction clear exists;
-  `indicators.stream` on Slack, or `indicators.cancelButton` on Slack Agent, is refused;
+- a missing or blank chat or bound-route model credential variable. An `openaiCompatible` model's
+  `apiKeyEnv` is optional (OpenRouter requires it): absent means the endpoint needs no key, as a
+  loopback llama.cpp does not, while naming a variable that is unset or blank is refused, and this
+  process cannot see one exported after it started;
+- an unknown Slack experience, indicator key or enum value;
+- with resolved `mode: native`, `indicators.stream` or `indicators.cancelButton` on
+  `whatsappCloudApi`, which can neither edit a message nor carry an interactive component;
+  `indicators.stream` on Slack; `indicators.cancelButton` on Slack Agent; or `cancelButton` with
+  neither streaming nor a progress line;
+- `reaction.working: on|auto` on WhatsApp, which cannot clear a working reaction;
 - resolved `indicators.statusText: true` on anything except Slack Agent, or alongside
   `progress: message`, including conversation and route overrides;
-- an effective `indicators.keepAlive` with `everySeconds: 0` or an offset of `0` — a period of
-  zero is a render loop rather than a keep-alive;
-- an `indicators.templates` line using a placeholder that field cannot render. The known placeholders
-  are `{word}` (the `tool` line only), `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and
-  `{elapsed_s}`, plus `{note}` only in `note`/`noteEta` and `{eta_s}` only in `noteEta`;
-  neither note field permits `{word}`. `stopped` (person/operator stops) and `failed` (failures without a fixed cause line) render none. Every
-  offending placeholder in the block is named, not the first;
+- an effective `indicators.keepAlive` with `everySeconds: 0` or an offset of `0`, which is a render
+  loop rather than a keep-alive;
+- an `indicators.templates` line using a placeholder its field cannot render. `working` and
+  `keepAlive` render `{turn}`, `{of}`, `{calls}`, `{calls_max}` and `{elapsed_s}`; `tool` adds
+  `{word}`; `note` adds `{note}`, and `noteEta` adds `{note}` and `{eta_s}`; `stopped` and `failed`
+  render none. Every offending placeholder in the block is named, not only the first;
 - an empty `stopWords:` list, or one with a blank word. Omit the key to keep `[stop, cancel]`;
 - a route with `progressNotes: true` and `progressDetail: off`: notes need a progress line;
-- a route with `limits.maxDurationMs: 0`, which would cancel every session the instant it started;
-- a route with `limits.scriptTimeoutMs: 0`, which would end every script the instant it started, or one whose `scriptTimeoutMs` is greater than its `maxDurationMs`, where the session bound is reached first and the script deadline could never take effect; that refusal names both numbers;
-- an unreachable broker. `dekopon-gatewayd` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`;
-- an empty `transports:`, `models:`, or `routes:` list;
-- a model with `timeoutMs: 0`, or `shutdownGraceMs: 0`;
-- a `whatsappCloudApi` transport whose `bind` port is 0, whose `wabaId` or `phoneNumberId` is not a canonical positive decimal, whose `callbackPath` is not lowercase literal segments, or whose `graphApiVersion` is not `v<major>.0`; two `whatsappCloudApi` transports on one `bind`, even with distinct callback paths, because each owns its own listener;
-- broker frame bounds the protocol rejects (`maxFrameBytes` zero or above its hard ceiling, `ioTimeoutMs` zero), a broker socket that neither `broker.socketPath` nor the discovery order starting at `DEKOPON_BROKER_SOCKET` resolves, or a `telemetry:` block `dekopon-telemetry` refuses.
+- a `whatsappCloudApi` transport whose `bind` port is 0, whose `wabaId` or `phoneNumberId` is not a
+  canonical positive decimal, whose `callbackPath` is not lowercase literal segments, or whose
+  `graphApiVersion` is not `v<major>.0`; two `whatsappCloudApi` transports on one `bind`, even with
+  distinct callback paths, because each owns its own listener;
+- broker frame bounds the protocol rejects (`maxFrameBytes` zero or above its hard ceiling,
+  `ioTimeoutMs` zero), a broker socket that neither `broker.socketPath` nor the discovery order
+  starting at `DEKOPON_BROKER_SOCKET` resolves, or a `telemetry:` block `dekopon-telemetry`
+  refuses;
+- an unreachable broker, or one whose generation is not active. Before connecting any transport,
+  `dekopon-gatewayd` makes one `capabilities()` call on the configured socket and logs the
+  capability count as `gateway_broker_ready`.
 
-The `memory:` block adds three more:
+**Every problem at once.** A file that decoded is scanned to the end before it is refused, and the
+refusal lists everything wrong with it: `3 validation problems found:`, then one line per problem,
+the shape `dekopon-config` uses for a catalog. Only a file that cannot be understood at all — wrong
+ownership or permissions, oversize, or invalid YAML — stops at the first error. Route binding scans
+the whole table the same way, so a catalog that disabled two routed agents is one refusal naming
+both. A list that failed itself is not blamed on the routes that name it: no transports at all, or
+a transport with no name, is reported once rather than again for every route pointing at it.
 
-- a `persistent` route with a zero idle timeout, a zero turn window, or a zero byte window — the same rule a zero step budget already follows, because a bound of zero is a bound nobody meant to write;
-- an idle timeout, window bound, or `scope` on a `oneShot` route; an unknown, null, or wrong-case persistent `scope`. Those settings cannot take effect as written, and silently accepting them could turn an intended private route into some other behavior;
-- a zero `sessions.maxConversations`, which would make every history immediately evictable and turn a persistent route into an expensive one-shot one.
-
-**Every problem at once.** A file that decoded is scanned to the end before it is refused, and the refusal lists everything wrong with it — `3 validation problems found:` and then one line per problem, the shape `dekopon-config` already refuses a catalog with. Only a file that cannot be understood at all — wrong ownership or permissions, oversize, or invalid YAML — stops at the first error. Route binding scans the whole table the same way, so a catalog that disabled two of the agents routes name is one refusal naming both. And a list that failed itself is not blamed on the routes that name it: no transports at all, or a transport with no name, is reported once rather than again for every route pointing at it.
-
-**Every credential before any connection.** The chat credentials and the bound-route model credentials all resolve, and every transport client is built, before the first transport authenticates to anything. Preparation still reports every missing credential together, by variable name rather than value. After preparation and the broker probe succeed, all transports connect concurrently. A healthy transport serves immediately while another recovers; its authenticated bot identity is installed before its first message can route. `gateway_started` means supervision is running, not that every transport is connected.
+**Every credential before any connection.** Chat credentials and bound-route model credentials all
+resolve, and every transport client is built, before the first transport authenticates. Preparation
+reports every missing credential together, by variable name. After preparation and the broker probe
+succeed, all transports connect concurrently. A healthy transport serves at once while another
+recovers; its authenticated bot identity is installed before its first message can route.
+`gateway_started` means supervision is running, not that every transport is connected.
 
 ### Connection recovery
 
-Every adapter — Slack, Discord, Telegram, WhatsApp and local — uses the same private composable
-recovery extension. It wraps only connection establishment and receiving, never reply drivers,
-provider invocations, or outbound message effects. Existing clients, Slack's dedup ring, Telegram
-offsets, Slack thread ownership and Discord resume/identify state survive recovery. WhatsApp keeps
-no dedup ring, so a Meta webhook retry — which happens only when its HTTP 200 is lost in the
-network — either joins an in-flight turn as a steer or starts a fresh one and gets a second reply.
-Discord's own resume sequence-number tracking already prevented a resumed connection from replaying
-an event the client had already received, so deleting its now-redundant `SeenIds` ring changes
-nothing about resume.
+Every adapter — Slack, Discord, Telegram, WhatsApp and local — shares one recovery policy. It wraps
+only connection establishment and receiving, never reply drivers, provider invocations or outbound
+message effects. Clients, Slack's dedup ring, Telegram offsets, Slack thread ownership and Discord
+resume/identify state survive recovery. WhatsApp keeps no dedup ring, so a Meta webhook retry —
+which happens only when its HTTP 200 is lost in the network — either joins an in-flight turn as a
+steer or starts a fresh one and gets a second reply.
 
-The fixed policy requires no configuration:
+The fixed policy needs no configuration:
 
 - Each initial or reconnect attempt has a **30-second deadline**, including a hung handshake.
 - A failed attempt or established-connection failure spends one of **10 failures per episode**.
@@ -471,185 +597,188 @@ The fixed policy requires no configuration:
   A successful handshake or message alone does not reset it, so rapid flapping eventually exits.
   Adapter liveness detects established-path loss; a quiet but healthy listener is not timed out.
 - Terminal failure of **any** transport stops all readers, drains sessions for `shutdownGraceMs`,
-  then exits nonzero through `gateway_exit`, preserving the failure cause. The executable also
-  bounds teardown of abandoned blocking work to five seconds. A supervisor such as Kubernetes
-  can then restart the **gateway container**, not necessarily the pod. This is recovery behavior,
-  not a claim about the root cause of a connection reset.
+  then exits nonzero through `gateway_exit`, preserving the failure cause. The executable bounds
+  teardown of abandoned blocking work to five seconds. A supervisor such as Kubernetes can then
+  restart the **gateway container**, not necessarily the pod.
 
-The extension delegates reconnect protocol details to the adapter, without nesting retry loops.
-A changed bot identity on recovery is terminal rather than routing under stale identity metadata.
-
+The adapter owns reconnect protocol details; retry loops never nest. A changed bot identity on
+recovery is terminal rather than routing under stale identity metadata.
 
 ## Agent configuration self-inspection
 
-Every authorized session on a route that has written `inspectAgentConfig: true` is offered
-`inspect_agent_config`. When someone asks “what is this
-agent's configuration?”, the model can call it and receive one bounded JSON snapshot designed to
-render as concise Markdown tables:
+A route with `inspectAgentConfig: true` offers every authorized session the `inspect_agent_config`
+tool. When someone asks "what is this agent's configuration?", the model can call it and receive
+one bounded JSON snapshot designed to render as concise Markdown tables:
 
 - agent identifier, description, and catalog `modelClass`;
 - the exact catalog `instructions` supplied as this session's system prompt;
 - the skills mounted for the agent, each as its name, description, and resource file paths —
   never the skill text, which `read_skill` discloses on demand — and absent when nothing is
   mounted;
-- route step/capability limits and the one-shot or persistent `memory:` window, including the effective persistent scope; and
+- route step/capability limits and the one-shot or persistent `memory:` window, including the
+  effective persistent scope; and
 - the capability metadata in this sender's fresh `capabilities(subject, agent, scope)` result:
   identifier, selected provider, description, effect, and risk, as the provider manifest and the
   broker's `capabilities` define them.
 
-That last section is an **effective Cedar view**, not Cedar source. Raw policy, policy IDs and
-digests, denied or merely declared capabilities, execution constraints, credential bindings,
+That last section is an **effective Cedar view**, not Cedar source. Absent: raw policy, policy IDs
+and digests, denied or merely declared capabilities, execution constraints, credential bindings,
 private secret-map source/selector/use inventory, principal/subject/channel/transport identifiers,
-model endpoints and auth paths, broker paths, and all credential values are absent. Exact standing
-instructions remain visible and may intentionally contain a public inert DRN. The gateway never receives provider credentials or raw
-policy, and the typed view has no field for the chat/model credentials it does hold. Each serialized
-result has a 128 KiB hard ceiling. A route without `inspectAgentConfig: true` does not offer the tool at all: the model's tool list does not carry it and a scripted call is an unknown tool. What that buys is flat: the structured dump is gone, and the `instructions` are still this session's system prompt, so secrecy from a determined user is the model's obedience rather than a gate. Calls are repeatable under the prompt loop's shared per-turn tool
-call and model-step bounds; there is no inspection-specific call limit. What a repeat does not do is
-append a second copy: a tool result stays in the session's message vector and is re-sent to the
-provider on every remaining turn, so the configuration is serialized once and every later call is
-answered with a short pointer at it. The view cannot change while a session runs — it is built once,
-from one fresh broker answer. An oversized view produces one fixed content-free diagnostic instead of
-a partial configuration.
+model endpoints and auth paths, broker paths, and all credential values. Exact standing
+instructions stay visible and may intentionally contain a public inert DRN. The gateway never
+receives provider credentials or raw policy, and the typed view has no field for the chat and model
+credentials it does hold.
 
-Inspection happens only after the ordinary authorization gate, makes no broker invocation, spends
-no capability-call budget, grants nothing, and creates no durable broker audit record. It does make
-standing instructions visible to any sender authorized to use that agent. Those instructions were
-already model input and must never contain credentials; operators should not treat a system prompt
-as a secret from its users.
+- **Bounds:** each serialized result has a 128 KiB hard ceiling; an oversized view produces one
+  fixed content-free diagnostic, never a partial configuration. Calls are repeatable under the
+  prompt loop's shared per-turn tool-call and model-step bounds, with no inspection-specific limit.
+- **Repeats:** the view is built once per session from one fresh broker answer and cannot change
+  while the session runs. A tool result stays in the message vector and is re-sent on every later
+  turn, so only the first call carries the configuration; every later call gets a short pointer to
+  it.
+- **Without the flag:** the tool is not offered; the model's tool list lacks it and a scripted call
+  is an unknown tool. That removes the structured dump and nothing else: the `instructions` are
+  still the system prompt, so secrecy from a determined user is the model's obedience, not a gate.
+- **Authority:** inspection happens only after the ordinary authorization gate, makes no broker
+  invocation, spends no capability-call budget, grants nothing, and creates no durable broker audit
+  record. Standing instructions are visible to every sender authorized to use the agent. They were
+  already model input, must never contain credentials, and are not a secret from the agent's users.
 
 ## Multi-message media inputs
 
-The shared gateway collects **media-first** inputs after routing/address checks and before
-session admission. WhatsApp `debounceMs` is the quiet interval (default **5000ms**), and
-`debounceMaxWaitMs` is the hard maximum from the first media receipt (default **15000ms**).
-Both are unsigned 32-bit millisecond durations (`0..=4294967295`). `debounceMs: 0` disables
-collection entirely; the maximum is then unused. Idle inputs use immediate admission.
-When enabled, the maximum must be at least the quiet interval. Invalid types, negative/out-of-range
-integers, incompatible enabled combinations and unrepresentable timer deadlines are refused at
-configuration load. Accepted later photos, captions and standalone text extend that actor's quiet
-deadline, but never beyond the first receipt plus the maximum. Refused inputs do not extend it.
-Text arriving first remains immediate. These are heuristic bursts, not WhatsApp albums; webhook
-payload boundaries are not album identities.
+The shared gateway collects **media-first** inputs after routing and address checks and before
+session admission. Text that arrives first is admitted immediately.
 
-Telegram uses a separate fixed **3-second** window only for authenticated `media_group_id`
-members, because Telegram supplies no group-end marker. Member captions join; ordinary text and
-ungrouped Telegram media remain immediate and cannot claim membership. Different native groups
-never merge: a competing group for the same pending actor/audience is visibly refused. WhatsApp's
-setting never changes Telegram timing. In groups/topics, unaddressed native members may inherit
-addressing only from an already-open addressed lead with the exact same actor, route, full scope,
-reply audience and native group ID. Members arriving before that addressed lead (or after expiry)
-remain ignored unless individually addressed; there is no pre-address buffer or grant inheritance.
-Slack/Discord native attachment arrays remain indivisible
-and immediate; local text remains immediate. Their existing 10-attachment parser ceiling now
-refuses an oversized native envelope instead of accepting a truncated subset.
+- **WhatsApp:** `debounceMs` is the quiet interval (default **5000ms**) and `debounceMaxWaitMs` the
+  hard maximum from the first media receipt (default **15000ms**), both unsigned 32-bit
+  milliseconds (`0..=4294967295`). `debounceMs: 0` disables collection, and the maximum is then
+  unused. When enabled, the maximum must be at least the quiet interval. Invalid types,
+  negative or out-of-range integers, incompatible enabled combinations and unrepresentable timer
+  deadlines are refused at configuration load. Accepted later photos, captions and standalone text
+  extend that actor's quiet deadline, never beyond the first receipt plus the maximum; refused
+  inputs do not extend it. These are heuristic bursts: webhook payload boundaries are not album
+  identities.
+- **Telegram:** a separate fixed **3-second** window applies only to authenticated
+  `media_group_id` members, because Telegram supplies no group-end marker. Member captions join;
+  ordinary text and ungrouped media stay immediate and cannot claim membership. Different native
+  groups never merge: a competing group for the same pending actor and audience is visibly
+  refused. WhatsApp's setting never changes Telegram timing. In groups and topics, an unaddressed
+  native member inherits addressing only from an already-open addressed lead with the exact same
+  actor, route, full scope, reply audience and native group ID. Members arriving before that lead,
+  or after expiry, stay ignored unless individually addressed; there is no pre-address buffer or
+  grant inheritance.
+- **Slack, Discord and local:** native attachment arrays are indivisible and immediate, and local
+  text is immediate. Slack and Discord refuse a native envelope over 10 attachments rather than
+  accept a truncated subset.
 
-Collection is isolated by canonical authenticated subject, exact bound route, configured transport,
-complete conversation/container/thread and reply audience, even on shared-history routes. Each
-batch retains at most **8 envelopes, 32 assets and 16 KiB of rendered text**, including the source
-boundary/caption-presence labels added for multiple inputs. Limits reject only the incoming
-envelope, visibly and with a traced cause; already collected members remain intact. Native arrays
-are never split. There is at most one collecting batch per compatible actor key and globally at
-most `sessions.maxConcurrent` batches, independently of execution permits.
+**Isolation and bounds.** Collection is isolated by canonical authenticated subject, exact bound
+route, configured transport, complete conversation/container/thread and reply audience, even on
+shared-history routes. Each batch holds at most **8 envelopes, 32 assets and 16 KiB of rendered
+text**, including the source-boundary and caption-presence labels added for multiple inputs. A limit
+rejects only the incoming envelope, visibly and with a traced cause; members already collected stay.
+Native arrays are never split. Each compatible actor key has at most one collecting batch, and at
+most `sessions.maxConcurrent` batches collect at once, independently of execution permits.
 
-At quiet expiry or the hard deadline, whichever comes first, the batch attempts normal admission.
-For a running conversation with mailbox room, batches follow the session’s steering rule:
-on mapped shared or one-shot channels another authorized native-chat participant joins the turn;
-elsewhere the same sender steers and another sender queues. After cancellation or the turn’s seal, both queue.
-Steers and follow-ups share a 100-item mailbox. A full mailbox or exhausted execution capacity
-makes a batch eligible for a busy reply even when `replyOnBusy` is false, subject to the bounded
-refusal-reply capacity and transport delivery.
-Later media starts another bounded collection; standalone text follows ordinary steering/admission.
-There is no replay or rollback of paid effects. WhatsApp collection waits at most its configured
-maximum (15 seconds by default); Telegram waits its fixed 3 seconds. Queueing, inference and
-transport time remain additional; collection does not guarantee that every group member joins one turn.
+**Admission.** At quiet expiry or the hard deadline, whichever comes first, the batch attempts
+normal admission. For a running conversation with mailbox room, batches follow the session's
+steering rule: on mapped shared or one-shot channels another authorized native-chat participant
+joins the turn; elsewhere the same sender steers and another sender queues. After cancellation or
+the turn's seal, both queue. Steers and follow-ups share a 100-item mailbox. A full mailbox or
+exhausted execution capacity makes a batch eligible for a busy reply even when `replyOnBusy` is
+false, subject to the bounded refusal-reply capacity and transport delivery. Later media starts
+another bounded collection; standalone text follows ordinary steering and admission. WhatsApp
+collection waits at most its configured maximum and Telegram's at most 3 seconds; queueing,
+inference and transport time come on top. Collection does not guarantee that every group member
+joins one turn, and nothing replays or rolls back paid effects.
 
-New turns receive fresh broker authorization and generation selection after admission; a same-sender
-steer joins the running turn's existing leg and asset access. Other participants on a mapped
-shared or one-shot channel receive fresh authorization before joining its asset access. Collection itself does
-not fetch assets, contact the model/provider or publish progress. One lead message owns progress,
-reply target and native delivery identity; other message IDs are not fabricated into an album ID.
-An authenticated stop removes only that actor's pending work and preserves the existing ownership
-rules for active sessions. Shutdown discards pending batches without starting them. Original
-receipt traces retain their input and terminal disposition. Ordinary collected executions export
-causal links to every constituent; consumed steers link their constituents only to the admission
-span, not the running execution (see [observability](observability.md)). Asset leases, history
-scope and generation fences are unchanged.
+**Authority and traces.** New turns receive fresh broker authorization and generation selection
+after admission; a same-sender steer joins the running turn's existing leg and asset access. Other
+participants on a mapped shared or one-shot channel receive fresh authorization before joining its
+asset access. Collection itself fetches no assets, contacts no model or provider and publishes no
+progress. One lead message owns progress, reply target and native delivery identity; other message
+IDs are not fabricated into an album ID. An authenticated stop removes only that actor's pending
+work and keeps the ownership rules for active sessions. Shutdown discards pending batches without
+starting them. Original receipt traces keep their input and terminal disposition. Ordinary collected
+executions export causal links to every constituent; consumed steers link their constituents only
+to the admission span, not the running execution (see [observability](observability.md)).
+Collection does not change asset leases, history scope or generation fences.
 
 ## Asset handles and delivery
 
 The gateway's conversation-generation table is the only asset inventory. The model learns it from
 the note on its newest turn, which lists every attachment that fits, newest first, and says how to
 read it: `fetch_chat_asset` for an image or document, `asset cat chat-asset:N` for other text when
-`asset.cat` is granted. Every reachable file has a number, including files the model cannot show.
-Older files omitted for space remain addressable by their numbers. To hand a file to a provider
-command, write `chat-asset:N` as its own unquoted word. Quoted references, escaped text, variable
-values and references inside larger words are plain text. Builtins never read attachments;
-use `asset cat chat-asset:3 | head` to pipe file text into a builtin.
+`asset.cat` is granted. Every reachable file has a number, including files the model cannot show,
+and older files omitted for space stay addressable by number.
 
-Each provider command sends one `Run` frame and receives one `Ran` response. The gateway resolves
-and pins at most five distinct references, numbers indices by first occurrence, and sends only
-those metadata rows and read-only, close-on-exec descriptors. Repeated references share one pin
-and descriptor. Pins last until the response or cancellation. Data URLs in argv, including the
-value after the first `=`, are refused before submission. The broker parses the command word and
-authorizes its proposal through the existing subject, Cedar, grants, secret-use and HTTP checks.
-An unquoted literal `<word> --help` uses the cached page without a frame or capability-call charge.
-Gateway-built proposals use `Invoke` with no inventory rows or asset input descriptors. An
-`Invoke` can carry at most five metadata rows.
-
-A successful provider `attach` returns a descriptor and typed metadata, not a JSON byte envelope.
-The gateway numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded
-stderr note naming the reference, declared content type and stored-byte count. The declared label
-is authoritative; a bounded decoded-prefix disagreement produces one metadata-only event.
-With `sessions.journal`, admission copies provider outputs into the content-addressed store under
-`sessions.assets.path`; generated files remain session-only and are discarded at restart. Without
-a journal, pathless outputs stay on temporary disk without copying and are reclaimed by closing
-their last descriptor. Both modes share `sessions.assetRetentionBytes`, defaulting to 1 GiB.
-All descriptor reads are positional. A trap, denial or timeout admits no asset effects.
-
-Outbound `video/mp4` files are named `asset-N.mp4`, and their bytes bypass the model: an MP4
-is not a model-readable image. Slack, Discord, the local transport and feature-only fauxlack deliver the named file;
-WhatsApp refuses it before upload. Telegram currently tries `sendPhoto` and Telegram's API
-rejects it after upload, rather than Dekopon refusing before upload.
+- **References:** to hand a file to a provider command, write `chat-asset:N` as its own unquoted
+  word. Quoted references, escaped text, variable values and references inside larger words are
+  plain text. Builtins never read attachments; use `asset cat chat-asset:3 | head` to pipe file text
+  into a builtin.
+- **Invocation:** each provider command sends one `Run` frame and receives one `Ran` response. The
+  gateway resolves and pins at most five distinct references, numbers indices by first occurrence,
+  and sends only those metadata rows and read-only, close-on-exec descriptors. Repeated references
+  share one pin and descriptor. Pins last until the response or cancellation. Data URLs in argv,
+  including the value after the first `=`, are refused before submission. The broker parses the
+  command word and authorizes its proposal through the usual subject, Cedar, grant, secret-use and
+  HTTP checks. An unquoted literal `<word> --help` uses the cached page without a frame or
+  capability-call charge. Gateway-built proposals use `Invoke` with no inventory rows or asset
+  input descriptors; an `Invoke` carries at most five metadata rows.
+- **Attach:** a successful provider `attach` returns a descriptor and typed metadata. The gateway
+  numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded stderr note
+  naming the reference, declared content type and stored-byte count. The declared label is
+  authoritative; a bounded decoded-prefix disagreement produces one metadata-only event. With
+  `sessions.journal`, admission copies provider outputs into the content-addressed store under
+  `sessions.assets.path`; generated files stay session-only and are discarded at restart. Without a
+  journal, outputs stay on temporary disk without copying and are reclaimed by closing their last
+  descriptor. Both modes share `sessions.assetRetentionBytes` (default 1 GiB). All descriptor reads
+  are positional. A trap, denial or timeout admits no asset effects.
+- **MP4:** outbound `video/mp4` files are named `asset-N.mp4`, and their bytes bypass the model: an
+  MP4 is not a model-readable image. Slack, Discord, the local transport and test-only fauxlack
+  deliver the named file; WhatsApp and Telegram refuse it before upload.
 
 **Attach is not send.** An explicit broker-authorized `asset.send` queues a file for this turn's
-reply. Four newly sent assets are permitted per turn. Sent state persists for the lifetime of the
-table entry: duplicate sends, even in later turns, are no-ops; a sent file cannot be removed.
-Removal of an unsent asset closes its unpinned retained file and releases accounting. No failure
-implicitly retries or clears sent state. Empty answer text still delivers queued files; failed
-or cancelled turns deliver none. Delivery disposition is logged as `agent.asset.send`; a failure
-adds one bounded gateway notice to the next turn. An output retention refusal names the failure
-without suggesting a repeat of an already-executed paid capability.
+reply. Four newly sent assets are permitted per turn. Sent state lasts as long as the table entry:
+a duplicate send, even in a later turn, is a no-op, and a sent file cannot be removed. Removing an
+unsent asset closes its unpinned retained file and releases its accounting. No failure implicitly
+retries or clears sent state. Empty answer text still delivers queued files; failed or cancelled
+turns deliver none. Delivery disposition is logged as `agent.asset.send`; a failure adds one bounded
+gateway notice to the next turn. An output retention refusal names the failure without suggesting a
+repeat of an already-executed paid capability.
 
-Limits are **8 MiB decoded per asset, five distinct references or attached outputs and 40 MiB
-decoded per invocation**, and the configurable 1 GiB default disk budget. There is no per-conversation
-count cap or idle expiry for live generations. One-shot inventories retain their one-hour idle expiry.
-An eight-MiB base64 asset may store up to 11,184,812 bytes; identity stays at 8,388,608.
-Disk retention and broker in-flight spool budgets account for actual stored bytes.
-These limits are separate from model-facing fetch limits. Resolving bytes updates LRU recency.
-Unknown inbound lengths are shown as `size unknown` in the inventory note and as null stored-byte
-counts in metadata rows, not as empty files. Reported or fetched lengths, including a genuine zero,
-remain numeric. Building the inventory never fetches files just to learn their size. Evicted files retain their last known length; a session-bound use refetches inbound bytes with fresh authorization. Generated files are never regenerated.
+**Limits.** **8 MiB decoded per asset, five distinct references or attached outputs and 40 MiB
+decoded per invocation**, and the configurable 1 GiB default disk budget. These are separate from
+model-facing fetch limits.
 
-Delivery keeps existing native paths: Slack external upload, Discord multipart Create Message,
-Telegram `sendPhoto`, WhatsApp Graph media/image messages, and local base64 JSON. Each upload reads
-a bounded file; the shared native codec converts base64 storage to raw upload bytes, and local
-encodes into its output line. There is no image-format conversion.
+- An 8 MiB asset stored as base64 may take up to 11,184,812 bytes; identity stays at 8,388,608.
+  Disk retention and broker in-flight spool budgets account for actual stored bytes.
+- Live generations have no per-conversation count cap or idle expiry; one-shot inventories expire
+  after one idle hour. Resolving bytes updates LRU recency.
+- An unknown inbound length shows as `size unknown` in the inventory note and as a null stored-byte
+  count in metadata rows, never as an empty file; reported or fetched lengths, including a genuine
+  zero, stay numeric. Building the inventory never fetches a file just to learn its size.
+- Evicted files keep their last known length; a session-bound use refetches inbound bytes with
+  fresh authorization. Generated files are never regenerated.
+
+**Delivery.** Each adapter uses its native path: Slack external upload, Discord multipart Create
+Message, Telegram `sendPhoto`, WhatsApp Graph media/image messages, and local base64 JSON. Each
+upload reads a bounded file; the shared native codec converts base64 storage to raw upload bytes,
+and local encodes into its output line. There is no image-format conversion.
 
 | Adapter | Supported declared content types |
 |---|---|
 | Slack, Discord, local | Any concrete syntactically valid media type; no wildcards |
 | Telegram, WhatsApp | `image/png`, `image/jpeg` |
 
-Route instructions should name the adapter's accepted types and tell the model to plan a converter
-when necessary. These are adapter-supported sets, not claims about every upstream feature.
-Unsupported formats refuse before uploading. WhatsApp additionally retains its 5,000,000-byte
-ceiling. Filenames are gateway-generated. Only authenticated reply coordinates select the target;
-a partial delivery fails the reply and suppresses durable recording. Provider result byte envelopes
-are refused by capability name with a message naming `dekopon:asset`.
+Unsupported formats refuse before uploading, and WhatsApp also keeps its 5,000,000-byte ceiling.
+These are adapter-supported sets, not claims about every upstream feature, so route instructions
+should name the adapter's accepted types and tell the model to plan a converter when necessary.
+Filenames are gateway-generated. Only authenticated reply coordinates select the target; a partial
+delivery fails the reply and suppresses durable recording.
 
-Slack installations need `files:write` in addition to the existing reply/read scopes. Discord bots
-need **Attach Files** in addition to View/Send/Read History/Send in Threads. Telegram needs no
-additional bot permission.
+Slack installations need `files:write` beside the reply and read scopes. Discord bots need
+**Attach Files** beside View, Send, Read History and Send in Threads. Telegram needs no additional
+bot permission.
 
 ## Transports
 
