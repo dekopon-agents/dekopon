@@ -118,12 +118,6 @@ LaunchDaemons, sleep, logout or reboot recovery, Gatekeeper, Slack plan entitlem
 permissions or OpenRouter billing, so pass [acceptance](#acceptance-before-switching) after a
 green run too.
 
-The released 0.74.0 tap passed `mode: env-file` on a hosted macOS 15 ARM64 runner: tap commit
-`ad54c51917e50aeb59193940d12315775f6c05c6`, all three daemons 0.74.0 from tag `v0.74.0`
-([run 41092694914](https://github.com/dekopon-agents/dekopon/actions/runs/41092694914)). That is
-synthetic same-user evidence only, not live Slack, GitHub or OpenRouter traffic, separate-UID system
-services, Gatekeeper or sleep and reboot recovery.
-
 ### From a checkout
 
 Build from source only if you maintain a Rust toolchain, with the compiler pinned in
@@ -284,24 +278,6 @@ file's contract:
   the gateway refuses to serve, naming the path and line, never a value.
 - Its values never go in gateway YAML, a plist, agent instructions, a repository or
   `launchctl setenv`. launchd does not inherit your shell's exports.
-
-**Converting a file a shell used to source.** `--env-file` is not a drop-in replacement for a
-shell-sourced file. A file written for `. credentials.env` may use `$VAR` expansion, backslash
-escapes, `$(…)` or backtick commands, or `export` lines that expand other variables; the loader
-reads each as literal text, so a daemon would receive the characters `$(…)`, not the command's
-output. Resolve each such value by hand into its literal form in the editor that `sudo -e` opens,
-never by sourcing the old file into the new one, and merge repeated keys, which the loader refuses.
-
-```sh
-# Before: a shell-sourced file
-SUFFIX=example-suffix
-export OPENROUTER_API_KEY="synthetic-$SUFFIX"
-export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN="$(cat /path/to/synthetic-bot-token)"
-
-# After: literal values for --env-file
-export OPENROUTER_API_KEY='synthetic-example-suffix'
-export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN='synthetic-bot-token-value'
-```
 
 ### GitHub PAT under launchd
 
