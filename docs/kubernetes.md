@@ -1,6 +1,6 @@
 # Run Dekopon on Kubernetes
 
-Kubernetes is the preferred deployment. People moving from OpenClaw or Hermes to a Mac mini can
+Kubernetes is the preferred deployment. People moving from OpenClaw or Hermes to a Mac can
 [run on a Mac](run-on-mac.md) instead.
 
 The operator reference for the [Helm chart](../charts/dekopon/), for readers who know Kubernetes and
@@ -180,8 +180,9 @@ states what this separation protects.
   configuration without it; an existing Secret or ConfigMap directory is opaque, so its owner must
   set it.
 - Broker `identities` must map gateway UID `65533` and, separately, `65532` for the probes. The
-  chart refuses an inline `broker.yaml` that does not map `65532`;
-  [`broker.configDirectory.peers`](#configuration-directories) renders both.
+  chart refuses an inline `broker.yaml` that does not map `65532`; with
+  `broker.configDirectory.configMap`, [`broker.configDirectory.peers`](#configuration-directories)
+  renders both.
 - The gateway receives no broker configuration, secret or storage mount; the broker receives no
   gateway configuration, model credential or gateway `/tmp`.
 
@@ -509,7 +510,8 @@ configCheck:
   Deployment's live catalog read-only at `paths.catalogDir`, where the live gateway configuration
   must resolve its catalog.
 - **Broker check.** A root init container copies the broker ConfigMaps into a `0700` directory owned
-  by `65532`, as `0600` regular files, because `check` refuses ConfigMap symlinks. When the pod gets the chart-rendered `peers.yaml` (`broker.configDirectory.configMap` with
+  by `65532`, as `0600` regular files, because `check` refuses ConfigMap symlinks. When the pod
+  gets the chart-rendered `peers.yaml` (`broker.configDirectory.configMap` with
   `broker.configDirectory.peers`), the hook copies the same file from a `<fullname>-check-peers` hook
   ConfigMap and refuses a candidate `peers.yaml` key, as the Deployment does. The check runs as
   `65532` and resolves `providerSetConfigMap`'s `providers.yaml` into `<paths.stateDir>/config-check`
@@ -750,7 +752,8 @@ returned by `helm get values`, and usually committed.
 
 The default `broker.config.inline` is the broker README's cli-probe example on the chart's paths: a
 deny-by-default configuration that starts, loads the baked `cli-probe-provider.wasm`, and maps the
-probe UID without granting an executable capability. Replace it. It sets
+probe UID without granting an executable capability. Install with it, wait for the pod to become
+Ready, then replace it. It sets
 `serverLimits.maxFrameBytes` to 2 MiB explicitly; raise or omit that field when raising payload
 bounds ([broker configuration](../crates/dekopon-brokerd/README.md#configuration)). `gateway.enabled`
 is `false` by default because the chart cannot supply a gateway's transport, model endpoint, agent
@@ -878,8 +881,8 @@ routes only the configured callback path and terminates public TLS outside the p
 `tls.crt`, `tls.key` and `ca.crt`; the daemon's `proxy.tls` must name those paths, and `proxy.bind`
 must use the same port on a non-loopback address. The chart refuses enablement without the Secret,
 and for inline configuration without a `proxy:` block or with a different bind port. For opaque
-configuration, only the config check's candidate validation loads the TLS files and validates
-`proxy`, so disabling the check skips it. The broker never mounts this Secret.
+configuration the chart cannot inspect `proxy`; the config check loads the TLS files and validates it
+before rollout, so disabling the check skips that. The broker never mounts this Secret.
 
 ## What is not proven
 
@@ -900,7 +903,7 @@ CI does not prove:
   OpenAI;
 - a provider-sync or config-check hook completing in a cluster, or `dekopon-gatewayd check --probe`
   calling a vendor;
-- `linux/arm64`, the reference platform, or Kubernetes versions other than 1.33;
+- the init proof on `linux/arm64`, the reference platform, or Kubernetes versions other than 1.33;
 - cross-UID isolation between real daemons, which `ipc_process.rs` proves only with
   `DEKOPON_REQUIRE_CROSS_UID=1` in a root container
   ([IPC directory](../crates/dekopon-brokerd/README.md#ipc-directory-and-distinct-peer-uids)).
