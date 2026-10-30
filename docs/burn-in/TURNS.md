@@ -20,3 +20,4 @@ One line per push to the standing draft PR `burn-in/webhook-turn`. Each push wak
 - 2026-10-26T15:15Z: core 0.58.0 / chart 0.45.0 (xrl/rpi-homelab#320, 5fbbf6ce)
 - 2026-10-29T15:37Z: core 0.72.0 / chart 0.59.0 (xrl/rpi-homelab#357)
 - 2026-10-30T09:08Z: core 0.73.0 / chart 0.60.0 (xrl/rpi-homelab#367)
+- 2026-10-30T13:54Z: core 0.74.0 / chart 0.61.0 (xrl/rpi-homelab#369)
