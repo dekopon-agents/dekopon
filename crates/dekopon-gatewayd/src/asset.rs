@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     io::Read,
-    os::fd::OwnedFd,
+    os::{fd::OwnedFd, unix::fs::FileExt},
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -1642,6 +1642,138 @@ impl AssetFailure {
 const MAX_RELEASE_TOMBSTONES: usize = 1024;
 type RetentionKey = (AssetStateKey, u64);
 
+pub(crate) enum SummaryInput {
+    Image { mime: String, blob: DiskBlob },
+    Text(String),
+    Binary { mime: String, blob: DiskBlob },
+}
+
+#[derive(Debug)]
+pub(crate) enum NotReadable {
+    Revoked,
+    NotResident,
+}
+
+impl NotReadable {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Revoked => "revoked",
+            Self::NotResident => "not-resident",
+        }
+    }
+}
+
+struct SummaryReader {
+    file: std::fs::File,
+    offset: u64,
+}
+
+impl Read for SummaryReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read_at(out, self.offset)?;
+        self.offset += read as u64;
+        Ok(read)
+    }
+}
+
+impl AssetStore {
+    pub(crate) fn is_resident(
+        &self,
+        access: &AssetAccess,
+        number: dekopon_core::AssetNumber,
+    ) -> bool {
+        access
+            .with_active(|key| {
+                let entries = self.entries.lock();
+                let retention = self.retention.lock();
+                match entries.get(key).and_then(|entry| {
+                    entry
+                        .assets
+                        .iter()
+                        .find(|row| row.asset.id == u64::from(number))
+                }) {
+                    Some(Row {
+                        asset,
+                        state: Attachment::Resident(digest),
+                    }) => retention.is_bound(key, asset, digest),
+                    Some(Row {
+                        state:
+                            Attachment::Registered
+                            | Attachment::Downloading(_)
+                            | Attachment::NotStored(_)
+                            | Attachment::Evicted
+                            | Attachment::PlatformGone,
+                        ..
+                    })
+                    | None => false,
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn summary_input(
+        &self,
+        access: &AssetAccess,
+        number: dekopon_core::AssetNumber,
+        kind: dekopon_core::asset::AssetKind,
+    ) -> Result<SummaryInput, NotReadable> {
+        use dekopon_core::asset::AssetKind;
+        match kind {
+            AssetKind::Other => return Err(NotReadable::NotResident),
+            AssetKind::Image | AssetKind::TextDocument | AssetKind::BinaryDocument => {}
+        }
+        let blob = self
+            .pin(access, u64::from(number), Recency::Keep)
+            .map_err(summary_unreadable)?
+            .ok_or(NotReadable::NotResident)?;
+        let mime = access
+            .with_active(|key| {
+                self.entries
+                    .lock()
+                    .get(key)
+                    .and_then(|entry| {
+                        entry
+                            .assets
+                            .iter()
+                            .find(|row| row.asset.id == u64::from(number))
+                    })
+                    .map(|row| row.asset.mime.clone())
+            })
+            .ok_or(NotReadable::Revoked)?
+            .ok_or(NotReadable::NotResident)?;
+        match kind {
+            AssetKind::Image => Ok(SummaryInput::Image { mime, blob }),
+            AssetKind::BinaryDocument => Ok(SummaryInput::Binary { mime, blob }),
+            AssetKind::TextDocument => {
+                let mut bytes =
+                    Vec::with_capacity(blob.len().min(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES));
+                SummaryReader {
+                    file: std::fs::File::from(blob.descriptor().map_err(summary_unreadable)?),
+                    offset: 0,
+                }
+                .take(dekopon_process::DEFAULT_MAX_OUTPUT_BYTES as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|error| summary_unreadable(BlobError::Io(error.kind())))?;
+                Ok(SummaryInput::Text(
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ))
+            }
+            AssetKind::Other => Err(NotReadable::NotResident),
+        }
+    }
+}
+
+fn summary_unreadable(error: BlobError) -> NotReadable {
+    match error {
+        BlobError::Unauthorized => NotReadable::Revoked,
+        BlobError::Unknown | BlobError::Reclaimed | BlobError::Disabled => NotReadable::NotResident,
+        BlobError::TooLarge | BlobError::Capacity | BlobError::Io(_) | BlobError::LengthChanged => {
+            tracing::warn!(event = "gateway_memory_summary_refused", error = %error, "resident summary input unavailable");
+            NotReadable::NotResident
+        }
+    }
+}
+
 impl AssetStore {
     fn get_inventory(&self, access: &AssetAccess) -> Vec<AssetRef> {
         self.assets_for_access(access, Vec::new(), Instant::now())
@@ -1758,7 +1890,12 @@ impl AssetStore {
             })
     }
     #[cfg(test)]
-    fn admit(&self, access: &AssetAccess, id: u64, bytes: &[u8]) -> Result<DiskBlob, BlobError> {
+    pub(crate) fn admit(
+        &self,
+        access: &AssetAccess,
+        id: u64,
+        bytes: &[u8],
+    ) -> Result<DiskBlob, BlobError> {
         access
             .with_active(|key| {
                 let mut entries = self.entries.lock();
@@ -2001,7 +2138,7 @@ mod note_tests;
 mod resolve_tests;
 
 #[cfg(test)]
-mod retention_tests {
+pub(crate) mod retention_tests {
     use super::*;
 
     fn inventory_rows(session: &SessionAssets) -> Vec<AssetRow> {
@@ -2061,7 +2198,13 @@ mod retention_tests {
     fn residents(store: &AssetStore) -> usize {
         store.retention.lock().resident_files()
     }
-    fn reclaim(store: &AssetStore, access: &AssetAccess, id: u64) {
+    pub(crate) async fn hold_downloads(store: &AssetStore) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&store.downloads.permits)
+            .acquire_many_owned(MAX_CONCURRENT_DOWNLOADS as u32)
+            .await
+            .unwrap()
+    }
+    pub(crate) fn reclaim(store: &AssetStore, access: &AssetAccess, id: u64) {
         let mut entries = store.entries.lock();
         let row = row_mut(&mut entries, &access.key, id).unwrap();
         store
@@ -2070,7 +2213,7 @@ mod retention_tests {
             .evict((access.key.clone(), id), row)
             .unwrap();
     }
-    fn store(budget: usize) -> Arc<AssetStore> {
+    pub(crate) fn store(budget: usize) -> Arc<AssetStore> {
         Arc::new(AssetStore::with_retention(
             8,
             Duration::from_secs(600),
@@ -2533,7 +2676,7 @@ mod retention_tests {
         .unwrap();
     }
 
-    fn durable_window() -> crate::config::MemoryWindow {
+    pub(crate) fn durable_window() -> crate::config::MemoryWindow {
         crate::config::MemoryWindow {
             scope: crate::config::MemoryScope::PrivateConversation,
             idle_timeout: Duration::from_secs(3600),
@@ -3723,7 +3866,12 @@ mod retention_tests {
         assert!(!text.contains("dekopon-assets-") && !text.contains("base64"));
     }
 
-    struct Fetcher(std::sync::atomic::AtomicUsize);
+    #[derive(Default)]
+    pub(crate) struct Fetcher {
+        pub calls: std::sync::atomic::AtomicUsize,
+        pub bytes: std::sync::atomic::AtomicUsize,
+        pub gone: std::sync::atomic::AtomicBool,
+    }
     impl AssetFetcher for Fetcher {
         fn fetch(
             &self,
@@ -3731,8 +3879,14 @@ mod retention_tests {
             _: u64,
         ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, crate::transport::TransportError>>
         {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async { Ok(b"aaa".to_vec()) })
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                if self.gone.load(Ordering::Relaxed) {
+                    return Err(crate::transport::TransportError::Service { code: "404".into() });
+                }
+                self.bytes.fetch_add(3, Ordering::Relaxed);
+                Ok(b"aaa".to_vec())
+            })
         }
     }
     #[tokio::test(flavor = "multi_thread")]
@@ -3766,7 +3920,7 @@ mod retention_tests {
         assert!(note.contains("input-0.png (image/png, size unknown)"));
         assert!(note.contains("input-1.png (image/png, 0 B)"));
         assert!(note.contains("input-2.png (image/png, 2 KB)"));
-        let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let fetcher = Arc::new(Fetcher::default());
         let session = SessionAssets::new(
             Arc::clone(&store),
             access.clone(),
@@ -3781,7 +3935,7 @@ mod retention_tests {
                 .collect::<Vec<_>>(),
             [None, Some(0), Some(2048)]
         );
-        assert_eq!(fetcher.0.load(Ordering::Relaxed), 0);
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 0);
         tokio::task::spawn_blocking(move || {
             let id = registered.arrived[0];
             let blob = input(&session, id).unwrap();
@@ -3794,7 +3948,7 @@ mod retention_tests {
                 Err(BlobError::Reclaimed)
             );
             assert_eq!(inventory_rows(&session)[0].bytes, Some(3));
-            assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+            assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
             let empty_id = registered.arrived[1];
             let empty = store.admit(&access, empty_id, b"").unwrap();
             assert_eq!(empty.len(), 0);
@@ -3806,7 +3960,7 @@ mod retention_tests {
                 Err(BlobError::Reclaimed)
             );
             assert_eq!(inventory_rows(&session)[1].bytes, Some(0));
-            assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+            assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
         })
         .await
         .unwrap();
@@ -3831,7 +3985,7 @@ mod retention_tests {
                     Instant::now(),
                 )
                 .arrived[0];
-            let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+            let fetcher = Arc::new(Fetcher::default());
             let session = SessionAssets::new(
                 Arc::clone(&store),
                 access,
@@ -3842,14 +3996,14 @@ mod retention_tests {
             tokio::task::spawn_blocking(move || {
                 let first = session.fetch(id).unwrap_err();
                 assert!(first.contains("store-failed"), "{first}");
-                assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+                assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
                 let second = session.fetch(id).unwrap_err();
                 assert!(second.contains("store-failed"), "{second}");
                 assert_eq!(
                     input(&session, id).unwrap_err(),
                     ChatAssetRefusal::StoreFailed
                 );
-                assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+                assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
                 assert_eq!(inventory_rows(&session)[0].bytes, Some(3));
                 assert_eq!(store.retention.lock().bytes, 0);
                 assert_eq!(residents(&store), 0);
@@ -3864,7 +4018,7 @@ mod retention_tests {
         let store = store(2);
         let access = access("one");
         let id = register(&store, &access);
-        let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let fetcher = Arc::new(Fetcher::default());
         let session = SessionAssets::new(
             Arc::clone(&store),
             access.clone(),
@@ -3881,7 +4035,7 @@ mod retention_tests {
                         .contains("attachment exceeds the byte limit")
                 );
             }
-            assert_eq!(fetcher.0.load(Ordering::Relaxed), 0);
+            assert_eq!(fetcher.calls.load(Ordering::Relaxed), 0);
             assert!(store.pin(&access, id, Recency::Keep).unwrap().is_none());
         })
         .await
@@ -3958,7 +4112,7 @@ mod retention_tests {
         let store = store(3);
         let access = access("one");
         let a = register(&store, &access);
-        let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let fetcher = Arc::new(Fetcher::default());
         let session = SessionAssets::new(
             Arc::clone(&store),
             access.clone(),
@@ -3974,7 +4128,7 @@ mod retention_tests {
             assert_eq!(weak.data.read(), Err(BlobError::Reclaimed));
             assert_eq!(input(&session, a).unwrap().read().unwrap(), b"aaa");
             assert_eq!(weak.data.read().unwrap(), b"aaa");
-            assert_eq!(fetcher.0.load(Ordering::Relaxed), 2);
+            assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
         })
         .await
         .unwrap();
@@ -3985,8 +4139,7 @@ mod retention_tests {
         let store = store(3);
         let access = access("one");
         let a = register(&store, &access);
-        let fetcher: Arc<dyn AssetFetcher> =
-            Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let fetcher: Arc<dyn AssetFetcher> = Arc::new(Fetcher::default());
         let source = AssetSourceRef::Telegram {
             file_id: "file".into(),
         };

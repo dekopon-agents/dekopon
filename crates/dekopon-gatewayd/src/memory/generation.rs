@@ -27,6 +27,7 @@ pub(crate) struct PostReply {
     pub attachments: crate::config::memory::AttachmentSummaries,
     pub keep: Keep,
     pub plan: Option<SummaryPlan>,
+    pub recalled: Option<journal::records::Snapshot>,
 }
 
 /// A turn's journal writes; nothing here touches disk until the session drains it after the
@@ -101,6 +102,14 @@ pub(crate) async fn drain(runner: &SessionRunner, deferred: Deferred) {
     runner.assets.finish_publications().await;
 }
 
+struct Persisted {
+    record: Option<SlotTask>,
+    stem: String,
+    access: AssetAccess,
+    recalled: Vec<journal::records::Head>,
+    appended: Option<journal::records::Header>,
+}
+
 async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
     let Deferred {
         corrupt,
@@ -136,6 +145,7 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
                 attachments,
                 keep,
                 plan,
+                recalled,
             } = reply;
             let stem = key.journal_stem();
             let next_asset_id = access.next_asset_id();
@@ -182,18 +192,41 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
                 let _written = journal.write_choice(&stem, choice);
             }
             journal.maintain(&stem, SystemTime::now(), next_asset_id);
-            appended.filter(|_| planned).map(|record| SlotTask {
-                stem,
+            let record = appended
+                .as_ref()
+                .filter(|_| planned)
+                .map(|header| SlotTask {
+                    stem: stem.clone(),
+                    record: header.id,
+                    part: NonZeroU8::MIN,
+                    subject: super::record::Subject::Record,
+                    access: None,
+                });
+            Some(Persisted {
                 record,
-                part: NonZeroU8::MIN,
+                stem,
+                access,
+                recalled: recalled.map_or_else(Vec::new, |snapshot| snapshot.records),
+                appended,
             })
         })
     })
     .await;
     match written {
-        Ok(Some(task)) => {
+        Ok(Some(written)) => {
             if let Some(summaries) = runner.summaries.as_ref() {
-                summaries.enqueue(task).await;
+                if let Some(task) = written.record {
+                    summaries.enqueue(task).await;
+                }
+                summaries.sweep(
+                    &written.stem,
+                    &written.access,
+                    written
+                        .recalled
+                        .iter()
+                        .map(|head| (&head.header, head.asset_lines.as_slice()))
+                        .chain(written.appended.iter().map(|header| (header, &[][..]))),
+                );
             }
         }
         Ok(None) => {}

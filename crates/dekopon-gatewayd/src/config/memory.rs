@@ -8,6 +8,8 @@ use dekopon_core::AgentId;
 use serde::Deserialize;
 use thiserror::Error;
 
+pub(crate) const ATTACHMENT_QUEUE_DIVISOR: usize = 2;
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MemorySettings {
@@ -238,7 +240,7 @@ impl ResolvedSummaries {
             (Toggle::Summarize, Toggle::Off | Toggle::Summarize)
             | (Toggle::Off, Toggle::Summarize) => true,
         };
-        if enabled && queue.get() < 2 {
+        if enabled && queue.get() < ATTACHMENT_QUEUE_DIVISOR {
             problems.push(PolicyProblem::AttachmentSummariesNeedQueue { queue: queue.get() });
         }
         match self.attachments.images {

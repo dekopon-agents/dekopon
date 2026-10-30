@@ -1943,6 +1943,7 @@ struct Turn {
     commit: Option<Commit>,
     pins: Vec<crate::memory::record::PinLine>,
     choice: Option<crate::memory::record::ChoiceLine>,
+    recalled: Option<journal::records::Snapshot>,
 }
 
 impl Turn {
@@ -1954,6 +1955,7 @@ impl Turn {
             commit: None,
             pins: Vec::new(),
             choice: None,
+            recalled: None,
         }
     }
 }
@@ -3137,6 +3139,7 @@ async fn session_turn(
                 commit,
                 pins: memory_tools.map_or_else(Vec::new, |tools| tools.into_pins()),
                 choice,
+                recalled: recalled_journal,
             }
         })
     };
@@ -3154,6 +3157,7 @@ async fn session_turn(
         commit,
         pins,
         choice,
+        recalled,
     } = match result {
         Ok(turn) => turn,
         Err(failure) => {
@@ -3265,8 +3269,8 @@ async fn session_turn(
                         steers
                             .raw_texts
                             .lock()
-                            .iter()
-                            .map(|steer| steer.arrived.clone()),
+                            .iter_mut()
+                            .map(|steer| std::mem::take(&mut steer.arrived)),
                     )
                     .collect(),
                 attachments: route
@@ -3276,6 +3280,7 @@ async fn session_turn(
                     .map_or_default(|summaries| summaries.attachments),
                 keep: crate::memory::generation::keep(window.recall),
                 plan: crate::memory::generation::plan(route),
+                recalled,
             });
         }
     }

@@ -1,5 +1,7 @@
+mod assets;
+
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::{NonZeroU8, NonZeroU32, NonZeroUsize},
     ops::ControlFlow,
     sync::{
@@ -9,7 +11,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use dekopon_core::AgentId;
+use dekopon_core::{AgentId, AssetNumber};
 use dekopon_model::{
     error::{InferenceError, TransportFailure},
     model::{AssistantTurn, ChatModel, CompletionOptions, ModelKey, ModelMessage},
@@ -30,13 +32,30 @@ use super::{
     },
     record::{RecordId, Slot, SlotLine, Subject, SummaryError, SummaryFailure, TurnId},
 };
-use crate::{gateway::CurrentGeneration, session::ModelCache};
+use crate::{
+    asset::{AssetAccess, AssetStore},
+    gateway::CurrentGeneration,
+    session::ModelCache,
+};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct SlotTask {
     pub stem: String,
     pub record: RecordId,
     pub part: NonZeroU8,
+    pub subject: Subject,
+    pub access: Option<AssetAccess>,
+}
+
+impl std::fmt::Debug for SlotTask {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("SlotTask")
+            .field("stem", &self.stem)
+            .field("record", &self.record)
+            .field("part", &self.part)
+            .field("subject", &self.subject)
+            .finish_non_exhaustive()
+    }
 }
 
 struct Queued {
@@ -46,6 +65,7 @@ struct Queued {
 
 pub(crate) struct Resources {
     pub journal: Arc<Journal>,
+    pub assets: Arc<AssetStore>,
     pub current: CurrentGeneration,
     pub models: Arc<ModelCache>,
     pub counts: Arc<Counts>,
@@ -58,6 +78,12 @@ pub(crate) struct Counts {
     pub enqueued: AtomicU64,
     pub overflowed: AtomicU64,
     pub evicted: AtomicU64,
+    pub asset_enqueued: AtomicU64,
+    pub asset_deferred: AtomicU64,
+    #[cfg(test)]
+    pub(crate) joined: tokio::sync::Notify,
+    #[cfg(test)]
+    panic_before_walk: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -66,6 +92,9 @@ pub(crate) struct Sender {
     cancel: watch::Sender<bool>,
     journal: Arc<Journal>,
     pub counts: Arc<Counts>,
+    assets: Arc<AssetStore>,
+    in_flight: AssetReservations,
+    asset_limit: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -79,12 +108,20 @@ struct RunningTask {
     task: SlotTask,
     binding: Binding,
     span: tracing::Span,
+    stage: Stage,
 }
 
-struct CancelOnDrop(watch::Sender<bool>);
+enum Stage {
+    Summary,
+    PanicWrite,
+}
+
+type AssetReservations = Arc<parking_lot::Mutex<HashSet<(String, RecordId, AssetNumber)>>>;
+struct CancelOnDrop(watch::Sender<bool>, AssetReservations);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.send_replace(true);
+        self.1.lock().clear();
     }
 }
 
@@ -96,6 +133,7 @@ pub(crate) struct Dispatcher {
 
 pub(crate) fn channel(
     journal: Arc<Journal>,
+    assets: Arc<AssetStore>,
     counts: Arc<Counts>,
     queue: NonZeroUsize,
     concurrency: NonZeroUsize,
@@ -106,6 +144,9 @@ pub(crate) fn channel(
         cancel: watch::channel(false).0,
         journal,
         counts,
+        assets,
+        in_flight: Arc::default(),
+        asset_limit: queue.get() / crate::config::memory::ATTACHMENT_QUEUE_DIVISOR,
     };
     let dispatcher = Dispatcher {
         receiver,
@@ -126,6 +167,7 @@ impl Dispatcher {
     ) {
         let resources = Resources {
             journal: Arc::clone(&self.sender.journal),
+            assets: Arc::clone(&self.sender.assets),
             current,
             models,
             thread_owner,
@@ -150,6 +192,7 @@ pub(crate) fn spawn(
 ) -> Sender {
     let (sender, dispatcher) = channel(
         Arc::clone(&resources.journal),
+        Arc::clone(&resources.assets),
         Arc::clone(&resources.counts),
         queue,
         concurrency,
@@ -170,6 +213,10 @@ impl Sender {
     }
 
     pub(crate) async fn enqueue(&self, task: SlotTask) {
+        match task.subject {
+            Subject::Asset(_) => return,
+            Subject::Record => {}
+        }
         match self.queue.try_send(Queued {
             task,
             since: Instant::now(),
@@ -215,7 +262,7 @@ async fn dispatch(
     sender: Sender,
     concurrency: NonZeroUsize,
 ) {
-    let cancel = CancelOnDrop(sender.cancel.clone());
+    let cancel = CancelOnDrop(sender.cancel.clone(), Arc::clone(&sender.in_flight));
     let mut stopped = cancel.0.subscribe();
     let mut running = JoinSet::new();
     let mut tasks: HashMap<Id, RunningTask> = HashMap::new();
@@ -229,24 +276,39 @@ async fn dispatch(
                 match result {
                     Some(Ok((id, next))) => {
                         if let Some(running) = tasks.remove(&id) {
-                            let task = running.task;
-                            match next {
-                                Next::Continue(part) => sender.enqueue(SlotTask { part, ..task }).await,
-                                Next::Stop => {}
+                            sender.release(&running.task);
+                            match (running.stage, running.task.subject, next) {
+                                (Stage::Summary, Subject::Record, Next::Continue(part)) => sender.enqueue(SlotTask { part, ..running.task }).await,
+                                (Stage::Summary, Subject::Record, Next::Stop)
+                                | (Stage::Summary, Subject::Asset(_), Next::Continue(_) | Next::Stop)
+                                | (Stage::PanicWrite, Subject::Record | Subject::Asset(_), Next::Continue(_) | Next::Stop) => {}
                             }
                         }
                     }
                     Some(Err(error)) => {
-                        if let Some(running) = tasks.remove(&error.id()).filter(|_| error.is_panic()) {
-                            let journal = Arc::clone(&resources.journal);
-                            let turn = *running.binding.lock();
-                            let subscriber = tracing::dispatcher::get_default(Clone::clone);
-                            let _written = tokio::task::spawn_blocking(move || {
-                                let _subscriber = tracing::dispatcher::set_default(&subscriber);
-                                running.span.in_scope(|| {
-                                    mark_later(&journal, &running.task, turn, SummaryFailure::Panicked, "summary task panicked")
-                                })
-                            }).await;
+                        if let Some(mut task) = tasks.remove(&error.id()) {
+                            match (error.is_panic(), &task.stage) {
+                                (true, Stage::Summary) => {
+                                    let journal = Arc::clone(&resources.journal);
+                                    let turn = *task.binding.lock();
+                                    let write = task.task.clone();
+                                    let subscriber = tracing::dispatcher::get_default(Clone::clone);
+                                    let span = task.span.clone();
+                                    let cancelled = stopped.clone();
+                                    let handle = running.spawn_blocking(move || {
+                                        let _subscriber = tracing::dispatcher::set_default(&subscriber);
+                                        span.in_scope(|| {
+                                            if !*cancelled.borrow() {
+                                                let _written = mark_later(&journal, &write, turn, SummaryFailure::Panicked, "summary task panicked");
+                                            }
+                                            Next::Stop
+                                        })
+                                    });
+                                    task.stage = Stage::PanicWrite;
+                                    tasks.insert(handle.id(), task);
+                                }
+                                (false, Stage::Summary | Stage::PanicWrite) | (true, Stage::PanicWrite) => sender.release(&task.task),
+                            }
                         }
                     }
                     None => {}
@@ -258,10 +320,12 @@ async fn dispatch(
                 let binding: Binding = Arc::default();
                 let span = summarize_span(&task, &queued.since);
                 let handle = running.spawn(run(Arc::clone(&resources), queued, cancel.0.subscribe(), Arc::clone(&binding), span.clone()));
-                tasks.insert(handle.id(), RunningTask { task, binding, span });
+                tasks.insert(handle.id(), RunningTask { task, binding, span, stage: Stage::Summary });
             }
         }
     }
+    cancel.0.send_replace(true);
+    sender.in_flight.lock().clear();
 }
 
 fn summarize_span(task: &SlotTask, since: &Instant) -> tracing::Span {
@@ -269,6 +333,14 @@ fn summarize_span(task: &SlotTask, since: &Instant) -> tracing::Span {
         "memory.summarize",
         memory.record.id = task.record.0.get(),
         memory.summary.part = task.part.get(),
+        memory.summary.subject = subject_label(task.subject),
+        asset.number = match task.subject {
+            Subject::Record => None,
+            Subject::Asset(number) => Some(u64::from(number)),
+        },
+        asset.kind = tracing::field::Empty,
+        asset.input.bytes = tracing::field::Empty,
+        asset.read = tracing::field::Empty,
         memory.summary.queue_wait_ms = since.elapsed().as_millis() as u64,
         gen_ai.request.model = tracing::field::Empty,
         gen_ai.response.model = tracing::field::Empty,
@@ -328,52 +400,54 @@ fn summarize(
     cancel: watch::Receiver<bool>,
     binding: &Binding,
 ) -> Next {
+    #[cfg(test)]
+    assert!(
+        !resources
+            .counts
+            .panic_before_walk
+            .swap(false, Ordering::Relaxed),
+        "forced stale task panic before walk"
+    );
     let journal = &resources.journal;
-    let loaded = journal.record_lookup(&task.stem, task.record);
-    let (snapshot, position) = match loaded {
-        Ok(Some(snapshot)) => match snapshot
-            .records
-            .iter()
-            .position(|head| head.header.id == task.record)
-        {
-            Some(position) => (snapshot, position),
-            None => return evicted(resources, task),
-        },
-        Ok(None) => return evicted(resources, task),
-        Err(error) => {
-            return fail(
-                resources,
-                task,
-                None,
-                &Slot::Queued,
-                error_slot(io_failure(error), "could not read summary input"),
-                task.part
-                    .get()
-                    .checked_add(1)
-                    .and_then(NonZeroU8::new)
-                    .map_or(Next::Stop, Next::Continue),
-            );
-        }
+    let snapshot = match load(resources, task) {
+        Ok(snapshot) => snapshot,
+        Err(next) => return next,
     };
-    let head = &snapshot.records[position];
+    let Some(head) = snapshot
+        .records
+        .iter()
+        .find(|head| head.header.id == task.record)
+    else {
+        return evicted(resources, task);
+    };
     let expected = Some(head.header.turn);
     *binding.lock() = expected;
     let part = usize::from(task.part.get() - 1);
     let Some(plan) = &head.header.plan else {
         return Next::Stop;
     };
-    match head.header.summaries.get(part) {
+    let Some(slots) = head.slots(task.subject) else {
+        return Next::Stop;
+    };
+    match slots.get(part) {
         Some(Slot::Queued) => {}
         Some(Slot::Running) | None => return Next::Stop,
         Some(Slot::Generated(_) | Slot::Error(_)) => {
-            return next_pending(&head.header.summaries, part + 1);
+            return match task.subject {
+                Subject::Record => next_pending(&slots, part + 1),
+                Subject::Asset(_) => Next::Stop,
+            };
         }
     }
     tracing::Span::current().record("gen_ai.request.model", plan.model.as_str());
     let Some(limit) = plan.parts.get(part) else {
         return Next::Stop;
     };
-    let next = next_pending(&head.header.summaries, part + 1);
+    let next = next_pending(&slots, part + 1);
+    let asset_input = match assets::load_input(resources, task, head) {
+        Ok(input) => input,
+        Err(_refusal) => return Next::Stop,
+    };
     match write_slot(journal, task, &Slot::Queued, Slot::Running, expected) {
         Ok(true) => {}
         Ok(false) => return evicted(resources, task),
@@ -399,6 +473,21 @@ fn summarize(
         );
         return Next::Stop;
     };
+    let image = match &asset_input {
+        Some(crate::asset::SummaryInput::Image { .. }) => true,
+        Some(crate::asset::SummaryInput::Text(_) | crate::asset::SummaryInput::Binary { .. })
+        | None => false,
+    };
+    if image && !model.accepts_images() {
+        let _written = mark_later(
+            journal,
+            task,
+            expected,
+            SummaryFailure::Unconfigured,
+            "summary model no longer accepts images",
+        );
+        return Next::Stop;
+    }
     let client = match resources.models.client_bound(model, runtime, cancel) {
         Ok(client) => client,
         Err(error) => {
@@ -412,20 +501,7 @@ fn summarize(
             );
         }
     };
-    let input = match input(&snapshot, head, plan.max_input_bytes.get() as usize) {
-        Ok(input) => input,
-        Err(error) => {
-            return fail(
-                resources,
-                task,
-                expected,
-                &Slot::Running,
-                error_slot(io_failure(error), "could not read summary input"),
-                next,
-            );
-        }
-    };
-    let previous: String = head.header.summaries[..part]
+    let previous: String = slots[..part]
         .iter()
         .filter_map(|slot| match slot {
             Slot::Generated(text) => Some(text.as_str()),
@@ -447,7 +523,71 @@ fn summarize(
         backend: model.backend(),
         via: Via::Summary,
     };
-    let slot = match complete_summary(client.as_ref(), call, input, previous, task.part, *limit) {
+    let completed = match asset_input {
+        Some(input) => assets::complete(client.as_ref(), call, task, input, &slots[..part], plan),
+        None => {
+            let input = match input(&snapshot, head, plan.max_input_bytes.get() as usize) {
+                Ok(input) => input,
+                Err(error) => {
+                    return fail(
+                        resources,
+                        task,
+                        expected,
+                        &Slot::Running,
+                        error_slot(io_failure(error), "could not read summary input"),
+                        next,
+                    );
+                }
+            };
+            complete_summary(client.as_ref(), call, input, previous, task.part, *limit)
+        }
+    };
+    finish(resources, task, completed, expected, next)
+}
+
+fn load(resources: &Resources, task: &SlotTask) -> Result<Snapshot, Next> {
+    let journal = &resources.journal;
+    let loaded = journal.record_lookup(&task.stem, task.record);
+    match loaded {
+        Ok(Some(snapshot)) => Ok(snapshot),
+        Ok(None) => Err(evicted(resources, task)),
+        Err(error) => {
+            match task.subject {
+                Subject::Record => {}
+                Subject::Asset(_) => {
+                    tracing::warn!(
+                        event = "gateway_memory_summary_refused",
+                        reason = error.label(),
+                        "asset summary header unavailable"
+                    );
+                    return Err(Next::Stop);
+                }
+            }
+            Err(fail(
+                resources,
+                task,
+                None,
+                &Slot::Queued,
+                error_slot(io_failure(error), "could not read summary input"),
+                task.part
+                    .get()
+                    .checked_add(1)
+                    .and_then(NonZeroU8::new)
+                    .map_or(Next::Stop, Next::Continue),
+            ))
+        }
+    }
+}
+
+fn finish(
+    resources: &Resources,
+    task: &SlotTask,
+    completed: Completed,
+    expected: Option<TurnId>,
+    next: Next,
+) -> Next {
+    let journal = &resources.journal;
+    let slot = match completed {
         Completed::Slot(slot) => slot,
         Completed::Cancelled => return Next::Stop,
         Completed::Refused => {
@@ -518,26 +658,32 @@ fn complete_summary(
             message: ReplayMessage::User(input),
         },
     ];
+    complete_request(client, call, &messages, input_bytes, 0, limit)
+}
+
+fn complete_request(
+    client: &dyn ChatModel,
+    call: Call,
+    messages: &[ModelMessage],
+    input_bytes: usize,
+    images: usize,
+    limit: NonZeroU32,
+) -> Completed {
     let estimate = Estimate::from_sizes(
         Sizes {
             bytes: input_bytes + messages[0].content().map_or(0, str::len),
-            images: 0,
+            images,
         },
         None,
         Tokens::from_bytes(limit.get() as usize),
     );
     let mut meter = Metering::unadmitted(call, estimate);
-    let result = client.complete(
-        &messages,
-        &[],
-        &CompletionOptions::default(),
-        &mut |event| {
-            match event {
-                dekopon_model::TurnEvent::TextDelta(text) => meter.observe_text(text.len()),
-            }
-            ControlFlow::Continue(())
-        },
-    );
+    let result = client.complete(messages, &[], &CompletionOptions::default(), &mut |event| {
+        match event {
+            dekopon_model::TurnEvent::TextDelta(text) => meter.observe_text(text.len()),
+        }
+        ControlFlow::Continue(())
+    });
     let (usage, bytes, outcome, kind) = match &result {
         Ok(turn) => (
             turn.usage,
@@ -618,6 +764,7 @@ fn dropped(task: &SlotTask, reason: Dropped) {
         event = "gateway_memory_summary_dropped",
         memory.record.id = task.record.0.get(),
         memory.summary.part = task.part.get(),
+        memory.summary.subject = subject_label(task.subject),
         memory.summary.failure = match reason {
             Dropped::Overflow => "overflow",
             Dropped::Evicted => "evicted",
@@ -733,7 +880,7 @@ fn slot_line(task: &SlotTask, slot: Slot) -> SlotLine {
         record: task.record,
         part: task.part,
         slot,
-        subject: Subject::Record,
+        subject: task.subject,
     }
 }
 
@@ -753,9 +900,11 @@ fn write_slot(
 ) -> Result<bool, JournalError> {
     let to = slot.clone();
     let line = slot_line(task, slot);
-    let written = match turn {
-        Some(turn) => journal.write_slot_for(&task.stem, line, turn),
-        None => journal.write_slot(&task.stem, line),
+    let written = match (task.subject, turn) {
+        (Subject::Asset(_), Some(turn)) => journal.write_pending_slot_for(&task.stem, line, turn),
+        (Subject::Record, Some(turn)) => journal.write_slot_for(&task.stem, line, turn),
+        (Subject::Record, None) => journal.write_slot(&task.stem, line),
+        (Subject::Asset(_), None) => return Ok(false),
     }?;
     if written {
         transition(task, from, &to);
@@ -810,9 +959,12 @@ fn mark_later(
     }) else {
         return Ok(0);
     };
+    let Some(slots) = head.slots(task.subject) else {
+        return Ok(0);
+    };
     let mut count = 0;
-    for part in usize::from(task.part.get() - 1)..head.header.summaries.len() {
-        if !head.header.summaries[part].is_pending() {
+    for part in usize::from(task.part.get() - 1)..slots.len() {
+        if !slots[part].is_pending() {
             continue;
         }
         let part =
@@ -828,11 +980,7 @@ fn mark_later(
             slot_line(&later, to.clone()),
             head.header.turn,
         )? {
-            transition(
-                &later,
-                &head.header.summaries[usize::from(part.get() - 1)],
-                &to,
-            );
+            transition(&later, &slots[usize::from(part.get() - 1)], &to);
             match kind {
                 SummaryFailure::Overflow => dropped(&later, Dropped::Overflow),
                 SummaryFailure::Timeout
@@ -851,3 +999,10 @@ fn mark_later(
 
 #[cfg(test)]
 mod tests;
+
+fn subject_label(subject: Subject) -> &'static str {
+    match subject {
+        Subject::Record => "record",
+        Subject::Asset(_) => "asset",
+    }
+}

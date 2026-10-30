@@ -305,6 +305,7 @@ where
     let engine = journal.as_ref().map(|journal| {
         memory::engine::channel(
             Arc::clone(journal),
+            Arc::clone(&assets),
             Arc::default(),
             config.memory.summaries.queue,
             config.memory.summaries.concurrency,
