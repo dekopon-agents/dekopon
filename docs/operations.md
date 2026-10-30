@@ -68,7 +68,7 @@ DRNs. This is committed direction, not an upgrade required today
 
 | Question | Read |
 |---|---|
-| Native macOS | [Run on a Mac](run-on-mac.md) |
+| Native macOS, launchd, sleep, logs and rollback | [Run on a Mac](run-on-mac.md) |
 | Kubernetes | [Kubernetes guide](kubernetes.md) |
 | The container image — what is in it and what does it assume? | [`container-image.md`](container-image.md) |
 | Getting an ordinary daemon file or a projection-backed DRN source into a pod | [`1password-eso.md`](1password-eso.md) and [`secrets.md` § `kubernetesProjection`](secrets.md#kubernetesprojection) |

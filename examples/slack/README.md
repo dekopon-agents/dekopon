@@ -1,6 +1,10 @@
 # Slack setup
 
-This directory contains the Slack app profiles used by the
+For a native Mac installation with a budgeted OpenRouter key, start with
+[Run on a Mac](../../docs/run-on-mac.md) and its [read-only Slack starter](../mac-slack/README.md).
+This page owns the Slack app and token setup.
+
+This directory contains the Slack app profiles also used by the
 [conditional writer](../conditional-write/README.md). Both receive direct messages and
 explicit channel mentions over Socket Mode, open supported attachments on demand, and publish
 best-effort in-flight liveness. Both profiles receive channel history for opted-in `follow: true`

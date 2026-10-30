@@ -6,7 +6,7 @@ Start with [`design.md`](design.md). It carries the [constitution](design.md#con
 
 ### Install and run
 
-- [Run on a Mac](run-on-mac.md): native installation, model setup, and a read-only local session
+- [Run on a Mac](run-on-mac.md): native installation, Slack/OpenRouter, launchd, budgets and recovery
 - [Run on Kubernetes](kubernetes.md): Helm and ArgoCD installation, credentials, storage, and upgrades
 - [Operations](operations.md): startup refusals, audit, shutdown, and the detailed daemon contracts
 
