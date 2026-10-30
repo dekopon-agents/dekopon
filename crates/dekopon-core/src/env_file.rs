@@ -46,7 +46,7 @@ pub enum EnvFileProblem {
     InvalidKey { line: NonZeroU32 },
     #[error("line {line} needs '=' directly after the variable name")]
     MissingEquals { line: NonZeroU32 },
-    #[error("line {line} has a quote inside an unquoted value")]
+    #[error("line {line} has a quote or whitespace inside an unquoted value")]
     UnquotedSpecial { line: NonZeroU32 },
     #[error("line {line} has an unmatched quote")]
     UnmatchedQuote { line: NonZeroU32 },
@@ -237,9 +237,11 @@ fn parse(bytes: &[u8]) -> Result<Vec<(String, Redacted<String>)>, EnvFileProblem
     })?;
     let mut pairs = Vec::new();
     let mut seen: HashMap<&str, NonZeroU32> = HashMap::new();
-    for (index, raw) in text.split('\n').enumerate() {
+    for (index, segment) in text.split_inclusive('\n').enumerate() {
         let line = line_number(index);
-        let content = raw.strip_suffix('\r').unwrap_or(raw);
+        let content = segment
+            .strip_suffix('\n')
+            .map_or(segment, |raw| raw.strip_suffix('\r').unwrap_or(raw));
         if content.contains('\0') {
             return Err(EnvFileProblem::Nul { line });
         }
@@ -301,7 +303,9 @@ fn parse_line(content: &str, line: NonZeroU32) -> Result<Option<(&str, &str)>, E
         None => {
             let end = value.find(is_blank).unwrap_or(value.len());
             let (unquoted, after) = value.split_at(end);
-            if unquoted.contains(['\'', '"']) {
+            if unquoted.contains(|character: char| {
+                character == '\'' || character == '"' || character.is_whitespace()
+            }) {
                 return Err(EnvFileProblem::UnquotedSpecial { line });
             }
             (unquoted, after)
@@ -403,6 +407,18 @@ mod tests {
                 EnvFileProblem::UnmatchedQuote { line: line(1) },
             ),
             ("KEY=a'b", EnvFileProblem::UnquotedSpecial { line: line(1) }),
+            (
+                "KEY=a\x0bb",
+                EnvFileProblem::UnquotedSpecial { line: line(1) },
+            ),
+            (
+                "KEY=a\x0cb",
+                EnvFileProblem::UnquotedSpecial { line: line(1) },
+            ),
+            (
+                "OK=1\nKEY=v\r",
+                EnvFileProblem::StrayCarriageReturn { line: line(2) },
+            ),
             ("KEY='a'b", EnvFileProblem::TrailingText { line: line(1) }),
             (
                 "KEY=value # note",
