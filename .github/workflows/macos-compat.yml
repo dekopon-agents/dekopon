@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   homebrew-smoke:
-    name: Homebrew ARM64 process smoke
+    name: Homebrew ARM64 Slack, replay and user launchd
     runs-on: macos-15
     timeout-minutes: 20
     env:
@@ -29,8 +29,9 @@ jobs:
           brew update
           brew tap dekopon-agents/tap
           brew trust dekopon-agents/tap
-          brew install dekopon-agents/tap/dekopon
+          brew install dekopon-agents/tap/dekopon dekopon-agents/tap/cassette
           prefix=$(brew --prefix dekopon)
+          cassette_prefix=$(brew --prefix cassette)
           tap_commit=$(git -C "$(brew --repository dekopon-agents/tap)" rev-parse HEAD)
           {
             printf '### Homebrew installation\n\n'
@@ -44,21 +45,39 @@ jobs:
               file "$prefix/bin/$binary" | grep -Eq 'Mach-O 64-bit executable arm64'
               "$prefix/bin/$binary" --version
             done
+            test "$("$cassette_prefix/bin/cassette" --version)" = 'cassette 0.1.0'
+            file "$cassette_prefix/bin/cassette"
+            file "$cassette_prefix/bin/cassette" | grep -Eq 'Mach-O 64-bit executable arm64'
+            "$cassette_prefix/bin/cassette" --version
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Fetch the pinned public provider component
+      - name: Fetch the pinned public provider components
         shell: bash
         run: |
           set -euo pipefail
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
             https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder/releases/download/v0.7.0/jsonplaceholder-provider.wasm \
             --output "$RUNNER_TEMP/jsonplaceholder-provider.wasm"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            https://github.com/dekopon-agents/dekopon-provider-gh/releases/download/v0.11.1/gh-provider.wasm \
+            --output "$RUNNER_TEMP/gh-provider.wasm"
 
-      - name: Check configuration, start daemons and complete a local tool turn
+      - name: Install the pinned Slack fixture dependency
         shell: bash
         run: |
           set -euo pipefail
-          python3 ci/macos-compat-smoke.py \
+          python3 -m venv "$RUNNER_TEMP/dekopon-compat-venv"
+          "$RUNNER_TEMP/dekopon-compat-venv/bin/python" -m pip install --require-hashes --no-deps \
+            -r ci/macos-compat-requirements.txt
+
+      - name: Exercise credential loading, Slack Agent, replay and user launchd
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/dekopon-compat-venv/bin/python" ci/macos-compat-smoke.py \
+            --launchd \
             --bin-dir "$(brew --prefix dekopon)/bin" \
             --provider "$RUNNER_TEMP/jsonplaceholder-provider.wasm" \
+            --gh-provider "$RUNNER_TEMP/gh-provider.wasm" \
+            --cassette-bin "$(brew --prefix cassette)/bin/cassette" \
             | tee -a "$GITHUB_STEP_SUMMARY"
