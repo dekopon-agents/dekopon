@@ -203,6 +203,29 @@ impl MockServer {
         format!("http://{}", self.address)
     }
 
+    pub(crate) fn request_uris(&self) -> Vec<String> {
+        self.requests()
+            .iter()
+            .map(|request| {
+                let target = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let host = request
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                    .unwrap()
+                    .1
+                    .trim();
+                format!("http://{host}{target}")
+            })
+            .collect()
+    }
+
     pub(crate) fn requests(&self) -> Vec<String> {
         self.requests.lock().clone()
     }

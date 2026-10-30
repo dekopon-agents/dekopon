@@ -366,7 +366,7 @@ where
         candidate,
         broker_digest,
         gateway::ResidentModels {
-            credentials: configured,
+            credentials: Arc::clone(&configured),
             metering,
             proxy: boot_proxy,
         },
@@ -394,6 +394,7 @@ where
     readers.abort_all();
     owned_tasks.shutdown().await;
     thread_owner.shutdown().await;
+    configured.drain_credentials().await;
     assets.shutdown().await;
     while let Some(result) = readers.join_next().await {
         match result {

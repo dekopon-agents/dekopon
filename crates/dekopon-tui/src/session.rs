@@ -543,7 +543,7 @@ impl CancellationProbe for StopFlag {
 pub fn build_model(
     options: &ConsoleOptions,
     stop: &StopFlag,
-) -> Result<Box<dyn ChatModel + Send + Sync>, SessionError> {
+) -> Result<BlockingModel, SessionError> {
     let client = match &options.model_choice {
         ModelChoice::ChatGptSubscription { auth_file } => {
             let path = resolve_console_credential(auth_file.as_deref())?;
@@ -576,12 +576,12 @@ pub fn build_model(
             )?)
         }
     };
-    Ok(Box::new(BlockingModel::new(
+    Ok(BlockingModel::new(
         Arc::new(client),
         tokio::runtime::Handle::current(),
         stop.model_cancel(),
         options.model_timeout,
-    )))
+    ))
 }
 
 /// One agent hop: the leg, its granted surface, and the conversation it accumulates.

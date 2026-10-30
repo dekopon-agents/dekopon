@@ -431,7 +431,7 @@ async fn call(
         Err(error) => {
             tracing::warn!(target: "model", event = "proxy.upstream_failed", error.kind = error.kind(), error = %error, "proxy.upstream_failed");
             let outcome = match error {
-                SendError::Credential(_) | SendError::CredentialTask(_) => Outcome::NotSent,
+                SendError::Credential(_) => Outcome::NotSent,
                 SendError::Request(_) => Outcome::Failed,
             };
             if let Some(admission) = admission {
@@ -448,8 +448,6 @@ async fn call(
 enum SendError {
     #[error("Codex credential is unavailable")]
     Credential(#[source] dekopon_model::chatgpt::ChatGptError),
-    #[error("Codex credential task failed")]
-    CredentialTask(#[source] tokio::task::JoinError),
     #[error("upstream request failed")]
     Request(#[source] reqwest::Error),
 }
@@ -457,7 +455,7 @@ enum SendError {
 impl SendError {
     const fn kind(&self) -> &'static str {
         match self {
-            Self::Credential(_) | Self::CredentialTask(_) => "credential",
+            Self::Credential(_) => "credential",
             Self::Request(_) => "request",
         }
     }
@@ -520,18 +518,14 @@ async fn send(
     }
 }
 
-/// The credential file refreshes over blocking HTTP, so it runs on the blocking pool.
 async fn codex_credential(
     credential: &Arc<CredentialFile>,
     rejected: Option<Redacted<String>>,
 ) -> Result<dekopon_model::chatgpt::ResolvedCredential, SendError> {
-    let credential = Arc::clone(credential);
-    tokio::task::spawn_blocking(move || match rejected {
-        Some(rejected) => credential.force_refresh(&rejected),
-        None => credential.current(),
-    })
-    .await
-    .map_err(SendError::CredentialTask)?
+    match rejected {
+        Some(rejected) => credential.force_refresh(&rejected).await,
+        None => credential.current().await,
+    }
     .map_err(SendError::Credential)
 }
 

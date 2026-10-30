@@ -919,7 +919,8 @@ fn codex_client(
     auth_file: &Path,
     timeout: Duration,
 ) -> Result<CodexClient, InferenceError> {
-    let credential = CredentialFile::open(auth_file, timeout).map_err(AuthError::Credential)?;
+    let credential =
+        CredentialFile::open(auth_file, timeout, &[]).map_err(AuthError::Credential)?;
     CodexClient::with_credential(model, Arc::new(credential), timeout, &[])
 }
 
@@ -1049,6 +1050,7 @@ fn run() -> Result<u32, EvalError> {
             }
         }
     }
+    runtime.block_on(client.drain_credentials());
     Ok(failed)
 }
 

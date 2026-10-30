@@ -234,6 +234,7 @@ fn build_with(
                     .chatgpt_credential(
                         auth_file.as_deref(),
                         std::time::Duration::from_millis(*timeout_ms),
+                        model.ca_bundles(),
                     )
                     .map_err(|source| ProxyStartError::Codex {
                         model: name.clone(),

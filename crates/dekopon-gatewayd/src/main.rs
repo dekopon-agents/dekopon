@@ -53,10 +53,14 @@ fn main() -> ExitCode {
     let builder = runtime_builder(&cli).unwrap_or_else(|error| error.exit());
     match &cli.command {
         Some(cli::Command::Auth(options)) => {
-            return if auth_output::run(options) == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
+            return match bounded_runtime(builder, BLOCKING_EXIT_TIMEOUT, auth_output::run(options))
+            {
+                Ok(0) => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::FAILURE,
+                Err(error) => {
+                    eprintln!("dekopon-gatewayd: could not start the async runtime: {error}");
+                    ExitCode::FAILURE
+                }
             };
         }
         Some(cli::Command::Check(check)) => {

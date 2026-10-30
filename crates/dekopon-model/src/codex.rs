@@ -49,7 +49,8 @@ impl CodexClient {
         let model = model.into();
         Self::validate(&model, timeout)?;
         let path = resolve_auth_path(auth_path).map_err(AuthError::Credential)?;
-        let credential = CredentialFile::open(&path, timeout).map_err(AuthError::Credential)?;
+        let credential = CredentialFile::open(&path, timeout, extra_ca_bundles)
+            .map_err(AuthError::Credential)?;
         Self::configured(
             model,
             Arc::new(credential),
@@ -159,19 +160,20 @@ impl CodexClient {
                 .unrefreshed()
                 .map_err(|source| AuthError::Credential(source).into());
         }
-        let credential = Arc::clone(&self.credential);
-        let span = tracing::Span::current();
         control
-            .run(tokio::task::spawn_blocking(move || {
-                span.in_scope(|| match mode {
-                    RefreshMode::IfNeeded => credential.current(),
-                    RefreshMode::Forced(rejected) => credential.force_refresh(&rejected),
-                })
-            }))
+            .run(async {
+                match mode {
+                    RefreshMode::IfNeeded => self.credential.current().await,
+                    RefreshMode::Forced(rejected) => self.credential.force_refresh(&rejected).await,
+                }
+            })
             .await
             .inspect_err(|_| record_phase(FailurePhase::BeforeSend))?
-            .map_err(TransportFailure::Blocking)?
             .map_err(credential_failure)
+    }
+
+    pub async fn drain_credentials(&self) {
+        self.credential.drain().await;
     }
 
     async fn exchange(
