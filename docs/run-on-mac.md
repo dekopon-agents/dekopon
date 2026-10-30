@@ -1,16 +1,18 @@
 # Run Dekopon on a Mac
 
 For an always-on Apple Silicon Mac, use the native release binaries and **launchd**, with a
-separate user for each daemon. Start with one Slack bot, one explicitly selected OpenRouter
+separate user for each daemon. Start with a Slack Agent app, one explicitly selected OpenRouter
 model, and a dedicated prepaid API key with an OpenRouter spending limit. This path needs no
 local model, Docker, Kubernetes, Linux VM, or Firecracker.
 
 **Status: released building blocks; manual setup.** The release and tap supply executables,
 not a configured Mac service. There is no native installer or account-provisioning command. The
-[Slack starter](../examples/mac-slack/README.md) has been checked with released binaries on Linux;
+[harmless Slack Agent starter](../examples/mac-slack/README.md) has been checked with released binaries on Linux;
 its actual Mac/Slack/OpenRouter acceptance remains an operator step. The broker requires an installed compatible provider, and the
 gateway refuses a sender with no granted capability: a provider-free chat bot is not currently
-supported. Complete the acceptance checks below before replacing an existing agent.
+supported. For useful GitHub work, follow the [Slack Agent review-channel guide](../examples/slack-github/README.md):
+it maps an owner and colleague to explicit read profiles and keeps the PAT in the broker. Complete
+the acceptance checks below before replacing an existing agent.
 
 ## Choose the process manager
 
@@ -94,6 +96,28 @@ run `brew --prefix dekopon` and substitute that literal prefix plus `/bin/` for 
 expand `$(brew --prefix dekopon)` or `~` in a plist. Account, configuration and directory setup is
 still required, and the Homebrew prefix must not be writable by either daemon account.
 
+### Manual Homebrew compatibility check
+
+The [macOS compatibility workflow](../.github/workflows/macos-compat.yml) installs the real tap
+on GitHub's ARM64 `macos-15` runner. It checks the installed release and Mach-O architecture,
+then runs a minimal provider-backed turn with the installed broker and gateway, a pinned
+JSONPlaceholder component, and loopback model/API fixtures. It uses no Slack, OpenRouter or
+GitHub PAT credentials and does not build replacement daemon binaries.
+
+Once that workflow exists on the repository's default branch, a maintainer can run it manually:
+
+```console
+gh workflow run macos-compat.yml --repo dekopon-agents/dekopon --ref main
+gh run list --repo dekopon-agents/dekopon --workflow macos-compat.yml --event workflow_dispatch --limit 5
+```
+
+GitHub requires the workflow to be on the default branch before dispatch; selecting a draft
+branch with `--ref` does not register a new workflow. This lane is manual, not a required PR
+check. Its one-user, read-only process smoke does not prove separate-user permissions, launchd,
+sleep/logout/reboot recovery, Gatekeeper behavior or live integrations. Complete those checks
+below even after a green run. The [development instructions](development.md#macos-homebrew-compatibility)
+also explain how to run the same fixture locally.
+
 ### From a checkout
 
 Source installation is for operators prepared to maintain a Rust toolchain. Use the compiler
@@ -113,13 +137,31 @@ crates have finished publishing. Neither method installs providers or a service.
 
 ## Prepare Slack and the model
 
-Use the [classic Slack manifest from the release](https://github.com/dekopon-agents/dekopon/blob/v0.72.0/examples/slack/manifest.yaml)
-for a free or paid workspace.
+Use the [Slack Agent manifest from the release](https://github.com/dekopon-agents/dekopon/blob/v0.72.0/examples/slack/manifest-agent.yaml).
+It enables Slack's Agent view and native Working/Stop session UI. The workspace plan and admin
+policy must allow those features. It still uses **Socket Mode**, with the same two credentials;
+Agent API support does not introduce a public listener or webhook URL.
+
 The [Slack setup guide](../examples/slack/README.md#create-the-app-and-credentials) owns app
-creation: create the app from the manifest, generate an `xapp-…` token with `connections:write`,
-install it to the workspace, and obtain its `xoxb-…` bot token. Socket Mode opens outbound
-connections; no public listener, port forwarding or webhook URL is required. Start with DMs from
-one mapped sender; invite the bot and add a specific channel route only when needed.
+creation: create the app from this manifest, generate an `xapp-…` token with `connections:write`,
+install it to the workspace, and obtain its `xoxb-…` bot token. For the
+[GitHub review channel](../examples/slack-github/README.md), invite the bot to one channel and map
+the owner, colleague and channel separately. Use a private channel whose members may see the
+repository code and findings: invocation grants do not hide replies from other channel members,
+and reviewed content also reaches the configured model. The [harmless DM starter](../examples/mac-slack/README.md)
+can first prove the model and provider path without a GitHub PAT.
+
+Pair the Agent manifest with `experience: agent`. Agent DMs and channel continuations are scoped
+to threads; a new channel conversation requires a mention. A freshly authorized sender can
+continue their owned thread without mentioning again. Another participant must mention and
+pass their own authorization. Agent mode uses Slack's Stop control; `cancelButton: true` is
+invalid for this profile. Stop is cooperative and cannot undo a GitHub effect already sent.
+
+A permanent Agent-status error such as `feature_disabled` can fall back to a configured reaction;
+that changes the indicator, not the thread semantics or workspace entitlement. Verify native
+Working/Stop during acceptance. If the workspace cannot use the Agent profile, deliberately
+choose the [classic manifest](../examples/slack/manifest.yaml) and `experience: classic` instead;
+it is a separate installation choice, not promised Agent API parity.
 
 Create a **dedicated OpenRouter key** with a finite USD limit and an explicit reset policy (for
 example monthly, or no reset for a fixed trial allocation). Verify the saved key's limit and
@@ -129,7 +171,8 @@ shared across keys; a separate key makes this installation's usage and revocatio
 See OpenRouter's [key limits](https://openrouter.ai/docs/api/api-reference/api-keys/create-a-new-api-key)
 and [BYOK billing](https://openrouter.ai/docs/guides/overview/auth/byok).
 
-The OpenRouter key limit is the dollar control. Dekopon's optional meter counts **raw input plus
+The OpenRouter key limit controls requests billed through that key; separately billed provider
+tools are outside it. Dekopon's optional meter counts **raw input plus
 output tokens**, not dollars; it resets on restart without best-effort telemetry restore and can
 settle above its reservation. Background memory summaries are not refused by that local meter.
 OpenRouter's own [in-flight accounting](https://openrouter.ai/docs/api_reference/limits) also has
@@ -153,9 +196,35 @@ export OPENROUTER_API_KEY='REPLACE_WITH_DEDICATED_KEY'
 
 Use mode `0600` under a `0700` gateway-owned directory. This is a shell file: keep the fixed
 variable names, quote values, and source only your own file. Create it with an editor rather than
-pasting secrets into a command that will remain in shell history. Do not put values in YAML,
-plists, agent instructions, a repository, or `launchctl setenv`. launchd does not inherit your
-interactive shell's exports. Provider credentials, if added later, belong only to the broker.
+pasting secrets into a command that will remain in shell history. Do not put these values in
+gateway configuration YAML, plists, agent instructions, a repository, or `launchctl setenv`.
+launchd does not inherit your interactive shell's exports or automatically read `.env` files.
+The gateway wrapper below explicitly sources this private shell file; its filename is not a
+built-in dotenv feature. Provider credentials belong only to the broker.
+
+### GitHub PAT under launchd
+
+For GitHub tools, use the [review-channel guide's private credential file](../examples/slack-github/README.md#keep-the-github-pat-in-the-broker)
+at `/usr/local/etc/dekopon/broker/broker-credentials.yaml`. The broker loads it through
+`credentialsPath` in its own configuration and selects the symbolic `github-pat` binding for
+permitted capabilities. Its native HTTP host adds the Authorization header for `api.github.com`;
+the provider Wasm, gateway and model never receive the PAT. Both Slack users borrow this same
+GitHub credential: Dekopon audits their distinct Slack identities, while GitHub sees the PAT
+account. Their own GitHub logins are not independently checked.
+
+This is intentionally a **private credentials YAML file containing the literal secret**, owned
+by `_dekopon_broker`, mode `0600`, under its `0700` directory. It is separate from ordinary
+broker configuration, which contains references. Use an editor to create it privately, not a
+command line containing the token. The broker launchd plist below runs the binary directly and
+needs no `EnvironmentVariables` entry or secret-loading wrapper.
+
+Setting `GITHUB_TOKEN` in a plist or sourcing a broker `.env` does not populate this credential:
+the released broker has no dotenv loader and this bearer-token field does not expand `${...}`.
+Do not add the PAT to the gateway's `credentials.env`; that would give the wrong process the
+secret. Keep the file out of Git and ordinary logs/backups. Rotate it privately, stop the gateway
+then the broker, and restart broker then gateway to load the replacement. The review guide
+separates read access from optional publishing permission; a broader PAT alone grants no
+additional Dekopon capability.
 
 ## Prepare the broker and gateway
 
@@ -185,15 +254,16 @@ path under the broker's private directory. Direct paths compile at each broker b
 stores require sync/precompile for the selected host. Do not copy an old bundled provider or a
 compiled cache from another CPU/release. The core archive and tap contain no starter provider.
 
-The [Mac Slack starter](../examples/mac-slack/README.md) supplies the broker configuration,
-Cedar policy, agent catalog and budgeted OpenRouter gateway configuration together, using the
-released JSONPlaceholder provider for one harmless GET capability. Replace its numeric UIDs,
+Choose one complete example: the [Slack Agent review channel](../examples/slack-github/README.md)
+for GitHub tools and owner/colleague profiles, or the [harmless DM starter](../examples/mac-slack/README.md)
+using JSONPlaceholder before adding a PAT. Each supplies broker configuration, Cedar policy,
+an agent catalog and budgeted OpenRouter gateway configuration. Replace its numeric UIDs,
 Slack team/member IDs and model placeholder before checking it. The peer principal must be
 exactly `dekopon-gatewayd`; another name can pass config checks and still fail gateway boot.
 The broker also maps its own UID for the operator probe.
 
-The starter selects classic Slack DMs, one concurrent session, bounded tool/output/history
-limits, and a rolling token meter. It keeps recent text only in memory; restart loses it.
+The harmless starter selects Slack Agent DMs, one concurrent session, bounded tool/output/history
+limits, and a rolling token meter. The review-channel example scopes routes and grants to one channel. It keeps recent text only in memory; restart loses it.
 Attachments, journal summaries, follow, ambient triggers, wakes, detached jobs and the guest model
 proxy are not enabled. Its numeric bounds are a starting point, not a price estimate. Add durable
 history only after choosing retention and accounting for its additional inference. The complete
