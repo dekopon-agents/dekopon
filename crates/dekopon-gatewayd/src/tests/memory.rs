@@ -2318,7 +2318,7 @@ async fn a_degrade_never_orphans_a_call() {
 
 #[test]
 fn a_narrowed_grant_or_a_seal_stops_admission_past_side_lines() {
-    use dekopon_agent::memory_tools::{MemoryRefusal, MemoryTools as _, Rung};
+    use dekopon_agent::memory_tools::{MemoryRefusal, MemoryTools as _, Rung, Target};
     let journal_dir = temporary();
     let journal = crate::journal::Journal::open(
         journal_dir.path(),
@@ -2405,27 +2405,16 @@ fn a_narrowed_grant_or_a_seal_stops_admission_past_side_lines() {
     assert!(after_narrowing.grant_boundary);
     let narrowed = tools(&narrow, None);
     assert!(matches!(
-        narrowed.read(
-            dekopon_agent::memory_tools::Target::Record(wide_record.0.get()),
-            "native",
-            None
-        ),
+        narrowed.read(Target::Record(wide_record.0.get()), "native", None),
         Err(MemoryRefusal::RecordIneligible)
     ));
     assert!(matches!(
-        narrowed.set_pin(
-            dekopon_agent::memory_tools::Target::Record(wide_record.0.get()),
-            "metadata"
-        ),
+        narrowed.set_pin(Target::Record(wide_record.0.get()), "metadata"),
         Err(MemoryRefusal::RecordIneligible)
     ));
     assert!(
         narrowed
-            .read(
-                dekopon_agent::memory_tools::Target::Record(narrow_record.0.get()),
-                "native",
-                None
-            )
+            .read(Target::Record(narrow_record.0.get()), "native", None)
             .is_ok()
     );
     assert!(narrowed.into_pins().is_empty());
@@ -2447,27 +2436,16 @@ fn a_narrowed_grant_or_a_seal_stops_admission_past_side_lines() {
     assert!(!after_seal.grant_boundary);
     let sealed = tools(&narrow, Some(crate::journal::millis(sealed_at)));
     assert!(matches!(
-        sealed.read(
-            dekopon_agent::memory_tools::Target::Record(narrow_record.0.get()),
-            "native",
-            None
-        ),
+        sealed.read(Target::Record(narrow_record.0.get()), "native", None),
         Err(MemoryRefusal::RecordIneligible)
     ));
     assert!(matches!(
-        sealed.set_pin(
-            dekopon_agent::memory_tools::Target::Record(narrow_record.0.get()),
-            "native"
-        ),
+        sealed.set_pin(Target::Record(narrow_record.0.get()), "native"),
         Err(MemoryRefusal::RecordIneligible)
     ));
     assert!(
         sealed
-            .read(
-                dekopon_agent::memory_tools::Target::Record(resumed.0.get()),
-                "native",
-                None
-            )
+            .read(Target::Record(resumed.0.get()), "native", None)
             .is_ok()
     );
 }
@@ -2714,13 +2692,15 @@ async fn a_native_pin_replays_the_file_and_shares_the_request_bound() {
         answer("again"),
     ]);
     models.capture_images.store(true, Ordering::Relaxed);
-    let session_assets = SessionAssets::new(
-        Arc::clone(&world.store),
-        world.access.clone(),
-        None,
-        tokio::runtime::Handle::current(),
-        true,
-    );
+    let session_assets = || {
+        SessionAssets::new(
+            Arc::clone(&world.store),
+            world.access.clone(),
+            None,
+            tokio::runtime::Handle::current(),
+            true,
+        )
+    };
     let current = tokio::runtime::Handle::current();
     let (_cancel, cancelled) = tokio::sync::watch::channel(false);
     let model = models
@@ -2728,6 +2708,7 @@ async fn a_native_pin_replays_the_file_and_shares_the_request_bound() {
         .unwrap();
     let prior = first.prior.clone();
     let runner = Arc::clone(&models);
+    let first_assets = session_assets();
     tokio::task::spawn_blocking(move || {
         run_prompt_session(
             model.as_ref(),
@@ -2739,7 +2720,7 @@ async fn a_native_pin_replays_the_file_and_shares_the_request_bound() {
                     max_capability_calls: 0,
                 },
             )
-            .with_assets(&session_assets)
+            .with_assets(&first_assets)
             .with_native_asset_bytes(first.assets.native_bytes as usize),
             &first.messages,
         )
@@ -2757,13 +2738,7 @@ async fn a_native_pin_replays_the_file_and_shares_the_request_bound() {
     let model = models
         .build_bound(&Arc::new(model_config()), current, cancelled)
         .unwrap();
-    let session_assets = SessionAssets::new(
-        Arc::clone(&world.store),
-        world.access.clone(),
-        None,
-        tokio::runtime::Handle::current(),
-        true,
-    );
+    let session_assets = session_assets();
     tokio::task::spawn_blocking(move || {
         run_prompt_session(
             model.as_ref(),

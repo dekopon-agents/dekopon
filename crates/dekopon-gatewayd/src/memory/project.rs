@@ -212,6 +212,19 @@ fn is_object(file: &File, offset: u64, len: u64) -> Result<bool, JournalError> {
     })
 }
 
+fn asset_positions(
+    head: &Head,
+    item: u32,
+    next_item: u32,
+    at: usize,
+) -> impl Iterator<Item = (u32, usize)> {
+    head.header
+        .arrived
+        .iter()
+        .filter(move |asset| asset.item > item && asset.item < next_item)
+        .map(move |asset| (asset.item, at))
+}
+
 /// Verbatim steps within the record's share: text items first, then exchanges, cutting only
 /// result text; an argument that does not fit, or is not an object, becomes `{"cut":N}`.
 fn native(
@@ -258,11 +271,7 @@ fn native(
                     first.len,
                 )?]));
                 let next_item = spans.get(index).map_or(u32::MAX, |span| span.item);
-                for asset in &head.header.arrived {
-                    if asset.item > item && asset.item < next_item {
-                        positions.push((asset.item, out.len()));
-                    }
-                }
+                positions.extend(asset_positions(head, item, next_item, out.len()));
             }
             Field::Assistant { .. } => {
                 if step.started() {
@@ -393,7 +402,12 @@ fn asset_text(rows: &[assets::Row]) -> u64 {
 
 fn projected_cost(head: &Head, rung: Option<Rung>, native: &Native, rows: &[assets::Row]) -> u64 {
     let text = match rung {
-        Some(Rung::Native | Rung::Summary(_)) => asset_text(rows),
+        Some(Rung::Native) => asset_text(rows),
+        Some(Rung::Summary(_)) => rows
+            .iter()
+            .filter_map(assets::Row::line)
+            .map(|line| line.len() as u64 + 1)
+            .sum(),
         Some(Rung::Metadata) | None => 0,
     };
     cost(head, rung, native.bytes) + text
