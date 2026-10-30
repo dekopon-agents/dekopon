@@ -111,7 +111,7 @@ where
         warning.log();
     }
     let candidate = match candidate {
-        Some(Loaded::Candidate(candidate)) => candidate,
+        Some(Loaded::Candidate(candidate)) => *candidate,
         Some(Loaded::Unchanged) | None => {
             return Err(BrokerdError::from_problems(report.problems));
         }
@@ -295,7 +295,7 @@ struct Candidate {
 }
 
 enum Loaded {
-    Candidate(Candidate),
+    Candidate(Box<Candidate>),
     Unchanged,
 }
 
@@ -423,7 +423,7 @@ impl Coordination {
                     return (active.digest.clone(), GenerationOutcome::Active);
                 }
                 Loaded::Candidate(next) => {
-                    let next = Arc::new(next);
+                    let next = Arc::<Candidate>::from(next);
                     state.prepared = Some((uid, active, Arc::clone(&next)));
                     next
                 }
@@ -713,7 +713,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                 }
             };
             (
-                Some(Loaded::Candidate(Candidate {
+                Some(Loaded::Candidate(Box::new(Candidate {
                     digest,
                     fingerprint,
                     ready,
@@ -724,7 +724,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                     assets,
                     locked_providers,
                     snapshot,
-                })),
+                }))),
                 report,
             )
         }
