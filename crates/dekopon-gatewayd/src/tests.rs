@@ -1064,7 +1064,7 @@ async fn attachment_summaries_with_a_queue_below_two_refuse_at_load() {
 
 #[tokio::test(start_paused = true)]
 async fn an_image_summary_route_without_an_image_model_refuses_at_load() {
-    use crate::config::memory::{AttachmentSummaries, PolicyProblem};
+    use crate::config::memory::{AttachmentSummaries, PolicyProblem, Toggle};
     let directory = temporary();
     let mut input = document(directory.path());
     input["sessions"] = json!({"journal":{"path":"journal"},"assets":{"path":"assets"},
@@ -1116,7 +1116,10 @@ async fn an_image_summary_route_without_an_image_model_refuses_at_load() {
             .as_ref()
             .unwrap()
             .attachments,
-        AttachmentSummaries::default()
+        AttachmentSummaries {
+            images: Toggle::Off,
+            documents: Toggle::Off
+        }
     );
 }
 
