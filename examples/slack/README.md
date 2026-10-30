@@ -132,7 +132,7 @@ labels, so name the accepted set in the route instructions.
 Each file goes through `files.getUploadURLExternal`, a tokenless upload to Slack's returned,
 origin-checked URL, then `files.completeUploadExternal` to the authenticated channel or thread.
 The bot token goes only to the two Web API calls, never to the upload URL.
-[Asset handles](../../docs/gatewayd.md#asset-handles-and-delivery) lists the bounds.
+[Asset handles](../../docs/gateway-assets.md#asset-handles-and-delivery) lists the bounds.
 
 ## Configure in-flight indicators
 
@@ -163,7 +163,7 @@ indicators:
 ```
 
 - `statusText: true` shows notes from a route with `progressNotes: true`; omit it for native status
-  only. The [status-text contract](../../docs/gatewayd.md#slack-socket-mode) covers its lease and
+  only. The [status-text contract](../../docs/gateway-transports.md#slack-socket-mode) covers its lease and
   hidden Stop control.
 - With `reaction.seen: on` on the resolved route, accepted steers and queued non-wake messages get
   a best-effort `eyes`. It acknowledges admission, not permission to run.
@@ -176,7 +176,7 @@ indicators:
 - Stop is cooperative: it blocks further model turns and capability calls, drops the stale answer
   and its history commit, and posts `Stopped.`. A model request or provider effect already running
   cannot be rolled back
-  ([stopping a run](../../docs/gatewayd.md#liveness-progress-and-stopping-a-run)).
+  ([stopping a run](../../docs/gateway-liveness.md#liveness-progress-and-stopping-a-run)).
 
 ## Follow a thread
 
@@ -186,6 +186,6 @@ only when useful, and runs each batch under its newest speaker's fresh authoriza
 
 `mute`, a configured stop word, an authorized `follow leave`, a human thumbs-down on an agent
 message in the thread, or expiry ends following; only a delivered reply renews the 24-hour ticket.
-[Slack thread follow](../../docs/gatewayd.md#slack-thread-follow) covers batching and installation.
+[Slack thread follow](../../docs/gateway-transports.md#slack-thread-follow) covers batching and installation.
 For top-level PR links, also set
-[`ambient.pullRequestLinks`](../../docs/gatewayd.md#slack-pull-request-links).
+[`ambient.pullRequestLinks`](../../docs/gateway-transports.md#slack-pull-request-links).

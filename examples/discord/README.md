@@ -43,7 +43,7 @@ model sees bounded metadata first and downloads bytes only if it calls `fetch_ch
    guild messages that mention the bot user. A mention of the bot's managed role, which renders as
    the same "@" pill, arrives without its text unless **Message Content Intent** is on and the
    transport sets `messageContent: true`; see
-   [How @mentions reach the bot on Discord](../../docs/gatewayd.md#how-mentions-reach-the-bot-on-discord).
+   [How @mentions reach the bot on Discord](../../docs/gateway-transports.md#how-mentions-reach-the-bot-on-discord).
 
 The transport implements heartbeat ACK detection, Resume after reconnect, Invalid Session handling,
 fatal close-code handling, identify/session-start limits, and jittered reconnect backoff. Slash
@@ -95,7 +95,7 @@ limits are cosmetic and never alter the answer.
 `progress: message` adds one editable message that says what the session is doing and becomes the
 answer at the end, and `cancelButton: true` puts a Stop button on it. A reply of `stop` or `cancel`
 in the same conversation does the same thing on any transport — see
-[Liveness, progress, and stopping a run](../../docs/gatewayd.md#liveness-progress-and-stopping-a-run).
+[Liveness, progress, and stopping a run](../../docs/gateway-liveness.md#liveness-progress-and-stopping-a-run).
 
 ## 3. Map Discord users at the broker
 

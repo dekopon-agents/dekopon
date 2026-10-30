@@ -50,9 +50,9 @@ model spend is the `meter` record below.
 
 ### The `meter` charge record
 
-Every model call — the agent's own and one a guest makes through the [model proxy](gatewayd.md#guest-model-proxy) — writes exactly
+Every model call — the agent's own and one a guest makes through the [model proxy](gateway-models.md#guest-model-proxy) — writes exactly
 one OTLP log record on the `meter` target, message `model call charged`, whether or not its agent
-has a [token budget](gatewayd.md#token-budgets). It is a log record rather than a span event
+has a [token budget](gateway-models.md#token-budgets). It is a log record rather than a span event
 because the log queue carries only `job` and `meter`, while the span queue carries every debug span
 and is the one that fills. The trace filter does not include `meter`.
 
@@ -76,7 +76,7 @@ zeros; restore skips both. A post-admission `NotSent` is `failed` and carries it
 kind; only pre-admission budget refusal is `refused`. Every number is recorded as an integer, so
 neither OpenObserve nor Quickwit sees it as a string. The boot restore that reads these records logs one `meter.restore`
 record on the same target: at info with the row count when it applies, at warn with `error.kind`
-when it keeps the live meters ([best effort](gatewayd.md#restoring-token-windows-at-boot-is-best-effort)).
+when it keeps the live meters ([best effort](gateway-models.md#restoring-token-windows-at-boot-is-best-effort)).
 
 ### Counting exported accounting
 
@@ -584,7 +584,7 @@ when a person's message went unserved (`content-withheld`, `malformed-envelope`,
 `content-withheld` drop records `mention.roles` on both, true when the message mentioned any role:
 a mention of the bot's managed role renders as the bot but is not a user mention, so Discord withholds
 its content unless the transport sets `messageContent: true`
-([How @mentions reach the bot on Discord](gatewayd.md#how-mentions-reach-the-bot-on-discord)).
+([How @mentions reach the bot on Discord](gateway-transports.md#how-mentions-reach-the-bot-on-discord)).
 
 A WhatsApp group payload is the one drop that does not use the field. One `transport.receive` span
 covers a whole delivery, so a `drop.reason` there would be overwritten by the next message in the
@@ -608,7 +608,7 @@ Direct WIT writer calls record guest-list length and copied-byte count: oversize
 rejected before a payload copy. These are payload-copy bounds, not process RSS measurements.
 **Current:** content-type labels remain authoritative; gateway intake compares a bounded decoded
 prefix and emits the existing `gateway.asset.content_type_mismatch` event once on disagreement, with metadata
-only (see [asset handles](gatewayd.md#asset-handles-and-delivery)). The broker does not sniff labels. Native `asset.encode` and `asset.decode` spans carry `bytes` and
+only (see [asset handles](gateway-assets.md#asset-handles-and-delivery)). The broker does not sniff labels. Native `asset.encode` and `asset.decode` spans carry `bytes` and
 `duration_us`. Streamed HTTP uses the same `http.request` span and `accounting.http.request`
 record as buffered HTTP, including refused attempts; its request byte count is the exact total
 body length, while its request grant bounds literal parts only. An `asset.send` capability uses
@@ -777,7 +777,7 @@ carries a phone number, a WABA identifier, a message ID, or message text.
 
 ### What conversation history changes
 
-A route set to `mode: persistent` — the contract is in [`gatewayd.md`](gatewayd.md#conversations) —
+A route set to `mode: persistent` — the contract is in [`gatewayd.md`](gateway-conversations.md#conversations) —
 is the default and changes the meaning of a field that already exists. A route explicitly set to
 `oneShot` replays no history.
 
@@ -856,7 +856,7 @@ of every person-originated prompt sent to the selected model provider independen
 Every model request declares the key (`prompt_cache_key`; `session_id` on OpenRouter) — one per
 conversation on a `persistent` route, one per bound route on a `oneShot` one. OpenRouter can
 additionally mark an explicit system prefix.
-[`gatewayd.md`](gatewayd.md#the-prompt-cache-key) has the local key contract; two things follow for telemetry.
+[`gatewayd.md`](gateway-conversations.md#the-prompt-cache-key) has the local key contract; two things follow for telemetry.
 
 **`usage.cached_input_tokens` is how you find out whether it works.** Plot its ratio to
 `usage.input_tokens` on a conversation's second and later turns, the requests that repeat a prefix
