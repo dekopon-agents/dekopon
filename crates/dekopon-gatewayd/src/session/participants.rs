@@ -189,6 +189,7 @@ impl SessionGate {
                 if queued.kind == FollowUpKind::MappingPending {
                     queued.kind = FollowUpKind::Turn;
                     if mapped
+                        && running.participation == TurnParticipation::Ordinary
                         && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
                     {
                         running.steers.push_back(queued.message);

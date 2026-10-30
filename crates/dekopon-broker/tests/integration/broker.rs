@@ -1436,6 +1436,7 @@ async fn a_request_template_pins_the_attested_conversation_and_needs_a_chat_scop
         agent("provider-test"),
         dekopon_broker::ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "family-slack".parse().expect("transport"),
             kind: dekopon_broker::ChatTransportKind::Slack,
             conversation: dekopon_broker::Conversation {
@@ -3107,6 +3108,7 @@ fn smoke_claim() -> Attestation {
         agent("some-agent"),
         dekopon_broker::ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "console-smoke".parse().expect("transport"),
             kind: dekopon_broker::ChatTransportKind::Local,
             conversation: dekopon_broker::Conversation {
@@ -4014,6 +4016,7 @@ async fn a_spaces_request_forbid_stops_http_before_the_network() {
         agent("provider-test"),
         dekopon_broker::ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "slack".parse().expect("transport"),
             kind: dekopon_broker::ChatTransportKind::Slack,
             conversation: dekopon_broker::Conversation {
@@ -4101,6 +4104,7 @@ async fn a_space_only_policy_error_records_its_id() {
         agent("provider-test"),
         dekopon_broker::ChatScopeClaim {
             participant: None,
+            github: None,
             transport: "slack".parse().expect("transport"),
             kind: dekopon_broker::ChatTransportKind::Slack,
             conversation: dekopon_broker::Conversation {

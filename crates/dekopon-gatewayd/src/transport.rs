@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
     progress::ProgressText,
+    wake::WakeOrigin,
 };
 use futures_util::future::BoxFuture;
 use thiserror::Error;
@@ -59,6 +60,7 @@ pub(crate) struct InboundMessage {
     /// Reference lines naming attachments are appended by the session, not the transport, because
     /// AssetStore assigns the numbers and a transport minting its own would collide.
     pub text: String,
+    pub pull_request_links: Option<crate::pull_request_links::PullRequestLinkContext>,
     pub assets: Vec<PendingAsset>,
     pub asset_overflow: bool,
     /// Discord sets addressed to Some(false) deliberately from its authenticated mentions array so
@@ -81,11 +83,12 @@ pub(crate) struct InboundMessage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MessageId {
     Native(String),
-    Github(Box<github::GithubBatch>),
+    Github(Box<dekopon_core::github::GithubBatch>),
     Follow(String),
     Wake {
         id: WakeId,
         notice: String,
+        origin: WakeOrigin,
     },
     Job {
         id: dekopon_process::JobId,
@@ -94,10 +97,24 @@ pub(crate) enum MessageId {
 }
 
 impl MessageId {
+    pub(crate) const fn wake_origin(&self) -> Option<&WakeOrigin> {
+        match self {
+            Self::Wake { origin, .. } => Some(origin),
+            Self::Native(_) | Self::Github(_) | Self::Follow(_) | Self::Job { .. } => None,
+        }
+    }
+
     pub(crate) const fn trigger(&self) -> Trigger {
         match self {
             Self::Native(_) | Self::Follow(_) | Self::Github(_) => Trigger::Message,
-            Self::Wake { .. } => Trigger::Wake,
+            Self::Wake {
+                origin: WakeOrigin::Digest,
+                ..
+            } => Trigger::Probe,
+            Self::Wake {
+                origin: WakeOrigin::Scheduled | WakeOrigin::Subscription(_),
+                ..
+            } => Trigger::Wake,
             Self::Job { .. } => Trigger::Job,
         }
     }
@@ -107,7 +124,7 @@ impl fmt::Display for MessageId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Native(id) | Self::Follow(id) => formatter.write_str(id),
-            Self::Github(batch) => formatter.write_str(&batch.lead().delivery),
+            Self::Github(batch) => formatter.write_str(batch.lead().delivery.as_str()),
             Self::Wake { id, .. } => write!(formatter, "wake-{id}"),
             Self::Job { id, .. } => write!(formatter, "job-{id}"),
         }

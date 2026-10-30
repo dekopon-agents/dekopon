@@ -663,7 +663,11 @@ impl logs::LogProcessor for EventArrayProcessor {
     fn emit(&self, record: &mut logs::SdkLogRecord, _: &opentelemetry::InstrumentationScope) {
         use opentelemetry::logs::LogRecord as _;
         let context = opentelemetry::Context::current();
-        if let Some(array) = context.get::<crate::EventStringArray>() {
+        for array in context
+            .get::<crate::EventStringArrays>()
+            .into_iter()
+            .flat_map(|arrays| arrays.iter())
+        {
             record.add_attribute(
                 array.name,
                 opentelemetry::logs::AnyValue::ListAny(Box::new(
@@ -671,7 +675,24 @@ impl logs::LogProcessor for EventArrayProcessor {
                         .values
                         .iter()
                         .cloned()
-                        .map(opentelemetry::logs::AnyValue::from)
+                        .map(|value| match value {
+                            opentelemetry::Value::String(value) => {
+                                opentelemetry::logs::AnyValue::from(value)
+                            }
+                            opentelemetry::Value::I64(value) => {
+                                opentelemetry::logs::AnyValue::from(value)
+                            }
+                            opentelemetry::Value::Bool(value) => {
+                                opentelemetry::logs::AnyValue::from(value)
+                            }
+                            opentelemetry::Value::F64(value) => {
+                                opentelemetry::logs::AnyValue::from(value)
+                            }
+                            opentelemetry::Value::Array(value) => {
+                                opentelemetry::logs::AnyValue::from(value.to_string())
+                            }
+                            value => opentelemetry::logs::AnyValue::from(value.to_string()),
+                        })
                         .collect(),
                 )),
             );
@@ -716,9 +737,13 @@ mod event_array_tests {
             .build();
         let logger = provider.logger("array-test");
         crate::with_event_string_array("github.deliveries", &["first", "second"], || {
-            let mut record = logger.create_log_record();
-            record.add_attribute("outcome", "queued");
-            logger.emit(record);
+            crate::with_event_string_array("github.repository.names", &["one", "two"], || {
+                crate::with_event_string_array("github.actor.id", &[&1_i64, &2_i64], || {
+                    let mut record = logger.create_log_record();
+                    record.add_attribute("outcome", "queued");
+                    logger.emit(record);
+                });
+            });
         });
         logger.emit(logger.create_log_record());
         let records = capture.0.lock();
@@ -733,10 +758,28 @@ mod event_array_tests {
                 AnyValue::from("second")
             ]))
         );
+        let (_, names) = records[0]
+            .attributes_iter()
+            .find(|(key, _)| key.as_str() == "github.repository.names")
+            .unwrap();
+        assert_eq!(
+            names,
+            &AnyValue::ListAny(Box::new(vec![AnyValue::from("one"), AnyValue::from("two")]))
+        );
+        let (_, actors) = records[0]
+            .attributes_iter()
+            .find(|(key, _)| key.as_str() == "github.actor.id")
+            .unwrap();
+        assert_eq!(
+            actors,
+            &AnyValue::ListAny(Box::new(vec![AnyValue::Int(1), AnyValue::Int(2)]))
+        );
         assert!(
             !records[1]
                 .attributes_iter()
-                .any(|(key, _)| key.as_str() == "github.deliveries")
+                .any(|(key, _)| key.as_str() == "github.deliveries"
+                    || key.as_str() == "github.repository.names"
+                    || key.as_str() == "github.actor.id")
         );
     }
 }

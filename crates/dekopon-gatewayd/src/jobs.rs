@@ -120,17 +120,6 @@ impl Table {
             .find(|row| row.id == id && row.owner == *owner)
             .ok_or(JobRefusal::NotYours)
     }
-
-    fn evict_finished(&mut self) -> bool {
-        let Some(index) = self.rows.iter().position(|row| match row.state {
-            RowState::Running => false,
-            RowState::Finished { .. } => row.waiters == 0,
-        }) else {
-            return false;
-        };
-        self.rows.remove(index);
-        true
-    }
 }
 
 #[expect(
@@ -142,6 +131,7 @@ pub(crate) struct Jobs {
     ended: parking_lot::Condvar,
     permits: Arc<Semaphore>,
     maximum: usize,
+    pub(crate) thread_owner: Arc<crate::threads::Owner>,
     notices: mpsc::Sender<InboundMessage>,
     notice_receiver: Mutex<Option<mpsc::Receiver<InboundMessage>>>,
 }
@@ -151,7 +141,7 @@ impl Jobs {
         clippy::disallowed_types,
         reason = "owner: Jobs; bound: every wait is wait_for a WAIT_SLICE, re-checking cancellation and the deadline"
     )]
-    pub(crate) fn new(maximum: usize) -> Self {
+    pub(crate) fn new(maximum: usize, thread_owner: Arc<crate::threads::Owner>) -> Self {
         let (notices, receiver) = mpsc::channel(maximum);
         Self {
             table: Mutex::new(Table {
@@ -162,6 +152,7 @@ impl Jobs {
             ended: parking_lot::Condvar::new(),
             permits: Arc::new(Semaphore::new(maximum)),
             maximum,
+            thread_owner,
             notices,
             notice_receiver: Mutex::new(Some(receiver)),
         }
@@ -180,7 +171,8 @@ impl Jobs {
         anchor: Anchor,
         starter: Option<TraceParent>,
         text: Arc<str>,
-    ) -> Result<(JobRun, CancelSignal), JobRefusal> {
+        threads: &dekopon_process::ShellThreads,
+    ) -> Result<Admitted, JobRefusal> {
         let full = JobRefusal::Full {
             maximum: self.maximum,
         };
@@ -192,10 +184,28 @@ impl Jobs {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => return Err(full),
         };
-        let (handle, signal) = CancelSignal::pair();
-        if table.rows.len() >= self.maximum && !table.evict_finished() {
-            return Err(full);
+        let evict = if table.rows.len() >= self.maximum {
+            Some(
+                table
+                    .rows
+                    .iter()
+                    .position(|row| match row.state {
+                        RowState::Running => false,
+                        RowState::Finished { .. } => row.waiters == 0,
+                    })
+                    .ok_or(full)?,
+            )
+        } else {
+            None
+        };
+        let thread = self
+            .thread_owner
+            .reserve(threads)
+            .map_err(JobRefusal::Limit)?;
+        if let Some(index) = evict {
+            table.rows.remove(index);
         }
+        let (handle, signal) = CancelSignal::pair();
         let id = JobId::new(table.next);
         table.next += 1;
         table.rows.push_back(Row {
@@ -210,8 +220,8 @@ impl Jobs {
             waited: false,
         });
         drop(table);
-        Ok((
-            JobRun {
+        Ok(Admitted {
+            run: JobRun {
                 jobs: Arc::clone(self),
                 id,
                 anchor,
@@ -221,7 +231,8 @@ impl Jobs {
                 completed_span: None,
             },
             signal,
-        ))
+            thread,
+        })
     }
 
     /// Every ending passes through here exactly once. The permit is released under the table lock
@@ -423,6 +434,12 @@ impl Jobs {
             }
         }
     }
+}
+
+pub(crate) struct Admitted {
+    pub(crate) run: JobRun,
+    pub(crate) signal: CancelSignal,
+    pub(crate) thread: crate::threads::Ticket,
 }
 
 pub(crate) struct Notice {
@@ -748,11 +765,16 @@ impl Started {
 
 impl JobControl for JobContext {
     fn start(&self, seed: JobSeed) -> Result<JobId, JobRefusal> {
-        let (run, signal) = self.jobs.admit(
+        let Admitted {
+            run,
+            signal,
+            thread,
+        } = self.jobs.admit(
             self.owner.clone(),
             self.anchor.clone(),
             current_trace_parent(),
             Arc::clone(seed.text()),
+            seed.tree().shell_threads(),
         )?;
         let id = run.id;
         let tree = self.tree(&seed);
@@ -775,9 +797,17 @@ impl JobControl for JobContext {
         };
         let _runtime = self.runtime.enter();
         let subscriber = tracing::dispatcher::get_default(Clone::clone);
-        drop(tokio::task::spawn_blocking(move || {
+        match thread.spawn(crate::threads::Work::Job, move || {
             tracing::dispatcher::with_default(&subscriber, || started.run());
-        }));
+        }) {
+            Ok(result) => drop(result),
+            Err(error) => tracing::error!(
+                event = "gateway_job_thread_failed",
+                job.id = %id,
+                error.kind = ?error.kind(),
+                "gateway.job.thread.failed"
+            ),
+        }
         Ok(id)
     }
 

@@ -1285,6 +1285,26 @@ impl Default for BrokerLimits {
     }
 }
 
+fn space_subject(scope: &ChatScopeClaim) -> Option<ExternalSubject> {
+    match scope.conversation.kind {
+        ConversationKind::Channel | ConversationKind::Thread => {}
+        ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => return None,
+    }
+    let service = match scope.kind {
+        ChatTransportKind::Fauxlack => "fauxlack",
+        ChatTransportKind::Slack => "slack",
+        ChatTransportKind::Discord => "discord",
+        ChatTransportKind::Telegram
+        | ChatTransportKind::Whatsapp
+        | ChatTransportKind::Github
+        | ChatTransportKind::Local => return None,
+    };
+    let container = scope.conversation.container.as_deref()?;
+    format!("{service}.{container}.{}", scope.conversation.id)
+        .parse()
+        .ok()
+}
+
 /// Every value here comes from the broker's own authenticated-context view; caller-supplied
 /// proposal input is deliberately excluded so no policy can be made to depend on it.
 fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
@@ -1303,6 +1323,7 @@ fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
         trigger: context
             .chat_scope()
             .map(|scope| scope.trigger.as_str().to_owned()),
+        github: None,
         conversation: context.chat_scope().map(|scope| PolicyConversation {
             kind: scope.conversation.kind.as_str().to_owned(),
             container: scope.conversation.container.clone(),
@@ -2084,6 +2105,7 @@ where
                     errors_present: decision.policy.errors_present,
                     cause: decision.policy.refusal,
                     space: decision.space,
+                    github_denial: decision.github_denial,
                 })),
                 ..determined_refusal(reason, decision.policy.determining_policy_ids)
             });
@@ -2151,6 +2173,7 @@ where
                     errors_present: secret_errors,
                     cause: None,
                     space: decision.space.clone(),
+                    github_denial: secret_decision.github_denial,
                 })),
                 ..determined_refusal("secret-denied", decision.policy_ids.clone())
             });
@@ -2176,7 +2199,13 @@ where
             },
             context: policy_context(context),
         };
-        Self::evaluate(&self.policy, request, facts, context.space.as_ref())
+        Self::evaluate(
+            &self.policy,
+            request,
+            facts,
+            context.space.as_ref(),
+            context.chat_scope().and_then(|scope| scope.github.as_ref()),
+        )
     }
 
     fn evaluate(
@@ -2184,54 +2213,106 @@ where
         request: PolicyRequest,
         facts: Option<dekopon_policy::HttpRequestFacts>,
         space: Option<&PrincipalId>,
+        github: Option<&dekopon_core::github::GithubBatch>,
     ) -> EvaluatedDecision {
         let evaluate = |request, facts| match facts {
             Some(facts) => policy.authorize_http(request, facts),
             None => policy.authorize(request),
         };
-        if space.is_none() {
-            return EvaluatedDecision {
-                policy: evaluate(request, facts),
+        let mut contexts = Vec::new();
+        if let Some(batch) = github {
+            for event in batch.events() {
+                let full = match serde_json::to_value(event) {
+                    Ok(value) => value,
+                    Err(source) => {
+                        tracing::warn!(event="broker_policy_context_failed",error=%source,"broker.policy.context.failed");
+                        return EvaluatedDecision {
+                            policy: PolicyDecision {
+                                errors_present: true,
+                                refusal: Some("github-context".to_owned()),
+                                ..PolicyDecision::default()
+                            },
+                            space: None,
+                            github_denial: Some(GithubDenial {
+                                phase: GithubDenier::Facts,
+                                delivery: event.delivery.clone(),
+                            }),
+                        };
+                    }
+                };
+                let mut stripped = full.clone();
+                if let Some(record) = stripped.as_object_mut() {
+                    record.remove("authorSet");
+                }
+                for (value, phase) in [
+                    (stripped, GithubDenier::Facts),
+                    (full, GithubDenier::AuthorSet),
+                ] {
+                    let mut context = request.context.clone();
+                    context.github = Some(value);
+                    contexts.push((
+                        context,
+                        Some(GithubDenial {
+                            phase,
+                            delivery: event.delivery.clone(),
+                        }),
+                    ));
+                }
+            }
+        } else {
+            contexts.push((request.context.clone(), None));
+        }
+        let mut result = EvaluatedDecision {
+            policy: PolicyDecision {
+                allowed: true,
+                ..PolicyDecision::default()
+            },
+            space: None,
+            github_denial: None,
+        };
+        for (context, coordinate) in contexts {
+            let request = PolicyRequest {
+                context,
+                ..request.clone()
+            };
+            let asker = evaluate(request.clone(), facts.clone());
+            let mut pass = EvaluatedDecision {
+                policy: asker,
                 space: None,
+                github_denial: None,
             };
+            if let Some(id) = space.filter(|id| **id == request.principal) {
+                pass.space = Some(SpaceDecision {
+                    id: id.clone(),
+                    asker_allowed: None,
+                    allowed: Some(pass.policy.allowed),
+                    policy_ids: pass.policy.determining_policy_ids.clone(),
+                    denied_by: None,
+                });
+            } else if let Some(id) = space {
+                let mut verdict = evaluate(
+                    PolicyRequest {
+                        principal: id.clone(),
+                        ..request
+                    },
+                    facts.clone(),
+                );
+                pass.space = Some(SpaceDecision {
+                    id: id.clone(),
+                    asker_allowed: Some(pass.policy.allowed),
+                    allowed: Some(verdict.allowed),
+                    policy_ids: std::mem::take(&mut verdict.determining_policy_ids),
+                    denied_by: denying_principal(pass.policy.allowed, verdict.allowed),
+                });
+                merge_policy_decision(&mut pass.policy, verdict);
+            }
+            if !pass.policy.allowed && result.github_denial.is_none() {
+                result.github_denial = coordinate;
+            }
+            merge_policy_decision(&mut result.policy, pass.policy);
+            merge_space_decision(&mut result.space, pass.space);
         }
-        let mut asker = evaluate(request.clone(), facts.clone());
-        let space = space.map(|id| {
-            let verdict = evaluate(
-                PolicyRequest {
-                    principal: id.clone(),
-                    ..request
-                },
-                facts,
-            );
-            let denied_by = match (asker.allowed, verdict.allowed) {
-                (true, true) => None,
-                (false, true) => Some(DenyingPrincipal::Asker),
-                (true, false) => Some(DenyingPrincipal::Space),
-                (false, false) => Some(DenyingPrincipal::Both),
-            };
-            let result = SpaceDecision {
-                id: id.clone(),
-                asker_allowed: Some(asker.allowed),
-                allowed: Some(verdict.allowed),
-                policy_ids: verdict.determining_policy_ids,
-                denied_by,
-            };
-            asker.allowed &= verdict.allowed;
-            asker.errors_present |= verdict.errors_present;
-            asker
-                .erroring_policy_ids
-                .extend(verdict.erroring_policy_ids);
-            asker.erroring_policy_ids.sort();
-            asker.erroring_policy_ids.dedup();
-            asker.refusal = asker.refusal.take().or(verdict.refusal);
-            asker.opaque_body = asker.opaque_body.or(verdict.opaque_body);
-            result
-        });
-        EvaluatedDecision {
-            policy: asker,
-            space,
-        }
+        result
     }
 
     fn authorize_secret_use(
@@ -2255,6 +2336,7 @@ where
             },
             None,
             context.space.as_ref(),
+            context.chat_scope().and_then(|scope| scope.github.as_ref()),
         )
     }
 
@@ -2276,6 +2358,7 @@ where
             },
             None,
             context.space.as_ref(),
+            context.chat_scope().and_then(|scope| scope.github.as_ref()),
         )
     }
 
@@ -2770,7 +2853,17 @@ where
             }
             return (refused(), Some(refusal));
         };
-        if self.identities.principal_kind(principal) == PrincipalKind::Space {
+        if self.identities.principal_kind(principal) == PrincipalKind::Space
+            && !claim.scope.as_ref().is_some_and(|scope| {
+                (match scope.trigger {
+                    Trigger::Wake | Trigger::Probe => true,
+                    Trigger::Message | Trigger::Job => false,
+                }) && scope.participant.is_none()
+                    && scope.github.is_none()
+                    && scope.delivery.is_none()
+                    && space_subject(scope).as_ref() == Some(&claim.subject)
+            })
+        {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         }
         let actor = Actor::Agent {
@@ -2806,6 +2899,23 @@ where
                 {
                     return (refused(), Some(unevaluated_refusal("attestation-denied")));
                 }
+                if let Some(batch) = &scope.github {
+                    let subject = match (claim.subject.tenant(), claim.subject.subject()) {
+                        (Some(owner), repo) => format!("{owner}/{repo}"),
+                        _ => String::new(),
+                    };
+                    if scope.kind != ChatTransportKind::Github
+                        || scope.trigger != Trigger::Message
+                        || !matches!(&scope.delivery,Some(DeliveryIdentity::Github{delivery}) if delivery==batch.lead().delivery.as_str())
+                        || batch.events().iter().any(|event| {
+                            event.repository.full_name.as_str() != subject
+                                || scope.conversation.thread.as_deref()
+                                    != Some(event.thread().to_string().as_str())
+                        })
+                    {
+                        return (refused(), Some(unevaluated_refusal("attestation-denied")));
+                    }
+                }
                 AuthenticatedContext::attested_chat(
                     principal.clone(),
                     actor,
@@ -2824,32 +2934,15 @@ where
         let Ok(mut context) = derived else {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         };
-        context.space = context.chat_scope().and_then(|scope| {
-            let in_space = match scope.conversation.kind {
-                ConversationKind::Channel | ConversationKind::Thread => true,
-                ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => false,
-            };
-            if !in_space {
-                return None;
-            }
-            let service = match scope.kind {
-                ChatTransportKind::Fauxlack => "fauxlack",
-                ChatTransportKind::Slack => "slack",
-                ChatTransportKind::Discord => "discord",
-                ChatTransportKind::Telegram
-                | ChatTransportKind::Whatsapp
-                | ChatTransportKind::Github
-                | ChatTransportKind::Local => return None,
-            };
-            let container = scope.conversation.container.as_deref()?;
-            let subject = format!("{service}.{container}.{}", scope.conversation.id)
-                .parse()
-                .ok()?;
-            self.identities
-                .resolve(&subject)
-                .filter(|mapped| self.identities.principal_kind(mapped) == PrincipalKind::Space)
-                .cloned()
-        });
+        context.space = context
+            .chat_scope()
+            .and_then(space_subject)
+            .and_then(|subject| {
+                self.identities
+                    .resolve(&subject)
+                    .filter(|mapped| self.identities.principal_kind(mapped) == PrincipalKind::Space)
+                    .cloned()
+            });
         let decision = self.authorize_agent_prompt(&context, &claim.agent);
         if decision.allowed {
             (context, None)
@@ -3374,13 +3467,16 @@ where
             evaluation,
             ..
         } = refusal;
-        let authority = decision_authority(
+        let mut authority = decision_authority(
             context,
             self.identities.principal_kind(context.principal()),
             evaluation
                 .as_ref()
                 .and_then(|evaluation| evaluation.space.clone()),
         );
+        authority.github_denial = evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.github_denial.clone());
         let decision_id = format!("deny-{}", request.id);
         let decision = self.decision_reference(&decision_id);
         let trace = request.trace_parent.trace();
@@ -3648,6 +3744,7 @@ where
             let capability = capability.clone();
             let authority = authority.clone();
             let space = context.space.clone();
+            let github = context.chat_scope().and_then(|scope| scope.github.clone());
             let context = policy_context(context);
             let sequence = std::sync::atomic::AtomicUsize::new(0);
             Arc::new(move |facts: dekopon_broker_host::HttpRequestFacts| {
@@ -3676,10 +3773,17 @@ where
                 // Cedar measures its recursion reserve against stacker's thread bounds, which a
                 // Wasmtime fiber stack falls outside, so it evaluates on a segment stacker tracks.
                 let result = stacker::grow(POLICY_STACK_BYTES, || {
-                    Self::evaluate(&policy, request, Some(facts), space.as_ref())
+                    Self::evaluate(
+                        &policy,
+                        request,
+                        Some(facts),
+                        space.as_ref(),
+                        github.as_ref(),
+                    )
                 });
                 let mut authority = authority.clone();
                 authority.space = result.space.clone();
+                authority.github_denial = result.github_denial.clone();
                 let material = DecisionMaterial {
                     invocation: &invocation,
                     trace,
@@ -4584,6 +4688,7 @@ fn is_console_smoke_literal(scope: &ChatScopeClaim) -> bool {
             },
         delivery,
         participant: _,
+        github,
         trigger,
     } = scope;
     *kind == ChatTransportKind::Local
@@ -4593,6 +4698,7 @@ fn is_console_smoke_literal(scope: &ChatScopeClaim) -> bool {
         && thread.is_none()
         && *trigger == Trigger::Message
         && delivery.is_none()
+        && github.is_none()
 }
 
 fn console_smoke_delivery(
@@ -4653,7 +4759,54 @@ pub struct SpaceDecision {
     denied_by: Option<DenyingPrincipal>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum GithubDenier {
+    Facts,
+    AuthorSet,
+}
+impl GithubDenier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Facts => "facts",
+            Self::AuthorSet => "author-set",
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubDenial {
+    phase: GithubDenier,
+    delivery: dekopon_core::github::GithubDeliveryId,
+}
+
+fn denying_principal(asker: bool, space: bool) -> Option<DenyingPrincipal> {
+    match (asker, space) {
+        (true, true) => None,
+        (false, true) => Some(DenyingPrincipal::Asker),
+        (true, false) => Some(DenyingPrincipal::Space),
+        (false, false) => Some(DenyingPrincipal::Both),
+    }
+}
+fn merge_policy_decision(previous: &mut PolicyDecision, next: PolicyDecision) {
+    previous.allowed &= next.allowed;
+    previous.errors_present |= next.errors_present;
+    previous
+        .determining_policy_ids
+        .extend(next.determining_policy_ids);
+    previous.determining_policy_ids.sort();
+    previous.determining_policy_ids.dedup();
+    previous
+        .erroring_policy_ids
+        .extend(next.erroring_policy_ids);
+    previous.erroring_policy_ids.sort();
+    previous.erroring_policy_ids.dedup();
+    previous.refusal = previous.refusal.take().or(next.refusal);
+    previous.opaque_body = previous.opaque_body.take().or(next.opaque_body);
+}
+
 struct EvaluatedDecision {
+    github_denial: Option<GithubDenial>,
     policy: PolicyDecision,
     space: Option<SpaceDecision>,
 }
@@ -4676,6 +4829,10 @@ fn merge_space_decision(previous: &mut Option<SpaceDecision>, next: Option<Space
             next.policy_ids.sort();
             next.policy_ids.dedup();
         }
+        next.denied_by = next
+            .asker_allowed
+            .zip(next.allowed)
+            .and_then(|(asker, space)| denying_principal(asker, space));
         *previous = Some(next);
     }
 }
@@ -4683,6 +4840,8 @@ fn merge_space_decision(previous: &mut Option<SpaceDecision>, next: Option<Space
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecisionAuthority {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    github_denial: Option<GithubDenial>,
     principal_kind: PrincipalKind,
     started_by: Option<TurnStartedBy>,
     chat: Option<ChatScopeClaim>,
@@ -4695,6 +4854,7 @@ fn decision_authority(
     space: Option<SpaceDecision>,
 ) -> Box<DecisionAuthority> {
     Box::new(DecisionAuthority {
+        github_denial: None,
         principal_kind: kind,
         started_by: turn_started_by(context),
         chat: context.chat_scope.clone(),
@@ -4719,6 +4879,7 @@ pub struct Refusal {
 }
 
 struct PolicyEvaluation {
+    github_denial: Option<GithubDenial>,
     errors_present: bool,
     cause: Option<String>,
     space: Option<SpaceDecision>,
@@ -4776,6 +4937,7 @@ fn decided_refusal(decision: EvaluatedDecision, denied: &'static str) -> Refusal
             errors_present: decision.errors_present,
             cause: decision.policy.refusal,
             space: decision.space,
+            github_denial: decision.github_denial,
         })),
         ..determined_refusal(reason, decision.policy.determining_policy_ids)
     }
@@ -4807,6 +4969,38 @@ fn report_inspection_refusal(
 }
 
 fn emit_audit_event(event: &AuditEvent) {
+    if let AuditEvent::Decision { authority, .. } = event
+        && let Some(batch) = authority
+            .chat
+            .as_ref()
+            .and_then(|scope| scope.github.as_ref())
+    {
+        let deliveries = batch.deliveries();
+        let labels = batch
+            .events()
+            .iter()
+            .map(dekopon_core::github::GithubEvent::label)
+            .collect::<Vec<_>>();
+        let labels = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        let actors = batch
+            .events()
+            .iter()
+            .map(|event| event.actor.id.get())
+            .collect::<Vec<_>>();
+        let actors = actors.iter().collect::<Vec<_>>();
+        dekopon_telemetry::with_event_string_array("github.delivery", &deliveries, || {
+            dekopon_telemetry::with_event_string_array("github.event", &labels, || {
+                dekopon_telemetry::with_event_string_array("github.actor.id", &actors, || {
+                    emit_audit_event_record(event)
+                })
+            })
+        });
+    } else {
+        emit_audit_event_record(event);
+    }
+}
+
+fn emit_audit_event_record(event: &AuditEvent) {
     match event {
         AuditEvent::Decision {
             authority,
@@ -4836,6 +5030,8 @@ fn emit_audit_event(event: &AuditEvent) {
             target: "dekopon_broker::audit",
             {
                 audit.event = "broker.decision",
+                github.denier = authority.github_denial.as_ref().map(|denial|denial.phase.as_str()),
+                github.denier.delivery = authority.github_denial.as_ref().map(|denial|denial.delivery.as_str()),
                 principal.kind = authority.principal_kind.as_str(),
                 turn.started_by = authority.started_by.map(TurnStartedBy::as_str),
                 space.id = authority.space.as_ref().map(|space| space.id.as_str()),

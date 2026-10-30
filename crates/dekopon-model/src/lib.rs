@@ -35,6 +35,7 @@ pub mod stream;
 pub mod text;
 #[cfg(test)]
 mod trace_capture;
+pub mod transcript;
 pub mod wire;
 
 pub use stream::{ModelText, TranscriptDialect, TurnEvent, events_from_transcript};

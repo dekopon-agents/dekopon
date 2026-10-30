@@ -509,6 +509,19 @@ impl SlackTransport {
             .generation
             .as_ref()
             .map(crate::gateway::CurrentGeneration::load);
+        let subject = ExternalSubject::slack(team, user).map_err(TransportError::Subject)?;
+        let pull_request_links = (!explicitly_addressed && kind == ConversationKind::Channel)
+            .then(|| {
+                generation
+                    .as_ref()?
+                    .routes
+                    .find(&self.name, &follow_conversation, &subject)
+                    .filter(|(_, route)| route.ambient.pull_request_links)?;
+                crate::pull_request_links::PullRequestLinkContext::parse(top_text)
+                    .unwrap_or_else(refused_pr_repository)
+            })
+            .flatten();
+        let ambient = pull_request_links.is_some();
         let follow_route = generation.as_ref().and_then(|active| {
             active
                 .routes
@@ -529,7 +542,7 @@ impl SlackTransport {
                     table.ticket(&key, SystemTime::now()) != crate::follow::FollowTicket::Absent
                 })
         });
-        if follow_route.is_some() && !explicitly_addressed && !followed {
+        if follow_route.is_some() && !explicitly_addressed && !followed && !ambient {
             return Ok(None);
         }
         let thread_continuation = match (is_shared, self.experience) {
@@ -540,13 +553,14 @@ impl SlackTransport {
                     thread_ts: root_ts.clone(),
                     user_id: user.to_owned(),
                 };
-                let inherited = !explicitly_addressed && self.thread_ownership.owns(&claim);
-                if !explicitly_addressed && !inherited && !followed {
+                let inherited =
+                    !explicitly_addressed && !ambient && self.thread_ownership.owns(&claim);
+                if !explicitly_addressed && !inherited && !followed && !ambient {
                     return Ok(None);
                 }
                 Some(ThreadContinuation { claim, inherited })
             }
-            (true, SlackExperience::Classic) if !explicitly_addressed && !followed => {
+            (true, SlackExperience::Classic) if !explicitly_addressed && !followed && !ambient => {
                 return Ok(None);
             }
             _ => None,
@@ -570,9 +584,10 @@ impl SlackTransport {
         let projection = project_message(event);
 
         Ok(Some(InboundMessage {
+            pull_request_links,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Slack,
-            subject: ExternalSubject::slack(team, user).map_err(TransportError::Subject)?,
+            subject,
             conversation,
             message_id: MessageId::Native(ts.to_owned()),
             text: projection.text,
@@ -3997,4 +4012,11 @@ mod markdown_tests {
             "```\n7.\n```\n~~~~\n8)\n~~~\n~~~~\n9\\."
         );
     }
+}
+
+fn refused_pr_repository(
+    error: dekopon_core::SubjectError,
+) -> Option<crate::pull_request_links::PullRequestLinkContext> {
+    tracing::info!(event = "gateway_message_ignored", reason = "invalid-repository", error = %error, "gateway.message.ignored");
+    None
 }

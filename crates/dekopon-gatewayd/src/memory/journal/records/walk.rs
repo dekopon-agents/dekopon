@@ -30,7 +30,7 @@ impl ReverseLines<'_> {
     }
 }
 
-pub(super) fn window(file: File, limit: NonZeroUsize) -> Result<Snapshot, JournalError> {
+pub(crate) fn window(file: File, limit: NonZeroUsize) -> Result<Snapshot, JournalError> {
     let file = Arc::new(file);
     let mut lines = ReverseLines {
         file: &file,
@@ -134,4 +134,40 @@ pub(super) fn window(file: File, limit: NonZeroUsize) -> Result<Snapshot, Journa
         }
     }
     Ok(Snapshot { file, records })
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Tail {
+    Clean,
+    Torn,
+}
+
+pub(crate) fn tail(file: &File) -> Result<Tail, JournalError> {
+    let end = file.metadata()?.len();
+    if end == 0 {
+        return Ok(Tail::Clean);
+    }
+    let mut byte = [0];
+    file.read_exact_at(&mut byte, end - 1)?;
+    if byte[0] != b'\n' {
+        return Ok(Tail::Torn);
+    }
+    let mut lines = ReverseLines {
+        file,
+        end,
+        buffer: [0; BUFFER],
+    };
+    let Some((at, len)) = lines.previous()? else {
+        return Ok(Tail::Clean);
+    };
+    let mut tag = [0; 5];
+    if len < tag.len() as u64 {
+        return Ok(Tail::Torn);
+    }
+    file.read_exact_at(&mut tag, at)?;
+    Ok(if &tag == b"{\"b\":" {
+        Tail::Torn
+    } else {
+        Tail::Clean
+    })
 }

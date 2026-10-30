@@ -9,17 +9,18 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   improvement-suggestion tools. Every call to a tool that was not offered, or `bash` call
   without a string `command`, in the first turn with such a rejection is answered with the
   tool shape as a tool result; one in a later turn ends the session.
-- `prompt::run_prompt_with_history` — the same loop run as the continuation of a
-  `prompt::History`: a window of earlier exchanges bounded by turn count and bytes, since
-  there is no tokenizer here and token counts only arrive after a call has been billed.
-  Only the prompt and the final answer of each exchange are remembered; the assistant
-  turns carrying `tool_calls` and the `tool` results answering them are dropped together,
-  which is both the cost control and what makes trimming safe. A `ConversationTurn` holds
-  text rather than messages, so it cannot remember a system prompt, cannot hold half a
-  tool call, and cannot carry provider replay state out of the session that produced it —
-  which is also what lets one conversation replay identically on either model backend
-  rather than losing encrypted reasoning silently on the way across. The session's own
-  exchange is recorded even when the session fails, so a failed turn is not silently lost. A chat
+- `prompt::run_prompt_with_history` — the same loop run as the continuation of prior
+  messages the embedder supplies (`prior: &[ModelMessage]`), returning the result beside an
+  `Option<CapturedTurn>`. The captured turn holds the turn's original items in order: the
+  recorded user text, each consumed person steer (never a gateway notice), assistant text,
+  reasoning, and every tool call with the result the model received, cut to the capture cap
+  (`SessionInputs::with_capture_cap`); opaque provider reasoning carries its model identity so an
+  embedder can replay it only to that model. It is returned even when the session fails, so a
+  failed turn is not silently lost, and is `None` only when no step could run.
+  `prompt::History` and `ConversationTurn` are a text-only window of earlier exchanges bounded by
+  turn count and bytes for embedders that keep no journal: `History::replay` gives the prior
+  messages, and `ConversationTurn::from_captured` records a turn's user and steer text with its
+  answer. A chat
   embedder may mark one request's reply optional; the loop then prompts and offers
   `decline_chat_reply`, returning a typed suppressed disposition and remembering the user-only turn.
   The tool is absent from ordinary prompts, capability work makes a visible reply mandatory, and
@@ -63,6 +64,18 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
   is independent of `with_agent_config`: it names the calling agent on every `accounting.model.turn`
   record, whether or not the route also offers `inspect_agent_config`; an embedder that never calls
   it gets no `agent` field on the record rather than a guessed one.
+- `meta::WakeReasonView` — the typed JSON returned by the no-argument `wake_reason`
+  tool. `SessionInputs::wake_reason(&WakeReasonView)` supplies it; without a view
+  the tool is absent. Every gateway session supplies a view, independently of
+  `inspectAgentConfig`; the console and TUI supply none. Its `trigger` is `chat`,
+  `webhook`, `wake` or `job`. Chat includes `transportKind`, the broker's principal
+  name or null, `admission` (`new` for fresh admission, `followUp` for a dequeued
+  turn), and `steers`, the consumed person-entry count. Notices and unread steers
+  do not increment it. Webhooks carry `source: github` and the same typed event
+  array as the claim, in arrival order. Wakes carry a `w-` ID and `scheduledBy`
+  principal name or null; jobs carry a `j-` ID. Chat and wake have no subject or
+  conversation fields. Each call returns JSON with the current steer count;
+  inspection spends no capability call and grants no authority.
 - `ShellRuntime` — runs each model-authored script on a fresh `dekopon-shell`
   interpreter while spending one session-wide capability budget.
 - `SessionInvoker` — capability dispatch that prefers a local read-only leg and falls
@@ -127,14 +140,18 @@ are: it shapes an answer and grants nothing, so nothing secret belongs in one.
 `category` (`instructions`, `skill`, `capability`, `tool`, `limits`, `efficiency`, `other`), `target` (at most
 `MAX_SUGGESTION_TARGET_BYTES`, 128), `summary` (`MAX_SUGGESTION_SUMMARY_BYTES`, 512), `evidence`
 and `proposal` (`MAX_SUGGESTION_DETAIL_BYTES`, 2048 each), and `confidence` (`low`, `medium`,
-`high`), at most `MAX_SUGGESTIONS_PER_SESSION` (3) times per session. Its description invites a
-note after the model has answered and says the person never sees it; every result tells the
-model to continue with the task.
+`high`). Its description invites notes that would change how the agent is run, guides the
+number per answered message, and says the person never sees the note. A note exists only after
+a tool receipt; a promise records nothing. An explicit request to record one calls for a tool
+call or an admission it was not recorded. Every result tells the model to continue with the task.
 The four text fields are trimmed and stripped of control characters other than newline and tab
 before their bounds are checked; a well-formed object that fails a bound or names an unknown
-token is answered with the reason so the model can fix it or move on, a fourth note is refused
-with `session-limit`, and the session continues either way. Malformed JSON or a non-object ends
-the session as it does for every tool, and an object that is not the six-string-field shape ends
+token is answered with the reason so the model can fix it or move on. Accepted notes receive
+`Recorded suggestion for the operator. Continue with the task, or finish.` A private runaway
+stop after ten recorded notes in one message execution refuses further calls with
+`No more notes this message; this one was not recorded. Continue with the task.` and reason
+`session-limit`. There is no persisted or per-conversation counter; the session continues either
+way. Malformed JSON or a non-object ends the session as it does for every tool, and an object that is not the six-string-field shape ends
 it with `PromptError::InvalidSuggestion` (telemetry kind `invalid-suggestion`). Accepted notes
 arrive in `PromptOutcome.suggestions` as `improvement::ImprovementSuggestion` values, already
 written to telemetry; the copy is for an embedder that shows them to the operator directly, without requiring telemetry to be their only presentation. A suggestion is advisory by construction: no

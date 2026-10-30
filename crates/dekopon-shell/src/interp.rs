@@ -4,9 +4,13 @@ use dekopon_process::{
     CallBudget, ExitCode, JOBS_OFF, LimitExceeded, Limits, ShellThreads, ThreadName, ThreadPermit,
     TreeContext,
 };
+mod case_pattern;
 mod ifs;
+use case_pattern::PatternChar;
 mod nesting;
+pub(crate) mod stage_out;
 use ifs::{Action, Boundary, Ifs, Kind};
+use stage_out::{OutputMode, StageOut, WriteTarget};
 
 use std::{
     cmp::Ordering,
@@ -25,10 +29,10 @@ use serde_json::Value;
 use crate::{
     CapabilityCallResult, CapabilityInvoker, JobSeed, ScriptOutcome,
     ast::{
-        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CasePattern,
-        CaseStatement, Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement,
-        Index, Modifier, Parameter, Pattern, Pipeline, Program, Redirect, RedirectTarget,
-        SimpleCommand, Statement, Stream, WhileLoop, Word, WordPart,
+        AndOr, AndOrList, ArithBinaryOp, ArithExpr, ArithUnaryOp, Background, CaseStatement,
+        Command, Conditional, ConditionalTest, DEV_NULL, ForLoop, IfStatement, Index, Modifier,
+        Parameter, Pattern, Pipeline, Program, Redirect, RedirectTarget, SimpleCommand, Statement,
+        Stream, WhileLoop, Word, WordPart,
     },
     builtins::{
         self, Builtin, BuiltinContext, CommandFailure, CommandResult, ControlWord, FatalError,
@@ -85,14 +89,85 @@ enum StageInput {
 
 enum BuiltinMode {
     Help,
-    Run { capture_output: bool },
+    Run,
 }
 
-enum ParsedStream {
+enum ParsedStream<'a> {
+    Cat(&'a [String]),
+    Base64(&'a [String]),
     Lines(builtins::text::lines::Selection),
     Text(builtins::text::stream::Operation),
     Extra(builtins::text::extra::Operation),
     Jq(builtins::jq::Options),
+    Awk(builtins::awk::Options),
+}
+
+impl ParsedStream<'_> {
+    fn run(
+        self,
+        input: builtins::awk::StageReader<'_>,
+        budget: &mut Budget,
+        emit: &mut impl FnMut(&[u8]) -> Result<bool, CommandFailure>,
+    ) -> Result<ExitCode, CommandFailure> {
+        match self {
+            Self::Awk(options) => {
+                return builtins::awk::run_stream(options, input, budget, emit)
+                    .map_err(CommandFailure::from);
+            }
+            Self::Cat(_) => unreachable!("named cat streams resolve each buffer separately"),
+            Self::Base64(_) | Self::Lines(_) | Self::Text(_) | Self::Extra(_) | Self::Jq(_) => {}
+        }
+        let (mut reader, _charge) = input.open();
+        match self {
+            Self::Lines(selection) => {
+                builtins::text::lines::run(selection, &mut reader, budget, emit)
+                    .map(|()| ExitCode::SUCCESS)
+            }
+            Self::Text(operation) => {
+                builtins::text::stream::run_parsed(operation, &mut reader, budget, emit)
+            }
+            Self::Extra(operation) => {
+                builtins::text::extra::run_parsed(operation, &mut reader, budget, emit)
+            }
+            Self::Jq(options) => {
+                builtins::jq::stream(options, &mut reader, budget, emit).map(|()| ExitCode::SUCCESS)
+            }
+            Self::Base64(arguments) => {
+                builtins::encode::stream(arguments, &mut reader, budget, emit)
+                    .map(|()| ExitCode::SUCCESS)
+            }
+            Self::Cat(_) | Self::Awk(_) => unreachable!("handled before opening inherited input"),
+        }
+    }
+}
+
+fn stage_input<'a>(
+    stdin: &'a mut [PipeReader<StageObservation>],
+    buffers: &BTreeMap<String, Vec<u8>>,
+    budget: &Budget,
+    command: &str,
+    operand: Option<&str>,
+    input: StageInput,
+) -> Result<builtins::awk::StageReader<'a>, CommandFailure> {
+    use builtins::awk::StageReader;
+    if let Some(name) = operand.filter(|name| *name != "-") {
+        check_buffer_operand(command, name)?;
+        if name == DEV_NULL {
+            return Ok(StageReader::Ready(PipeReader::default(), None));
+        }
+        let bytes = buffers.get(name).ok_or_else(|| CommandFailure::failed(format!(
+            "{command}: {name}: no such buffer; buffers exist only after `> {name}` in this script"
+        )))?;
+        let charge = budget.charge_value_bytes(bytes.len() as u64)?;
+        return Ok(StageReader::Ready(
+            PipeReader::from_bytes(bytes.clone(), None, telemetry::stage_read),
+            Some(charge),
+        ));
+    }
+    Ok(match input {
+        StageInput::Piped(reader) => StageReader::Ready(reader, None),
+        StageInput::Inherited => StageReader::Inherited(stdin.last_mut()),
+    })
 }
 
 impl Builtin {
@@ -104,116 +179,81 @@ impl Builtin {
         mode: BuiltinMode,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        let capture_output = match mode {
+        match mode {
             BuiltinMode::Help => {
                 return Ok(Executed::Result(builtins::help_result(
                     self.name(),
                     self.help(),
                 )));
             }
-            BuiltinMode::Run { capture_output } => capture_output,
+            BuiltinMode::Run => {}
         };
-        let run: builtins::Run = match self {
-            Self::Echo => builtins::misc::echo,
-            Self::Printf => builtins::misc::printf,
-            Self::Test => builtins::misc::test,
-            Self::TestBracket => builtins::misc::test_bracket,
-            Self::True => builtins::misc::succeed,
-            Self::False => builtins::misc::fail,
-            Self::Progress => builtins::misc::progress,
-            Self::Sleep => builtins::misc::sleep,
-            Self::Cat => return evaluator.run_cat(arguments, input, capture_output, stdout_sink),
-            Self::Jobs => builtins::jobs::jobs,
-            Self::Wait => builtins::jobs::wait,
-            Self::Kill => builtins::jobs::kill,
-            Self::Cap => builtins::cap::cap,
-            Self::Head => {
-                return evaluator.run_lines(
-                    self.name(),
-                    builtins::text::lines::head(arguments)
-                        .map(|(operation, operand)| (ParsedStream::Lines(operation), operand)),
+        let parsed = match self {
+            Self::Echo => {
+                return evaluator.run_simple_builtin(builtins::misc::echo, arguments, input);
+            }
+            Self::Printf => {
+                return evaluator.run_simple_builtin(builtins::misc::printf, arguments, input);
+            }
+            Self::Test => {
+                return evaluator.run_simple_builtin(builtins::misc::test, arguments, input);
+            }
+            Self::TestBracket => {
+                return evaluator.run_simple_builtin(
+                    builtins::misc::test_bracket,
+                    arguments,
                     input,
-                    stdout_sink,
                 );
             }
-            Self::Tail => {
-                return evaluator.run_lines(
-                    self.name(),
-                    builtins::text::lines::tail(arguments)
-                        .map(|(operation, operand)| (ParsedStream::Lines(operation), operand)),
-                    input,
-                    stdout_sink,
-                );
+            Self::True => {
+                return evaluator.run_simple_builtin(builtins::misc::succeed, arguments, input);
             }
-            Self::Grep => {
-                return evaluator.run_lines(
-                    self.name(),
-                    builtins::text::stream::grep(arguments)
-                        .map(|(operation, operand)| (ParsedStream::Text(operation), operand)),
-                    input,
-                    stdout_sink,
-                );
+            Self::False => {
+                return evaluator.run_simple_builtin(builtins::misc::fail, arguments, input);
             }
-            Self::Sed => {
-                return evaluator.run_lines(
-                    self.name(),
-                    builtins::text::stream::sed(arguments)
-                        .map(|(operation, operand)| (ParsedStream::Text(operation), operand)),
-                    input,
-                    stdout_sink,
-                );
+            Self::Progress => {
+                return evaluator.run_simple_builtin(builtins::misc::progress, arguments, input);
             }
-            Self::Cut => {
-                return evaluator.run_lines(
-                    self.name(),
-                    builtins::text::extra::cut(arguments)
-                        .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
-                    input,
-                    stdout_sink,
-                );
+            Self::Sleep => {
+                return evaluator.run_simple_builtin(builtins::misc::sleep, arguments, input);
             }
-            Self::Uniq => {
-                return evaluator.run_lines(
-                    self.name(),
-                    builtins::text::extra::uniq(arguments)
-                        .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
-                    input,
-                    stdout_sink,
-                );
+            Self::Jobs => {
+                return evaluator.run_simple_builtin(builtins::jobs::jobs, arguments, input);
             }
-            Self::Wc => {
-                return evaluator.run_lines(
-                    self.name(),
-                    builtins::text::extra::wc(arguments)
-                        .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
-                    input,
-                    stdout_sink,
-                );
+            Self::Wait => {
+                return evaluator.run_simple_builtin(builtins::jobs::wait, arguments, input);
             }
-            Self::Sort => {
-                return evaluator.run_lines(
-                    self.name(),
-                    builtins::text::extra::sort(arguments)
-                        .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
-                    input,
-                    stdout_sink,
-                );
+            Self::Kill => {
+                return evaluator.run_simple_builtin(builtins::jobs::kill, arguments, input);
             }
+            Self::Cap => return evaluator.run_simple_builtin(builtins::cap::cap, arguments, input),
+            Self::Head => builtins::text::lines::head(arguments)
+                .map(|(operation, operand)| (ParsedStream::Lines(operation), operand)),
+            Self::Tail => builtins::text::lines::tail(arguments)
+                .map(|(operation, operand)| (ParsedStream::Lines(operation), operand)),
+            Self::Grep => builtins::text::stream::grep(arguments)
+                .map(|(operation, operand)| (ParsedStream::Text(operation), operand)),
+            Self::Sed => builtins::text::stream::sed(arguments)
+                .map(|(operation, operand)| (ParsedStream::Text(operation), operand)),
+            Self::Cut => builtins::text::extra::cut(arguments)
+                .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
+            Self::Uniq => builtins::text::extra::uniq(arguments)
+                .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
+            Self::Wc => builtins::text::extra::wc(arguments)
+                .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
+            Self::Sort => builtins::text::extra::sort(arguments)
+                .map(|(operation, operand)| (ParsedStream::Extra(operation), operand)),
             Self::Jq => {
-                return evaluator.run_lines(
-                    self.name(),
-                    builtins::jq::options(arguments)
-                        .map(|options| (ParsedStream::Jq(options), None)),
-                    input,
-                    stdout_sink,
-                );
+                builtins::jq::options(arguments).map(|options| (ParsedStream::Jq(options), None))
             }
-            Self::Base64 => {
-                return evaluator.run_base64(arguments, input, capture_output, stdout_sink, false);
-            }
+            Self::Awk => builtins::awk::parse(arguments, &evaluator.budget)
+                .map(|(options, operand)| (ParsedStream::Awk(options), operand))
+                .map_err(CommandFailure::from),
+            Self::Cat => Ok((ParsedStream::Cat(arguments), None)),
+            Self::Base64 => Ok((ParsedStream::Base64(arguments), None)),
             Self::Xargs => return evaluator.run_xargs(arguments, input, stdout_sink),
         };
-        evaluator.run_simple_builtin(run, arguments, input)
+        evaluator.run_stream(self.name(), parsed, input, stdout_sink)
     }
 }
 
@@ -361,7 +401,7 @@ fn record_compound_outcome(span: Option<&tracing::Span>, executed: &Result<Execu
 
 struct StageOutcome {
     status: Result<ExitCode, FatalError>,
-    diagnostics: Vec<String>,
+    diagnostics: Vec<Diagnostic>,
     enclosing: Option<PipeReader<StageObservation>>,
 }
 
@@ -391,11 +431,59 @@ impl Stage<'_> {
     }
 }
 
+#[derive(Debug)]
+enum Diagnostic {
+    Line(String),
+    Fragment(String),
+}
+
+impl Diagnostic {
+    fn from_result(result: &CommandResult) -> Option<Self> {
+        if result.value.is_null() {
+            return None;
+        }
+        let text = display(&result.value);
+        Some(if result.suppress_newline {
+            Self::Fragment(text)
+        } else {
+            Self::Line(text)
+        })
+    }
+
+    fn followed_by(self, next: Self) -> Self {
+        let mut text = match self {
+            Self::Line(mut text) => {
+                text.push('\n');
+                text
+            }
+            Self::Fragment(text) => text,
+        };
+        match next {
+            Self::Line(next) => {
+                text.push_str(&next);
+                Self::Line(text)
+            }
+            Self::Fragment(next) => {
+                text.push_str(&next);
+                Self::Fragment(text)
+            }
+        }
+    }
+
+    fn into_result(self) -> CommandResult {
+        match self {
+            Self::Line(text) => CommandResult::value(Value::String(text)),
+            Self::Fragment(text) => CommandResult::value(Value::String(text)).without_newline(),
+        }
+    }
+}
+
 /// A redirected stderr capture must stay bounded by the same output ceilings, since a function can
 /// run thousands of commands into it.
 #[derive(Debug)]
 struct StderrCapture {
-    lines: Vec<String>,
+    lines: Vec<Diagnostic>,
+    pending: String,
     bytes: usize,
     max_lines: usize,
     max_bytes: usize,
@@ -406,6 +494,7 @@ impl StderrCapture {
     fn new(limits: &Limits) -> Self {
         Self {
             lines: Vec::new(),
+            pending: String::new(),
             bytes: 0,
             max_lines: limits.max_output_lines,
             max_bytes: limits.max_output_bytes,
@@ -414,12 +503,37 @@ impl StderrCapture {
     }
 
     fn push(&mut self, line: &str) {
-        if self.lines.len() >= self.max_lines || self.bytes + line.len() > self.max_bytes {
-            self.truncated = true;
-            return;
+        self.push_fragment(line);
+        self.push_fragment("\n");
+    }
+
+    fn push_fragment(&mut self, text: &str) {
+        for part in text.split_inclusive('\n') {
+            if self.lines.len() >= self.max_lines {
+                self.truncated = true;
+                return;
+            }
+            let line = part.strip_suffix('\n').unwrap_or(part);
+            let room = self.max_bytes.saturating_sub(self.bytes);
+            let mut end = line.len().min(room);
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.pending.push_str(&line[..end]);
+            self.bytes += end;
+            self.truncated |= end < line.len();
+            if part.ends_with('\n') {
+                self.lines
+                    .push(Diagnostic::Line(std::mem::take(&mut self.pending)));
+            }
         }
-        self.bytes += line.len();
-        self.lines.push(line.to_owned());
+    }
+
+    fn flush_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.lines
+                .push(Diagnostic::Line(std::mem::take(&mut self.pending)));
+        }
     }
 
     fn push_bytes(&mut self, bytes: &[u8]) {
@@ -436,17 +550,20 @@ impl StderrCapture {
         while !prefix.is_char_boundary(end) {
             end -= 1;
         }
-        let text = prefix[..end].strip_suffix('\n').unwrap_or(&prefix[..end]);
-        self.push(text);
+        self.push_fragment(&prefix[..end]);
         if bytes.len() > room || end < prefix.len() {
             self.truncated = true;
         }
     }
 
-    fn finish(mut self) -> Vec<String> {
+    fn finish(mut self) -> Vec<Diagnostic> {
         if self.truncated {
-            self.lines
-                .push("... redirected diagnostics truncated ...".to_owned());
+            self.flush_pending();
+            self.lines.push(Diagnostic::Line(
+                "... redirected diagnostics truncated ...".to_owned(),
+            ));
+        } else if !self.pending.is_empty() {
+            self.lines.push(Diagnostic::Fragment(self.pending));
         }
         self.lines
     }
@@ -655,7 +772,16 @@ enum PreservedExpansion {
     Unsplit,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FieldContext {
+    Fields,
+    CasePattern,
+    QuotedCasePattern,
+}
+
 struct FieldExpansion<'a> {
+    context: FieldContext,
+    quoted_elements: bool,
     spans: &'a mut Vec<ExpansionSpan>,
 }
 
@@ -763,18 +889,8 @@ impl<'a> Evaluator<'a> {
     }
 
     fn write_redirected_diagnostics(&mut self, result: &CommandResult) {
-        if result.value.is_null() {
-            return;
-        }
-        let text = display(&result.value);
-        if result.suppress_newline {
-            if let Some(capture) = self.stderr_capture.last_mut() {
-                capture.push(text.strip_suffix('\n').unwrap_or(&text));
-            } else {
-                self.output.push_fragment(&text);
-            }
-        } else {
-            self.write_line(&text);
+        if let Some(diagnostic) = Diagnostic::from_result(result) {
+            self.write_diagnostic(diagnostic);
         }
     }
 
@@ -784,6 +900,15 @@ impl<'a> Evaluator<'a> {
             return;
         }
         self.output.push_block(line);
+    }
+
+    fn write_diagnostic(&mut self, diagnostic: Diagnostic) {
+        match diagnostic {
+            Diagnostic::Line(text) => self.write_line(&text),
+            Diagnostic::Fragment(text) => {
+                push_diagnostic_fragment(&text, &mut self.stderr_capture, &mut self.output)
+            }
+        }
     }
 
     fn active_buffer_name(&self) -> Option<&str> {
@@ -803,54 +928,19 @@ impl<'a> Evaluator<'a> {
             .is_some_and(|depth| self.captures.len() <= depth)
     }
 
-    fn stdin_to_diagnostics(&self, sink: &Sink) -> bool {
-        matches!(sink, Sink::Diagnostics)
-            || (matches!(sink, Sink::Value)
-                && self.diagnostics_redirected()
-                && !self.output_discarded()
-                && self.active_buffer_name().is_none())
+    fn emit(&mut self, result: CommandResult) -> Result<(), LimitExceeded> {
+        self.emit_to(result, &Sink::Value)
     }
 
-    fn emit(&mut self, mut result: CommandResult) -> Result<(), LimitExceeded> {
-        if result.value.is_null() || self.output_discarded() {
+    fn emit_to(&mut self, mut result: CommandResult, sink: &Sink) -> Result<(), LimitExceeded> {
+        if result.value.is_null() {
             return Ok(());
         }
-        if let Some(name) = self.active_buffer_name().map(str::to_owned) {
-            self.append_buffer(&name, result)?;
-            return Ok(());
-        }
-        if self.diagnostics_redirected() {
-            self.write_redirected_diagnostics(&result);
-            return Ok(());
-        }
-        if let Some(capture) = self.captures.last_mut() {
-            retain_value(&self.budget, &result.value, &mut result.retained)?;
-            capture.push(result);
-            return Ok(());
-        }
-        if let Some(stdout) = self.stdout.as_mut() {
-            let written = match write_display(stdout, &result.value) {
-                WriteOutcome::Accepted if !result.suppress_newline => stdout.write(b"\n"),
-                written @ (WriteOutcome::Accepted | WriteOutcome::ReaderGone) => written,
-            };
-            match written {
-                WriteOutcome::Accepted => {}
-                WriteOutcome::ReaderGone => self.reader_gone = true,
-            }
-            return Ok(());
-        }
-        let text = display(&result.value);
-        telemetry::stage_write(
-            text.len() + usize::from(!result.suppress_newline),
-            true,
-            &None,
-        );
-        if result.suppress_newline {
-            self.output.push_fragment(&text);
-        } else {
-            self.output.push_block(&text);
-        }
-        Ok(())
+        let mut output = result
+            .output
+            .take()
+            .unwrap_or_else(|| StageOut::new(self, sink, OutputMode::Value));
+        output.value(self, result)
     }
 
     /// Whether a command produced no value has to be recognized before it reaches a capture, not
@@ -881,20 +971,12 @@ impl<'a> Evaluator<'a> {
         if stdout.is_empty() {
             return Ok(Executed::Result(CommandResult::status(status)));
         }
-        let result = match stdout.strip_suffix('\n') {
-            Some(terminated) => CommandResult {
-                value: Value::String(terminated.to_owned()),
-                status,
-                suppress_newline: false,
-                retained: vec![retained],
-            },
-            None => CommandResult {
-                value: Value::String(stdout),
-                status,
-                suppress_newline: true,
-                retained: vec![retained],
-            },
+        let mut result = match stdout.strip_suffix('\n') {
+            Some(terminated) => CommandResult::value(Value::String(terminated.to_owned())),
+            None => CommandResult::value(Value::String(stdout)).without_newline(),
         };
+        result.status = status;
+        result.retained.push(retained);
         Ok(Executed::Result(result))
     }
 
@@ -1094,38 +1176,14 @@ impl<'a> Evaluator<'a> {
         for clause in &statement.clauses {
             for pattern in &clause.patterns {
                 self.budget.charge_step()?;
-                let matched = match pattern {
-                    CasePattern::Any => true,
-                    CasePattern::Literal(word) => {
-                        match self.expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit) {
-                            Ok(expanded) => expanded.join(" ") == subject,
-                            Err(failure) => {
-                                let status = self.absorb(failure)?;
-                                self.last_status = status;
-                                return Ok(Flow::Normal);
-                            }
-                        }
-                    }
-                    CasePattern::Expanded(word) => {
-                        let expanded = match self
-                            .expand_preserved_fields(&word.parts, ExpansionOutput::Unsplit)
-                        {
-                            Ok(expanded) => expanded.join(" "),
-                            Err(failure) => {
-                                let status = self.absorb(failure)?;
-                                self.last_status = status;
-                                return Ok(Flow::Normal);
-                            }
-                        };
-                        if let Some(character) = pattern_metacharacter(&expanded) {
-                            self.write_line(&format!(
-                                "dekopon-shell: {}",
-                                expanded_pattern(character)
-                            ));
-                            self.last_status = ExitCode::SYNTAX;
-                            return Ok(Flow::Normal);
-                        }
-                        expanded == subject
+                let matched = match self
+                    .expand_case_pattern(pattern)
+                    .and_then(|expanded| case_pattern::matches(&expanded, &subject, &self.budget))
+                {
+                    Ok(matched) => matched,
+                    Err(failure) => {
+                        self.last_status = self.absorb(failure)?;
+                        return Ok(Flow::Normal);
                     }
                 };
                 if matched {
@@ -1525,7 +1583,7 @@ impl<'a> Evaluator<'a> {
             }
             let _entered_compound = compound_span.as_ref().map(tracing::Span::enter);
             let executed = self.tested(pipeline.negated, |evaluator| {
-                evaluator.execute_command(last, input, false)
+                evaluator.execute_command(last, input)
             });
             record_compound_outcome(compound_span.as_ref(), &executed);
             drop(_entered_compound);
@@ -1545,8 +1603,8 @@ impl<'a> Evaluator<'a> {
         for (index, outcome) in outcomes.into_iter().enumerate() {
             match outcome {
                 Ok(outcome) => {
-                    for line in outcome.diagnostics {
-                        self.write_line(&line);
+                    for diagnostic in outcome.diagnostics {
+                        self.write_diagnostic(diagnostic);
                     }
                     match outcome.status {
                         Ok(status) => {
@@ -1570,8 +1628,8 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
-        for line in diagnostics {
-            self.write_line(&line);
+        for diagnostic in diagnostics {
+            self.write_diagnostic(diagnostic);
         }
         let executed = executed.map_err(|error| fatal.take().unwrap_or(error))?;
         if let Some(error) = fatal {
@@ -1660,7 +1718,7 @@ impl<'a> Evaluator<'a> {
                 }
                 let status = (|| {
                     let executed =
-                        stage.tested(true, |stage| stage.execute_command(command, input, false));
+                        stage.tested(true, |stage| stage.execute_command(command, input));
                     record_compound_outcome(compound_span.as_ref(), &executed);
                     let executed = executed?;
                     match executed {
@@ -1858,181 +1916,57 @@ impl<'a> Evaluator<'a> {
     fn copy_stdin(
         &mut self,
         input: StageInput,
-        capture_output: bool,
         sink: &Sink,
     ) -> Result<CommandResult, CommandFailure> {
-        if self.stdin_to_diagnostics(sink) {
-            let mut piped = match input {
-                StageInput::Piped(reader) => Some(reader),
-                StageInput::Inherited => None,
-            };
-            let mut excerpt = Vec::new();
-            let mut truncated = false;
-            while let Some(reader) = piped.as_mut().or_else(|| self.stdin.last_mut()) {
-                let ReadOutcome::Bytes(chunk) = reader.read(self.budget.tree())? else {
-                    break;
-                };
-                self.budget.charge_step()?;
-                let room = self.limits.max_output_bytes.saturating_sub(excerpt.len());
-                truncated |= chunk.len() > room;
-                excerpt.extend_from_slice(&chunk[..chunk.len().min(room)]);
-            }
-            if let Some(capture) = self.stderr_capture.last_mut() {
-                capture.push_bytes(&excerpt);
-                if truncated {
-                    capture.truncated = true;
-                }
-            } else {
-                push_lossy_bytes(&mut self.output, &excerpt);
-                if truncated {
-                    self.output
-                        .push_block("... redirected diagnostics truncated ...");
-                }
-            }
+        let mut output = StageOut::new(self, sink, OutputMode::Copy);
+        let mut piped = match input {
+            StageInput::Piped(reader) => Some(reader),
+            StageInput::Inherited => None,
+        };
+        if piped.is_none() && self.stdin.is_empty() {
             return Ok(CommandResult::status(ExitCode::SUCCESS));
         }
-        if let Some(name) = self.active_buffer_name().map(str::to_owned) {
-            let mut piped = match input {
-                StageInput::Piped(reader) => Some(reader),
-                StageInput::Inherited => None,
+        while let Some(reader) = piped.as_mut().or_else(|| self.stdin.last_mut()) {
+            let ReadOutcome::Bytes(chunk) = reader.read(self.budget.tree())? else {
+                break;
             };
-            while let Some(reader) = piped.as_mut().or_else(|| self.stdin.last_mut()) {
-                let ReadOutcome::Bytes(chunk) = reader.read(self.budget.tree())? else {
-                    break;
-                };
-                self.budget.charge_step()?;
-                self.append_buffer_bytes(&name, &chunk)?;
-            }
-            return Ok(CommandResult::status(ExitCode::SUCCESS));
-        }
-        let discard = self.output_discarded() || matches!(sink, Sink::Discard);
-        let routed = discard || !self.captures.is_empty() || self.diagnostics_redirected();
-        let Self {
-            stdin,
-            stdout,
-            output,
-            captures,
-            budget,
-            reader_gone,
-            ..
-        } = self;
-        let mut collected = Vec::new();
-        let into_capture = !captures.is_empty();
-        let collect = capture_output;
-        let mut piped;
-        let reader = match input {
-            StageInput::Piped(reader) => {
-                piped = reader;
-                &mut piped
-            }
-            StageInput::Inherited => match stdin.last_mut() {
-                Some(reader) => reader,
-                None => return Ok(CommandResult::status(ExitCode::SUCCESS)),
-            },
-        };
-        let mut partial = Vec::new();
-        while let ReadOutcome::Bytes(chunk) = reader.read(budget.tree())? {
-            budget.charge_step()?;
-            if discard {
-                continue;
-            }
-            let Some(writer) = stdout.as_mut().filter(|_| !routed) else {
-                telemetry::stage_write(chunk.len(), true, &None);
-                partial.extend_from_slice(&chunk);
-                let complete = lossy_complete_prefix(&partial);
-                if !into_capture && !collect {
-                    output.push_fragment(&String::from_utf8_lossy(&partial[..complete]));
-                } else if complete > 0 {
-                    let text =
-                        std::str::from_utf8(&partial[..complete]).map_err(|_invalid_utf8| {
-                            CommandFailure::failed("standard input is not valid UTF-8 text")
-                        })?;
-                    let charge = budget.charge_value_bytes(complete as u64)?;
-                    let mut result =
-                        CommandResult::value(Value::String(text.to_owned())).without_newline();
-                    result.retained.push(charge);
-                    if into_capture {
-                        if let Some(capture) = captures.last_mut() {
-                            capture.push(result);
-                        }
-                    } else {
-                        collected.push(result);
-                    }
-                }
-                partial.drain(..complete);
-                continue;
-            };
-            match writer.write(&chunk) {
-                WriteOutcome::Accepted => {}
-                WriteOutcome::ReaderGone => {
-                    *reader_gone = true;
-                    break;
-                }
+            self.budget.charge_step()?;
+            if !output.write(&mut WriteTarget::split(self).1, &chunk)? {
+                break;
             }
         }
-        if !partial.is_empty() {
-            if !into_capture && !collect {
-                output.push_fragment(&String::from_utf8_lossy(&partial));
-            } else {
-                return Err(CommandFailure::failed(
-                    "standard input is not valid UTF-8 text",
-                ));
-            }
-        }
-        let mut retained = capture_charges(&mut collected);
-        let value = if collected.is_empty() {
-            Value::Null
-        } else {
-            reduce_charged(budget, collected, &mut retained)?
-        };
-        retain_value(budget, &value, &mut retained)?;
-        Ok(CommandResult {
-            value,
-            status: ExitCode::SUCCESS,
-            suppress_newline: true,
-            retained,
-        })
+        output.finish(self, ExitCode::SUCCESS)
     }
 
     fn execute_command(
         &mut self,
         command: &Command,
         input: StageInput,
-        capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let parent = std::mem::take(&mut self.expansion_charges);
         let result = match command {
-            Command::Simple(command) => self.execute_simple_command(command, input, capture_output),
+            Command::Simple(command) => self.execute_simple_command(command, input),
             Command::Compound {
                 statement,
                 redirects,
-            } => self.nested(|this| {
-                this.execute_compound_command(statement, redirects, input, capture_output)
-            }),
+            } => self.nested(|this| this.execute_compound_command(statement, redirects, input)),
         };
         self.expansion_charges = parent;
         result
     }
 
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
     fn execute_compound_command(
         &mut self,
         statement: &Statement,
         redirects: &[Redirect],
         input: StageInput,
-        capture_output: bool,
     ) -> Result<Executed, FatalError> {
         let (stdout, stderr) = match self.resolve_redirects(redirects) {
             Ok(sinks) => sinks,
             Err(failure) => {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
+                return self.failed(failure);
             }
         };
-        let collect = stdout == Sink::Value && capture_output;
         self.open_buffers(&[&stdout, &stderr])?;
         let previous_buffer = match &stdout {
             Sink::Buffer { name, .. } => self
@@ -2053,9 +1987,6 @@ impl<'a> Evaluator<'a> {
             }
             StageInput::Inherited => false,
         };
-        if collect {
-            self.captures.push(Vec::new());
-        }
         let previous_discard = self.discard_capture_depth;
         match stdout {
             Sink::Discard => self.discard_capture_depth = Some(self.captures.len()),
@@ -2079,11 +2010,6 @@ impl<'a> Evaluator<'a> {
             self.active_buffer = previous_buffer;
         }
 
-        let mut captured = if collect {
-            self.captures.pop().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         if piped {
             self.stdin.pop();
         }
@@ -2094,33 +2020,22 @@ impl<'a> Evaluator<'a> {
             .unwrap_or_default();
 
         let flow = flow?;
-        let mut retained = capture_charges(&mut captured);
-        let value = if collect {
-            reduce_charged(&self.budget, captured, &mut retained)?
-        } else {
-            Value::Null
-        };
         let status = match flow {
             Flow::Normal => self.last_status,
-            _ => {
+            Flow::Break(_) | Flow::Continue(_) | Flow::Return(_) | Flow::Exit(_) => {
                 self.route_diagnostics(diagnostics, &stderr)?;
                 return Ok(Executed::Flow(flow));
             }
         };
 
-        let mut result = CommandResult {
-            value,
-            status,
-            suppress_newline: false,
-            retained,
-        };
+        let mut result = CommandResult::status(status);
         if stderr == Sink::Value {
             if let Sink::Buffer { name, .. } = &stdout {
-                for line in diagnostics.drain(..) {
-                    self.append_buffer_bytes(name, format!("{line}\n").as_bytes())?;
+                for diagnostic in diagnostics.drain(..) {
+                    self.append_buffer(name, diagnostic.into_result())?;
                 }
             } else {
-                result.value = merge_diagnostics(result.value, diagnostics);
+                merge_diagnostics(&mut result, diagnostics);
                 diagnostics = Vec::new();
             }
         }
@@ -2129,12 +2044,10 @@ impl<'a> Evaluator<'a> {
 
         match stdout {
             Sink::Value => Ok(Executed::Result(result)),
-            Sink::Discard => Ok(Executed::Result(CommandResult::status(result.status))),
-            Sink::Diagnostics => {
-                self.write_redirected_diagnostics(&result);
+            Sink::Diagnostics => self.redirect_result(result, &stdout),
+            Sink::Discard | Sink::Buffer { .. } => {
                 Ok(Executed::Result(CommandResult::status(result.status)))
             }
-            Sink::Buffer { .. } => Ok(Executed::Result(CommandResult::status(result.status))),
         }
     }
 
@@ -2169,15 +2082,13 @@ impl<'a> Evaluator<'a> {
         &mut self,
         command: &SimpleCommand,
         input: StageInput,
-        capture_output: bool,
     ) -> Result<Executed, FatalError> {
         self.budget.charge_step()?;
 
         let argv = match self.expand_command_argv(&command.words) {
             Ok(argv) => argv,
             Err(failure) => {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
+                return self.failed(failure);
             }
         };
 
@@ -2197,8 +2108,7 @@ impl<'a> Evaluator<'a> {
                 Ok(value) => value,
                 Err(failure) => {
                     self.restore_all(restore);
-                    let status = self.absorb(failure)?;
-                    return Ok(Executed::Result(CommandResult::status(status)));
+                    return self.failed(failure);
                 }
             };
             assignment_status = self.last_substitution_status;
@@ -2237,8 +2147,7 @@ impl<'a> Evaluator<'a> {
                 }
                 Err(failure) => {
                     self.restore_all(restore);
-                    let status = self.absorb(failure)?;
-                    return Ok(Executed::Result(CommandResult::status(status)));
+                    return self.failed(failure);
                 }
             },
         };
@@ -2247,8 +2156,7 @@ impl<'a> Evaluator<'a> {
             Ok(sinks) => sinks,
             Err(failure) => {
                 self.restore_all(restore);
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
+                return self.failed(failure);
             }
         };
 
@@ -2278,7 +2186,7 @@ impl<'a> Evaluator<'a> {
         if let Sink::Buffer { name, .. } = &stdout {
             self.active_buffer = Some((name.clone(), self.captures.len()));
         }
-        let executed = self.run_argv(&argv, input, capture_output, literal_help, &stdout);
+        let executed = self.run_argv(&argv, input, literal_help, &stdout);
         if stdout != Sink::Value {
             self.active_buffer = active_buffer;
         }
@@ -2303,7 +2211,7 @@ impl<'a> Evaluator<'a> {
         };
 
         if stderr == Sink::Value {
-            result.value = merge_diagnostics(result.value, diagnostics);
+            merge_diagnostics(&mut result, diagnostics);
             diagnostics = Vec::new();
         }
 
@@ -2312,16 +2220,19 @@ impl<'a> Evaluator<'a> {
         // other depending on order.
         self.route_diagnostics(diagnostics, &stderr)?;
 
-        match stdout {
+        self.redirect_result(result, &stdout)
+    }
+
+    fn redirect_result(
+        &mut self,
+        result: CommandResult,
+        sink: &Sink,
+    ) -> Result<Executed, FatalError> {
+        match sink {
             Sink::Value => Ok(Executed::Result(result)),
-            Sink::Discard => Ok(Executed::Result(CommandResult::status(result.status))),
-            Sink::Diagnostics => {
-                self.write_redirected_diagnostics(&result);
-                Ok(Executed::Result(CommandResult::status(result.status)))
-            }
-            Sink::Buffer { name, .. } => {
+            Sink::Discard | Sink::Diagnostics | Sink::Buffer { .. } => {
                 let status = result.status;
-                self.append_buffer(&name, result)?;
+                self.emit_to(result, sink)?;
                 Ok(Executed::Result(CommandResult::status(status)))
             }
         }
@@ -2386,7 +2297,7 @@ impl<'a> Evaluator<'a> {
 
     fn route_diagnostics(
         &mut self,
-        diagnostics: Vec<String>,
+        diagnostics: Vec<Diagnostic>,
         sink: &Sink,
     ) -> Result<(), FatalError> {
         if diagnostics.is_empty() {
@@ -2395,14 +2306,14 @@ impl<'a> Evaluator<'a> {
         match sink {
             Sink::Discard => {}
             Sink::Diagnostics | Sink::Value => {
-                for line in diagnostics {
-                    self.write_line(&line);
+                for diagnostic in diagnostics {
+                    self.write_diagnostic(diagnostic);
                 }
             }
             Sink::Buffer { name, .. } => {
                 let name = name.clone();
-                for line in diagnostics {
-                    self.append_buffer_bytes(&name, format!("{line}\n").as_bytes())?;
+                for diagnostic in diagnostics {
+                    self.append_buffer(&name, diagnostic.into_result())?;
                 }
             }
         }
@@ -2436,11 +2347,16 @@ impl<'a> Evaluator<'a> {
     }
 
     fn append_buffer_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<(), LimitExceeded> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
-        self.append_charged_buffer_bytes(name, bytes, vec![charge])
+        append_buffer_bytes(
+            &self.budget,
+            BufferStorage {
+                buffers: &mut self.buffers,
+                charges: &mut self.buffer_charges,
+                shared_charges: &mut self.shared_charges,
+            },
+            name,
+            bytes,
+        )
     }
 
     fn append_charged_buffer_bytes(
@@ -2466,7 +2382,6 @@ impl<'a> Evaluator<'a> {
         &mut self,
         argv: &[crate::Arg],
         input: StageInput,
-        capture_output: bool,
         literal_help: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
@@ -2500,7 +2415,6 @@ impl<'a> Evaluator<'a> {
             resolution,
             typed_arguments,
             input,
-            capture_output,
             literal_help,
             stdout_sink,
         );
@@ -2532,338 +2446,81 @@ impl<'a> Evaluator<'a> {
         executed
     }
 
-    fn run_base64(
-        &mut self,
-        arguments: &[String],
-        input: StageInput,
-        capture_output: bool,
-        stdout_sink: &Sink,
-        literal_help: bool,
-    ) -> Result<Executed, FatalError> {
-        if literal_help {
-            return Ok(Executed::Result(builtins::help_result(
-                "base64",
-                crate::builtins::encode::HELP,
-            )));
-        }
-        let mut reader = match input {
-            StageInput::Piped(reader) => reader,
-            StageInput::Inherited => self
-                .stdin
-                .last_mut()
-                .map(std::mem::take)
-                .unwrap_or_default(),
-        };
-        let mut bytes = Vec::new();
-        let mut charges = Vec::new();
-        let mut utf8_pending = Vec::new();
-        let retention_budget = self.budget.fork();
-        let discard = self.output_discarded();
-        let diagnostics = self.diagnostics_redirected();
-        let active_buffer = self.active_buffer_name().map(str::to_owned);
-        let outcome =
-            crate::builtins::encode::stream(arguments, &mut reader, &mut self.budget, |chunk| {
-                if matches!(stdout_sink, Sink::Discard) {
-                    return Ok(true);
-                }
-                if matches!(stdout_sink, Sink::Value)
-                    && diagnostics
-                    && !discard
-                    && active_buffer.is_none()
-                {
-                    push_diagnostic_bytes(chunk, &mut self.stderr_capture, &mut self.output);
-                    return Ok(true);
-                }
-                if !discard
-                    && self.captures.is_empty()
-                    && active_buffer.is_none()
-                    && matches!(stdout_sink, Sink::Value)
-                    && let Some(writer) = self.stdout.as_mut()
-                {
-                    return Ok(match writer.write(chunk) {
-                        WriteOutcome::Accepted => true,
-                        WriteOutcome::ReaderGone => {
-                            self.reader_gone = true;
-                            false
-                        }
-                    });
-                }
-                if matches!(stdout_sink, Sink::Value) && discard {
-                    return Ok(true);
-                }
-                if matches!(stdout_sink, Sink::Value)
-                    && let Some(name) = active_buffer.as_deref()
-                {
-                    let charge = retention_budget.charge_value_bytes(chunk.len() as u64)?;
-                    append_charged_buffer(
-                        &retention_budget,
-                        BufferStorage {
-                            buffers: &mut self.buffers,
-                            charges: &mut self.buffer_charges,
-                            shared_charges: &mut self.shared_charges,
-                        },
-                        name,
-                        chunk,
-                        vec![charge],
-                    )?;
-                    return Ok(true);
-                }
-                if matches!(stdout_sink, Sink::Value) && !capture_output && self.captures.is_empty()
-                {
-                    telemetry::stage_write(chunk.len(), true, &None);
-                    utf8_pending.extend_from_slice(chunk);
-                    let complete = lossy_complete_prefix(&utf8_pending);
-                    self.output
-                        .push_fragment(&String::from_utf8_lossy(&utf8_pending[..complete]));
-                    utf8_pending.drain(..complete);
-                } else {
-                    charges.push(retention_budget.charge_value_bytes(chunk.len() as u64)?);
-                    bytes.extend_from_slice(chunk);
-                }
-                Ok(true)
-            });
-        let status = match outcome {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(failure) => self.absorb(failure)?,
-        };
-        if !utf8_pending.is_empty() {
-            self.output
-                .push_fragment(&String::from_utf8_lossy(&utf8_pending));
-        }
-        if bytes.is_empty() || status != ExitCode::SUCCESS {
-            return Ok(Executed::Result(CommandResult::status(status)));
-        }
-        if let Sink::Buffer { name, .. } = stdout_sink {
-            self.append_charged_buffer_bytes(name, &bytes, charges)?;
-            return Ok(Executed::Result(CommandResult::status(status)));
-        }
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_invalid_utf8) => {
-                let status = self.absorb(CommandFailure::failed(
-                    "standard input is not valid UTF-8 text",
-                ))?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            }
-        };
-        Ok(Executed::Result(CommandResult {
-            value: Value::String(text),
-            status,
-            suppress_newline: true,
-            retained: charges,
-        }))
-    }
-
-    fn stream_input(
-        &mut self,
-        command: &str,
-        operand: Option<&str>,
-        input: StageInput,
-    ) -> Result<
-        (
-            PipeReader<StageObservation>,
-            Option<dekopon_process::RetainedBytes>,
-        ),
-        CommandFailure,
-    > {
-        if let Some(name) = operand.filter(|name| *name != "-") {
-            check_buffer_operand(command, name)?;
-            if name == DEV_NULL {
-                return Ok((PipeReader::default(), None));
-            }
-            let bytes = self.buffers.get(name).ok_or_else(|| {
-                CommandFailure::failed(format!(
-                    "{command}: {name}: no such buffer; buffers exist only after `> {name}` in this script"
-                ))
-            })?;
-            let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
-            return Ok((
-                PipeReader::from_bytes(bytes.clone(), None, crate::interp::telemetry::stage_read),
-                Some(charge),
-            ));
-        }
-        Ok((
-            match input {
-                StageInput::Piped(reader) => reader,
-                StageInput::Inherited => self
-                    .stdin
-                    .last_mut()
-                    .map(std::mem::take)
-                    .unwrap_or_default(),
-            },
-            None,
-        ))
-    }
-
-    fn run_lines(
+    fn run_stream(
         &mut self,
         name: &str,
-        parsed: Result<(ParsedStream, Option<String>), CommandFailure>,
+        parsed: Result<(ParsedStream<'_>, Option<String>), CommandFailure>,
         input: StageInput,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
         let (parsed, operand) = match parsed {
             Ok(parsed) => parsed,
-            Err(failure) => {
-                return Ok(Executed::Result(CommandResult::status(
-                    self.absorb(failure)?,
-                )));
-            }
+            Err(failure) => return self.failed(failure),
         };
-        let retention_budget = self.budget.fork();
-        let mut redirected_bytes = Vec::new();
-        let mut redirect_charges = Vec::new();
-        let mut utf8_pending = Vec::new();
-        let (mut reader, _input_charge) = match self.stream_input(name, operand.as_deref(), input) {
-            Ok(selected) => selected,
-            Err(failure) => {
-                return Ok(Executed::Result(CommandResult::status(
-                    self.absorb(failure)?,
-                )));
-            }
-        };
-        let discard = self.output_discarded();
-        let diagnostics = self.diagnostics_redirected();
-        let active_buffer = self.active_buffer_name().map(str::to_owned);
-        let mut emit = |line: &[u8]| {
-            if matches!(stdout_sink, Sink::Discard) {
-                return Ok(true);
-            }
-            if matches!(stdout_sink, Sink::Value)
-                && diagnostics
-                && !discard
-                && active_buffer.is_none()
-            {
-                push_diagnostic_bytes(line, &mut self.stderr_capture, &mut self.output);
-                return Ok(true);
-            }
-            if matches!(stdout_sink, Sink::Value)
-                && !discard
-                && self.captures.is_empty()
-                && active_buffer.is_none()
-                && let Some(writer) = self.stdout.as_mut()
-            {
-                match writer.write(line) {
-                    WriteOutcome::Accepted => return Ok(true),
-                    WriteOutcome::ReaderGone => {
-                        self.reader_gone = true;
-                        return Ok(false);
-                    }
-                }
-            }
-            if matches!(stdout_sink, Sink::Value) && discard {
-                return Ok(true);
-            }
-            if matches!(stdout_sink, Sink::Value)
-                && let Some(name) = active_buffer.as_deref()
-            {
-                append_stream_buffer(
-                    &retention_budget,
-                    BufferStorage {
-                        buffers: &mut self.buffers,
-                        charges: &mut self.buffer_charges,
-                        shared_charges: &mut self.shared_charges,
-                    },
-                    name,
-                    line,
-                )?;
-                return Ok(true);
-            }
-            if !matches!(stdout_sink, Sink::Value) {
-                let charge = retention_budget.charge_value_bytes(line.len() as u64)?;
-                redirected_bytes.extend_from_slice(line);
-                redirect_charges.push(charge);
-                return Ok(true);
-            }
-            telemetry::stage_terminal_write(line.len(), self.captures.is_empty());
-            utf8_pending.extend_from_slice(line);
-            let complete = match std::str::from_utf8(&utf8_pending) {
-                Ok(text) => text.len(),
-                Err(error) if error.error_len().is_none() => error.valid_up_to(),
-                Err(_invalid_utf8) if self.captures.is_empty() => {
-                    lossy_complete_prefix(&utf8_pending)
-                }
-                Err(_invalid_utf8) => {
-                    return Err(CommandFailure::failed(
-                        "standard input is not valid UTF-8 text",
+        let mode = match &parsed {
+            ParsedStream::Cat([]) => {
+                if self.stdout.is_none()
+                    && self.captures.is_empty()
+                    && self.stdout_redirected
+                    && self.active_buffer_name().is_none()
+                    && stdout_sink != &Sink::Diagnostics
+                {
+                    return Ok(Executed::Result(
+                        CommandResult::value(Value::Null).without_newline(),
                     ));
                 }
-            };
-            if complete > 0 {
-                let text = String::from_utf8_lossy(&utf8_pending[..complete]);
-                if let Some(capture) = self.captures.last_mut() {
-                    let charge = retention_budget.charge_value_bytes(complete as u64)?;
-                    let mut result =
-                        CommandResult::value(Value::String(text.into_owned())).without_newline();
-                    result.retained.push(charge);
-                    capture.push(result);
-                } else {
-                    self.output.push_fragment(&text);
-                }
-                utf8_pending.drain(..complete);
+                let outcome = self.copy_stdin(input, stdout_sink);
+                return self.completed(outcome);
             }
-            Ok(true)
+            ParsedStream::Cat(_) => OutputMode::Named,
+            ParsedStream::Base64(_) => OutputMode::Base64,
+            ParsedStream::Awk(_) => OutputMode::Awk,
+            ParsedStream::Lines(_)
+            | ParsedStream::Text(_)
+            | ParsedStream::Extra(_)
+            | ParsedStream::Jq(_) => OutputMode::Lines,
         };
+        let mut output = StageOut::new(self, stdout_sink, mode);
+        let mut budget = self.budget.fork();
         let outcome = match parsed {
-            ParsedStream::Lines(selection) => {
-                builtins::text::lines::run(selection, &mut reader, &mut self.budget, &mut emit)
+            ParsedStream::Cat(arguments) => {
+                builtins::misc::cat_stream(arguments, |name| output.named(self, name))
                     .map(|()| ExitCode::SUCCESS)
             }
-            ParsedStream::Extra(operation) => builtins::text::extra::run_parsed(
-                operation,
-                &mut reader,
-                &mut self.budget,
-                &mut emit,
-            ),
-            ParsedStream::Text(operation) => builtins::text::stream::run_parsed(
-                operation,
-                &mut reader,
-                &mut self.budget,
-                &mut emit,
-            ),
-            ParsedStream::Jq(opts) => {
-                builtins::jq::stream(opts, &mut reader, &mut self.budget, &mut emit)
-                    .map(|()| ExitCode::SUCCESS)
+            parsed @ (ParsedStream::Base64(_)
+            | ParsedStream::Lines(_)
+            | ParsedStream::Text(_)
+            | ParsedStream::Extra(_)
+            | ParsedStream::Jq(_)
+            | ParsedStream::Awk(_)) => {
+                let (stdin, mut target) = WriteTarget::split(self);
+                match target.input(stdin, name, operand.as_deref(), input) {
+                    Ok(input) => parsed.run(input, &mut budget, &mut |bytes| {
+                        output.write(&mut target, bytes)
+                    }),
+                    Err(failure) => Err(failure),
+                }
             }
         };
-        let mut status = match outcome {
-            Ok(status) => status,
-            Err(failure) => self.absorb(failure)?,
-        };
-        if status == ExitCode::SUCCESS && !utf8_pending.is_empty() {
-            if self.captures.is_empty() {
-                self.output
-                    .push_fragment(&String::from_utf8_lossy(&utf8_pending));
-            } else {
-                status = self.absorb(CommandFailure::failed(
-                    "standard input is not valid UTF-8 text",
-                ))?;
-            }
-        }
-        self.finish_stream_redirect(stdout_sink, redirected_bytes, redirect_charges, status)
+        output.flush_diagnostics(self);
+        let status = outcome.or_else(|failure| self.absorb(failure))?;
+        let outcome = output.finish(self, status);
+        self.completed(outcome)
     }
 
-    fn finish_stream_redirect(
+    fn failed(&mut self, failure: CommandFailure) -> Result<Executed, FatalError> {
+        self.absorb(failure)
+            .map(|status| Executed::Result(CommandResult::status(status)))
+    }
+
+    fn completed(
         &mut self,
-        sink: &Sink,
-        bytes: Vec<u8>,
-        charges: Vec<dekopon_process::RetainedBytes>,
-        status: ExitCode,
+        outcome: Result<CommandResult, CommandFailure>,
     ) -> Result<Executed, FatalError> {
-        if bytes.is_empty() {
-            return Ok(Executed::Result(CommandResult::status(status)));
+        match outcome {
+            Ok(result) => Ok(Executed::Result(result)),
+            Err(failure) => self.failed(failure),
         }
-        if let Sink::Buffer { name, .. } = sink {
-            self.append_charged_buffer_bytes(name, &bytes, charges)?;
-            return Ok(Executed::Result(CommandResult::status(status)));
-        }
-        let text = String::from_utf8(bytes).map_err(|_invalid_utf8| {
-            FatalError::Unsupported("standard input is not valid UTF-8 text".to_owned())
-        })?;
-        let mut result = CommandResult::value(Value::String(text)).without_newline();
-        result.status = status;
-        result.retained = charges;
-        Ok(Executed::Result(result))
     }
 
     fn append_named_buffer(
@@ -2893,115 +2550,6 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
-    fn run_named_cat(&mut self, arguments: &[String], sink: &Sink) -> Result<Executed, FatalError> {
-        for name in arguments {
-            if name.starts_with('-') && name.len() > 1 {
-                let status = self.absorb(CommandFailure::usage(format!(
-                    "cat: unsupported flag {name}"
-                )))?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            }
-            if let Err(failure) = check_buffer_operand("cat", name) {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            }
-            if name == DEV_NULL {
-                continue;
-            }
-            let Some(bytes) = self.buffers.get(name) else {
-                let status = self.absorb(CommandFailure::failed(format!(
-                    "cat: {name}: no such buffer; buffers exist only after `> {name}` in this script"
-                )))?;
-                return Ok(Executed::Result(CommandResult::status(status)));
-            };
-            match sink {
-                Sink::Buffer {
-                    name: destination, ..
-                } => self.append_named_buffer(name, destination)?,
-                Sink::Discard => {}
-                Sink::Diagnostics => {
-                    if let Some(capture) = self.stderr_capture.last_mut() {
-                        capture.push_bytes(bytes);
-                    } else {
-                        push_lossy_bytes(&mut self.output, bytes);
-                    }
-                }
-                Sink::Value => {
-                    if let Some(destination) = self.active_buffer_name().map(str::to_owned) {
-                        self.append_named_buffer(name, &destination)?;
-                        continue;
-                    }
-                    if self.output_discarded() {
-                        continue;
-                    }
-                    if self.diagnostics_redirected() {
-                        push_diagnostic_bytes(bytes, &mut self.stderr_capture, &mut self.output);
-                        continue;
-                    }
-                    if let Some(writer) = self.stdout.as_mut() {
-                        if writer.write(bytes) == WriteOutcome::ReaderGone {
-                            self.reader_gone = true;
-                            break;
-                        }
-                    } else {
-                        let text = match std::str::from_utf8(bytes) {
-                            Ok(text) => text,
-                            Err(_) if self.captures.is_empty() => {
-                                push_lossy_bytes(&mut self.output, bytes);
-                                continue;
-                            }
-                            Err(_) => {
-                                let status = self.absorb(CommandFailure::failed(
-                                    "standard input is not valid UTF-8 text",
-                                ))?;
-                                return Ok(Executed::Result(CommandResult::status(status)));
-                            }
-                        };
-                        if let Some(capture) = self.captures.last_mut() {
-                            let charge = self.budget.charge_value_bytes(bytes.len() as u64)?;
-                            let mut result = CommandResult::value(Value::String(text.to_owned()))
-                                .without_newline();
-                            result.retained.push(charge);
-                            capture.push(result);
-                        } else {
-                            self.output.push_fragment(text);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Executed::Result(CommandResult::status(ExitCode::SUCCESS)))
-    }
-
-    fn run_cat(
-        &mut self,
-        arguments: &[String],
-        input: StageInput,
-        capture_output: bool,
-        stdout_sink: &Sink,
-    ) -> Result<Executed, FatalError> {
-        if !arguments.is_empty() {
-            return self.run_named_cat(arguments, stdout_sink);
-        }
-        if arguments.is_empty()
-            && (self.stdout.is_some()
-                || capture_output
-                || !self.captures.is_empty()
-                || !self.stdout_redirected
-                || self.active_buffer_name().is_some()
-                || matches!(stdout_sink, Sink::Diagnostics))
-        {
-            return match self.copy_stdin(input, capture_output, stdout_sink) {
-                Ok(result) => Ok(Executed::Result(result)),
-                Err(failure) => {
-                    let status = self.absorb(failure)?;
-                    Ok(Executed::Result(CommandResult::status(status)))
-                }
-            };
-        }
-        self.run_simple_builtin(builtins::misc::cat, arguments, input)
-    }
-
     fn run_simple_builtin(
         &mut self,
         run: builtins::Run,
@@ -3009,21 +2557,13 @@ impl<'a> Evaluator<'a> {
         input: StageInput,
     ) -> Result<Executed, FatalError> {
         drop(input);
-        let outcome = {
-            let mut context = BuiltinContext {
-                invoker: self.invoker,
-                budget: &mut self.budget,
-                started_jobs: &self.jobs.started,
-            };
-            run(&mut context, arguments, None)
+        let mut context = BuiltinContext {
+            invoker: self.invoker,
+            budget: &mut self.budget,
+            started_jobs: &self.jobs.started,
         };
-        match outcome {
-            Ok(result) => Ok(Executed::Result(result)),
-            Err(failure) => {
-                let status = self.absorb(failure)?;
-                Ok(Executed::Result(CommandResult::status(status)))
-            }
-        }
+        let outcome = run(&mut context, arguments, None);
+        self.completed(outcome)
     }
 
     #[allow(
@@ -3038,7 +2578,6 @@ impl<'a> Evaluator<'a> {
         resolution: Option<Resolution>,
         typed_arguments: &[crate::Arg],
         input: StageInput,
-        capture_output: bool,
         literal_help: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
@@ -3052,9 +2591,7 @@ impl<'a> Evaluator<'a> {
 
         match resolution {
             Resolution::Rejected(reason) => Err(FatalError::Unsupported(reason.to_owned())),
-            Resolution::Function => {
-                self.call_function(command, arguments, input, capture_output, stdout_sink)
-            }
+            Resolution::Function => self.call_function(command, arguments, input, stdout_sink),
             Resolution::Builtin(builtin) => builtin.run(
                 self,
                 arguments,
@@ -3062,7 +2599,7 @@ impl<'a> Evaluator<'a> {
                 if literal_help {
                     BuiltinMode::Help
                 } else {
-                    BuiltinMode::Run { capture_output }
+                    BuiltinMode::Run
                 },
                 stdout_sink,
             ),
@@ -3081,13 +2618,8 @@ impl<'a> Evaluator<'a> {
                     word: command.to_owned(),
                     argv: typed_arguments.to_vec(),
                 };
-                match self.run_provider(call, input, capture_output, stdout_sink) {
-                    Ok(result) => Ok(Executed::Result(result)),
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        Ok(Executed::Result(CommandResult::status(status)))
-                    }
-                }
+                let outcome = self.run_provider(call, input, stdout_sink);
+                self.completed(outcome)
             }
             Resolution::NotFound => {
                 self.write_line(&format!("dekopon-shell: {command}: command not found"));
@@ -3105,7 +2637,6 @@ impl<'a> Evaluator<'a> {
         &mut self,
         call: crate::RunCall,
         input: StageInput,
-        capture_output: bool,
         sink: &Sink,
     ) -> Result<CommandResult, CommandFailure> {
         self.budget.check_deadline()?;
@@ -3172,7 +2703,7 @@ impl<'a> Evaluator<'a> {
                     inherited.then_some(reader)
                 })
             });
-            let copied = self.copy_stdin(StageInput::Piped(output), capture_output, sink);
+            let copied = self.copy_stdin(StageInput::Piped(output), sink);
             let result = call.join();
             finished.store(true, atomic::Ordering::Relaxed);
             let fed = feeder.map(|spawned| spawned.map(ScopedJoinHandle::join));
@@ -3278,10 +2809,7 @@ impl<'a> Evaluator<'a> {
             ControlWord::Break | ControlWord::Continue => {
                 let level = match parse_level(command, arguments) {
                     Ok(level) => level,
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        return Ok(Some(Executed::Result(CommandResult::status(status))));
-                    }
+                    Err(failure) => return self.failed(failure).map(Some),
                 };
                 Executed::Flow(if command == "break" {
                     Flow::Break(level)
@@ -3291,10 +2819,7 @@ impl<'a> Evaluator<'a> {
             }
             ControlWord::Set => match self.apply_set_options(arguments) {
                 Ok(()) => Executed::Result(CommandResult::status(ExitCode::SUCCESS)),
-                Err(failure) => {
-                    let status = self.absorb(failure)?;
-                    Executed::Result(CommandResult::status(status))
-                }
+                Err(failure) => self.failed(failure)?,
             },
             ControlWord::Return => {
                 if !self
@@ -3309,29 +2834,20 @@ impl<'a> Evaluator<'a> {
                 }
                 let status = match parse_status(command, arguments, self.last_status) {
                     Ok(status) => status,
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        return Ok(Some(Executed::Result(CommandResult::status(status))));
-                    }
+                    Err(failure) => return self.failed(failure).map(Some),
                 };
                 Executed::Flow(Flow::Return(status))
             }
             ControlWord::Exit => {
                 let status = match parse_status(command, arguments, self.last_status) {
                     Ok(status) => status,
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        return Ok(Some(Executed::Result(CommandResult::status(status))));
-                    }
+                    Err(failure) => return self.failed(failure).map(Some),
                 };
                 Executed::Flow(Flow::Exit(status))
             }
             ControlWord::Read => match self.run_read(arguments, input) {
                 Ok(result) => Executed::Result(result),
-                Err(failure) => {
-                    let status = self.absorb(failure)?;
-                    Executed::Result(CommandResult::status(status))
-                }
+                Err(failure) => self.failed(failure)?,
             },
             ControlWord::Local => {
                 if !self
@@ -3368,10 +2884,7 @@ impl<'a> Evaluator<'a> {
                 };
                 let count = match parse_shift_count(arguments) {
                     Ok(count) => count,
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        return Ok(Some(Executed::Result(CommandResult::status(status))));
-                    }
+                    Err(failure) => return self.failed(failure).map(Some),
                 };
                 if count > frame.positional.len() {
                     Executed::Result(CommandResult::status(ExitCode::FAILURE))
@@ -3417,17 +2930,15 @@ impl<'a> Evaluator<'a> {
         name: &str,
         arguments: &[String],
         input: StageInput,
-        capture_output: bool,
         stdout_sink: &Sink,
     ) -> Result<Executed, FatalError> {
-        let capture_output = *stdout_sink == Sink::Value && capture_output;
         let Some(body) = self.functions.get(name).cloned() else {
             self.write_line(&format!("dekopon-shell: {name}: command not found"));
             return Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)));
         };
 
         self.budget.charge_step()?;
-        let (flow, mut captured) = self.nested(|this| {
+        let flow = self.nested(|this| {
             let positional = arguments
                 .iter()
                 .map(|argument| Value::String(argument.clone()))
@@ -3450,9 +2961,6 @@ impl<'a> Evaluator<'a> {
                 }
                 StageInput::Inherited => false,
             };
-            if capture_output {
-                this.captures.push(Vec::new());
-            }
             let saved_stdout = (*stdout_sink != Sink::Value)
                 .then(|| this.stdout.take())
                 .flatten();
@@ -3472,39 +2980,22 @@ impl<'a> Evaluator<'a> {
             }
             this.discard_capture_depth = previous_discard;
             this.diagnostics_depth = previous_diagnostics;
-            let captured = if capture_output {
-                this.captures.pop().unwrap_or_default()
-            } else {
-                Vec::new()
-            };
             if piped {
                 this.stdin.pop();
             }
             this.frames.pop();
-            Ok::<_, FatalError>((flow, captured))
+            Ok::<_, FatalError>(flow)
         })?;
 
-        let mut retained = capture_charges(&mut captured);
-        let value = if capture_output {
-            reduce_charged(&self.budget, captured, &mut retained)?
-        } else {
-            Value::Null
-        };
-        retain_value(&self.budget, &value, &mut retained)?;
+        let mut result = CommandResult::status(self.last_status);
+        retain_value(&self.budget, &result.value, &mut result.retained)?;
         Ok(match flow? {
-            Flow::Return(status) => Executed::Result(CommandResult {
-                value,
-                status,
-                suppress_newline: false,
-                retained,
-            }),
+            Flow::Return(status) => {
+                result.status = status;
+                Executed::Result(result)
+            }
             Flow::Exit(status) => Executed::Flow(Flow::Exit(status)),
-            Flow::Normal | Flow::Break(_) | Flow::Continue(_) => Executed::Result(CommandResult {
-                value,
-                status: self.last_status,
-                suppress_newline: false,
-                retained,
-            }),
+            Flow::Normal | Flow::Break(_) | Flow::Continue(_) => Executed::Result(result),
         })
     }
 
@@ -3517,8 +3008,7 @@ impl<'a> Evaluator<'a> {
         let template = match xargs::parse(arguments) {
             Ok(template) => template,
             Err(failure) => {
-                let status = self.absorb(failure)?;
-                return Ok(Executed::Result(CommandResult::status(status)));
+                return self.failed(failure);
             }
         };
         let mut piped = match input {
@@ -3562,7 +3052,6 @@ impl<'a> Evaluator<'a> {
                         .collect::<Vec<_>>(),
                     StageInput::Piped(PipeReader::default()),
                     false,
-                    false,
                     stdout_sink,
                 )? {
                     Executed::Flow(flow) => return Ok(Executed::Flow(flow)),
@@ -3570,12 +3059,7 @@ impl<'a> Evaluator<'a> {
                         if result.status != ExitCode::SUCCESS {
                             status = result.status;
                         }
-                        match stdout_sink {
-                            Sink::Value => self.emit(result)?,
-                            Sink::Diagnostics => self.write_redirected_diagnostics(&result),
-                            Sink::Discard => {}
-                            Sink::Buffer { name, .. } => self.append_buffer(name, result)?,
-                        }
+                        self.emit_to(result, stdout_sink)?;
                         if self.reader_gone {
                             return Ok(Executed::Result(CommandResult::status(status)));
                         }
@@ -3652,7 +3136,7 @@ impl<'a> Evaluator<'a> {
             ExpansionOutput::Fields | ExpansionOutput::Value => {
                 let mut spans = Vec::new();
                 for part in &word.parts {
-                    self.collect_field_part(part, &mut spans, output)?;
+                    self.collect_field_part(part, &mut spans, output, FieldContext::Fields)?;
                 }
                 let resplit = word.parts.iter().any(|part| match part {
                     WordPart::Parameter(_)
@@ -3809,6 +3293,57 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
+    fn expand_case_pattern(&mut self, word: &Word) -> Result<Vec<PatternChar>, CommandFailure> {
+        let mut spans = Vec::new();
+        for part in &word.parts {
+            self.collect_field_part(
+                part,
+                &mut spans,
+                ExpansionOutput::Unsplit,
+                FieldContext::CasePattern,
+            )?;
+        }
+        let mut characters = Vec::new();
+        for span in spans {
+            let (text, protection) = match span.content {
+                SpanContent::Text(text, protection) => (text, protection),
+                SpanContent::Elements(items, _) => {
+                    (quoted_text(&Value::Array(items)), Protection::Unquoted)
+                }
+                SpanContent::Boundary(_) => break,
+                SpanContent::SplitSpace => continue,
+            };
+            self.expansion_charges.push(
+                self.budget.charge_value_bytes(
+                    text.len().saturating_mul(size_of::<PatternChar>()) as u64,
+                )?,
+            );
+            characters.reserve_exact(text.chars().count());
+            characters.extend(text.chars().map(|character| match protection {
+                Protection::Unquoted | Protection::EmptyIfs => PatternChar::Unquoted(character),
+                Protection::Quoted | Protection::Checked => PatternChar::Literal(character),
+            }));
+        }
+        Ok(characters)
+    }
+
+    fn record_expanded_value(
+        &mut self,
+        spans: &mut Vec<ExpansionSpan>,
+        value: &Value,
+        context: FieldContext,
+    ) -> Result<(), CommandFailure> {
+        match context {
+            FieldContext::Fields => self.record_value(spans, value),
+            FieldContext::CasePattern => {
+                self.record_text(spans, &quoted_text(value), Protection::Unquoted)
+            }
+            FieldContext::QuotedCasePattern => {
+                self.record_text(spans, &quoted_text(value), Protection::Quoted)
+            }
+        }
+    }
+
     fn record_split_text(
         &mut self,
         spans: &mut Vec<ExpansionSpan>,
@@ -3881,10 +3416,19 @@ impl<'a> Evaluator<'a> {
         part: &WordPart,
         spans: &mut Vec<ExpansionSpan>,
         output: ExpansionOutput,
+        context: FieldContext,
     ) -> Result<Value, CommandFailure> {
         match part {
             WordPart::Literal(text) => {
-                self.collect_literal(spans, text)?;
+                match context {
+                    FieldContext::Fields => self.collect_literal(spans, text)?,
+                    FieldContext::CasePattern => {
+                        self.record_text(spans, text, Protection::Unquoted)?
+                    }
+                    FieldContext::QuotedCasePattern => {
+                        self.record_text(spans, text, Protection::Quoted)?
+                    }
+                }
                 self.expansion_text(text, output)
             }
             WordPart::SingleQuoted(text) => {
@@ -3898,12 +3442,17 @@ impl<'a> Evaluator<'a> {
             }
             WordPart::Arithmetic(expression) => {
                 let text = render_number(self.evaluate_arithmetic(expression)?);
-                self.record_text(spans, &text, Protection::Unquoted)?;
+                let protection = if context == FieldContext::QuotedCasePattern {
+                    Protection::Quoted
+                } else {
+                    Protection::Unquoted
+                };
+                self.record_text(spans, &text, protection)?;
                 Ok(Value::String(text))
             }
             WordPart::DoubleQuoted(parts) => {
                 let start = spans.len();
-                self.collect_quoted_parts(parts, spans)?;
+                self.collect_quoted_parts(parts, spans, context)?;
                 match output {
                     ExpansionOutput::Value => {
                         let bytes = spans[start..]
@@ -3941,7 +3490,7 @@ impl<'a> Evaluator<'a> {
                     | Parameter::LastStatus
                     | Parameter::LastJob => false,
                 };
-                if joined && self.ifs_separator().is_empty() {
+                if context == FieldContext::Fields && joined && self.ifs_separator().is_empty() {
                     let charge = self
                         .budget
                         .charge_value_bytes(size_of::<ExpansionSpan>() as u64)?;
@@ -3951,11 +3500,11 @@ impl<'a> Evaluator<'a> {
                         retained: Vec::new(),
                     });
                 }
-                self.expand_parameter_fields(parameter, spans)
+                self.expand_parameter_fields(parameter, spans, context)
             }
             WordPart::CommandSubstitution(program) => {
                 let result = self.run_substitution(program)?;
-                self.record_value(spans, &result.value)?;
+                self.record_expanded_value(spans, &result.value, context)?;
                 self.expansion_charges.extend(result.retained);
                 Ok(result.value)
             }
@@ -3966,6 +3515,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         parts: &[WordPart],
         spans: &mut Vec<ExpansionSpan>,
+        context: FieldContext,
     ) -> Result<(), CommandFailure> {
         if parts.is_empty() {
             self.record_text(spans, "", Protection::Quoted)?;
@@ -3978,22 +3528,24 @@ impl<'a> Evaluator<'a> {
                 WordPart::Asset(number) => {
                     self.record_text(spans, &number.to_string(), Protection::Quoted)?
                 }
-                WordPart::DoubleQuoted(inner) => self.collect_quoted_parts(inner, spans)?,
+                WordPart::DoubleQuoted(inner) => {
+                    self.collect_quoted_parts(inner, spans, context)?
+                }
                 WordPart::Arithmetic(expression) => {
                     let text = render_number(self.evaluate_arithmetic(expression)?);
                     self.record_text(spans, &text, Protection::Quoted)?;
                 }
                 WordPart::Parameter(parameter) => {
+                    if context != FieldContext::Fields {
+                        self.expand_parameter_fields(
+                            parameter,
+                            spans,
+                            FieldContext::QuotedCasePattern,
+                        )?;
+                        continue;
+                    }
                     let value = self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?;
                     if splits_inside_quotes(parameter) {
-                        let elements = match value {
-                            Value::Array(items) => items,
-                            Value::Null => Vec::new(),
-                            scalar @ (Value::Bool(_)
-                            | Value::Number(_)
-                            | Value::String(_)
-                            | Value::Object(_)) => vec![scalar],
-                        };
                         let protection = match parameter {
                             Parameter::Named { .. } => Protection::Checked,
                             Parameter::Positional(_)
@@ -4003,23 +3555,7 @@ impl<'a> Evaluator<'a> {
                             | Parameter::LastStatus
                             | Parameter::LastJob => Protection::Quoted,
                         };
-                        for (index, element) in elements.iter().enumerate() {
-                            if index > 0 {
-                                let mut separator = self.ifs_separator();
-                                if separator.is_empty() {
-                                    separator.push(' ');
-                                }
-                                let charge = self.budget.charge_value_bytes(
-                                    (size_of::<ExpansionSpan>() + separator.len()) as u64,
-                                )?;
-                                spans.push(ExpansionSpan {
-                                    content: SpanContent::Boundary(separator),
-                                    charge,
-                                    retained: Vec::new(),
-                                });
-                            }
-                            self.record_text(spans, &display(element), protection)?;
-                        }
+                        self.record_quoted_elements(spans, &value, protection, context)?;
                     } else {
                         self.record_text(spans, &quoted_text(&value), Protection::Quoted)?;
                     }
@@ -4029,6 +3565,46 @@ impl<'a> Evaluator<'a> {
                     self.record_capture(spans, result, Protection::Quoted)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn record_quoted_elements(
+        &mut self,
+        spans: &mut Vec<ExpansionSpan>,
+        value: &Value,
+        protection: Protection,
+        context: FieldContext,
+    ) -> Result<(), CommandFailure> {
+        let elements = match value {
+            Value::Array(items) => items.as_slice(),
+            Value::Null => &[],
+            scalar @ (Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_)) => {
+                std::slice::from_ref(scalar)
+            }
+        };
+        for (index, element) in elements.iter().enumerate() {
+            if index > 0 {
+                let mut separator = self.ifs_separator();
+                let literal_separator =
+                    context == FieldContext::QuotedCasePattern && separator.is_empty();
+                if separator.is_empty() {
+                    separator.push(' ');
+                }
+                let charge = self
+                    .budget
+                    .charge_value_bytes((size_of::<ExpansionSpan>() + separator.len()) as u64)?;
+                spans.push(ExpansionSpan {
+                    content: if literal_separator {
+                        SpanContent::Text(separator, protection)
+                    } else {
+                        SpanContent::Boundary(separator)
+                    },
+                    charge,
+                    retained: Vec::new(),
+                });
+            }
+            self.record_text(spans, &display(element), protection)?;
         }
         Ok(())
     }
@@ -4172,6 +3748,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         parameter: &Parameter,
         spans: &mut Vec<ExpansionSpan>,
+        context: FieldContext,
     ) -> Result<Value, CommandFailure> {
         match parameter {
             Parameter::Named {
@@ -4184,11 +3761,26 @@ impl<'a> Evaluator<'a> {
                     name,
                     indices,
                     modifier,
-                    Some(FieldExpansion { spans }),
+                    Some(FieldExpansion {
+                        spans,
+                        context,
+                        quoted_elements: context == FieldContext::QuotedCasePattern
+                            && splits_inside_quotes(parameter),
+                    }),
                     ExpansionOutput::Unsplit,
                 )
             }),
             Parameter::AllPositional | Parameter::AllPositionalJoined => {
+                if context != FieldContext::Fields {
+                    let value = self.parameter_value_with(parameter, ExpansionOutput::Unsplit)?;
+                    if context == FieldContext::QuotedCasePattern && splits_inside_quotes(parameter)
+                    {
+                        self.record_quoted_elements(spans, &value, Protection::Quoted, context)?;
+                    } else {
+                        self.record_expanded_value(spans, &value, context)?;
+                    }
+                    return Ok(value);
+                }
                 let values = self.positional().to_vec();
                 self.record_value(spans, &Value::Array(values.clone()))?;
                 Ok(Value::Array(values))
@@ -4199,7 +3791,7 @@ impl<'a> Evaluator<'a> {
             | Parameter::LastStatus
             | Parameter::LastJob => {
                 let value = self.parameter_value(parameter)?;
-                self.record_value(spans, &value)?;
+                self.record_expanded_value(spans, &value, context)?;
                 Ok(value)
             }
         }
@@ -4212,7 +3804,7 @@ impl<'a> Evaluator<'a> {
         output: ExpansionOutput,
     ) -> Result<Value, CommandFailure> {
         match split {
-            Some(split) => self.expand_replacement(word, split.spans),
+            Some(split) => self.expand_replacement(word, split.spans, split.context),
             None => self.expansion_value(word, output),
         }
     }
@@ -4223,7 +3815,16 @@ impl<'a> Evaluator<'a> {
         split: Option<FieldExpansion<'_>>,
     ) -> Result<Value, CommandFailure> {
         if let Some(split) = split {
-            self.record_value(split.spans, &value)?;
+            if split.quoted_elements {
+                self.record_quoted_elements(
+                    split.spans,
+                    &value,
+                    Protection::Quoted,
+                    split.context,
+                )?;
+            } else {
+                self.record_expanded_value(split.spans, &value, split.context)?;
+            }
         }
         Ok(value)
     }
@@ -4232,10 +3833,11 @@ impl<'a> Evaluator<'a> {
         &mut self,
         word: &Word,
         spans: &mut Vec<ExpansionSpan>,
+        context: FieldContext,
     ) -> Result<Value, CommandFailure> {
         if let [WordPart::CommandSubstitution(_)] = word.parts.as_slice() {
             let result = self.assignment_value(word)?;
-            self.record_value(spans, &result.value)?;
+            self.record_expanded_value(spans, &result.value, context)?;
             self.expansion_charges.extend(result.retained);
             return Ok(result.value);
         }
@@ -4244,7 +3846,14 @@ impl<'a> Evaluator<'a> {
             let start = spans.len();
             let value = match part {
                 WordPart::Literal(literal) => {
-                    self.record_split_text(spans, literal)?;
+                    match context {
+                        FieldContext::Fields | FieldContext::CasePattern => {
+                            self.record_split_text(spans, literal)?
+                        }
+                        FieldContext::QuotedCasePattern => {
+                            self.record_text(spans, literal, Protection::Quoted)?
+                        }
+                    }
                     self.expansion_text(literal, ExpansionOutput::Value)?
                 }
                 WordPart::Asset(_)
@@ -4253,7 +3862,7 @@ impl<'a> Evaluator<'a> {
                 | WordPart::Parameter(_)
                 | WordPart::CommandSubstitution(_)
                 | WordPart::Arithmetic(_) => {
-                    self.collect_field_part(part, spans, ExpansionOutput::Value)?
+                    self.collect_field_part(part, spans, ExpansionOutput::Value, context)?
                 }
             };
             if matches!(part, WordPart::SingleQuoted(_) | WordPart::DoubleQuoted(_)) {
@@ -4501,7 +4110,10 @@ impl<'a> Evaluator<'a> {
         let (value, bound) = self.select_parameter(
             name,
             indices,
-            if split.is_some() {
+            if split
+                .as_ref()
+                .is_some_and(|split| split.context == FieldContext::Fields)
+            {
                 ExpansionOutput::Fields
             } else {
                 output
@@ -4758,6 +4370,7 @@ impl<'a> Evaluator<'a> {
             text.truncate(text.trim_end_matches('\n').len());
         }
         let mut result = CommandResult {
+            output: None,
             value,
             status: self.last_substitution_status,
             suppress_newline: false,
@@ -4867,13 +4480,20 @@ fn parameter_length(value: &Value) -> Value {
     }
 }
 
-fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
-    if diagnostics.is_empty() {
-        return value;
-    }
-    let mut lines = value::to_lines(&value);
-    lines.extend(diagnostics);
-    value::from_lines(lines)
+fn merge_diagnostics(result: &mut CommandResult, diagnostics: Vec<Diagnostic>) {
+    let mut diagnostics = diagnostics.into_iter();
+    let Some(first) = diagnostics.next() else {
+        return;
+    };
+    let first = match Diagnostic::from_result(result) {
+        Some(output) => output.followed_by(first),
+        None => first,
+    };
+    let merged = diagnostics
+        .fold(first, Diagnostic::followed_by)
+        .into_result();
+    result.value = merged.value;
+    result.suppress_newline = merged.suppress_newline;
 }
 
 fn write_display(stdout: &mut PipeWriter<StageObservation>, value: &Value) -> WriteOutcome {
@@ -4893,20 +4513,23 @@ fn invert(status: ExitCode) -> ExitCode {
     }
 }
 
-fn append_stream_buffer(
+struct BufferStorage<'a> {
+    buffers: &'a mut Arc<BTreeMap<String, Vec<u8>>>,
+    charges: &'a mut BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
+    shared_charges: &'a mut Vec<dekopon_process::RetainedBytes>,
+}
+
+fn append_buffer_bytes(
     budget: &Budget,
     storage: BufferStorage<'_>,
     name: &str,
     bytes: &[u8],
 ) -> Result<(), LimitExceeded> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
     let charge = budget.charge_value_bytes(bytes.len() as u64)?;
     append_charged_buffer(budget, storage, name, bytes, vec![charge])
-}
-
-struct BufferStorage<'a> {
-    buffers: &'a mut Arc<BTreeMap<String, Vec<u8>>>,
-    charges: &'a mut BTreeMap<String, Vec<dekopon_process::RetainedBytes>>,
-    shared_charges: &'a mut Vec<dekopon_process::RetainedBytes>,
 }
 
 fn append_charged_buffer(
@@ -4974,6 +4597,14 @@ fn push_diagnostic_bytes(bytes: &[u8], captures: &mut [StderrCapture], output: &
         capture.push_bytes(bytes);
     } else {
         push_lossy_bytes(output, bytes);
+    }
+}
+
+fn push_diagnostic_fragment(text: &str, captures: &mut [StderrCapture], output: &mut OutputBuffer) {
+    if let Some(capture) = captures.last_mut() {
+        capture.push_fragment(text);
+    } else {
+        output.push_fragment(text);
     }
 }
 

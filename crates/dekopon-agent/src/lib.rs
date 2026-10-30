@@ -2446,6 +2446,7 @@ mod tests {
                     let (listener, socket) = listen(directory.path());
                     let scope = ChatScopeClaim {
                         participant: None,
+                        github: None,
                         transport: "scientist-slack".parse().expect("transport"),
                         kind: ChatTransportKind::Slack,
                         conversation: Conversation {
@@ -2512,6 +2513,7 @@ mod tests {
                     let (listener, socket) = listen(directory.path());
                     let scope = ChatScopeClaim {
                         participant: None,
+                        github: None,
                         transport: "scientist-slack".parse().expect("transport"),
                         kind: ChatTransportKind::Slack,
                         conversation: Conversation {

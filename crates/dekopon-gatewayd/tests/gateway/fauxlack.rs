@@ -473,7 +473,9 @@ async fn check_and_service_boot_report_transport_conflicts_together() {
             .iter()
             .any(|p| matches!(p, ConfigProblem::DuplicateTransport { .. }))
     );
-    let error = dekopon_gatewayd::run(&path, async {}).await.unwrap_err();
+    let error = dekopon_gatewayd::run(&path, async {}, 32)
+        .await
+        .unwrap_err();
     assert!(
         config_problems(&[error])
             .iter()
@@ -487,7 +489,7 @@ async fn check_and_service_boot_report_transport_conflicts_together() {
     ]);
     write_owner_only(&path, &serde_json::to_vec(&config).unwrap());
     let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
-    let error = dekopon_gatewayd::run_fauxlack(&path, async {}, chat)
+    let error = dekopon_gatewayd::run_fauxlack(&path, async {}, chat, 32)
         .await
         .unwrap_err();
     let errors: [GatewaydError; 1] = [error];

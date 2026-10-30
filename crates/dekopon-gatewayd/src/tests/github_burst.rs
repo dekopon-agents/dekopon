@@ -55,9 +55,18 @@ struct Fixture {
     broker: BrokerFixture,
     transport: GithubTransport,
     gateway: Gateway,
+    gate: crate::session::SessionGate,
 }
 
 async fn fixture(models: Arc<dyn ModelFactory>, maximum: usize) -> Fixture {
+    fixture_with_subscriptions(models, maximum, &[]).await
+}
+
+async fn fixture_with_subscriptions(
+    models: Arc<dyn ModelFactory>,
+    maximum: usize,
+    anchors: &[InboundMessage],
+) -> Fixture {
     let directory = temporary();
     fs::write(
         directory.path().join("dekopon.yaml"),
@@ -79,6 +88,11 @@ async fn fixture(models: Arc<dyn ModelFactory>, maximum: usize) -> Fixture {
         "check_run",
         "push"
     ]);
+    if !anchors.is_empty() {
+        doc["sessions"]["wakes"] = json!({"path":directory.path().join("wakes/wakes.jsonl")});
+        doc["transports"].as_array_mut().unwrap().push(json!({"name":"scientist-slack","kind":"slackSocketMode","appTokenEnv":"APP","botTokenEnv":"BOT"}));
+        doc["routes"].as_array_mut().unwrap().push(json!({"transport":"scientist-slack","agent":"reviewer","conversation":{"kind":["thread"]},"memory":{"mode":"oneShot"},"wakes":true}));
+    }
     let config = resolved(directory.path(), &doc).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
     let broker = BrokerFixture::scripted(directory.path(), |_, _| {
@@ -102,6 +116,32 @@ async fn fixture(models: Arc<dyn ModelFactory>, maximum: usize) -> Fixture {
         models,
         maximum,
     );
+    let mut runner = Arc::into_inner(runner).expect("sole runner owner");
+    if !anchors.is_empty() {
+        let store = wakes::wake_store(directory.path());
+        let target = crate::pull_request_links::PullRequestLinkContext::parse(
+            "https://github.com/owner/repo/pull/7",
+        )
+        .unwrap()
+        .unwrap()
+        .targets
+        .remove(0);
+        for message in anchors {
+            store
+                .subscribe(
+                    crate::wake::Anchor::from_inbound(message, &"reviewer".parse().unwrap())
+                        .unwrap()
+                        .as_space()
+                        .unwrap(),
+                    target.clone(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+        }
+        runner.wakes = Some(store);
+    }
+    let runner = Arc::new(runner);
+    let gate = runner.gate.clone();
     let generation = CurrentGeneration::boot(routes, Arc::default());
     let transport = GithubTransport::new(
         "github".into(),
@@ -110,27 +150,31 @@ async fn fixture(models: Arc<dyn ModelFactory>, maximum: usize) -> Fixture {
         generation.clone(),
         None,
     );
-    let gateway = Gateway::serving(
-        runner,
-        generation,
-        Arc::default(),
-        Arc::new(BTreeMap::from([("github".into(), transport.driver())])),
-    );
+    let mut drivers = BTreeMap::from([("github".into(), transport.driver())]);
+    if !anchors.is_empty() {
+        drivers.insert(
+            "scientist-slack".into(),
+            Arc::new(RecordingDriver::default()),
+        );
+    }
+    let gateway = Gateway::serving(runner, generation, Arc::default(), Arc::new(drivers));
     Fixture {
         _directory: directory,
         broker,
         transport,
         gateway,
+        gate,
     }
 }
 
 fn body(event: &str, number: u64, actor: u64) -> Value {
-    let mut body = crate::transport::github::tests::pr();
+    let mut body = crate::transport::github::tests::sample(event);
     body["sender"]["id"] = json!(actor);
     body["number"] = json!(number);
     body["pull_request"]["number"] = json!(number);
-    body["issue"] = json!({"number":number,"pull_request":{}});
-    body["check_run"] = json!({"pull_requests":[{"number":number,"base":{"repo":{"id":10}}}]});
+    body["issue"]["number"] = json!(number);
+    body["issue"]["pull_request"] = json!({});
+    body["check_run"]["pull_requests"] = json!([{"number":number,"base":{"repo":{"id":10}}}]);
     body["action"] = json!(if event == "pull_request" {
         "opened"
     } else {
@@ -664,4 +708,238 @@ async fn a_dispatcher_ignored_delivery_keeps_its_receipt_trace() {
     assert_eq!(records[0]["outcome"], "ignored");
     assert_eq!(records[0]["github.deliveries"], json!(["removed-route"]));
     assert_eq!(records[0]["parent.span.id"], receipt);
+}
+
+#[tokio::test(start_paused = true)]
+async fn wake_reason_returns_the_batch_the_claim_carries() {
+    use dekopon_core::github::GithubEvent;
+    let models = InterruptibleModel::new([
+        answer("lead"),
+        super::wake_reason::call(),
+        answer("reported"),
+    ]);
+    let mut fixture = fixture(Arc::new(Arc::clone(&models)), 1).await;
+    let mut sessions = tokio::task::JoinSet::new();
+    assert_eq!(
+        post(
+            &mut fixture,
+            &mut sessions,
+            "lead",
+            "issue_comment",
+            &body("issue_comment", 7, 1)
+        )
+        .await,
+        axum::http::StatusCode::OK
+    );
+    models.wait_until_entered().await;
+    for (id, event) in [
+        ("first", "issue_comment"),
+        ("second", "pull_request_review"),
+    ] {
+        assert_eq!(
+            post(&mut fixture, &mut sessions, id, event, &body(event, 7, 1)).await,
+            axum::http::StatusCode::OK
+        );
+    }
+    models.release();
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    let (_, encoded) = models
+        .prompt(2)
+        .into_iter()
+        .rev()
+        .find(|(role, _)| role == "tool")
+        .expect("the result reaches the model");
+    let value: Value = serde_json::from_str(&encoded).expect("wake_reason returns JSON");
+    assert_eq!(value["trigger"], "webhook");
+    assert_eq!(value["source"], "github");
+    let events: Vec<GithubEvent> = serde_json::from_value(value["events"].clone()).unwrap();
+    let claims: Vec<_> = fixture
+        .broker
+        .recorded()
+        .into_iter()
+        .filter_map(|request| match request.request {
+            BrokerRequest::Capabilities {
+                attestation: Some(claim),
+            } => claim.scope.and_then(|scope| scope.github),
+            BrokerRequest::Capabilities { attestation: None }
+            | BrokerRequest::Run { .. }
+            | BrokerRequest::Invoke { .. }
+            | BrokerRequest::RecordDeliveredTurn { .. }
+            | BrokerRequest::UpcallResult { .. }
+            | BrokerRequest::PrepareGeneration { .. }
+            | BrokerRequest::CommitGeneration { .. }
+            | BrokerRequest::AbortGeneration { .. }
+            | BrokerRequest::ObserveGeneration => None,
+        })
+        .collect();
+    assert_eq!(claims.len(), 2, "inspection opens no extra broker leg");
+    let frame_events: Vec<GithubEvent> =
+        serde_json::from_value(serde_json::to_value(&claims[1]).unwrap()).unwrap();
+    assert_eq!(events, frame_events);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.delivery.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    let note = models
+        .prompt(1)
+        .into_iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(note.find("delivery first.").unwrap() < note.find("delivery second.").unwrap());
+    assert!(note.ends_with("Read current state through a broker-granted capability before acting. Call wake_reason for every fact."));
+}
+
+#[tokio::test]
+async fn a_full_anchored_mailbox_returns_503_and_leaves_the_subscription_guid_retryable() {
+    use crate::{
+        collection::Dispositions,
+        session::{Admit, MAILBOX_CAPACITY},
+    };
+    let first = owned_slack_message("first anchor", false);
+    let mut second = owned_slack_message("second anchor", false);
+    second.conversation.thread = Some("1700000001.000001".into());
+    second.reply = ReplyTarget::Slack {
+        channel: second.conversation.id.clone(),
+        thread_ts: second.conversation.thread.clone(),
+    };
+    let anchors = [first, second];
+    let models = ModelScript::new([decline_reply(), decline_reply()]);
+    let mut fixture = fixture_with_subscriptions(Arc::new(Arc::clone(&models)), 4, &anchors).await;
+    let mut bound = route(model_config());
+    bound.transport = "scientist-slack".into();
+    bound.wakes = true;
+    let mut held = Vec::new();
+    for anchor in &anchors {
+        let mut message = owned_slack_message("held", false);
+        message.conversation = anchor.conversation.clone();
+        message.reply = anchor.reply.clone();
+        let Admit::Admitted(admission, ..) =
+            fixture
+                .gate
+                .admit(&bound, message, Dispositions(Vec::new()))
+        else {
+            panic!("anchor admitted")
+        };
+        held.push(admission);
+    }
+    for _ in 0..MAILBOX_CAPACITY {
+        assert!(matches!(
+            fixture.gate.admit(
+                &bound,
+                owned_slack_message("queued", false),
+                Dispositions(Vec::new())
+            ),
+            Admit::Steered(_)
+        ));
+    }
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut push = body("pull_request", 7, 1);
+    push["action"] = json!("synchronize");
+    assert_eq!(
+        post(
+            &mut fixture,
+            &mut sessions,
+            "anchored-full",
+            "pull_request",
+            &push
+        )
+        .await,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(models.requests(), 0);
+    drop(held);
+    assert_eq!(
+        post(
+            &mut fixture,
+            &mut sessions,
+            "anchored-full",
+            "pull_request",
+            &push
+        )
+        .await,
+        axum::http::StatusCode::OK
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(models.requests(), 2);
+    assert_eq!(
+        fixture
+            .transport
+            .request_for_test(signed(
+                &serde_json::to_vec(&push).unwrap(),
+                b"secret",
+                "anchored-full",
+                "pull_request"
+            ))
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    assert!(fixture.transport.try_delivery_for_test().is_err());
+}
+
+#[tokio::test]
+async fn a_subscription_without_an_anchor_driver_is_ignored_and_commits_its_guid() {
+    let models = ModelScript::new([]);
+    let mut fixture = fixture_with_subscriptions(
+        Arc::new(Arc::clone(&models)),
+        4,
+        &[owned_slack_message("anchor", false)],
+    )
+    .await;
+    fixture.gateway = Gateway::serving(
+        Arc::clone(fixture.gateway.runner_for_test()),
+        CurrentGeneration::boot(
+            Arc::clone(&fixture.gateway.generation_for_test().routes),
+            Arc::default(),
+        ),
+        Arc::default(),
+        Arc::new(BTreeMap::from([(
+            "github".into(),
+            fixture.transport.driver(),
+        )])),
+    );
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut push = body("pull_request", 7, 1);
+    push["action"] = json!("synchronize");
+    assert_eq!(
+        post(
+            &mut fixture,
+            &mut sessions,
+            "no-anchor-driver",
+            "pull_request",
+            &push
+        )
+        .await,
+        axum::http::StatusCode::OK
+    );
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(models.requests(), 0);
+    assert_eq!(
+        fixture
+            .transport
+            .request_for_test(signed(
+                &serde_json::to_vec(&push).unwrap(),
+                b"secret",
+                "no-anchor-driver",
+                "pull_request"
+            ))
+            .await
+            .status(),
+        axum::http::StatusCode::OK
+    );
+    assert!(fixture.transport.try_delivery_for_test().is_err());
 }

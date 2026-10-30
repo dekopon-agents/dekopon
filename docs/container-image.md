@@ -176,6 +176,14 @@ The publication job grants `artifact-metadata: write` so the attestation action 
 OCI digest from the organization's **Linked Artifacts** view. This records the already-published
 subject; it does not grant another registry write path.
 
+The verified index digest appears in the image job's step summary and its reusable workflow's
+`digest` output. On tag pushes, `release.yml` exposes both variants through the `release-digests`
+job outputs `digest` (stock) and `optimized-digest`, and its run summary. After both image jobs
+succeed, that job appends a **Container images** section to the existing generated release notes,
+with one line per image: `ghcr.io/dekopon-agents/dekopon:<tag> sha256:…` and
+`ghcr.io/dekopon-agents/dekopon:<tag>-wasmtime-optimization sha256:…`.
+Manual image recovery leaves the digest in the image job's summary; it does not edit release notes.
+
 Each release publishes two tags in the same GHCR repository:
 
 - `<tag>` uses crates.io Wasmtime and retains the normal release behavior

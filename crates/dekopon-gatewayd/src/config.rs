@@ -29,8 +29,11 @@ use serde::Deserialize;
 use thiserror::Error;
 
 pub(crate) mod memory;
-pub use memory::{MemorySettings, ResolvedPolicy, ResolvedSettings};
-use memory::{PolicyConfig, PolicyProblem, resolve_policy, resolve_settings};
+use memory::{
+    CaptureConfig, JournalRecall, KnobInputs, KnobOverrides, PolicyProblem, SelectionConfig,
+    SummariesConfig, resolve_knobs, resolve_settings,
+};
+pub use memory::{MemoryKnobs, MemorySettings, ResolvedSettings};
 
 use crate::{
     progress::{KeepAlive, ProgressDetail, Templates},
@@ -739,14 +742,20 @@ pub enum MemoryConfig {
         idle_timeout_ms: u64,
         #[serde(default = "default_conversation_max_turns")]
         max_turns: usize,
-        #[serde(default = "default_conversation_max_bytes")]
-        max_bytes: usize,
+        #[serde(default)]
+        max_bytes: Option<usize>,
         #[serde(default)]
         recall: Option<RecallSource>,
         #[serde(default)]
         forget_after_ms: Option<u64>,
         #[serde(default)]
-        policy: Option<Box<PolicyConfig>>,
+        hot_turns: Option<std::num::NonZeroUsize>,
+        #[serde(default)]
+        summaries: Option<SummariesConfig>,
+        #[serde(default)]
+        capture: Option<CaptureConfig>,
+        #[serde(default)]
+        selection: Option<SelectionConfig>,
     },
 }
 
@@ -764,10 +773,13 @@ impl Default for MemoryConfig {
             scope: MemoryScope::default(),
             idle_timeout_ms: default_idle_timeout_ms(),
             max_turns: default_conversation_max_turns(),
-            max_bytes: default_conversation_max_bytes(),
+            max_bytes: None,
             recall: None,
             forget_after_ms: None,
-            policy: None,
+            hot_turns: None,
+            summaries: None,
+            capture: None,
+            selection: None,
         }
     }
 }
@@ -780,12 +792,15 @@ const fn default_conversation_max_turns() -> usize {
     DEFAULT_CONVERSATION_MAX_TURNS
 }
 
-const fn default_conversation_max_bytes() -> usize {
-    DEFAULT_CONVERSATION_MAX_BYTES
-}
-
 // One week matches how long WhatsApp keeps an inbound media id, so recalled photos stay fetchable.
 pub const DEFAULT_FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct AmbientConfig {
+    #[serde(default)]
+    pub(crate) pull_request_links: bool,
+}
 
 #[expect(
     clippy::struct_excessive_bools,
@@ -794,6 +809,8 @@ pub const DEFAULT_FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60)
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RouteConfig {
+    #[serde(default)]
+    pub(crate) ambient: AmbientConfig,
     pub transport: String,
     pub conversation: ConversationMatchConfig,
     #[serde(default, deserialize_with = "github_events_present")]
@@ -880,6 +897,7 @@ impl MemoryPolicy {
 )]
 #[derive(Clone, Debug)]
 pub struct ResolvedRoute {
+    pub(crate) ambient: AmbientConfig,
     pub transport: String,
     pub github_events: Option<Vec<GithubEvent>>,
     pub conversation: ConversationMatch,
@@ -892,7 +910,7 @@ pub struct ResolvedRoute {
     pub(crate) steering: Steering,
     pub(crate) progress_notes: bool,
     pub memory: MemoryPolicy,
-    pub memory_policy: Option<ResolvedPolicy>,
+    pub memory_knobs: Option<MemoryKnobs>,
     pub(crate) indicators: BTreeMap<ConversationKind, Arc<ResolvedLiveness>>,
     pub wakes: bool,
     pub follow: bool,
@@ -908,6 +926,18 @@ pub struct WakesConfig {
     pub min_interval_ms: u64,
     #[serde(default = "default_wake_max_horizon_ms")]
     pub max_horizon_ms: u64,
+    #[serde(default = "default_max_subscriptions_per_agent")]
+    pub max_subscriptions_per_agent: usize,
+    #[serde(default = "default_subscription_expiry_ms")]
+    pub subscription_expiry_ms: u64,
+}
+
+const fn default_max_subscriptions_per_agent() -> usize {
+    64
+}
+
+const fn default_subscription_expiry_ms() -> u64 {
+    14 * 24 * 60 * 60 * 1_000
 }
 
 const fn default_wake_max_per_subject() -> usize {
@@ -927,6 +957,8 @@ pub struct WakeBounds {
     pub max_per_subject: usize,
     pub min_interval: Duration,
     pub max_horizon: Duration,
+    pub max_subscriptions_per_agent: usize,
+    pub subscription_expiry: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -2479,6 +2511,19 @@ fn resolve_with_service(
                 indicators.insert(kind, Arc::new(resolved));
             }
         }
+        if route.ambient.pull_request_links {
+            let slack = transports.iter().any(|transport| {
+                matches!(transport, TransportConfig::SlackSocketMode { name, .. } if name == &route.transport)
+            });
+            if !slack
+                || !matches!(&conversation.kind, ConversationKindMatch::Kinds(kinds) if !kinds.is_empty() && kinds.iter().all(|kind| matches!(kind, ConversationKind::Channel | ConversationKind::Thread)))
+            {
+                problems.push(ConfigProblem::UnsupportedPullRequestLinksRoute { route: index });
+            }
+            if !route.follow {
+                problems.push(ConfigProblem::PullRequestLinksWithoutFollow { route: index });
+            }
+        }
         if route.follow {
             if config.sessions.journal.is_none() {
                 problems.push(ConfigProblem::FollowWithoutJournal { route: index });
@@ -2572,41 +2617,7 @@ fn resolve_with_service(
             });
         }
         let agent_memory = config.sessions.memory.agents.get(&route.agent);
-        let policy_config = match &route.memory {
-            MemoryConfig::Persistent { policy, .. } => policy
-                .as_deref()
-                .or_else(|| agent_memory.and_then(|entry| entry.policy.as_ref())),
-            MemoryConfig::OneShot {} => agent_memory.and_then(|entry| entry.policy.as_ref()),
-        };
-        let memory_policy = match resolve_policy(
-            policy_config,
-            agent_memory.and_then(|entry| entry.routine.as_deref()),
-            &model_names,
-            &proxy_only,
-        ) {
-            Ok(mut policy) => {
-                policy.models = policy
-                    .routines
-                    .iter()
-                    .filter_map(|routine| {
-                        let name = routine.model.as_ref()?;
-                        config
-                            .models
-                            .iter()
-                            .find(|model| model.name() == name)
-                            .map(|model| (name.clone(), model.clone()))
-                    })
-                    .collect();
-                Some(policy)
-            }
-            Err(problem) => {
-                problems.push(ConfigProblem::MemoryPolicy {
-                    route: Some(index),
-                    problem,
-                });
-                None
-            }
-        };
+        let mut memory_knobs = None;
         let memory = match route.memory {
             MemoryConfig::OneShot {} => MemoryPolicy::OneShot,
             MemoryConfig::Persistent {
@@ -2616,8 +2627,45 @@ fn resolve_with_service(
                 max_bytes,
                 recall,
                 forget_after_ms,
-                policy: _,
+                hot_turns,
+                summaries,
+                capture,
+                selection,
             } => {
+                let journaled = config.sessions.journal.is_some();
+                let recall = recall.unwrap_or(if journaled {
+                    RecallSource::Journal
+                } else {
+                    RecallSource::None
+                });
+                let max_bytes = max_bytes.unwrap_or(match recall {
+                    RecallSource::Journal => memory::JOURNAL_RECALL_MAX_BYTES,
+                    RecallSource::None | RecallSource::Platform => DEFAULT_CONVERSATION_MAX_BYTES,
+                });
+                if journaled && max_turns > 0 {
+                    match resolve_knobs(&KnobInputs {
+                        route: &KnobOverrides {
+                            hot_turns,
+                            summaries,
+                            capture,
+                            selection,
+                        },
+                        agent: agent_memory,
+                        max_turns,
+                        journal_recall: match recall {
+                            RecallSource::Journal => JournalRecall::Replays,
+                            RecallSource::None | RecallSource::Platform => JournalRecall::Never,
+                        },
+                        models: &model_names,
+                        proxy_only: &proxy_only,
+                    }) {
+                        Ok(knobs) => memory_knobs = Some(knobs),
+                        Err(problem) => problems.push(ConfigProblem::MemoryPolicy {
+                            route: Some(index),
+                            problem,
+                        }),
+                    }
+                }
                 if idle_timeout_ms == 0
                     || max_turns == 0
                     || max_bytes == 0
@@ -2627,12 +2675,6 @@ fn resolve_with_service(
                         agent: route.agent.to_string(),
                     });
                 }
-                let journaled = config.sessions.journal.is_some();
-                let recall = recall.unwrap_or(if journaled {
-                    RecallSource::Journal
-                } else {
-                    RecallSource::None
-                });
                 match recall {
                     RecallSource::Journal if !journaled => {
                         problems.push(ConfigProblem::JournalRecallWithoutJournal { route: index });
@@ -2700,14 +2742,11 @@ fn resolve_with_service(
             steering: route.steering,
             progress_notes: route.progress_notes,
             memory,
-            memory_policy: if config.sessions.journal.is_some() && memory.window().is_some() {
-                memory_policy
-            } else {
-                None
-            },
+            memory_knobs,
             indicators,
             wakes: route.wakes,
             follow: route.follow,
+            ambient: route.ambient,
         });
     }
 
@@ -2736,7 +2775,12 @@ fn resolve_with_service(
         problems.push(ConfigProblem::InvalidMaxJobs);
     }
     let wakes = config.sessions.wakes.as_ref().map(|wakes| {
-        if wakes.max_per_subject == 0 || wakes.min_interval_ms == 0 || wakes.max_horizon_ms == 0 {
+        if wakes.max_per_subject == 0
+            || wakes.min_interval_ms == 0
+            || wakes.max_horizon_ms == 0
+            || wakes.max_subscriptions_per_agent == 0
+            || wakes.subscription_expiry_ms == 0
+        {
             problems.push(ConfigProblem::InvalidWakeBounds);
         }
         ResolvedWakes {
@@ -2745,6 +2789,8 @@ fn resolve_with_service(
                 max_per_subject: wakes.max_per_subject,
                 min_interval: Duration::from_millis(wakes.min_interval_ms),
                 max_horizon: Duration::from_millis(wakes.max_horizon_ms),
+                max_subscriptions_per_agent: wakes.max_subscriptions_per_agent,
+                subscription_expiry: Duration::from_millis(wakes.subscription_expiry_ms),
             },
         }
     });
@@ -3334,6 +3380,10 @@ pub enum ConfigProblem {
         "routes[{route}]: follow requires a Slack channel/thread route or a Discord channel/thread route with messageContent enabled"
     )]
     UnsupportedFollowRoute { route: usize },
+    #[error("routes[{route}]: ambient.pullRequestLinks requires a Slack channel/thread route")]
+    UnsupportedPullRequestLinksRoute { route: usize },
+    #[error("routes[{route}]: ambient.pullRequestLinks requires follow: true and its journal")]
+    PullRequestLinksWithoutFollow { route: usize },
     #[error(
         "stopWords must not be empty and no word may be blank; omit the key to keep the default list"
     )]
@@ -3446,7 +3496,7 @@ pub enum ConfigProblem {
     #[error("routes[{route}]: `wakes: true` needs `sessions.wakes`")]
     WakesWithoutStore { route: usize },
     #[error(
-        "sessions.wakes.maxPerSubject, minIntervalMs and maxHorizonMs must be greater than zero; omit sessions.wakes to turn wakes off"
+        "sessions.wakes.maxPerSubject, minIntervalMs, maxHorizonMs, maxSubscriptionsPerAgent and subscriptionExpiryMs must be greater than zero; omit sessions.wakes to turn wakes off"
     )]
     InvalidWakeBounds,
     #[error(
@@ -4094,6 +4144,62 @@ routes:
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn pull_request_links_require_slack_channel_kinds_and_existing_follow() {
+        let slack = "transports:\n  - name: chat\n    kind: slackSocketMode\n    appTokenEnv: APP\n    botTokenEnv: BOT\n";
+        let local = "transports:\n  - name: chat\n    kind: local\n    socketPath: dev.sock\n";
+        let route = "routes:\n  - transport: chat\n    conversation: { kind: [channel, thread] }\n    agent: reviewer\n    follow: true\n    ambient: { pullRequestLinks: true }\n";
+        let journal = "sessions:\n  journal: { path: journal }\n  assets: { path: assets }\n";
+        assert!(
+            resolved(&format!("{journal}{slack}{route}"))
+                .unwrap()
+                .routes[0]
+                .ambient
+                .pull_request_links
+        );
+        for (transport, route) in [
+            (local, route.to_owned()),
+            (slack, route.replace("channel, thread", "directMessage")),
+            (
+                slack,
+                route.replace("channel, thread", "groupDirectMessage"),
+            ),
+        ] {
+            assert!(
+                matches!(resolved(&format!("{journal}{transport}{route}")), Err(ConfigError::Invalid { problems, .. })
+                if problems.iter().any(|p| matches!(p, super::ConfigProblem::UnsupportedPullRequestLinksRoute { route: 0 })))
+            );
+        }
+        assert!(
+            matches!(resolved(&format!("{slack}{}", route.replace("follow: true", "follow: false"))), Err(ConfigError::Invalid { problems, .. })
+            if problems.iter().any(|p| matches!(p, super::ConfigProblem::PullRequestLinksWithoutFollow { route: 0 })))
+        );
+        assert!(
+            matches!(resolved(&format!("{slack}{route}")), Err(ConfigError::Invalid { problems, .. })
+            if problems.iter().any(|p| matches!(p, super::ConfigProblem::FollowWithoutJournal { route: 0 })))
+        );
+        assert!(
+            !resolved(&format!(
+                "{journal}{slack}{}",
+                route.replace("    ambient: { pullRequestLinks: true }\n", "")
+            ))
+            .unwrap()
+            .routes[0]
+                .ambient
+                .pull_request_links
+        );
+        assert!(matches!(
+            super::decode(
+                format!(
+                    "{PREAMBLE}{journal}{slack}{}",
+                    route.replace("pullRequestLinks: true", "pullRequestLinks: yes")
+                )
+                .as_bytes()
+            ),
+            Err(ConfigError::Decode { .. })
+        ));
     }
 
     #[test]

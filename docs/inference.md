@@ -37,7 +37,7 @@ Slack event
        empty/refused -> fixed unauthorized reply; no model call
   -> conversation store optionally supplies compacted history + an opaque cache key
   -> prompt loop builds ModelMessage values and ModelTool definitions
-  -> a per-session BlockingModel enters the supplied tokio runtime from spawn_blocking
+  -> a per-session BlockingModel enters the supplied tokio runtime from an admitted ShellThreads turn
   -> the shared ModelClient selects Codex, OpenRouter, or OpenAI-compatible encoding
   -> pooled async reqwest sends compact typed JSON with Content-Length
   -> SSE events stream visible text back to the caller and become AssistantTurn
@@ -271,9 +271,10 @@ One long-lived optimization is in place: `dekopon-gatewayd` shares one model cli
 A route selects replay behavior with a `memory:` block, and [`gatewayd.md`](gatewayd.md#conversations) owns its
 keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
-`persistent` is the route default; `oneShot` disables history replay. A persistent route seeds the prompt with
-compacted `(question, final answer)` pairs ahead of the new message, oldest dropped first until both
-the turn and byte bounds hold. Every person-originated turn, in every scope, is prefixed with
+`persistent` is the route default; `oneShot` disables history replay. A journal-recall route
+replays its journal records ahead of the new message, as described below; other persistent routes
+seed the prompt from an owned window of `(question, final answer)` pairs, oldest dropped first
+until both the turn and byte bounds hold. Every person-originated turn, in every scope, is prefixed with
 `[gateway: authenticated participant: <principal>]` before it is sent and retained, naming the
 broker principal the sender maps to, or `[gateway: unmapped participant]` when the broker named
 none, so that principal name is model input whatever the telemetry gate says.
@@ -284,23 +285,29 @@ running session's leg. An empty grant stops before the
 model call and removes remembered state for that key; a broker or attestation failure stops before
 inference with no fresh grant vector to replace state with. A capability set that differs from the one
 stored beside the conversation drops the entry and closes its attachment generation, and on a shared
-route participants with different grant vectors reset the window between them. The new exchange is
-appended only if its generation remains current.
+route participants with different grant vectors reset the window between them. Whether the turn is
+kept is decided at its lease commit: a stopped completion, or one stale at that commit, records
+nothing, and a journal route appends the commit's record after the reply.
 
-### What history drops
+### What history keeps and drops
 
-- model reasoning, including encrypted replay items;
-- function/tool calls;
-- scripts and capability outputs;
-- system instructions, which are supplied fresh from the catalog;
-- the gateway's fixed failure sentence; and
-- any synthetic assistant text for a no-reply decision — there is none, so a declined turn keeps the
-  user message alone.
+A journal-recall persistent route keeps one record per turn: the turn's original items (the
+user text, consumed steers, assistant text, reasoning, and every tool call with the result the
+model received) and a slot for each summary part. A background engine fills the slots
+best-effort, after the reply. No reply waits for it, and a summary that fails is recorded as
+failed, never faked. Provider reasoning that only its own model can read is replayed only to
+that model.
 
-The model is told what is missing or replaced; journal replay retains captured bash exchanges, while platform and resident replay keep request and final reply text only, and neither keeps reasoning or other tool calls.
+The newest `hotTurns` records replay verbatim. Older records replay as their deepest
+generated summary, or verbatim if none exists yet. When the window is short, the oldest
+record steps down (summary, metadata, a counted omission), so a turn is shortened, never
+silently lost.
 
-This is conversation continuity, not evidence continuity. The broker audit is where authorized
-effects remain verifiable.
+History drops system instructions (supplied fresh), the gateway's fixed failure sentence,
+opaque reasoning bound for another model, and records written under a different grant.
+Routes that do not recall from the journal store only tool exchanges, and platform-recall
+routes replay chat messages only. This is conversation continuity, not
+evidence continuity. The broker audit is where authorized effects remain verifiable.
 
 ### Memory never becomes authority
 

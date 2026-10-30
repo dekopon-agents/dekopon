@@ -73,6 +73,8 @@ Variables are `serde_json::Value`; pipeline stages exchange bytes, not values. `
 
 **Kept**: simple commands and compound ones — `if`, `for`, `while`, `until`, `case`, and `{ ...; }` groups — anywhere a command may appear, including as a pipeline stage; `;`, `&&`, `||`, `|`; a leading `!` to invert a pipeline; `#` comments; `if`/`elif`/`else`; `for`; `while`; `until`; `case`/`esac`; `[[ ... ]]`; `break`/`continue` with levels; functions with `$1`/`$@`/`$*`/`$#`, `shift`, and `local` under bash's dynamic scoping; `unset`; the no-op `:`; `read`; `$NAME`, `${NAME}`, `${NAME[index]}`, `${NAME[@]}`/`${NAME[*]}`, `${#NAME}`, and the substitution forms `${NAME:-w}`, `${NAME:=w}`, `${NAME:?w}`, `${NAME:+w}`, `${NAME#p}`, `${NAME%p}`, `${NAME/p/r}`; both quoting forms, bash-exact, including `"$@"` splitting one word per parameter; `$( )`; `$(( ))`; `$?`; `${PIPESTATUS[@]}`; `set -e`, `set -u`, `set -o pipefail` and their `+` forms; `return`; `exit`; here-documents `<<EOF`, `<<-EOF`, and the literal `<<'EOF'`; and redirection of either stream — `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `>&2` — into named in-memory buffers read back by `cat`.
 
+`case` patterns follow Bash globs: unquoted `*`, `?` and bracket expressions (members, ranges and `!`/`^` negation) match pattern characters, including those produced by unquoted expansions, while quoted or escaped characters stay literal; POSIX bracket classes, collating symbols and equivalence classes are refused by name.
+
 Bash 5.2 IFS field splitting applies to unquoted parameter expansions and command-substitution
 output. Unset `IFS` uses space, tab and newline; empty `IFS` disables splitting. ASCII whitespace
 characters present in `IFS` trim and collapse, while other IFS characters delimit fields,
@@ -97,9 +99,7 @@ Some Bash quoting and `read` combinations split a UTF-8 character into invalid b
 combinations fail explicitly with `IFS: Bash would produce a field that is not valid UTF-8`,
 because shell argument and variable values must remain valid UTF-8.
 
-**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in an unflagged `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
-
-"Rejected loudly" reaches inside `case` too. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns follow when they are given no `-E`, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
+**Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in an unflagged `grep`/`sed` pattern. A model must never be able to believe something happened that did not.
 
 An unquoted whole word `chat-asset:N`, with a nonzero canonical decimal number fitting `u64`, is
 a typed attachment reference only in a provider command's argv. It is never field-split or
@@ -107,7 +107,7 @@ joined. Quoting, escaping, larger words, assignments and variable expansion prod
 text. Builtins refuse attachment operands with an `asset cat` pipeline suggestion. Provider
 `--help` as the sole literal unquoted argument uses the cached page without spending a call.
 
-**Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`). There is no filesystem to glob against, so there is nothing to reject *against*. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
+**Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: filesystem pathname expansion (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`). There is no filesystem to glob against, so there is nothing to reject *against*. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
 
 ### IFS differential corpus
 
@@ -197,6 +197,8 @@ named-buffer redirects there do not change the parent. `exit`, `return`, and `br
 stage end only that stage. Inside a compound, `read`, `cat`, and stdin-reading builtins share its
 one-shot input stream; provider commands do not inherit that stream.
 
+The private `StageOut` writer selects each command’s output destination: discard, diagnostics, named buffer, pipe, capture, or terminal. Value builtins and stream builtins, including `cat` and `base64`, share that routing.
+
 Pipeline stages exchange bytes; `xargs` runs one input line at a time and emits each command's
 output before reading the next line. Named redirection buffers append exact bytes, including invalid
 UTF-8, and `cat` copies those bytes to another pipe or buffer. `grep`, `sort`, `uniq`, `wc`,
@@ -274,13 +276,28 @@ inside a script; what a caller receives is the transcript a terminal would have 
 
 ## Builtins
 
-`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `head`, `tail`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `progress` (a note through `CapabilityInvoker::note`, a no-op without a sink), `cat`, and `cap` (what this session was granted). There is no `curl` builtin; HTTP is reached through a provider command word like any other capability. A loaded provider may also contribute *command words* (for example `gh`), resolved after functions and builtins through typed `CapabilityInvoker::run`, with invoked, returned or uncertain results and the corresponding call-budget handling (see [Provider command words](#provider-command-words)); a provider word that collides with a builtin, another reserved word, or another provider's word is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
+`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `awk`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `head`, `tail`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `progress` (a note through `CapabilityInvoker::note`, a no-op without a sink), `cat`, and `cap` (what this session was granted). There is no `curl` builtin; HTTP is reached through a provider command word like any other capability. A loaded provider may also contribute *command words* (for example `gh`), resolved after functions and builtins through typed `CapabilityInvoker::run`, with invoked, returned or uncertain results and the corresponding call-budget handling (see [Provider command words](#provider-command-words)); a provider word that collides with a builtin, another reserved word, or another provider's word is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
 
 `head` and `tail` select lines from standard input (10 by default): `-n N`, `--lines N`, or `-N` selects a count, and `tail -n +N` starts at line N. `head -c N`/`--bytes N` selects raw bytes; zero closes input without reading. Both accept one named-buffer operand or `-` for stdin, not host files; neither accepts `-f`.
 
 Every builtin answers `--help` on stdout at exit 0, naming the flags it accepts (`true`, `false`, `sleep`, `cat`, and `printf` take none, so theirs reads `no flags`); the interpreter intercepts `--help` before the builtin's own argument parsing ever runs, so it wins even over a call that is otherwise malformed, such as `[ --help` with no closing `]`. The same accepted-subset text `--help` prints is what `unsupported_flag` appends to a refusal: `grep: option not yet supported: -o (supported: -v -i -c -n -E -q -A N -B N -C N)`.
 
-`grep` and `sed` are the only two that take `-E`, and it is the only way regex syntax ever becomes regex syntax here. Unflagged, both read a literal pattern and reject an unescaped metacharacter by name — one matching semantics shared with `case`, `${p#…}`, and the right operand of `[[ == ]]`, so a script never has to know which construct it is in to know what `[0-9]` means. With `-E` the pattern goes to `regex-bites`, the engine `jq`'s own `regex` builtins already link, rather than to a second one added for this. Anchors are real (`grep -E '^ba(r|z)$'`, `sed -E 's/^ *//'`), `.` is the wildcard, and the engine's compile error is reported by name when a pattern does not compile. An `-E` pattern is model-authored text, so it is bounded before it sees input: 1 KiB of pattern source, a 64 KiB compiled program, and sixteen levels of nesting. A replacement stays literal text in both modes — the engine's `$1` interpolation is off, and a real-sed `\1` group reference is refused rather than emitted verbatim. For grep, `-i -E` and bundled `-iE` both fold ASCII case only, because this engine matches codepoint by codepoint; that is narrower than the literal path's `-i`, never wider.
+`grep` and `sed` take `-E`, and it and `awk`'s own regexes are the only ways regex syntax ever becomes regex syntax here. Unflagged, both read a literal pattern and reject an unescaped metacharacter by name — one matching semantics shared with `case`, `${p#…}`, and the right operand of `[[ == ]]`, so a script never has to know which construct it is in to know what `[0-9]` means. With `-E` the pattern goes to `regex-bites`, the engine `jq`'s own `regex` builtins already link, rather than to a second one added for this. Anchors are real (`grep -E '^ba(r|z)$'`, `sed -E 's/^ *//'`), `.` is the wildcard, and the engine's compile error is reported by name when a pattern does not compile. An `-E` pattern is model-authored text, so it is bounded before it sees input: 1 KiB of pattern source, a 64 KiB compiled program, and sixteen levels of nesting. A replacement stays literal text in both modes — the engine's `$1` interpolation is off, and a real-sed `\1` group reference is refused rather than emitted verbatim. For grep, `-i -E` and bundled `-iE` both fold ASCII case only, because this engine matches codepoint by codepoint; that is narrower than the literal path's `-i`, never wider.
+
+`awk` is POSIX awk without a filesystem, processes or a second input: pattern-action rules,
+`BEGIN`/`END`, range patterns, fields `$0`…`$N` with `NF`, `NR`, `FS` (`-F`), `OFS`, `ORS`,
+`-v name=value`, associative arrays with `for (k in a)` and `delete`, `if`/`while`/`do`/`for`,
+`next` and `exit`, `print` and `printf`, and the functions `length substr index split sub gsub
+match sprintf tolower toupper int sqrt exp log sin cos atan2`. It reads stdin a line at a time, or one
+named buffer operand. Regexes are the `-E` dialect `grep` and `sed` use (leftmost-first, the
+same bounds), lengths and substrings count characters, and numbers print as integers or with
+`%.6g`. Everything that needs something this shell does not have is refused before any input is
+read, at exit 2, with what to write instead (a printf format or field separator built at run time
+fails when it is used): `getline`, `system()`, `print > file` and `| cmd`,
+`close`, `rand`/`srand`, `ENVIRON`/`ARGV`, `RS`, `OFMT`/`CONVFMT`, user-defined `function`s,
+multi-dimensional subscripts, and gawk extensions such as `IGNORECASE` and `gensub`. A program
+is at most 8 KiB, nests at most 32 levels, and its loops and retained strings spend the script's
+own step and value-byte budgets; each regex it compiles is charged to that value budget too.
 
 The shell has no clock. Reading the wall time from here would be ambient authority with no capability to go through, so `date` is not a builtin. It was an embedder opt-in that no embedder ever set, and without a provider that claims it a script asking for the time gets "command not found" like any other unknown word. The time is a provider capability instead, granted, authorized, and audited like any other: a provider holding a durable-files storage grant already reads `wall-time-ms`, and the broker host's `dekopon:clock/wall@1.1.0` import is the clock a provider reads with no other grant, inside an authorized `invoke`. A provider that claims `date` proposes its clock capability from `run-command` and reads the clock when the broker invokes it, as the in-tree [`clock-probe`](../../examples/providers/clock-probe/README.md) fixture does.
 

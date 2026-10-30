@@ -5,12 +5,14 @@ use crate::{
     routes::RoutingTable,
     session::{ModelFactory, SessionError, SharedModel},
 };
+use dekopon_agent::memory_tools::Rung;
 use dekopon_model::model::{AssistantTurn, ChatModel, ModelTool};
 use parking_lot::Mutex;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
 
 async fn run(resources: Arc<Resources>, queued: Queued, cancel: watch::Receiver<bool>) -> Next {
-    super::run(resources, queued, cancel, Arc::default()).await
+    let span = summarize_span(&queued.task, &queued.since);
+    super::run(resources, queued, cancel, Arc::default(), span).await
 }
 
 const STEM: &str = "reviewer/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -20,6 +22,7 @@ enum Action {
     Timeout,
     Cancelled,
     Refused,
+    Failed,
     Panic,
     Hold(Arc<Gate>),
 }
@@ -95,6 +98,11 @@ impl ChatModel for Script {
                     dekopon_model::error::ProviderFailure::new(403, "refused"),
                 ));
             }
+            Action::Failed => {
+                return Err(InferenceError::Provider(
+                    dekopon_model::error::ProviderFailure::new(500, "fake summary error"),
+                ));
+            }
             Action::Panic => panic!("fake summary panic"),
             Action::Hold(gate) => {
                 gate.started.notify_one();
@@ -145,6 +153,8 @@ fn resources(
             current: CurrentGeneration::boot(Arc::new(routes), Arc::default()),
             models: Arc::new(ModelCache::new(Arc::new(Factory(Arc::clone(&script))))),
             counts: Arc::default(),
+            thread_owner: crate::threads::Owner::new(16),
+            shell_threads: dekopon_test_support::shell_threads(),
         },
         script,
     )
@@ -293,6 +303,7 @@ async fn a_refused_part_does_not_reopen_its_later_slots() {
 
 #[tokio::test]
 async fn a_panicked_summary_marks_its_later_parts() {
+    let (capture, _guard) = crate::tests::capture_spans();
     let (_dir, journal) = journal();
     let mut first = fixture();
     first.summaries = vec![Slot::Queued; 2];
@@ -341,6 +352,26 @@ async fn a_panicked_summary_marks_its_later_parts() {
     .unwrap();
     assert_eq!(script.calls.load(Ordering::Relaxed), 2);
     owned.shutdown().await;
+    let panicked: Vec<_> = capture
+        .records()
+        .into_iter()
+        .filter(|record| {
+            record.field("event") == Some("gateway_memory_summary_transition")
+                && record.field("memory.summary.failure") == Some("panicked")
+        })
+        .collect();
+    assert_eq!(
+        panicked
+            .iter()
+            .map(|record| record.field("memory.summary.part").unwrap())
+            .collect::<Vec<_>>(),
+        ["1", "2"]
+    );
+    assert!(
+        panicked
+            .iter()
+            .all(|record| record.parent() == Some("memory.summarize"))
+    );
 }
 
 #[tokio::test]
@@ -349,6 +380,7 @@ async fn an_overflowed_part_marks_its_later_parts() {
     journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
     let (tx, _rx) = mpsc::channel(1);
     let sender = Sender {
+        cancel: watch::channel(false).0,
         queue: tx,
         journal: Arc::clone(&journal),
         counts: Arc::default(),
@@ -704,6 +736,8 @@ fn live_resources(journal: Arc<Journal>, endpoint: &str, timeout_ms: u64) -> Res
             crate::session::ConfiguredModels::default(),
         ))),
         counts: Arc::default(),
+        thread_owner: crate::threads::Owner::new(16),
+        shell_threads: dekopon_test_support::shell_threads(),
     }
 }
 
@@ -1029,4 +1063,532 @@ async fn a_transport_content_filter_refusal_stops_the_summary_chain_after_one_ca
     );
     owned.shutdown().await;
     server.shutdown().await;
+}
+
+fn record(id: u64, user: &str, parts: usize) -> super::super::record::TurnRecord {
+    let mut record = fixture();
+    record.id = RecordId(id.try_into().unwrap());
+    record.turn = TurnId(id);
+    record.original = vec![dekopon_agent::memory::Item::User(
+        dekopon_agent::memory::Kept::new(user, usize::MAX),
+    )];
+    record.summaries = vec![Slot::Queued; parts];
+    record.plan.as_mut().unwrap().parts.truncate(parts);
+    if parts == 0 {
+        record.plan = None;
+    }
+    record
+}
+
+fn projection(
+    journal: &Journal,
+    prior: &[super::super::project::Prior],
+    max_turns: usize,
+    max_bytes: usize,
+) -> super::super::project::Projected {
+    let snapshot = journal.record_snapshot(STEM, false).unwrap().unwrap();
+    super::super::project::project(&super::super::project::ProjectionInput {
+        file: &snapshot.file,
+        records: &snapshot.records,
+        prior,
+        hot_turns: 1,
+        max_turns,
+        max_bytes,
+        model: &fixture().model,
+    })
+    .unwrap()
+}
+
+fn projected_text(projected: &super::super::project::Projected) -> String {
+    projected
+        .messages
+        .iter()
+        .map(|message| crate::tests::message_text(message).1)
+        .collect()
+}
+
+async fn run_part(resources: &Arc<Resources>, record: u64, part: u8) -> Next {
+    run(
+        Arc::clone(resources),
+        Queued {
+            task: SlotTask {
+                record: RecordId(record.try_into().unwrap()),
+                part: NonZeroU8::new(part).unwrap(),
+                ..task()
+            },
+            since: Instant::now(),
+        },
+        watch::channel(false).1,
+    )
+    .await
+}
+
+fn summaries_of(journal: &Journal, record: u64) -> Vec<Slot> {
+    journal
+        .record_snapshot(STEM, true)
+        .unwrap()
+        .unwrap()
+        .records
+        .into_iter()
+        .find(|head| head.header.id.0.get() == record)
+        .unwrap()
+        .header
+        .summaries
+}
+
+#[tokio::test]
+async fn a_failing_or_refusing_summarizer_leaves_errors_not_fakes() {
+    let (_dir, journal) = journal();
+    journal
+        .append_record(
+            STEM,
+            &record(1, &"refused-original ".repeat(90), 2),
+            Vec::new(),
+        )
+        .unwrap();
+    journal
+        .append_record(
+            STEM,
+            &record(2, &"failed-original ".repeat(90), 2),
+            Vec::new(),
+        )
+        .unwrap();
+    journal
+        .append_record(STEM, &record(3, "hot", 0), Vec::new())
+        .unwrap();
+    let (resources, script) = resources(
+        Arc::clone(&journal),
+        [Action::Refused, Action::Failed, Action::Timeout],
+        true,
+    );
+    let resources = Arc::new(resources);
+    assert!(matches!(run_part(&resources, 1, 1).await, Next::Stop));
+    assert!(matches!(
+        run_part(&resources, 2, 1).await,
+        Next::Continue(_)
+    ));
+    assert!(matches!(run_part(&resources, 2, 2).await, Next::Stop));
+    assert_eq!(script.calls.load(Ordering::Relaxed), 3);
+    assert!(
+        summaries_of(&journal, 1)
+            .iter()
+            .all(|slot| failed(slot, SummaryFailure::Refused))
+    );
+    let second = summaries_of(&journal, 2);
+    assert!(failed(&second[0], SummaryFailure::ModelFailed));
+    assert!(failed(&second[1], SummaryFailure::Timeout));
+    for (max_bytes, native, metadata) in [(64 * 1024, 3, 0), (2000, 2, 1)] {
+        let projected = projection(&journal, &[], 8, max_bytes);
+        assert_eq!(
+            projected.rungs,
+            super::super::project::RungCounts {
+                native,
+                summary: 0,
+                metadata
+            }
+        );
+        let text = projected_text(&projected);
+        assert!(!text.contains("fake summary error"), "{text}");
+        assert!(!text.contains("summary 1/"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn a_late_summary_waits_for_the_next_repack() {
+    let (_dir, journal) = journal();
+    journal
+        .append_record(STEM, &record(1, &"older ".repeat(700), 1), Vec::new())
+        .unwrap();
+    journal
+        .append_record(STEM, &record(2, "middle", 0), Vec::new())
+        .unwrap();
+    journal
+        .append_record(STEM, &record(3, "newest", 0), Vec::new())
+        .unwrap();
+    let first = projection(&journal, &[], 8, 64 * 1024);
+    assert!(!first.repacked);
+    assert_eq!(first.prior[0].rung, Some(Rung::Native));
+    let (resources, _script) = resources(Arc::clone(&journal), [Action::Text("late")], true);
+    assert!(matches!(
+        run_part(&Arc::new(resources), 1, 1).await,
+        Next::Stop
+    ));
+    assert_eq!(
+        summaries_of(&journal, 1),
+        vec![Slot::Generated("late".to_owned())]
+    );
+    let unchanged = projection(&journal, &first.prior, 8, 64 * 1024);
+    assert!(!unchanged.repacked);
+    assert_eq!(unchanged.prior, first.prior);
+    assert_eq!(projected_text(&unchanged), projected_text(&first));
+    let repacked = projection(&journal, &unchanged.prior, 8, first.bytes as usize - 1);
+    assert!(repacked.repacked);
+    assert_eq!(
+        repacked.prior[0].rung,
+        Some(Rung::Summary(NonZeroU8::new(1).unwrap()))
+    );
+    assert_eq!(repacked.rungs.summary, 1);
+    assert!(projected_text(&repacked).contains("\nlate"));
+}
+
+struct Chooses(&'static str);
+impl dekopon_shell::CapabilityInvoker for Chooses {
+    fn granted(&self) -> Vec<String> {
+        vec!["memory-decide.choose".to_owned()]
+    }
+    fn invoke(
+        &self,
+        _proposal: dekopon_shell::CommandProposal,
+        streams: dekopon_shell::Streams,
+        _tree: &dekopon_process::TreeContext,
+    ) -> dekopon_shell::CapabilityCallResult {
+        use std::io::Write as _;
+        std::fs::File::from(streams.stdout)
+            .write_all(format!("{{\"choice\":\"{}\"}}", self.0).as_bytes())
+            .unwrap();
+        dekopon_shell::CapabilityCallResult::Succeeded
+    }
+}
+
+fn decided(journal: &Journal, answer: &'static str) -> Option<super::super::record::ChoiceLine> {
+    let snapshot = journal.record_snapshot(STEM, false).unwrap().unwrap();
+    let record = super::super::project::decider_candidate(&snapshot.records, 1)?;
+    let runtime = dekopon_agent::ShellRuntime {
+        invoker: Chooses(answer),
+        limits: dekopon_process::Limits::default(),
+        calls: dekopon_process::CallBudget::new(4),
+        threads: dekopon_test_support::shell_threads(),
+    };
+    super::super::decider::choose(
+        &runtime,
+        &crate::config::memory::Decider {
+            capability: "memory-decide.choose".to_owned(),
+            backend: "fixture".to_owned(),
+            model: "fixture".to_owned(),
+            require_probabilities: false,
+        },
+        record,
+        &super::super::project::decider_labels(record),
+        &super::super::decider::evidence(&snapshot.records, 10),
+        10,
+    )
+}
+
+#[tokio::test]
+async fn the_decider_waits_for_final_slots() {
+    let (_dir, journal) = journal();
+    journal
+        .append_record(STEM, &record(1, "leaving", 2), Vec::new())
+        .unwrap();
+    journal
+        .append_record(STEM, &record(2, "hot", 0), Vec::new())
+        .unwrap();
+    assert!(decided(&journal, "summary-2").is_none());
+    let (resources, _script) = resources(
+        Arc::clone(&journal),
+        [Action::Text("first"), Action::Text("second")],
+        true,
+    );
+    let resources = Arc::new(resources);
+    assert!(matches!(
+        run_part(&resources, 1, 1).await,
+        Next::Continue(_)
+    ));
+    assert_eq!(
+        summaries_of(&journal, 1),
+        vec![Slot::Generated("first".to_owned()), Slot::Queued]
+    );
+    assert!(decided(&journal, "summary-1").is_none());
+    assert!(matches!(run_part(&resources, 1, 2).await, Next::Stop));
+    let choice = decided(&journal, "summary-2").expect("a final record is asked");
+    assert_eq!(choice.record, RecordId(1.try_into().unwrap()));
+    assert_eq!(choice.choice, Rung::Summary(NonZeroU8::new(2).unwrap()));
+}
+
+#[test]
+fn a_record_without_generated_summaries_is_never_asked() {
+    let (_dir, journal) = journal();
+    let mut errored = record(1, "errored-original", 2);
+    errored.summaries = vec![error_slot(SummaryFailure::Timeout, "timeout"); 2];
+    journal.append_record(STEM, &errored, Vec::new()).unwrap();
+    journal
+        .append_record(STEM, &record(2, "unplanned-original", 0), Vec::new())
+        .unwrap();
+    journal
+        .append_record(STEM, &record(3, "hot", 0), Vec::new())
+        .unwrap();
+    assert!(decided(&journal, "metadata").is_none());
+    let projected = projection(&journal, &[], 8, 64 * 1024);
+    assert_eq!(projected.prior[0].rung, Some(Rung::Native));
+    assert_eq!(projected.prior[1].rung, Some(Rung::Native));
+    let text = projected_text(&projected);
+    assert!(text.contains("errored-original") && text.contains("unplanned-original"));
+}
+
+fn window_projection(
+    journal: &Journal,
+    prior: &[super::super::project::Prior],
+    (hot_turns, max_turns, max_bytes): (usize, usize, usize),
+) -> (super::super::project::Projected, Vec<RecordId>) {
+    let mut snapshot = journal.record_snapshot(STEM, false).unwrap().unwrap();
+    let walked = snapshot.records.len().saturating_sub(max_turns * 2);
+    snapshot.records.drain(..walked);
+    let projected = super::super::project::project(&super::super::project::ProjectionInput {
+        file: &snapshot.file,
+        records: &snapshot.records,
+        prior,
+        hot_turns,
+        max_turns,
+        max_bytes,
+        model: &fixture().model,
+    })
+    .unwrap();
+    let ids = snapshot.records.iter().map(|head| head.header.id).collect();
+    (projected, ids)
+}
+
+#[test]
+fn consecutive_turns_differ_at_the_hot_edge_only() {
+    const MAX_TURNS: usize = 4;
+    let (_dir, journal) = journal();
+    let mut previous: Option<super::super::project::Projected> = None;
+    let mut held_below_pin = 0;
+    for turn in 1..=(3 * MAX_TURNS) as u64 {
+        journal
+            .append_record(
+                STEM,
+                &record(turn, &format!("turn {turn} {}", "x".repeat(300)), 0),
+                Vec::new(),
+            )
+            .unwrap();
+        if turn == 4 {
+            journal
+                .write_pin(
+                    STEM,
+                    super::super::record::PinLine {
+                        at_ms: 4,
+                        record: RecordId(1.try_into().unwrap()),
+                        pin: Some(Rung::Native),
+                        subject: Subject::Record,
+                    },
+                )
+                .unwrap();
+        }
+        let prior = previous
+            .as_ref()
+            .map_or(&[][..], |projected| &projected.prior);
+        let (projected, _ids) = window_projection(&journal, prior, (2, MAX_TURNS, 1_500));
+        if let Some(previous) = &previous {
+            assert!(
+                !(previous.repacked && projected.repacked),
+                "turn {turn} repacked right after a repack"
+            );
+            if !projected.repacked {
+                for now in &projected.prior {
+                    if let Some(before) = previous
+                        .prior
+                        .iter()
+                        .find(|before| before.record == now.record)
+                        .filter(|before| before.hot == now.hot && before.pin == now.pin)
+                    {
+                        assert_eq!(before.rung, now.rung, "turn {turn}: {:?}", now.record);
+                    }
+                }
+            }
+        }
+        if let Some(pinned) = projected
+            .prior
+            .iter()
+            .find(|prior| prior.record.0.get() == 1 && prior.pin == Some(Rung::Native))
+            && pinned.rung != Some(Rung::Native)
+        {
+            held_below_pin += 1;
+        }
+        previous = Some(projected);
+    }
+    assert!(
+        held_below_pin >= 2,
+        "the pinned record was held below its pin"
+    );
+}
+
+#[test]
+fn a_turn_never_silently_disappears() {
+    let (_dir, journal) = journal();
+    let mut summarized = record(1, &"summarized ".repeat(80), 1);
+    summarized.summaries = vec![Slot::Generated("a generated summary".to_owned())];
+    journal
+        .append_record(STEM, &summarized, Vec::new())
+        .unwrap();
+    for id in 2..=6 {
+        journal
+            .append_record(STEM, &record(id, &"older ".repeat(120), 0), Vec::new())
+            .unwrap();
+    }
+    let mut budget = 64 * 1024;
+    loop {
+        let (projected, ids) = window_projection(&journal, &[], (2, 12, budget));
+        let shown = projected.rungs.native + projected.rungs.summary + projected.rungs.metadata;
+        assert_eq!(
+            shown as usize + projected.omitted.len(),
+            ids.len(),
+            "budget {budget}"
+        );
+        assert!(projected.omitted.iter().all(|id| ids.contains(id)));
+        if budget == 1 {
+            break;
+        }
+        budget = (budget / 2).max(1);
+    }
+}
+
+#[tokio::test]
+async fn each_slot_change_is_one_transition_event_inside_its_span() {
+    let (capture, _guard) = crate::tests::capture_spans();
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let (resources, _script) = resources(Arc::clone(&journal), [Action::Text("summary")], true);
+    run(
+        Arc::new(resources),
+        Queued {
+            task: task(),
+            since: Instant::now(),
+        },
+        watch::channel(false).1,
+    )
+    .await;
+    let transitions: Vec<_> = capture
+        .records()
+        .into_iter()
+        .filter(|record| record.field("event") == Some("gateway_memory_summary_transition"))
+        .collect();
+    assert_eq!(
+        transitions
+            .iter()
+            .map(|record| (
+                record.field("memory.summary.from").unwrap(),
+                record.field("memory.summary.to").unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [("queued", "running"), ("running", "generated")]
+    );
+    assert!(
+        transitions
+            .iter()
+            .all(|record| record.parent() == Some("memory.summarize"))
+    );
+    assert_eq!(transitions[1].field("memory.summary.bytes"), Some("7"));
+    assert_eq!(transitions[1].field("memory.summary.text"), Some("summary"));
+}
+
+#[tokio::test]
+async fn an_overflowed_part_logs_one_drop_per_later_part() {
+    let (capture, _guard) = crate::tests::capture_spans();
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let (tx, _rx) = mpsc::channel(1);
+    let sender = Sender {
+        cancel: watch::channel(false).0,
+        queue: tx,
+        journal: Arc::clone(&journal),
+        counts: Arc::default(),
+    };
+    sender.enqueue(task()).await;
+    sender.enqueue(task()).await;
+    let records = capture.records();
+    for (event, field, value) in [
+        (
+            "gateway_memory_summary_dropped",
+            "memory.summary.failure",
+            "overflow",
+        ),
+        (
+            "gateway_memory_summary_transition",
+            "memory.summary.to",
+            "error",
+        ),
+    ] {
+        let parts: Vec<_> = records
+            .iter()
+            .filter(|record| record.field("event") == Some(event))
+            .map(|record| {
+                assert_eq!(record.field(field), Some(value));
+                assert_eq!(record.parent(), Some("memory.summarize"));
+                record.field("memory.summary.part").unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(parts, ["1", "2", "3"], "{event}");
+    }
+}
+
+#[tokio::test]
+async fn a_summary_at_the_shell_thread_cap_is_refused_before_calling_the_model() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let before = slots(&journal);
+    let (mut resources, script) =
+        resources(Arc::clone(&journal), [Action::Text("must not run")], true);
+    resources.shell_threads =
+        dekopon_process::ShellThreads::new(1, tokio::runtime::Handle::current());
+    resources.thread_owner = crate::threads::Owner::new(1);
+    let held = resources.shell_threads.reserve::<1>().unwrap();
+    let resources = Arc::new(resources);
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    let next = run(
+        Arc::clone(&resources),
+        Queued {
+            task: task(),
+            since: Instant::now(),
+        },
+        watch::channel(false).1,
+    )
+    .with_subscriber(subscriber)
+    .await;
+    assert!(matches!(next, Next::Stop));
+    assert_eq!(script.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(slots(&journal), before);
+    let records = capture.records();
+    let refused = records
+        .iter()
+        .filter(|record| record.field("event") == Some("gateway_memory_summary_refused"))
+        .collect::<Vec<_>>();
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].field("reason"), Some("shell-threads"));
+    assert_eq!(refused[0].field("limit.maximum"), Some("1"));
+    assert_eq!(refused[0].field("memory.summary.part"), Some("1"));
+    drop(held);
+    assert!(resources.shell_threads.reserve::<1>().is_ok());
+    assert!(
+        resources
+            .thread_owner
+            .reserve(&resources.shell_threads)
+            .is_ok()
+    );
+    resources.thread_owner.shutdown().await;
+}
+
+#[tokio::test]
+async fn stopping_before_dispatch_starts_joins_without_running_queued_work() {
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let (resources, script) = resources(journal, [Action::Text("must not run")], true);
+    let mut owned = JoinSet::new();
+    let sender = spawn(
+        resources,
+        4.try_into().unwrap(),
+        1.try_into().unwrap(),
+        &mut owned,
+    );
+    sender.enqueue(task()).await;
+    sender.stop();
+    tokio::time::timeout(Duration::from_secs(2), owned.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(owned.is_empty());
+    assert_eq!(script.calls.load(Ordering::Relaxed), 0);
 }

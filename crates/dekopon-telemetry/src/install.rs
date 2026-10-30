@@ -31,7 +31,7 @@ const EXPORTER_DIAGNOSTICS_OFF: &str = "opentelemetry=off";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsoleWriter {
-    Stdout,
+    Stdout(&'static str),
     Stderr,
 }
 
@@ -123,7 +123,10 @@ impl ConsoleSink {
     const MAX_LINES: usize = 1024;
     const MAX_BYTES: usize = 4 * 1024 * 1024;
 
-    fn new(mut output: ConsoleOutput) -> Result<(Self, ConsoleWorker), InstallError> {
+    fn new(
+        thread_name: &str,
+        mut output: ConsoleOutput,
+    ) -> Result<(Self, ConsoleWorker), InstallError> {
         let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(Self::MAX_LINES);
         let (completed, completion) = mpsc::sync_channel(1);
         let sink = Self {
@@ -138,7 +141,7 @@ impl ConsoleSink {
             reason = "owner: TelemetryGuard joins it at shutdown; bound: one writer thread per install, 1024 queued lines and 4 MiB"
         )]
         let handle = std::thread::Builder::new()
-            .name("dekopon-console-stdout".into())
+            .name(thread_name.to_owned())
             .spawn(move || {
                 CONSOLE_WRITER_THREAD.set(true);
                 let mut reported = 0;
@@ -285,8 +288,8 @@ where
         let native = opentelemetry::Context::current();
         let span = native.span();
         let ids = span.span_context();
-        let array = native.get::<crate::EventStringArray>();
-        if !ids.is_valid() && array.is_none() {
+        let arrays = native.get::<crate::EventStringArrays>();
+        if !ids.is_valid() && arrays.is_none() {
             return self.0.format_event(context, writer, event);
         }
         let mut json = String::new();
@@ -302,11 +305,24 @@ where
                 ids.span_id()
             )?;
         }
-        if let Some(array) = array {
+        for array in arrays.into_iter().flat_map(|arrays| arrays.iter()) {
             let name =
                 serde_json::to_string(array.name).map_err(|_invalid_json| std::fmt::Error)?;
-            let values =
-                serde_json::to_string(&array.values).map_err(|_invalid_json| std::fmt::Error)?;
+            let values = serde_json::to_string(
+                &array
+                    .values
+                    .iter()
+                    .map(|value| match value {
+                        opentelemetry::Value::String(value) => serde_json::json!(value.as_str()),
+                        opentelemetry::Value::I64(value) => serde_json::json!(value),
+                        opentelemetry::Value::Bool(value) => serde_json::json!(value),
+                        opentelemetry::Value::F64(value) => serde_json::json!(value),
+                        opentelemetry::Value::Array(value) => serde_json::json!(value.to_string()),
+                        value => serde_json::json!(value.to_string()),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|_invalid_json| std::fmt::Error)?;
             write!(writer, ",{name}:{values}")?;
         }
         writeln!(writer, "}}")
@@ -395,8 +411,8 @@ impl Install {
         } = self;
 
         let (writer, console_worker) = match console.writer {
-            ConsoleWriter::Stdout => {
-                let (sink, worker) = ConsoleSink::new(Box::new(io::stdout()))?;
+            ConsoleWriter::Stdout(thread_name) => {
+                let (sink, worker) = ConsoleSink::new(thread_name, Box::new(io::stdout()))?;
                 (BoxMakeWriter::new(sink), Some(worker))
             }
             ConsoleWriter::Stderr => (BoxMakeWriter::new(io::stderr), None),
@@ -536,7 +552,7 @@ where
             metadata.is_event()
                 && metadata.fields().field("audit.event").is_some()
                 && opentelemetry::Context::current()
-                    .get::<crate::EventStringArray>()
+                    .get::<crate::EventStringArrays>()
                     .is_some()
         })
         .with_callsite_filter(|metadata| {
@@ -677,14 +693,18 @@ mod tests {
         let (started, start) = std::sync::mpsc::sync_channel(1);
         let (release, released) = std::sync::mpsc::sync_channel(1);
         let (written, writes) = std::sync::mpsc::sync_channel(super::ConsoleSink::MAX_LINES + 2);
-        let (sink, worker) = super::ConsoleSink::new(Box::new(StalledOutput {
-            output: output.clone(),
-            started: Some(started),
-            release: released,
-            written,
-            dispatch: None,
-        }))
+        let (sink, worker) = super::ConsoleSink::new(
+            "test-stdout",
+            Box::new(StalledOutput {
+                output: output.clone(),
+                started: Some(started),
+                release: released,
+                written,
+                dispatch: None,
+            }),
+        )
         .expect("console writer spawned");
+        assert_eq!(worker.handle.thread().name(), Some("test-stdout"));
         let subscriber = registry().with(
             tracing_subscriber::fmt::layer()
                 .json()
@@ -733,13 +753,16 @@ mod tests {
         let (started, start) = std::sync::mpsc::sync_channel(1);
         let (release, released) = std::sync::mpsc::sync_channel(1);
         let (written, _writes) = std::sync::mpsc::sync_channel(4);
-        let (sink, worker) = super::ConsoleSink::new(Box::new(StalledOutput {
-            output: output.clone(),
-            started: Some(started),
-            release: released,
-            written,
-            dispatch: None,
-        }))
+        let (sink, worker) = super::ConsoleSink::new(
+            "test-stdout",
+            Box::new(StalledOutput {
+                output: output.clone(),
+                started: Some(started),
+                release: released,
+                written,
+                dispatch: None,
+            }),
+        )
         .expect("console writer spawned");
         let state = Arc::clone(&sink.state);
         let subscriber = registry().with(
@@ -780,13 +803,16 @@ mod tests {
         let queued = super::ConsoleSink::MAX_LINES;
         let (written, _writes) = std::sync::mpsc::sync_channel(queued + 2);
         let (dispatch_sender, dispatch_receiver) = std::sync::mpsc::sync_channel(1);
-        let (sink, worker) = super::ConsoleSink::new(Box::new(StalledOutput {
-            output: output.clone(),
-            started: Some(started),
-            release: released,
-            written,
-            dispatch: Some(dispatch_receiver),
-        }))
+        let (sink, worker) = super::ConsoleSink::new(
+            "test-stdout",
+            Box::new(StalledOutput {
+                output: output.clone(),
+                started: Some(started),
+                release: released,
+                written,
+                dispatch: Some(dispatch_receiver),
+            }),
+        )
         .expect("console writer spawned");
         let state = Arc::clone(&sink.state);
         let dropped = Arc::clone(&sink.dropped);
@@ -845,7 +871,11 @@ mod tests {
             .with_writer(move || writer.clone());
         tracing::subscriber::with_default(registry().with(console), || {
             crate::with_event_string_array("github.deliveries", &["first", "second"], || {
-                tracing::info!(outcome = "queued", "admission")
+                crate::with_event_string_array("github.repository.names", &["one", "two"], || {
+                    crate::with_event_string_array("github.actor.id", &[&1_i64, &2_i64], || {
+                        tracing::info!(outcome = "queued", "admission")
+                    });
+                });
             });
             tracing::info!(outcome = "ignored", "next");
         });
@@ -854,6 +884,13 @@ mod tests {
             lines[0]["github.deliveries"],
             serde_json::json!(["first", "second"])
         );
+        assert_eq!(
+            lines[0]["github.repository.names"],
+            serde_json::json!(["one", "two"])
+        );
+        assert_eq!(lines[0]["github.actor.id"], serde_json::json!([1, 2]));
+        assert!(lines[1].get("github.actor.id").is_none());
+        assert!(lines[1].get("github.repository.names").is_none());
         assert!(lines[1].get("github.deliveries").is_none());
     }
 

@@ -3,10 +3,12 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{ast::Statement, interp::JobScope};
-use dekopon_process::{JOBS_OFF, JobId, JobSummary, JobWait, TreeContext};
+use dekopon_process::{JOBS_OFF, JobId, JobSummary, JobWait, LimitExceeded, TreeContext};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum JobRefusal {
+    #[error("shell thread admission refused: {0:?}")]
+    Limit(LimitExceeded),
     #[error("{maximum} jobs are already running, the most this gateway allows (sessions.maxJobs)")]
     Full { maximum: usize },
     #[error("no job of this person has that id")]

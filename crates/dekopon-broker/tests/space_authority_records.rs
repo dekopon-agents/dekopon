@@ -91,6 +91,7 @@ async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
 fn slack_scope() -> ChatScopeClaim {
     ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "chat".parse().expect("transport"),
         kind: ChatTransportKind::Slack,
         conversation: Conversation {
@@ -176,6 +177,7 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
     let (broker, audit) = broker_fixture().await;
     let github = ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "github".parse().expect("transport"),
         kind: ChatTransportKind::Github,
         conversation: Conversation {

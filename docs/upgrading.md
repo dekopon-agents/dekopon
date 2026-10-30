@@ -8,6 +8,170 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## The wake_reason tool and GitHub review deliveries (0.72.0)
+
+No configuration change is required.
+
+Every gateway session offers the no-argument `wake_reason` tool, which returns why
+its turn started: chat, webhook, wake or job. It grants no authority and calls no
+broker capability. Embedders that supply no view, including the console and
+`dekopon-tui`, do not offer it. Each route's tool definitions change, so its
+prompt cache goes cold once after the upgrade.
+
+The GitHub prompt note ends "Call wake_reason for every fact." Run notes name
+the associated pull request as `#N` or `none`.
+
+GitHub `pull_request_review`, `pull_request_review_comment` and
+`pull_request_review_thread` deliveries no longer answer 400 malformed. A route
+that does not list the family answers 200 not-listed. A delivery from a repository
+whose name contains a dot is acknowledged and ignored rather than refused.
+
+Downgrading to 0.71.0 is revert-safe and migrates no state. Its gateway again
+refuses those review-family deliveries without a `merged` field and dotted-repository
+deliveries with 400 malformed.
+
+## Gateway and broker upgrade together; turns share the shell thread budget (0.71.0)
+
+No configuration change is required.
+
+**Upgrade and roll back gatewayd and brokerd together.** A 0.71.0 gateway adds the
+optional `github` field to GitHub message claims; a 0.70.0 broker refuses it because
+`ChatScopeClaim` denies unknown fields. Non-GitHub claims are byte-identical. The
+chart runs both daemons from one image in one pod.
+
+Cedar policies may read `context.github`, guarded with `has`. Author-set facts
+(`context.github.authorSet`) can only deny; trust an actor by `actor.id`.
+Existing policies need no change, and their policy digests do not change.
+
+Gatewayd's `--blocking-threads` default is 8, down from 512. An explicit flag or
+`DEKOPON_BLOCKING_THREADS` keeps its configured value.
+
+Turns, jobs, wake ticks and memory summaries now take permits from
+`--shell-threads` (default 32): one per turn plus one per non-final pipeline stage.
+At the cap, work is refused at once with `LimitExceeded::ShellThreads` rather than
+queued. If you run many concurrent sessions with long pipelines, raise
+`--shell-threads`.
+
+Awk `%d` and `%i` format nan and inf as `nan` and `inf`, without zero padding.
+
+Downgrading to 0.70.0 is revert-safe and migrates no state; revert gatewayd and
+brokerd together. Remove policies that rely on `context.github` before downgrading.
+On 0.70.0, unguarded reads fail validation; `has`-guarded GitHub conditions validate
+but cannot match because the field is absent.
+
+## awk is a builtin and case patterns match globs (0.70.0)
+
+No configuration change is required.
+
+`awk` joins the reserved command words. A provider that declares an `awk` command word
+is now refused at load by `dekopon_core::command_word_conflicts`; if you run such a
+provider, rename its command word before upgrading.
+
+Scripts gain an `awk` builtin with a POSIX subset. Unsupported program constructs are
+refused at exit 2 before input is read; formats and field separators built at run time
+are checked when used. Unquoted `case` patterns now match globs (`*`, `?` and bracket
+expressions); quoted or escaped characters remain literal. The model-facing shell tool
+description advertises unquoted case globs.
+
+Downgrading to 0.69.0 is revert-safe: these changes migrate no state and require no
+configuration rollback. Scripts using `awk` or the newly supported `case` globs fail
+again on 0.69.0.
+
+## Ambient pull-request links and improvement notes (0.69.0)
+
+No configuration change or provider re-pin is required.
+
+With `ambient.pullRequestLinks` enabled on a Slack route, a link from an unmapped or
+agent-denied poster gets no thread reply or reaction. The rejection is still recorded as
+`gateway_session_rejected` with message `gateway.session.rejected`, reason `unmapped-subject`
+or `agent-denied`, and `admission.trigger = "pull-request-link"`; the unmapped case retains
+its `audit.event = "gateway.session.rejected"` owner-notice selector. With no route enabling
+`ambient.pullRequestLinks`, this change is inert.
+
+`suggest_improvement` has no per-session cap and returns an unnumbered receipt. A private
+runaway stop still limits accepted notes to ten per message execution, and the existing
+text-field bounds remain. No persisted or per-conversation counter is introduced.
+
+Downgrading to 0.68.0 is revert-safe: these changes migrate no state and require no
+configuration rollback. The earlier ambient refusal replies and three-per-session
+suggestion cap return.
+
+## Daemon thread pools can be sized (0.68.0)
+
+No configuration change or provider re-pin is required. Every new flag and chart value is
+optional; existing defaults are unchanged when no sizing option is supplied.
+
+Brokerd, gatewayd and console accept `--worker-threads` (`DEKOPON_WORKER_THREADS`),
+`--blocking-threads` (`DEKOPON_BLOCKING_THREADS`) and `--blocking-keep-alive`
+(`DEKOPON_BLOCKING_KEEP_ALIVE`). Brokerd also accepts `--cpu-threads` (`DEKOPON_CPU_THREADS`);
+gatewayd and console accept `--shell-threads` (`DEKOPON_SHELL_THREADS`). Explicit flags override
+the corresponding environment variables. Without a worker setting, `TOKIO_WORKER_THREADS`
+then the available CPU count selects workers; console idle mode keeps no workers unless
+`--worker-threads` or `DEKOPON_WORKER_THREADS` is supplied. Without a CPU setting, brokerd uses
+`RAYON_NUM_THREADS` then the available CPU count. Blocking threads default to 512 and their
+keep-alive to 10s; shell threads default to 32 for gatewayd and 16 for console.
+
+Chart values `gateway.runtime.workerThreads`, `gateway.runtime.blockingThreads`,
+`gateway.runtime.blockingKeepAlive` and `gateway.runtime.shellThreads` render the corresponding
+gateway flags. Values `broker.runtime.workerThreads`, `broker.runtime.blockingThreads`,
+`broker.runtime.blockingKeepAlive` and `broker.runtime.cpuThreads` render the broker flags,
+including for precompile, provider sync, configuration checks and probes. Unset or null values
+render no flags; console can use the environment variables through its existing environment
+settings. Counts must be positive, with worker, blocking and broker CPU counts capped at 4096;
+keep-alive accepts humantime durations such as `10s`.
+
+Run chart 0.55.0 only with a v0.68.0 image: 0.67.0 binaries refuse the new flags. These changes
+are revert-safe while no sizing value is set; remove new flags and environment settings and
+unset chart runtime values before downgrading core and chart together. No broker wire, provider
+WIT or daemon configuration key changes accompany these options.
+
+When pinning a container image, use the published image digests now listed in the release notes.
+
+## Slack routes can review pull-request links (0.67.0)
+
+No configuration change or provider re-pin is required for existing deployments.
+Slack channel/thread routes can opt in with `ambient: {pullRequestLinks: true}` alongside
+`follow: true` and `sessions.journal`; the boolean defaults to false. Install the follow provider
+and reviewed broker grants before enabling it. An unaddressed human top-level post containing a
+GitHub pull-request link starts one review turn threaded under that post. Bot posts, edits and
+thread replies do not trigger it. Only the posting user's broker authority can authorize the
+review, downscoped by the channel when mapped; other speakers' grants cannot join that turn.
+
+Run gatewayd 0.67.0 before adding `ambient.pullRequestLinks` to a route. Version 0.66.0 rejects
+the new `ambient` route field, even when `pullRequestLinks` is false. No broker wire, provider WIT
+or journal format changes accompany this opt-in. Reverting to 0.66.0 is revert-safe for these
+changes only if no route sets it: remove the `ambient` field before downgrading.
+
+## Conversation memory records, summaries and removed memory keys (0.65.0)
+
+One configuration change on gateways that set the removed memory keys; no provider WIT or SDK
+re-pin and no broker wire change. Before upgrading:
+
+- `sessions.memory.arena`, `sessions.memory.agents.<id>.routine` and `.policy`, and
+  `routes[].memory.policy` are removed, and unknown names refuse at load. Delete them and, where
+  a route used a decider, set `selection: {decider: {capability, backend, model,
+  requireProbabilities}}` on the route or agent instead. A 0.64.0 gateway refuses the new
+  `hotTurns`, `summaries`, `capture`, `selection` and `sessions.memory.summaries` keys, so the
+  configuration change and the image roll out, and revert, together; expect the gateway to refuse
+  its configuration between the two.
+- Summaries are on by default on journal-recall routes and use the route's own model after each
+  reply. Their calls are metered with `via = "summary"` but never refused by a budget. Set
+  `summaries: off` to opt out.
+- The journal moves to a new record format. At startup earlier-format journals in per-agent
+  directories reset (counted in `gateway_memory_startup`'s `memory.journals.reset`). Files under
+  pre-0.58.0 conversation stems without matching follow markers are removed separately and emit
+  `gateway_journal_reset` with reason `legacy`; files paired with follow markers remain but are
+  not replayed. Conversation memory starts empty once. Follow markers, seals and the prompt-cache
+  secret are kept; the journal reset does not change the prompt-cache `session_id` for unchanged
+  conversation coordinates.
+- Journal-recall routes default `maxBytes` to 524288 instead of 65536.
+- `agent.model.prompt` is split into records of at most 16 KiB carrying `transcript.segment` and
+  `transcript.segments`; a query that read one prompt per model turn concatenates the segments of
+  a turn in order. `gateway_memory_selection` and `gateway_memory_deviation` are gone; the
+  [memory records](observability.md) replace them.
+- Reverting to 0.64.0 needs the configuration reverted too, and resets the new-format journals
+  the same way. The drop is not revert-safe.
+
 ## Slack routes can follow threads (0.64.0)
 
 No configuration change or provider re-pin is required for existing deployments.

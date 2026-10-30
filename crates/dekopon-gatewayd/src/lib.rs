@@ -30,8 +30,10 @@ mod metering;
 mod probe;
 mod progress;
 mod proxy;
+mod pull_request_links;
 mod routes;
 mod session;
+mod threads;
 mod transport;
 mod wake;
 
@@ -91,8 +93,6 @@ pub const OTEL_TRACE_FILTER: &str = "dekopon_gatewayd=trace,dekopon_agent=trace,
 const INBOUND_BUFFER: usize = 64;
 const ONE_SHOT_ASSET_IDLE: Duration = Duration::from_secs(60 * 60);
 
-const SHELL_THREADS: u32 = 32;
-
 #[must_use]
 pub fn current_uid() -> u32 {
     rustix::process::geteuid().as_raw()
@@ -141,7 +141,11 @@ async fn boot_candidate_with_service(
     Ok((candidate, prepared))
 }
 
-pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), GatewaydError>
+pub async fn run<F>(
+    config_path: impl AsRef<Path>,
+    shutdown: F,
+    shell_threads: u32,
+) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
 {
@@ -149,6 +153,7 @@ where
         config_path.as_ref(),
         shutdown,
         &config::InProcess::default(),
+        shell_threads,
     )
     .await
 }
@@ -158,6 +163,7 @@ pub async fn run_fauxlack<F>(
     config_path: impl AsRef<Path>,
     shutdown: F,
     fauxlack: fauxlack::Fauxlack,
+    shell_threads: u32,
 ) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
@@ -168,6 +174,7 @@ where
         &config::InProcess {
             fauxlack: Some(fauxlack),
         },
+        shell_threads,
     )
     .await
 }
@@ -180,6 +187,7 @@ async fn run_with_service<F>(
     config_path: &Path,
     shutdown: F,
     service: &config::InProcess,
+    shell_threads: u32,
 ) -> Result<(), GatewaydError>
 where
     F: Future<Output = ()> + Send,
@@ -215,7 +223,10 @@ where
         capability.count = capabilities.len(),
         "gateway.broker.ready"
     );
-    let journal = open_journal(config.journal.clone(), &config.memory).await?;
+    let (journal, boot) = match open_journal(config.journal.clone(), &config.memory).await? {
+        Some((journal, boot)) => (Some(journal), Some(boot)),
+        None => (None, None),
+    };
     let follow =
         load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?;
     generation.set_follow(follow.clone());
@@ -242,12 +253,8 @@ where
     .await
     .map_err(GatewaydError::TransportTask)??;
     if journal.is_some() {
-        for route in &config.routes {
-            if let (Some(window), Some(policy)) =
-                (route.memory.window(), route.memory_policy.as_ref())
-            {
-                memory::generation::report_policy(policy, window.recall);
-            }
+        for route in generation.load().routes.routes() {
+            memory::generation::report_policy(route);
         }
     }
     let wakes = match config.wakes.clone() {
@@ -292,18 +299,28 @@ where
     })
     .await
     .map_err(GatewaydError::TransportTask)??;
+    let models = Arc::new(ModelCache::new(
+        Arc::clone(&configured) as Arc<dyn session::ModelFactory>
+    ));
+    let engine = journal.as_ref().map(|journal| {
+        memory::engine::channel(
+            Arc::clone(journal),
+            Arc::default(),
+            config.memory.summaries.queue,
+            config.memory.summaries.concurrency,
+        )
+    });
+    let thread_owner = threads::Owner::new(shell_threads);
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
         sealed_conversations: Default::default(),
         broker: config.broker.clone(),
-        models: Arc::new(ModelCache::new(
-            Arc::clone(&configured) as Arc<dyn session::ModelFactory>
-        )),
+        models: Arc::clone(&models),
+        summaries: engine.as_ref().map(|(sender, _)| sender.clone()),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::with_cache_keys(
             config.sessions.max_conversations,
-            config.memory.arena.max_transient_bytes.get() as usize,
             cache_keys,
         ),
         follow,
@@ -312,9 +329,13 @@ where
         asset_fetchers,
         thread_ownership,
         wakes,
-        jobs: Arc::new(jobs::Jobs::new(config.sessions.max_jobs)),
+        jobs: Arc::new(jobs::Jobs::new(
+            config.sessions.max_jobs,
+            Arc::clone(&thread_owner),
+        )),
         metering: Arc::clone(&metering),
-        shell_threads: ShellThreads::new(SHELL_THREADS, tokio::runtime::Handle::current()),
+        shell_threads: ShellThreads::new(shell_threads, tokio::runtime::Handle::current()),
+        thread_owner: Arc::clone(&thread_owner),
     });
     let (mut owned_tasks, boot_proxy) = start_metering_tasks(config, &configured, &metering)?;
 
@@ -333,9 +354,10 @@ where
     let shutdown_grace = config.shutdown_grace;
     let collector = collection::Collector::new(&config.transports, config.sessions.max_concurrent);
     let proxy_listener = config.proxy.clone();
+    let runner_threads = runner.shell_threads.clone();
     let gateway = gateway::Gateway::serving(
         runner,
-        generation,
+        generation.clone(),
         Arc::new(BTreeMap::new()),
         Arc::new(drivers),
     )
@@ -354,11 +376,24 @@ where
             .await
             .map_err(GatewaydError::Proxy)?;
     }
+    if let Some((sender, dispatcher)) = engine {
+        dispatcher.start(
+            generation.clone(),
+            models,
+            Arc::clone(&thread_owner),
+            runner_threads,
+            &mut owned_tasks,
+        );
+        if let Some(boot) = boot {
+            enqueue_boot(&sender, boot).await;
+        }
+    }
     let outcome = gateway
         .serve(receiver, stopped, shutdown_grace, collector)
         .await;
     readers.abort_all();
     owned_tasks.shutdown().await;
+    thread_owner.shutdown().await;
     assets.shutdown().await;
     while let Some(result) = readers.join_next().await {
         match result {
@@ -407,10 +442,26 @@ where
     }
 }
 
+async fn enqueue_boot(sender: &memory::engine::Sender, boot: memory::journal::records::Boot) {
+    let enqueued = boot.tasks.len();
+    for task in boot.tasks {
+        sender.enqueue(task).await;
+    }
+    tracing::info!(
+        event = "gateway_memory_startup",
+        memory.journals.reset = boot.reset,
+        memory.slots.requeued = boot.requeued,
+        memory.slots.enqueued = enqueued,
+        memory.slots.overflowed = boot.overflowed,
+        memory.boot.crashed_files = boot.crashed_files,
+        "gateway.memory.startup"
+    );
+}
+
 async fn open_journal(
     config: Option<config::ResolvedJournal>,
     memory: &config::ResolvedSettings,
-) -> Result<Option<Arc<journal::Journal>>, GatewaydError> {
+) -> Result<Option<(Arc<journal::Journal>, memory::journal::records::Boot)>, GatewaydError> {
     let Some(config) = config else {
         return Ok(None);
     };
@@ -426,18 +477,21 @@ async fn open_journal(
         .map(|(id, agent)| (id.as_str().to_owned(), agent.max_bytes.get()))
         .collect();
     let max_bytes_per_agent = memory.retention.max_bytes_per_agent.get();
+    let queue = memory.summaries.queue;
     let journal = tokio::task::spawn_blocking(move || {
-        let mut journal = journal::Journal::open_with_age(
+        let (mut journal, boot) = journal::Journal::boot(
             &config.dir,
             max_age,
             config.retention,
             config.seal_retention,
+            queue,
+            std::time::SystemTime::now(),
         )?;
         journal.agent_ages = agent_ages;
         journal.agent_bytes = agent_bytes;
         journal.max_bytes_per_agent = max_bytes_per_agent;
         journal.enforce_caps()?;
-        Ok::<_, journal::JournalError>(journal)
+        Ok::<_, journal::JournalError>((journal, boot))
     })
     .await
     .map_err(GatewaydError::TransportTask)?
@@ -447,7 +501,7 @@ async fn open_journal(
             journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
         },
     })?;
-    Ok(Some(Arc::new(journal)))
+    Ok(Some((Arc::new(journal.0), journal.1)))
 }
 
 async fn load_follow_table(
@@ -843,7 +897,7 @@ fn spawn_tick(
     store: &Arc<wake::WakeStore>,
     ticks: &mut JoinSet<Option<wake::Fired>>,
     tick: wake::Tick,
-) {
+) -> Result<(), threads::Failure> {
     let store = Arc::clone(store);
     // No transport is named "wake", so a tick's admission key never collides with a session's.
     let Some(admission) = runner
@@ -856,8 +910,22 @@ fn spawn_tick(
             reason = "busy",
             "gateway.wake.tick.skipped"
         );
-        return;
+        return Ok(());
     };
+    let ticket = runner
+        .thread_owner
+        .reserve(&runner.shell_threads)
+        .map_err(|limit| {
+            tracing::info!(
+                event = "gateway_wake_tick_skipped",
+                wake.id = %tick.id(),
+                reason = "shell-threads",
+                limit.maximum = runner.thread_owner.maximum,
+                error = ?limit,
+                "gateway.wake.tick.skipped"
+            );
+            threads::Failure::Limit(limit)
+        })?;
     let shell = routes.route_for_anchor(tick.anchor()).map(|route| {
         dekopon_shell::Interpreter::new(
             dekopon_process::Limits {
@@ -878,7 +946,7 @@ fn spawn_tick(
     let jobs = Arc::clone(&runner.jobs);
     let broker = runner.broker.clone();
     let runtime = tokio::runtime::Handle::current();
-    ticks.spawn_blocking(move || {
+    let result = ticket.spawn(threads::Work::Tick, move || {
         let _admission = admission;
         wake::run_tick(
             tick,
@@ -888,7 +956,24 @@ fn spawn_tick(
             shell,
             job_limits.map(|limits| (jobs, limits)),
         )
+    }).map_err(|error| {
+        tracing::error!(event = "gateway_wake_task_failed", error.kind = ?error.kind(), "gateway.wake.task.failed");
+        threads::Failure::Spawn { kind: error.kind() }
+    })?;
+    ticks.spawn(async move {
+        match result.await {
+            Ok(Ok(fired)) => fired,
+            Ok(Err(failure)) => {
+                tracing::error!(event = "gateway_wake_task_failed", failure = failure.category(), error = %failure, "gateway.wake.task.failed");
+                None
+            }
+            Err(_closed) => {
+                tracing::error!(event = "gateway_wake_task_failed", failure = "cancelled", "gateway.wake.task.failed");
+                None
+            }
+        }
     });
+    Ok(())
 }
 
 fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {

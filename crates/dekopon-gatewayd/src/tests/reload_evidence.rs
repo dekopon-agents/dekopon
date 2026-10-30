@@ -327,7 +327,7 @@ async fn repeated_invalid_gateway_sources_emit_once_until_edit_or_repair() {
 }
 
 #[tokio::test]
-async fn rejected_budget_and_routine_values_stay_out_of_reload_and_boot_diagnostics() {
+async fn rejected_budget_and_summary_model_values_stay_out_of_reload_and_boot_diagnostics() {
     let root = temporary();
     fs::write(
         root.path().join("dekopon.yaml"),
@@ -356,12 +356,8 @@ async fn rejected_budget_and_routine_values_stay_out_of_reload_and_boot_diagnost
         "reviewer": {"models": [MODEL], "meters": [{"kind": "fixed", "limit": 10, "period": "1d"}]}
     }});
     config["metering"]["budgets"][KEY] = meter;
-    config["routes"][0]["memory"] = json!({"mode": "persistent", "policy": {
-        "capture": {"user": "uncapped", "assistant": "uncapped", "toolRequest": "uncapped", "toolResult": 262144},
-        "routines": [{"id": "summary", "kind": "progressiveOneShot", "model": ROUTINE,
-            "parts": [{"id": "short", "maxBytes": 100}, {"id": "long", "maxBytes": 200}]}],
-        "retain": ["summary"], "selection": {"mode": "fixed", "routine": "summary"}
-    }});
+    config["sessions"] = json!({"journal": {"path": "journal"}, "assets": {"path": "assets"}});
+    config["routes"][0]["memory"] = json!({"mode": "persistent", "summaries": {"model": ROUTINE}});
     write_config(root.path(), &config);
     let report = crate::check(&path, None, None).await;
     assert!(report.problems.iter().any(|problem| matches!(
@@ -380,7 +376,7 @@ async fn rejected_budget_and_routine_values_stay_out_of_reload_and_boot_diagnost
     }
     assert!(reason.contains("metering.budgets entry #"), "{reason}");
     assert!(
-        reason.contains("memory routine names an unknown model"),
+        reason.contains("summaries.model names an unknown model"),
         "{reason}"
     );
 
@@ -755,7 +751,7 @@ async fn boot_never_echoes_auth_file_content() {
         let (capture, guard) = capture_spans();
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            crate::run(&path, std::future::pending()),
+            crate::run(&path, std::future::pending(), 32),
         )
         .await
         .expect("boot is bounded")

@@ -1074,11 +1074,7 @@ permit(
 
 #[test]
 fn every_action_declares_exactly_these_context_attributes() {
-    fn pretty(value: &serde_json::Value) -> String {
-        serde_json::to_string_pretty(value).expect("a context record serializes")
-    }
-
-    let prompt_context = json!({
+    let mut prompt_context = json!({
         "type": "Record",
         "attributes": {
             "subject": { "type": "String", "required": false },
@@ -1100,6 +1096,7 @@ fn every_action_declares_exactly_these_context_attributes() {
             "agent": { "type": "String" },
         }
     });
+    prompt_context["attributes"]["github"] = super::github::schema();
     let mut capability_context = prompt_context.clone();
     for name in ["effect", "risk"] {
         capability_context["attributes"][name] = json!({ "type": "String" });
@@ -1130,13 +1127,9 @@ fn every_action_declares_exactly_these_context_attributes() {
         (AGENT_PROMPT_ACTION, &prompt_context),
         (SECRET_USE_ACTION, &secret_context),
     ] {
-        let (rendered, expected) = (
-            pretty(&actions[action]["appliesTo"]["context"]),
-            pretty(expected),
-        );
-        assert!(
-            rendered == expected,
-            "the {action} context record moved\n--- rendered ---\n{rendered}\n--- pinned ---\n{expected}"
+        assert_eq!(
+            &actions[action]["appliesTo"]["context"], expected,
+            "{action} context"
         );
     }
 }
@@ -1596,4 +1589,314 @@ fn identity_digest_binds_each_group_to_its_principal() {
         "direct-caller".parse().expect("group"),
     )]);
     assert_ne!(first.identity_digest(), second.identity_digest());
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one family table exercises all action contexts and both author-set passes"
+)]
+fn every_family_sample_validates_strictly_against_the_schema() {
+    use dekopon_core::github::GithubEvent;
+    let common = json!({"delivery":"delivery-1","event":"repository","repository":{"id":10,"fullName":"owner/repo"},"actor":{"id":1,"kind":"user"},"authorSet":{"actorLogin":"owner"},"kind":"none"});
+    let pr = json!({"baseRef":"main","baseSha":"a".repeat(40),"merged":false,"crossRepository":false,"authorId":1,"authorAssociation":"OWNER","labels":[]});
+    let issue = json!({"authorId":1,"authorAssociation":"OWNER","labels":[],"assignees":[],"isPullRequest":false});
+    let comment = json!({"id":2,"authorAssociation":"OWNER"});
+    let samples = vec![
+        (
+            "pull_request",
+            json!({"kind":"pullRequest","pullRequest":pr,"number":7}),
+        ),
+        (
+            "pull_request_review",
+            json!({"kind":"review","pullRequest":pr,"review":comment,"number":7}),
+        ),
+        (
+            "pull_request_review_comment",
+            json!({"kind":"reviewComment","pullRequest":pr,"comment":comment,"number":7}),
+        ),
+        (
+            "pull_request_review_thread",
+            json!({"kind":"pullRequest","pullRequest":pr,"number":7}),
+        ),
+        ("issues", json!({"kind":"issue","issue":issue,"number":7})),
+        (
+            "issue_comment",
+            json!({"kind":"issueComment","issue":issue,"comment":comment,"number":7}),
+        ),
+        (
+            "sub_issues",
+            json!({"kind":"issue","issue":issue,"number":7}),
+        ),
+        (
+            "issue_dependencies",
+            json!({"kind":"issue","issue":issue,"number":7}),
+        ),
+        (
+            "discussion",
+            json!({"kind":"discussion","discussion":{"authorAssociation":"OWNER"},"number":7}),
+        ),
+        (
+            "discussion_comment",
+            json!({"kind":"discussionComment","discussion":{"authorAssociation":"OWNER"},"comment":comment,"number":7}),
+        ),
+        (
+            "commit_comment",
+            json!({"kind":"commitComment","comment":comment}),
+        ),
+        (
+            "push",
+            json!({"kind":"push","push":{"ref":"main","refType":"branch","before":"a".repeat(40),"after":"b".repeat(40),"created":false,"deleted":false,"forced":false,"commits":1}}),
+        ),
+        (
+            "create",
+            json!({"kind":"ref","gitRef":{"name":"main","refType":"branch"}}),
+        ),
+        (
+            "delete",
+            json!({"kind":"ref","gitRef":{"name":"main","refType":"branch"}}),
+        ),
+        (
+            "workflow_dispatch",
+            json!({"kind":"ref","gitRef":{"name":"main"}}),
+        ),
+        (
+            "workflow_run",
+            json!({"kind":"run","run":{"id":2,"runNumber":1,"attempt":1,"trigger":"push","pullRequests":[7]}}),
+        ),
+        (
+            "workflow_job",
+            json!({"kind":"run","run":{"jobId":3,"id":2,"attempt":1}}),
+        ),
+        (
+            "check_run",
+            json!({"kind":"check","check":{"id":2,"appId":3,"suiteId":4,"pullRequests":[7]}}),
+        ),
+        (
+            "check_suite",
+            json!({"kind":"check","check":{"appId":3,"suiteId":4}}),
+        ),
+        ("status", json!({"kind":"check","check":{"id":2}})),
+        (
+            "release",
+            json!({"kind":"release","release":{"id":2,"tag":"v1","draft":false,"prerelease":false}}),
+        ),
+        (
+            "deployment",
+            json!({"kind":"deployment","deployment":{"id":2}}),
+        ),
+        (
+            "deployment_status",
+            json!({"kind":"deployment","deployment":{"id":2}}),
+        ),
+        (
+            "deployment_review",
+            json!({"kind":"deployment","deployment":{}}),
+        ),
+        (
+            "deployment_protection_rule",
+            json!({"kind":"deployment","deployment":{}}),
+        ),
+        (
+            "code_scanning_alert",
+            json!({"kind":"alert","alert":{"number":2}}),
+        ),
+        (
+            "dependabot_alert",
+            json!({"kind":"alert","alert":{"number":2,"state":"open","severity":"high","ecosystem":"CONTAINER","package":"example","ghsa":"GHSA-1234"}}),
+        ),
+        (
+            "secret_scanning_alert",
+            json!({"kind":"alert","alert":{"number":2}}),
+        ),
+        (
+            "secret_scanning_alert_location",
+            json!({"kind":"alert","alert":{"number":2}}),
+        ),
+        (
+            "repository_vulnerability_alert",
+            json!({"kind":"alert","alert":{"ghsa":"GHSA-1234"}}),
+        ),
+        (
+            "repository_advisory",
+            json!({"kind":"alert","alert":{"ghsa":"GHSA-1234"}}),
+        ),
+        (
+            "label",
+            json!({"kind":"label","label":{"id":2,"name":"ready"}}),
+        ),
+        (
+            "milestone",
+            json!({"kind":"milestone","milestone":{"id":2,"number":1,"state":"open"}}),
+        ),
+        (
+            "merge_group",
+            json!({"kind":"mergeGroup","mergeGroup":{"headSha":"a".repeat(40),"baseSha":"b".repeat(40),"baseRef":"main"}}),
+        ),
+        (
+            "package",
+            json!({"kind":"package","package":{"id":2,"ecosystem":"CONTAINER"}}),
+        ),
+        (
+            "registry_package",
+            json!({"kind":"package","package":{"id":2,"ecosystem":"CONTAINER"}}),
+        ),
+        ("member", json!({"kind":"member","member":2})),
+    ];
+    let common_only = "fork branch_protection_configuration branch_protection_rule custom_property_values deploy_key gollum meta page_build project project_card project_column public repository repository_dispatch repository_import repository_ruleset secret_scanning_scan security_and_analysis star team_add watch";
+    let world = world_with_secret();
+    for (event, shape) in samples.into_iter().chain(
+        common_only
+            .split_whitespace()
+            .map(|event| (event, json!({"kind":"none"}))),
+    ) {
+        let mut value = common.clone();
+        value["event"] = json!(event);
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(shape.as_object().unwrap().clone());
+        let fact = shape.as_object().unwrap().iter().find(|(key,_)|key.as_str()!="kind" && key.as_str()!="number").and_then(|(key,value)| {
+            if let Some(record)=value.as_object(){record.iter().next().map(|(field,value)|format!("context.github has {key} && context.github.{key} has {field} && context.github.{key}.{field} == {value}"))}
+            else{Some(format!("context.github has {key} && context.github.{key} == {value}"))}
+        }).unwrap_or_else(||"context.github.repository.id == 10".to_owned());
+        value["action"] = json!("deploy:migrations");
+        value["at"] = json!(1790000000);
+        value["authorSet"] = json!({"actorLogin":"owner","headRef":"feature","headSha":"a".repeat(40),"headRepository":"owner/fork","draft":false,"state":"open","reviewState":"approved","reviewCommit":"a".repeat(40),"commentCommit":"a".repeat(40),"runStatus":"completed","conclusion":"success","runPath":".github/workflows/test.yml","alertRef":"main","forkRepository":"owner/fork","category":"q-a","answered":true,"environment":"staging","alertState":"open","deploymentRef":"main","deploymentSha":"a".repeat(40),"deploymentState":"success","task":"deploy:migrations"});
+        let typed: GithubEvent = serde_json::from_value(value).expect("typed family sample");
+        let full = serde_json::to_value(typed).unwrap();
+        for stripped in [false, true] {
+            let mut github = full.clone();
+            if stripped {
+                github.as_object_mut().unwrap().remove("authorSet");
+            }
+            let mut context = session();
+            context.github = Some(github);
+            let policy = format!(
+                r#"@id("family") permit(principal, action, resource) when {{ context has github && context.github.event == "{event}" && {fact} }};"#
+            );
+            let engine = PolicyEngine::new(&policy, &world).expect("strict policy");
+            for request in [
+                capability_request("cpetersen", "cli-probe.upper", context.clone()),
+                prompt_request("cpetersen", "reviewer", context.clone()),
+                secret_request("cpetersen", context.clone()),
+            ] {
+                assert!(
+                    engine.build_request(request.clone(), None).is_ok(),
+                    "{event}, stripped={stripped}"
+                );
+                assert!(
+                    engine.authorize(request.clone()).allowed,
+                    "{event}, stripped={stripped}"
+                );
+                let decision =
+                    engine.authorize_http(request.clone(), facts(Some(br#"{"text":"preserved"}"#)));
+                assert!(decision.allowed, "{event}, HTTP stripped={stripped}");
+                let (built, _) = engine
+                    .build_request(request, Some(facts(Some(br#"{"text":"preserved"}"#))))
+                    .unwrap();
+                let Some(cedar_policy::EvalResult::Record(http)) =
+                    built.context().unwrap().get("request")
+                else {
+                    panic!("HTTP context record")
+                };
+                let Some(cedar_policy::EvalResult::Record(body)) = http.get("body") else {
+                    panic!("HTTP body record")
+                };
+                assert_eq!(
+                    body.get("text"),
+                    Some(&cedar_policy::EvalResult::String("preserved".to_owned()))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_world_lists_what_it_registers() {
+    let world = world_with_secret();
+    fn names(mut items: Vec<&str>) -> Vec<&str> {
+        items.sort_unstable();
+        items
+    }
+    assert_eq!(
+        names(world.principals().map(|id| id.as_str()).collect()),
+        ["cpetersen", "direct-caller"]
+    );
+    assert_eq!(
+        names(world.providers().map(|id| id.as_str()).collect()),
+        ["cli-probe"]
+    );
+    assert_eq!(
+        names(
+            world
+                .capabilities()
+                .map(|(capability, provider)| {
+                    assert_eq!(provider.as_str(), "cli-probe");
+                    capability.as_str()
+                })
+                .collect()
+        ),
+        ["cli-probe.reverse", "cli-probe.upper"]
+    );
+    assert_eq!(
+        world
+            .secrets()
+            .map(|secret| secret.as_str())
+            .collect::<Vec<_>>(),
+        ["drn:com.xrl:secret:prod:api/token"]
+    );
+}
+
+#[test]
+fn unresolved_kinds_have_distinct_labels() {
+    let labels: std::collections::BTreeSet<_> = [
+        UnresolvedKind::Capability,
+        UnresolvedKind::Provider,
+        UnresolvedKind::ActionGroup,
+    ]
+    .map(UnresolvedKind::label)
+    .into();
+    assert_eq!(labels.len(), 3);
+    assert!(!labels.contains(""));
+    assert!(!labels.contains("xyzzy"));
+}
+
+#[test]
+fn opaque_body_reasons_have_distinct_labels() {
+    let labels: std::collections::BTreeSet<_> = [
+        OpaqueBody::Streamed,
+        OpaqueBody::MediaType,
+        OpaqueBody::TooLarge,
+        OpaqueBody::Malformed,
+        OpaqueBody::Unrepresentable,
+    ]
+    .map(OpaqueBody::label)
+    .into();
+    assert_eq!(labels.len(), 5);
+    assert!(!labels.contains(""));
+    assert!(!labels.contains("xyzzy"));
+}
+
+#[test]
+fn a_policy_set_over_the_policy_count_ceiling_is_refused() {
+    let policies = "permit(principal, action, resource);\n".repeat(super::MAX_POLICIES + 1);
+    let error = PolicyEngine::new(&policies, &world()).expect_err("too many policies");
+    assert!(matches!(error, PolicyBuildError::TooManyPolicies { .. }));
+}
+
+#[test]
+fn a_policy_id_annotation_that_is_empty_or_overlong_is_refused() {
+    for id in [String::new(), "a".repeat(super::MAX_POLICY_ID_BYTES + 1)] {
+        let error = PolicyEngine::new(
+            &format!(r#"@id("{id}") permit(principal, action, resource);"#),
+            &world(),
+        )
+        .expect_err("an unusable policy name");
+        assert!(
+            matches!(error, PolicyBuildError::InvalidPolicyId { .. }),
+            "{} bytes",
+            id.len()
+        );
+    }
 }

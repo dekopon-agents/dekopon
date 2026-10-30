@@ -23,6 +23,34 @@ dekopon-gatewayd --config /path/to/gatewayd.yaml
 
 The configuration file must be a regular non-symlink file owned by the daemon's UID, with a single link, not group- or world-writable, and no larger than 1 MiB. It is strictly decoded: an unknown field, an unknown transport kind, or an unknown route match is a startup failure, not a silently ignored setting.
 
+## Runtime threads
+
+Thread sizing is parsed before configuration; flags override their environment fallbacks and
+no configuration key controls a pool. Counts must be positive. Omitted worker and keep-alive options retain Tokio's defaults; the blocking cap defaults to 8.
+
+Effective Tokio worker and blocking counts must each be at most 4096, including values from
+flags, `DEKOPON_WORKER_THREADS`, `DEKOPON_BLOCKING_THREADS`, `TOKIO_WORKER_THREADS`, or available
+CPUs; larger counts are command-line validation errors (exit 2) before any pool is constructed.
+
+| Flag | Environment fallback | Default |
+|---|---|---|
+| `--worker-threads` | `DEKOPON_WORKER_THREADS` | `TOKIO_WORKER_THREADS`, otherwise available CPUs |
+| `--blocking-threads` | `DEKOPON_BLOCKING_THREADS` | 8 |
+| `--blocking-keep-alive` | `DEKOPON_BLOCKING_KEEP_ALIVE` | 10s; humantime duration |
+| `--shell-threads` | `DEKOPON_SHELL_THREADS` | 32 |
+
+With both OTel exporters enabled and idle blocking threads retired, gatewayd has `W + 4` idle threads (main, `W` workers named `gw-rt-N`, `gw-stdout`, and two SDK-owned export threads) and a process ceiling of `W + 4 + B + S`, where `B` is the blocking cap (8 by default) and `S` is the shared `ShellThreads` cap (32 by default); the Pi settings `W=2, B=8, S=32` give 6 idle and at most 46 threads.
+Without an exporter, subtract its thread from both counts. Blocking threads share the numbered
+`gw-rt-N` namespace and retire after the keep-alive. The stdout worker and OTel providers drain
+before runtime shutdown. The Pi settings are deployment values, not binary defaults.
+Turns (`sh-turn`), jobs (`sh-job`), wake ticks (`sh-tick`) and memory summaries (`sh-memory`)
+share that shell budget with pipeline stages and helpers. Admission refuses immediately with
+`LimitExceeded::ShellThreads` when capacity is exhausted. A turn holds one permit and each
+non-final pipeline stage adds one; the default retained-value budget permits at most sixteen
+producer stacks, or seventeen permits with the turn. Calls, feeders, jq pumps and upcalls
+also spend this same process budget. The blocking pool handles short I/O and final native joins
+after thread bodies finish; permits remain held through thread-local teardown and the join.
+
 ## Check a configuration
 
 ```console
@@ -218,6 +246,8 @@ sessions:
   wakes:                                      # optional; absent, no route may schedule a wake
     path: /var/lib/dekopon-gatewayd/wakes.jsonl       # relative paths resolve against this file
     maxPerSubject: 20                         # optional, default 20 pending wakes per person
+    maxSubscriptionsPerAgent: 64              # optional, default 64 pending PR subscriptions per agent
+    subscriptionExpiryMs: 1209600000          # optional, default 14 days from subscription creation
     minIntervalMs: 300000                     # optional, default 5 minutes between watch checks; must exceed scriptTimeoutMs
     maxHorizonMs: 2592000000                  # optional, default 30 days
 
@@ -236,9 +266,9 @@ The route's `conversation:` block is the **match**: `kind` is the word `any` or 
 
 `limits.scriptTimeoutMs` bounds one script rather than the whole session: the shell ends the run at that deadline with `dekopon-shell: script exceeded its <N>ms deadline`, and a provider call still in flight is abandoned with it — the broker's call is dropped along with the script, so an effect that had already reached the provider leaves a decision record and no execution record. It defaults to 30000, which is the deadline every route ran under before the field existed, and 30 seconds is not enough for a genuinely slow capability: `gpt-image.edit` routinely takes longer, while a generate finishes in about 24 seconds. `maxDurationMs` is still the session bound, and a `scriptTimeoutMs` above it is refused at startup because the session would be cancelled first.
 
-`sessions.memory` accepts `retention: {maxAgeMs, maxBytesPerAgent}` (defaults: 604800000 ms, 67108864 bytes), `arena: {maxTransientBytes}` (default: 134217728 bytes), and `agents.<agentId>` entries with optional `retention: {maxAgeMs?, maxBytes?}`, `routine`, and `policy`. Per-agent ceilings may only narrow the global limits; IDs must name a routed agent. Arena sweeping is fixed at one hour, not a config field. A persistent route may override its agent policy under `routes[].memory.policy`; without a policy, the resolved policy retains only `original` with fixed selection. A policy requires `capture: {user, assistant, toolRequest, toolResult}` (positive byte counts or `uncapped`), `routines: [{id, kind, maxBytes?, model?, parts?}]`, nonempty `retain`, and `selection: {mode, routine?, decisionCapability?, fallback?, backend?, model?, requireProbabilities?}`. Routine IDs are 1–128 ASCII letters, digits, `-`, `_` or `.`, because a decider offers them as labels. Kinds are `original`, `prefix` and `progressiveOneShot`/`progressiveTurducken`. A prefix needs `maxBytes`; progressive routines need a direct configured model and strictly increasing cumulative `{id, maxBytes}` parts. Selection is `fixed` (retained `routine`), `agentPreference` (retained route default `routine`, optionally replaced by the agent setting), or `decider` (nonempty `decisionCapability`, retained `fallback`, nonempty `backend` and `model`, and a boolean `requireProbabilities`, all required; at most 32 retained routines). `backend`, `model` and `requireProbabilities` are passed to the decision provider unchanged and refuse at load outside `decider` mode. Irrelevant fields and unknown names refuse at load. Without a journal, persistent routes remain window-only and config-check prints one warning; explicit `recall: journal` still refuses without storage. On journal-backed persistent routes, `read_memory_record`, `set_memory_pin`, and `clear_memory_pin` use the full scoped conversation key and current grant; one-shot and journal-less routes offer none of them. Reads and pins name a retained routine, so a refusal lists the same eligible representation IDs as the historical envelope. Reads return at most 16 KiB of eligible UTF-8 text (or a bounded unavailable/range reason) and persist only source/version/range/outcome references. Pins survive restart and choose representation fidelity for included records, not inclusion; a pin reports its selected text byte cost, even if that choice grows the output. Selected records carry their opaque record ID and eligible representation IDs in the model-facing historical envelope.
+`sessions.memory` accepts `retention: {maxAgeMs, maxBytesPerAgent}` (defaults: 604800000 ms, 67108864 bytes), `summaries: {concurrency, queue}` for the one gateway summary engine (defaults: 1 and 64), and `agents.<agentId>` entries with optional `retention: {maxAgeMs?, maxBytes?}`, `hotTurns`, `summaries`, `capture` and `selection`. Per-agent ceilings may only narrow the global limits; IDs must name a routed agent. A persistent route may set the same four keys under `routes[].memory`, and a route's value replaces its agent's. `hotTurns` (default `min(10, maxTurns)`) is how many newest records replay verbatim; an explicit value above `maxTurns` refuses. `summaries` is `off` or `{model?, parts?, maxInputBytes?}` (defaults: the route's own model, `[200, 1024, 4096]` bytes per part, 131072 input bytes); `parts` holds 1 to 255 entries, and an unknown or proxy-only `model` refuses. Summaries are on by default and resolve to `off` on a route whose `recall` is not `journal`, because those records never replay. `capture: {maxItemBytes}` (default 262144) caps each stored text item; opaque reasoning has its own fixed 64 KiB cap, and tool arguments are stored as sent. `selection` is `ladder` (the default) or `{decider: {capability, backend, model, requireProbabilities}}`, all four required and nonempty. Unknown names refuse at load, including the deleted `policy`, `routine`, `routines`, `retain` and `arena` keys. For journal-recall routes `maxBytes` defaults to 524288; other routes keep 65536. Without a journal, persistent routes remain window-only and config-check prints one warning; explicit `recall: journal` still refuses without storage. On journal-backed persistent routes, `read_memory_record`, `set_memory_pin`, and `clear_memory_pin` use the full scoped conversation key and current grant; one-shot and journal-less routes offer none of them. Representation IDs are `native` (the original turn), `summary-<n>` (generated summary part `n`) and `metadata` (the record's envelope); an ID that does not parse, or names a part the plan does not have, is refused with the record's available IDs, and a part whose summary is queued, running or failed is refused the same way without returning its error or any original text. Reads return at most 16 KiB of UTF-8 (or a typed refusal naming why) and persist nothing. A pin is queued during the turn and written after the reply, only if the turn's own record is written; it chooses the rung a record replays at when it is older than the hot window, not whether it replays.
 
-GitHub configuration: a transport of `kind: githubWebhook` requires `name`, `bind` (nonzero socket port), and `secretEnv` (an environment variable name, never the secret). The path is fixed at `/webhooks/github`; `callbackPath` is not accepted for GitHub. When sharing a listener with WhatsApp, binds must agree and callback paths cannot collide. `check` validates structure and warns about the credential without reading it; boot requires a present nonblank credential. GitHub POST bounds headers and the 256 KiB body and verifies the exact raw-body HMAC-SHA256 before parsing. Unknown event headers and repository-less events, including `ping`, are acknowledged and ignored. A GitHub route requires a nonempty, unique `githubEvents` list of typed family names (for example, `[issues, issue_comment, push]`), `memory: { mode: oneShot }`, and a canonical selector such as `conversation: { kind: [thread], container: owner, ids: [owner.repo] }`. `githubEvents: [pull_request, workflow_run]` retains its existing filters: opened/reopened/synchronize PR events and completed success/failure runs. Other listed families wake on every action. `githubEvents` is forbidden on other transports; `null`, unknown family names and dotted repo IDs fail. Declaration-order selection happens before the selected route's event filter: a later overlapping route cannot receive an event the first route omits.
+GitHub configuration: a transport of `kind: githubWebhook` requires `name`, `bind` (nonzero socket port), and `secretEnv` (an environment variable name, never the secret). The path is fixed at `/webhooks/github`; `callbackPath` is not accepted for GitHub. When sharing a listener with WhatsApp, binds must agree and callback paths cannot collide. `check` validates structure and warns about the credential without reading it; boot requires a present nonblank credential. GitHub POST bounds headers and the 256 KiB body and verifies the exact raw-body HMAC-SHA256 before parsing. Unknown event headers and repository-less events, including `ping`, are acknowledged and ignored. A repository name outside the subject grammar, including a name with a dot, is also acknowledged and ignored. A GitHub route requires a nonempty, unique `githubEvents` list of typed family names (for example, `[issues, issue_comment, push]`), `memory: { mode: oneShot }`, and a canonical selector such as `conversation: { kind: [thread], container: owner, ids: [owner.repo] }`. `githubEvents: [pull_request, workflow_run]` retains its existing filters: opened/reopened/synchronize PR events and completed success/failure runs. Other listed families wake on every action. `githubEvents` is forbidden on other transports; `null`, unknown family names and dotted repo IDs fail. Declaration-order selection happens before the selected route's event filter: a later overlapping route cannot receive an event the first route omits.
 
 A GitHub delivery enters the session admission gate as an addressed `message` with `github.<owner>.<repo>` as its attested subject. Conversations key by `owner.repo:<n>` for a local issue, PR or discussion number, or `owner.repo:repository` for repository-level events. A run or check keys by its one local associated PR, otherwise by the repository. A dependency keys by its local blocked issue; a foreign blocked issue uses the repository bucket, and a foreign blocking issue supplies no number or fact. Deliveries never steer or interrupt: consecutive queued deliveries from one actor coalesce into batches of at most 16. Another actor starts a new batch. The mailbox remains 100 slots and the session permit remains the global concurrency bound. Notes render from the batch at turn start, contain no titles, bodies or other prose from the payload, and direct the agent to read current state through a broker-granted capability.
 
@@ -588,7 +618,7 @@ additional bot permission.
 
 The `fauxlack` Cargo feature enables an in-process chat service for Rust gateway tests. It has
 no credentials, socket or listener. Build a `dekopon_gatewayd::fauxlack::Fauxlack` from one YAML
-manifest, then pass it to `run_fauxlack(config_path, shutdown, service)`. Ordinary `run`, `check`
+manifest, then pass it to `run_fauxlack(config_path, shutdown, service, shell_threads)`. Ordinary `run`, `check`
 and the executable have no service and refuse every fauxlack transport, even in a feature build.
 
 ```yaml
@@ -699,6 +729,36 @@ The protocol's one sharp edge is redelivery: Slack expects an acknowledgment wit
 - Subject: `slack.<team>.<user>`, lowercased.
 - A channel answer joins the thread it was asked in, starting one on the inbound message when there is none. A classic direct message has no thread to join; an Agent direct message is intentionally rooted at `thread_ts = event.thread_ts || event.ts`, and that root also scopes admission, history, status, Stop, and owned continuation.
 - An answer is posted in a Block Kit [`markdown` block](https://docs.slack.dev/reference/block-kit/blocks/markdown-block/), which carries the model's CommonMark unchanged and lets Slack render it. The `text` field is mrkdwn — a proprietary syntax where bold is `*one asterisk*` and a link is `<url|label>` — so an answer posted through it alone arrives with `**bold**` as four literal asterisks, and tables and task lists cannot be expressed in it at all. Translating in this process would be a second translation of what Slack is about to translate, so the gateway does none: the block gets the answer verbatim. `text` carries the notification fallback, the one place blocks do not render. The block caps a payload at 12,000 characters, which the 8 KiB outbound bound already sits under.
+
+### Slack pull-request links
+
+A Slack channel route may opt in with `ambient: { pullRequestLinks: true }` alongside
+`follow: true` and `sessions.journal`. The boolean defaults to false; enabled values refuse
+non-Slack transports and route kinds other than channel/thread, including DMs and group DMs.
+The first matching route controls the opt-in. Use core support before adding the key: older
+gateways reject it. Install the follow provider and reviewed broker grants before activation.
+
+An unaddressed human top-level message containing an HTTPS `github.com/<owner>/<repo>/pull/<n>`
+link starts one turn under that message. Host case is ignored; `/files`, `/commits`, `/checks`
+and one trailing slash are accepted, and query/fragment do not change the target. Slack
+`<URL|label>` links work. Distinct targets are deduplicated case-insensitively in arrival order
+and reviewed in one turn; structured owner, repository and positive number reach the prompt.
+Repository names must fit the canonical GitHub subject grammar; a dotted repository name is
+refused during link parsing before a review or subscription can be created.
+Bot posts, edits, other GitHub URLs and thread replies gain no trigger. A mention retains
+ordinary mention behavior. Both classic and Agent Slack experiences support the opt-in.
+An ambient link from an unmapped or agent-denied poster gets no reply or reaction; the refusal
+is still traced with `admission.trigger = "pull-request-link"`.
+
+A PR-link turn keeps only the poster's broker leg throughout execution, downscoped by the channel
+when mapped. Other speakers wait for separate, freshly authorized turns; their additional grants
+cannot authorize work within the review turn. Ordinary mention turns keep participant handles.
+The gateway provides review instructions, including a head-pinned COMMENT review, the short Slack
+summary with the returned review link, and the granted `follow stay` command. GitHub tools and
+authority remain broker/provider-owned; no repository allowlist is added here. The successful
+follow command opens the existing ticket, and delivered follow replies refresh it normally.
+With `wakes: true` and `sessions.wakes`, the first successful COMMENT review of a structured
+target in a mapped channel also subscribes that thread to new commits; see [PR subscriptions](#pr-subscriptions).
 
 ### Slack thread follow
 
@@ -1271,7 +1331,7 @@ session starts without prior history; the `persistent` clauses in steps 4 and 5 
 1. **Admission.** A process-wide semaphore bounds concurrent work. The per-`(transport, conversation)` map is checked first: the running session learns mapped status from the asker’s fresh broker space downscope. In a mapped shared or one-shot channel, other native-chat participants join after fresh authorization; messages arriving while that first lookup is pending wait for its result. Every other route keeps same-sender steering and other-sender follow-ups. Wakes, GitHub deliveries, and input arriving after cancellation or the turn’s seal queue as follow-ups. Together steers and follow-ups hold at most 100 items, so a conversation holds at most 100 bounded messages and the gateway at most that times `sessions.maxConcurrent`. Only a full mailbox (`busy.cause = same-conversation`) or lack of a permit for a new conversation (`saturated`) refuses admission. A refusal is eligible for `I'm busy — try again shortly.` when `replyOnBusy` is set; a collected batch is eligible regardless. Sending still requires a free refusal-reply permit and successful transport delivery. Follow-ups run inline under the existing permit, with their own route, subject, fresh cancellation, broker leg and receipt trace. A conversation with a steady stream of messages keeps its permit until its mailbox is empty.
 2. **Authorization.** A sealed thread is first refused with outcome `sealed`: an addressed turn gets the fixed sealed-thread sentence; a follow turn posts nothing. Other sessions open an attested broker leg with `capabilities(subject, agent, scope)`. A broker-confirmed unmapped sender emits the owner notice on every refusal and is eligible for the fixed Lange-family reply under the reply cooldown. A mapped principal denied this agent, or an empty grant with principal attribution, gets the named permission reply described in [Routing](#routing). Other authentication failures and legacy refusals without typed cause or principal attribution retain `You're not authorized to use this agent.` A follow turn posts nothing. **No model call or session progress starts** on either refusal. Queued or steered input may already have received its admission acknowledgment, which does not signify authorization.
 3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing, apart from an opted-in progress note. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
-4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. Every person-originated turn's user text starts with a gateway-authored participant label naming the sender's broker principal in every scope, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime executes scripts on the asker’s attested leg by default; on mapped channels, `as` selects one current participant’s leg for the whole script. The credential-free `inspect_agent_config` view is built from the asker’s fresh leg and offered only where the route wrote `inspectAgentConfig: true`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt, followed by the chat-memory note when memory is granted, a note that the chat shows only PNG and JPEG on WhatsApp and Telegram, and one line the gateway renders from the route's limits: `[gateway: N steps, M capability calls and W minutes per message.]`, the minutes only when `maxDurationMs` is set. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. Every session also offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh for each session and never stored in history; steers use that session's instructions. Shell bounds are `dekopon-process`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request declares a [prompt cache key](#the-prompt-cache-key) (`session_id` on OpenRouter) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
+4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. Every person-originated turn's user text starts with a gateway-authored participant label naming the sender's broker principal in every scope, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime executes scripts on the asker’s attested leg by default; on mapped channels, `as` selects one current participant’s leg for the whole script. The credential-free `inspect_agent_config` view is built from the asker’s fresh leg and offered only where the route wrote `inspectAgentConfig: true`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt, followed by the chat-memory note when memory is granted, a note that the chat shows only PNG and JPEG on WhatsApp and Telegram, and one line the gateway renders from the route's limits: `[gateway: N steps, M capability calls and W minutes per message.]`, the minutes only when `maxDurationMs` is set. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. Every session offers the no-argument `wake_reason` tool, independently of `inspectAgentConfig`, returning whether chat, a GitHub webhook, a scheduled wake or a job started the turn. Chat results include `new` or `followUp` admission and the number of consumed person steers; GitHub results carry the same typed events as the attested claim, in arrival order. It grants nothing and calls no broker. Every session also offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh for each session and never stored in history; steers use that session's instructions. Shell bounds are `dekopon-process`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request declares a [prompt cache key](#the-prompt-cache-key) (`session_id` on OpenRouter) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
 5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. On required turns, with a progress message up and no streamed answer, model failures, empty answers, step limits, and lost tasks remove that message before posting the fixed line as a fresh reply; cancellations keep the existing in-place delivery. Streamed partial answers on required turns retain their appended stop or failure line. Follow turns post no fixed failure line or partial answer, except the fixed unreported-work warning when a worked turn declines on its final step. A failed follow turn leaves no stop notice; cancellation still may leave one. An inherited Slack Agent continuation or an authorized Discord follow turn may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On a required turn's failure the sender gets the applicable fixed cause line above, or the `failed` template (`The agent could not complete this request.` by default); a follow turn instead stays silent unless capability work went unreported on its final step, when it posts the fixed audit warning but remains failed. A `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **Fixed stop/failure lines, the one-shot stop notice and attachment bytes are never stored in history.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
 
 `steering: abort` is the route default: a same-sender message interrupts only the in-flight model
@@ -1296,7 +1356,14 @@ grace, queued receipts become `abandoned`; queued wakes are lost and are not rep
 
 At shutdown, transport readers are aborted and in-flight sessions get `shutdownGraceMs` to finish — a model call is already paid for, and abandoning it means a person watching a chat window never hears back. If the grace expires, dropping each async owner marks its synchronous prompt loop cancelled before aborting the wrapper, so no later model turn or capability call starts. A model request or provider effect already in progress remains non-rollbackable and may finish after the async owner is gone.
 
-**Abandonment is bounded, so exit is too.** The async model transport observes the session watch even during a silent read, while other blocking work (including credential/file IO) can still drain after cancellation; dropping an async runtime waits for its blocking threads. The daemon therefore owns its runtime and gives that final wait five seconds before exiting anyway. Without it, worst-case exit is `shutdownGraceMs` plus a model timeout — on the reference deployment 120 s + 120 s — inside a pod termination grace that `dekopon-brokerd`'s own drain has to fit into as well, because the kubelet only starts stopping the broker sidecar once this container is gone. The chart defaults that grace to 270 s and asserts at template time that it covers both drains plus `drainBudget.bufferSeconds`, refusing to render anything shorter ([Kubernetes guide](kubernetes.md#draining-takes-both-graces-in-sequence)); 240 s of gateway abandonment does not leave the broker its 120 s inside it, and the kubelet SIGKILLs the broker mid-drain.
+The gateway retains every native thread's join operation even when its async caller is aborted.
+Admitted ticks still deliver their completed fires during shutdown. After resident tasks stop and
+the summary dispatcher requests model cancellation, the gateway joins all admitted native work
+while the runtime and assets remain available. Native thread-local destructors finish on the
+bounded blocking pool, without occupying an async worker. This cleanup follows the serving
+grace; the runtime's final five-second timeout applies to residual short blocking work. The
+chart's termination grace covers both daemon drains plus `drainBudget.bufferSeconds`
+([Kubernetes guide](kubernetes.md#draining-takes-both-graces-in-sequence)).
 
 **Exhausting one transport is a gateway failure.** Healthy transports keep serving during a peer's
 bounded recovery episode. A permanent refusal, exhausted episode, or reader-task panic stops the
@@ -1316,17 +1383,19 @@ This subsection describes the automatic replay window, not the separate on-deman
 `idleTimeoutMs` is how long a window stays in memory, not how long it is remembered. When a message finds no window in memory (first contact, idle expiry, capacity eviction, or a restart), the route's `recall` rebuilds one before the model runs:
 
 - `none` starts empty. It is the default without `sessions.journal`, and it is the only behaviour older releases had.
-- `journal` reads the gateway's own on-disk transcript. With `sessions.journal` set, each committed turn on a journal route is appended as one versioned JSONL record to `<journal path>/<agentId>/<stem>.jsonl`, where the stem is a SHA-256 of the complete conversation key: directories `0700`, files `0600`. The record carries the attachment inventory and next `chat-asset:` number; recall uses the newest eligible record's inventory. Only the trailing run under the current grant is recalled. Records older than `forgetAfterMs` or memory `maxAgeMs` are not replayed. File rewrites discard records past memory age, not eligible turns evicted from the prompt window. On append and at startup, the encoded JSONL file sizes in each agent directory are bounded by that agent's `retention.maxBytes` (or `retention.maxBytesPerAgent` globally): oldest whole records across conversations are evicted first. A single record larger than the cap is not retained and evicts nothing; the reply it belongs to has already succeeded. This disk cap is independent of the prompt window. At startup and on every recall, files not written for longer than the longer of memory age and journal-route forget intervals are deleted. Legacy unversioned root files without a matching `.followed` sibling are reset on open; corrupt and unknown-version v2 files are reset, with no v1 reader. A torn or corrupt newest line resets its file wherever it is read: recall, projection, append or sweep; the append that finds it is not retained. Upgrade loses the old journal chat window on the four WhatsApp journal routes.
+- `journal` reads the gateway's own on-disk transcript. With `sessions.journal` set, each turn on a journal route is appended after the reply as one record to `<journal path>/<agentId>/<stem>.jsonl`, where the stem is a SHA-256 of the complete conversation key: directories `0700`, files `0600`. A record is a body line holding the turn's original items (user text, consumed steers, assistant text, reasoning, and every tool call with the result the model received) followed by a small header line with the record's grant, model identity, summary slots and plan, attachment inventory and next `chat-asset:` number, and a span index into the body; summary, pin and decider-choice changes are appended as their own short lines. Readers decode only headers and slice the body by offset, on their own file descriptor and without the journal lock. Every journal-recall turn walks the newest `2 × maxTurns + 1` headers at its start (one past twice the window, so a warm window sees the count that forces a repack), whatever the window's residency, and recall uses the newest eligible record's inventory. Only the trailing run under the current grant is recalled. Records older than `forgetAfterMs` or memory `maxAgeMs` are not replayed. File rewrites discard records past memory age, not eligible turns evicted from the prompt window, and every rewrite writes a new file and renames it, so a reader holding the old file keeps its bytes. After every delivered turn and at startup, the file sizes in each agent directory are bounded by that agent's `retention.maxBytes` (or `retention.maxBytesPerAgent` globally): oldest whole records across conversations are evicted first, with their side lines. A single record larger than the cap is not retained and evicts nothing; the reply it belongs to has already succeeded. This disk cap is independent of the prompt window. At startup and after every delivered turn, files not written for longer than the longer of memory age and journal-route forget intervals are deleted. Legacy unversioned root files without a matching `.followed` sibling are reset on open, and a file in any earlier journal format resets at startup: old history is never migrated or re-keyed, and it is removed rather than left unreachable. A reader skips a torn newest line; a corrupt file is reset after the reply, by the turn that found it, or at startup. While each file loads at startup the gateway holds a `loading.marker` naming it, so a file that crashed the previous start is reset before anything else loads.
 - `platform` asks the chat service for the conversation's recent messages (Slack `conversations.replies` or `conversations.history`, Discord `GET /channels/{id}/messages`), so the model sees what the person sees, other participants included. It reads at most `min(2 × maxTurns, 100)` messages, waits at most 5 s, and a read that fails answers from an empty window. Only Slack and Discord have a history API; startup refuses `platform` on WhatsApp, Telegram, and local routes. Discord returns other people's text only when the application has the Message Content intent enabled in the Developer Portal, whether or not the transport sets `messageContent`; without it, those messages are skipped. Each author is labelled with the broker principal it maps to, `[gateway: chat history, from simon]`: for every distinct author other than the sender, the gateway asks the broker for that author's `capabilities` in this chat scope and reads only `principal`, inside the same 5 s. An author no principal names keeps `[gateway: chat history, from <service user id>]` on a private route and becomes `[gateway: chat history, from unmapped participant]` on a `sharedConversation` route, so no platform id reaches the model there. Either label is service-reported authorship, not broker authentication, and each unmapped lookup logs `broker_capabilities_refused` with `reason: unmapped-subject` in the broker.
 
-Every journal-backed persistent route appends captured tool exchanges after the reply, including platform-recall routes. A platform route still obtains user and answer text from the chat service, not a duplicate journal projection; journal-less persistent routes keep only their window and offer no memory tools. A failed append is reported without claiming durable retention. A stopped or stale completion cannot append.
+Every journal-backed persistent route appends its record after the reply. On a route whose `recall` is not `journal` (platform recall, or a journaled `recall: none` route) the record keeps only the tool exchanges, with no user, steer, assistant or reasoning item and no summary slots; those routes keep their own window of user and answer text in memory. Journal-less persistent routes keep only their window and offer no memory tools. A failed append is reported without claiming durable retention. A stopped completion, or one stale at its lease commit, cannot append. The record is written before the conversation's admission is released, so the next turn of the conversation always finds it.
 
-For a journal-backed persistent route, the resolved `memory.policy.selection` projects eligible retained representations before the next model call: `fixed` uses its named routine, `agentPreference` uses the per-agent preference when present, and `decider` makes at most one broker-governed invocation for the turn, never with historical text. Its input is the decision provider's `decide.choose` request: the configured `backend`, `model` and `requireProbabilities`, `labels` (the routine IDs available on the projected records) and `evidence`, one `{tool, outcome, exitStatus?, ageMs, bytes, pinned}` record per projected record, newest 256 at most, where `tool` is `bash` or `none` and `outcome` is `success`, `failure` or `none`. With fewer than two available labels no invocation is made and the fallback applies with `single-label`. A refused, ungranted, invalid or failed decision uses the configured fallback without a second invocation. An included pin selects fidelity, not inclusion; an eligible decider choice can override it, and `maxTurns`/`maxBytes` still evict oldest whole turns or omit an oversized pinned turn. Each selection records the requested and actually sent representation, including omission and pin state. Automatic replacements (fixed, fallback, or a decider choice missing on one record and replaced there by the fallback) that save no model-facing envelope bytes retain the original when available, with `kept-original: no-saving`. If retention disposed the original, the replacement is sent instead with `kept-replacement: original-unavailable`, and its signed size difference is still recorded; source text is not restored. The default policy selects retained originals without a decider. A request-only gateway memory notice tells the model what was omitted or replaced and why. The projection replaces the in-memory window: a journaled turn appears only as its selected representation, so an omitted record is never backfilled from in-memory text, and an in-memory turn is kept only while its record is not yet in the journal (append pending or failed).
+For a journal-recall route, the recalled headers are projected before the model call. The newest `hotTurns` records replay as verbatim steps: user and steer messages, assistant text, and each tool call followed by its result, all sliced from the journal. Each hot record may use `maxBytes / hotTurns`; within it, user, steer and assistant text are kept first, and tool results share what is left, cut at a safe UTF-8 and JSON-escape boundary; an argument that does not fit, or is not a JSON object, replays as `{"cut":N}`. Provider reasoning replays only to the model whose identity produced it. Older records replay at a rung: their pin, else a decider choice, else their deepest generated summary, else verbatim; summary and metadata rungs appear as envelopes (`[memory #41 · time · summary 3/3]`, the summary, and one line per tool call) in one leading `[gateway: earlier conversation]` message. When the projection is over `maxBytes`, the oldest record steps down one rung at a time (summary, metadata, then a counted omission), hot records last and whole, to three quarters of the budget; rungs change only on such a repack, when a record leaves the hot window, or when its pin changes, so consecutive requests differ only at the newest edge. With `selection: {decider: …}`, at most one broker-governed invocation per turn asks about the oldest older record that has no choice, whose summary slots are all final and which has at least one generated summary; its labels are that record's generated `summary-<n>` IDs and `metadata`, its input is the decision provider's `decide.choose` request with the configured `backend`, `model` and `requireProbabilities` and one `{tool, outcome, exitStatus?, ageMs, bytes, pinned}` evidence record per recalled record (newest 256 at most), and it never carries historical text. Its choice is written after the reply and takes effect at the next repack; a refused, ungranted, invalid or failed decision leaves the record on the ladder. The request-only `[gateway: memory]` notice names every record the window omitted, so no turn disappears silently.
+
+After the reply, a summary engine fills a journal-recall record's summary slots in the background, part by part, through its plan's model, with the record's non-opaque text cut to `maxInputBytes` (text first, then tool exchanges). No reply, steer or next turn waits on it. Concurrency and queue are bounded by `sessions.memory.summaries`; a task that does not fit the queue marks its part and later parts as failed (`overflow`) and is counted. Each part ends `generated` or failed (`timeout`, `refused`, `modelFailed`, `empty`, `overflow`, `panicked`, `io`, `unconfigured`); a failed summary is recorded as failed, never synthesized. The model's own `timeoutMs` bounds each call, and shutdown cancels running calls without lengthening the drain; a part left running resumes from the stored original at the next start. The plan is frozen into the record when it is written, so a later reload changes only new records, and a plan whose model name was removed stops its chain as `unconfigured`.
 
 With `sessions.journal` configured, a wall-clock seal writes only a sibling `<stem>.sealed`
 file containing `{"atMs":<u64>}`, mode `0600`; it never writes a transcript line on the cancel path.
 The `.sealed` marker is never consumed or cleared by a successful turn. Its mtime expires by the route's `forgetAfterMs` on read, and the longest configured forget interval bounds its directory sweep independently of the journal's memory-age file sweep (the separate `.followed` invitation uses its stored `untilMs` deadline instead), so expiry
-lifts the seal. A marker that does not parse is removed like a corrupt journal. A restart preserves
+lifts the seal. A marker that does not parse is removed at startup. A restart preserves
 the seal and the fresh DM window, but loses the notice. Without a journal, seals live only in a
 resident map and restart forgets them. A seal write failure is reported as `gateway_journal_seal_failed`.
 
@@ -1377,11 +1446,11 @@ The state key is *not* the admission key from step 1, which is `(transport, conv
 
 ### Prior turns are compacted
 
-The live chat window stores `(the user's message, the final answer)`, or the message alone when the session failed or declined an optional reply. On journal-backed routes a separate versioned record captures bounded tool requests/results and outcomes. Journal recall projects eligible retained representations into historical envelopes, never executable tool calls; platform recall obtains chat text from the platform and journals tool evidence without duplicating user/answer fields.
+A route without journal recall keeps a window of `(the user's message, the final answer)`, or the message alone when the session failed or declined an optional reply; the message includes consumed steers, each with its delivery and attribution frames, and never a gateway notice. A journal-recall route keeps one record per turn and replays it as described above: verbatim while hot, then as summaries or envelopes, never executable tool calls from an envelope. Platform recall obtains chat text from the platform and journals only tool evidence.
 
 The number that forces this: one script's combined output can reach 256 KiB, which is `dekopon-process`'s default `max_output_bytes` in [`../crates/dekopon-process/src/lib.rs`](../crates/dekopon-process/src/lib.rs). Replaying full transcripts would let a single earlier turn cost more than the entire window budget, and it would do so most on exactly the sessions that did the most work.
 
-Without a journal, intermediate commands and output are lost across sessions. With a journal, retained tool evidence can be read while its record remains eligible; a disposed original cannot be recovered from a summary or metadata. The broker audit log is not a conversation-text store.
+Without a journal, intermediate commands and output are lost across sessions. With a journal, a record's original stays readable through `read_memory_record` for as long as the record is eligible; a record and its summaries are kept and removed together. The broker audit log is not a conversation-text store.
 
 ### The bounds
 
@@ -1483,8 +1552,11 @@ On a `persistent` route, chat text sits in `dekopon-gatewayd`'s memory for at le
 
 A route with `wakes: true` offers the model a `wake` tool, so an agent can come back to a
 conversation later without anyone writing to it. A wake is a synthesized message: it carries the
-subject, conversation and reply target of the authenticated message that scheduled it, and the
-model chooses only when and the note it will read. It never names a person or a place.
+conversation and reply target of the authenticated message that scheduled it; the model chooses
+only when, its probe and the note it will read. Every new wake created in a mapped space carries
+`run_as: space` and the canonical channel subject. Creation is authorized as asker ∩ space;
+firing runs as that space alone. Wakes created outside a mapped space, including DMs, stay
+personal. Legacy once/watch rows without `run_as` retain their personal ownership.
 
 - `schedule` wakes the agent once, `afterSeconds` from now.
 - `watch` runs a probe script every `everySeconds` (at least `minIntervalMs`, at most `forSeconds`)
@@ -1493,17 +1565,28 @@ model chooses only when and the note it will read. It never names a person or a 
   output over 8 KiB, wakes it with the failure and retires the watch. `$PREV` holds the previous
   run's output. The first run happens while scheduling, with `$PREV` unset: it never wakes the
   agent, and a probe that exits 2 or more there is refused rather than stored.
-- `list` and `cancel` see only the asking person's wakes. The tool is the only way to see them.
+- `digest` uses the watch arguments for a daily digest anchored to this message's thread.
+  It requires a mapped channel, refuses a second digest in the same space, and checks at least
+  24 hours apart. Ordinary schedules/watches keep their existing configured bounds.
+- `list` and `cancel` include the current mapped channel's space schedules from any freshly
+  authorized participant, matching the anchor's conversation container rather than its thread
+  or original asker. Legacy personal entries remain subject-scoped; a DM sees only its own
+  personal wakes. Another channel or DM cannot cancel a space wake by its ID.
 
 Every probe run opens its own broker leg attested with `trigger: probe`. The broker neither lists
 nor authorizes a capability that is not read-only on that leg (`probe-write`), whatever policy
-says. The woken session attests `trigger: wake` and is authorized afresh, like any message, so
-a wake can do nothing the person could not do by typing; owner Cedar policy can narrow it further
-through `context.trigger`.
+says. A daily digest's woken session also attests `trigger: probe` and stays read-only; other
+woken sessions attest `trigger: wake`. Each is authorized afresh, so a personal wake can do only
+what its scheduling person could do by typing. Every wake newly
+created in a mapped space, whether schedule, watch, digest or PR subscription, runs as the space
+alone and can do only what that space may do, without a participant leg or the original person's
+grants. Space-watch probes also run as the space alone under the read-only ceiling.
+Owner Cedar policy can narrow either through `context.trigger`.
 
-Pending wakes live in one JSONL file (`0600`, rewritten through a rename, no fsync). A due wake's
-row is removed before its session starts, so a restart at that moment loses it; nothing is ever
-delivered twice. A due watch is leased by moving its next check forward in the same write, so one
+Pending wakes live in one JSONL file (`0600`, rewritten through a rename, no fsync). A due
+single-shot wake's row is removed before its session starts, so a restart at that moment loses
+it. A recurring digest retains its row after a changed firing; there is no crash-durable
+exactly-once guarantee. A due watch is leased by moving its next check forward in the same write, so one
 watch never runs two probes at once. Ticks take a `sessions.maxConcurrent` permit and are skipped,
 not queued, when none is free. A line that does not parse refuses startup; deleting the file
 resets every pending wake. On WhatsApp a wake cannot be scheduled past 24 hours after the message
@@ -1513,9 +1596,61 @@ A wake bypasses stop words, the addressed filter and media collection. Behind a 
 conversation it queues as a follow-up if there is mailbox room, never as a steer; an idle conversation
 starts its turn directly if a permit is free. Wakes receive no acknowledgment. The same mailbox
 and saturation refusals apply. Only when its route no longer answers there as
-the same agent with `wakes: true` does the gateway post the note and any probe output without a session. The local development
+the same agent with `wakes: true` does the gateway post a personal wake's note and any probe
+output without a session. Space wakes never use this orphan fallback. The local development
 transport cannot schedule wakes: its reply target is a connection number a restart reuses. Provider chat memory does not record wake turns;
 the resident window and the journal do. Platform recall for a wake reads the history up to now.
+
+### Daily digest
+
+A mention such as “post a daily digest here” uses `wake` action `digest` with a read-only
+probe, `everySeconds: 86400` and `forSeconds` within `sessions.wakes.maxHorizonMs` (30 days by
+default). The first probe records a baseline without posting. Later changed, nonempty checks
+wake the space to verify stale open non-draft PRs (seven inactive days), unanswered review
+requests and unassigned open issues through granted GitHub reads. Stable probe output excludes
+observation timestamps and changing age counters. Read failures retire the digest with a
+structured cause; they are not treated as empty results.
+
+Unchanged or empty checks produce no model turn or chat post. The model may also select
+`decline_chat_reply` after reading when there is nothing new to report. A digest posts at most
+one concise message in the anchored thread, with GitHub logins as plain text and Slack mention
+syntax neutralized; it produces no progress or streaming messages. Successful checks update the
+previous output and retain the recurring watch until cancellation or its fixed expiry.
+Expiry is quiet and never renews automatically: request a new digest after expiry or cancel
+and replace it. Both creation and replacement wait a full interval before their first check.
+
+Digests use the existing strict watch shape and a gateway-authored header in its script;
+`run_as` selects ownership independently of ordinary watch versus digest lifecycle. Old
+once/watch rows and s5 subscription rows still load. Older gateways reject the new strict
+store shapes: the coordinated s5/s6 release is **revert-safe: no**, and rollback requires
+removing the wakes file, losing all pending wakes and subscriptions.
+
+### PR subscriptions
+
+A successful PR-link COMMENT review on a mapped Slack channel route with `wakes: true` leaves
+one subscription per repository, PR and anchored thread. Repeating the review in the same
+thread reuses it. The store defaults to 64 subscriptions per agent and a 14-day lifetime from
+creation, configured by `sessions.wakes.maxSubscriptionsPerAgent` and `subscriptionExpiryMs`.
+The next distinct subscription above the limit is refused; pushes do not extend expiry.
+
+A later routed `pull_request.synchronize` delivery fires only when its repository subject is
+mapped by the broker and falls inside the GitHub route's `ids`. The wake resumes the anchored
+thread as the space alone, reads the current head, and refreshes its head-pinned COMMENT review.
+When every capability invocation in the turn successfully refreshes the subscribed PR's review,
+the model replies to Slack only when blocking findings changed; otherwise it may select
+`decline_chat_reply`, producing no chat post or progress message. Any other invocation, including
+a failed review or a review of another PR, requires a visible Slack report even after a successful
+refresh, or the fixed audit-before-retry warning when no reporting turn remains.
+Unmatched deliveries retain their ordinary repository-session handling.
+
+PR close, including merge, expiry and cancellation remove the subscription. From any mapped
+participant's freshly authorized turn in the channel, `wake` action `listSubscriptions` lists
+that channel's subscriptions and `cancelSubscription` cancels one by `id`; both require
+asker ∩ space authorization and are refused in DMs. These subscription actions remain separate
+from scheduled-wake `list` and `cancel`.
+Subscriptions share the strict JSONL wake store. Older gateways cannot read the new line kind;
+rollback requires removing the wakes file, resetting every pending wake and subscription.
+A lost subscription route is ignored silently rather than posted as an orphan reminder.
 
 ## Durable memory after transport acceptance
 
@@ -1638,7 +1773,9 @@ timed-out, or failed call is charged its input estimate and the text it already 
 settle above its estimate; that is real spend, and it shows as debt that delays the next allow.
 
 Without `metering`, or for an agent with no budget, spend is unbounded and still recorded: every
-model call writes one [`meter` record](observability.md#the-meter-charge-record), so a budget added
+model call writes one [`meter` record](observability.md#the-meter-charge-record). Summary calls are
+recorded with `via = "summary"` but never admitted or refused, so they never use room a reply step
+needs, and a ledger rebuilt from records skips them. A budget added
 later restores real history. A refusal mid-turn ends the turn with the sentence; capability calls
 that already ran stay run. It is logged as `gateway_session_refused` with category `over-budget`,
 never as `gateway_session_failed` or a `gateway.progress kind="failed"` record; its terminal is still

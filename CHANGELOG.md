@@ -7,6 +7,145 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-10-29
+
+### Added
+
+- the wake_reason tool returns why a turn started.
+
+### Fixed
+
+- GitHub pull_request_review, _comment and _thread deliveries no longer answer 400 malformed.
+- a GitHub delivery from a repository with a dot in its name is ignored instead of refused.
+- the GitHub run note names its associated pull request as #N or none.
+
+## [dekopon-chart-0.59.0] - 2026-10-29
+
+### Changed
+
+- Chart 0.59.0 targets core v0.72.0 and renders the `v0.72.0` image tag.
+
+## [0.71.0] - 2026-10-29
+
+### Added
+
+- Cedar policies read context.github, the typed facts of every GitHub webhook family; author-set facts can only deny.
+
+### Changed
+
+- Gateway turns, jobs, wake checks and memory summaries share the shell thread budget; the gateway blocking-thread default is 8.
+
+### Fixed
+
+- awk printf %d and %i print nan and inf as nan and inf, without zero padding
+
+## [dekopon-chart-0.58.0] - 2026-10-29
+
+### Changed
+
+- Chart 0.58.0 targets core v0.71.0 and renders the `v0.71.0` image tag.
+
+## [0.70.0] - 2026-10-28
+
+### Added
+
+- an awk builtin with a POSIX subset; everything outside it is refused before input is read
+- case patterns match bash globs (*, ?, bracket expressions)
+
+## [dekopon-chart-0.57.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.57.0 targets core v0.70.0 and renders the `v0.70.0` image tag.
+
+## [0.69.0] - 2026-10-28
+
+### Changed
+
+- an ambient PR link from an unmapped or denied poster is ignored without a thread reply
+- suggest_improvement has no three-per-session cap; its receipt is unnumbered and its description guides how many notes to send
+
+### Fixed
+
+- the memory notice tells the model that a tool call missing from replayed history is not evidence it did not run
+
+## [dekopon-chart-0.56.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.56.0 targets core v0.69.0 and renders the `v0.69.0` image tag.
+
+## [0.68.0] - 2026-10-28
+
+### Added
+
+- release notes list the published container image digests
+- --worker-threads, --blocking-threads, --blocking-keep-alive, --cpu-threads and --shell-threads, with chart values
+
+## [dekopon-chart-0.55.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.55.0 targets core v0.68.0 and renders the `v0.68.0` image tag.
+
+### Added
+
+- Optional `gateway.runtime` and `broker.runtime` values size worker threads, blocking threads and blocking keep-alive, plus gateway shell threads and broker CPU threads; unset or null values render no daemon flags.
+
+## [0.67.0] - 2026-10-28
+
+### Added
+
+- ambient.pullRequestLinks on Slack routes starts a review turn from a pull-request link
+
+### Changed
+
+- shell syntax errors inside $( ), ${ } and here-documents report the script's line
+
+## [dekopon-chart-0.54.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.54.0 targets core v0.67.0 and renders the `v0.67.0` image tag.
+
+## [0.66.0] - 2026-10-28
+
+### Changed
+
+- Shell builtins write their output through one internal writer; no behaviour change.
+
+## [dekopon-chart-0.53.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.53.0 targets core v0.66.0 and renders the `v0.66.0` image tag.
+
+## [0.65.0] - 2026-10-28
+
+### Added
+
+- Memory trace records `gateway_memory_summary_transition`, `gateway_memory_summary_dropped` and `gateway_memory_published`, and expiry reasons and record ids on `gateway_journal_expired`.
+- `sessions.memory.summaries` (`concurrency`, `queue`) and per-agent or per-route `hotTurns`, `summaries`, `capture` and `selection` memory keys.
+
+### Changed
+
+- `agent.model.prompt` is split into records of at most 16 KiB with `transcript.segment` and `transcript.segments`, replays journal turns in full and shows opaque reasoning only as `[opaque N B]`.
+- Conversation journals use the v3 record format only; older journals are reset at startup.
+- Journal-recall routes replay earlier turns as originals, summaries or envelopes within the hot window and `maxBytes`, and summaries are generated after the reply is delivered.
+- Memory tools name representations `native`, `summary-<n>` and `metadata`, and refusals list the eligible IDs.
+- Model clients stream replayable request bodies.
+- Conversation seals are replaced atomically for concurrent readers.
+
+### Removed
+
+- The memory `policy` key with its `routines`, `retain` and routine selection, and the in-memory replay arena.
+
+## [dekopon-chart-0.52.0] - 2026-10-28
+
+### Changed
+
+- Chart 0.52.0 targets core v0.65.0 and renders the `v0.65.0` image tag.
+
 ## [0.64.0] - 2026-10-28
 
 ### Added

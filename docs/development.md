@@ -34,7 +34,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Broker authorization, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context and bounded in-memory audit tests, `crates/dekopon-broker/tests/integration/broker.rs` constraint-validation and redaction tests, `crates/dekopon-broker/tests/audit_log_events.rs` for the audit log record, and `crates/dekopon-broker/tests/integration/policy_decisions.rs` for the workflow decision table |
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
 | Authenticated Unix broker service, private secret sources, and offline provider manager | `crates/dekopon-brokerd/src/`; strict public-DRN/private-map adapters in `secrets.rs`; provider set/lock, bounded OCI transport, content store, skill-directory export, and lifecycle commands in `provider_manager.rs`; the `check --workflows` essential-workflow phase in `workflows.rs` | Inline strict-config/socket/CLI tests; secret-map aggregate validation, strict JSON/YAML projection, secure-file and mock-backed 1Password/Vault/AWS/GCP/Azure/Kubernetes/`oauth2Refresh` adapters; local mock-registry resolution, locked-sync, offline list/verify/skills export, atomic-activation, and blob-hygiene tests; plus `crates/dekopon-brokerd/tests/integration/server.rs` mapped/unmapped-peer, end-to-end invocation, and clean-shutdown tests, `tests/integration/audit_stdout.rs` and `tests/audit_trace.rs` for the audit record on stdout and in the caller's trace, and `crates/dekopon-brokerd/tests/integration/examples.rs` pinning `examples/conditional-write/` against the loaded `http-probe` manifest and Cedar grammar |
-| Sandboxed script language | `crates/dekopon-shell/src/`; closed builtin and word vocabularies in `builtins/mod.rs`, execution in `interp.rs` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/tests/grammar.rs` |
+| Sandboxed script language | `crates/dekopon-shell/src/`; closed builtin and word vocabularies in `builtins/mod.rs`, execution in `interp.rs`, command output destinations in `interp/stage_out.rs` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/tests/grammar.rs` |
 | Cancel latch and shared script-tree accounting (`TreeContext`, `CallBudget`, `RetainedBytes`, `Limits`, `LimitExceeded`, `DEFAULT_*`) | `crates/dekopon-process/src/` | Direct signal-wait tests for requested cancellation, dropped handles and never signals, plus synchronous latch reads; Stop or the script deadline drops a command word in flight, after which the script reads `session-cancelled` |
 | Shared prompt loop, the safe agent-configuration meta view, session capability dispatch, descriptor-backed asset integration, mounted skills, and improvement suggestions | `crates/dekopon-agent/src/`; the typed-output intake and `chat-asset:` reference discovery in `attachment.rs`, the skills listing and `read_skill` tool in `skills.rs`, the `suggest_improvement` tool and its bounds in `improvement.rs` | Inline prompt/meta-tool, explicit-send slot and descriptor-reference, bounded redaction-shape, composite-dispatch, and stub-broker-socket leg tests, plus inline listing/argument and suggestion-validation tests in those two modules |
 | Chat gateway configuration, text/attachment transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopon-gatewayd/src/` | `crates/dekopon-gatewayd/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key derivation and stability, explicit asset delivery and descriptor inputs, route-mounted skills read on demand, and loopback Slack/Discord/Telegram/WhatsApp transports; `crates/dekopon-gatewayd/src/transport/whatsapp.rs` for webhook signature, refusal, saturation, listener, and reply-splitting tests; `crates/dekopon-gatewayd/tests/gateway.rs` for a real `dekopon-brokerd` end to end, including the feature-only fauxlack manifest harness; `crates/dekopon-gatewayd/tests/integration/examples.rs` for the checked-in walkthrough configuration |
@@ -188,6 +188,8 @@ Never edit `.wasm` files directly. Each in-tree source directory is a separate C
 
 ### Dependencies, crates, CI, or releases
 
+The dispatch-only `.github/workflows/burn-in.yml` appends a dated note to `docs/burn-in/TURNS.md` and pushes only `burn-in/webhook-turn` as the release App to trigger the standing draft PR’s webhook turn, recording the pushed commit SHA in its job summary.
+
 The root workspace temporarily patches `tracing-core` to commit
 `2b696a18454a04df9c9a60569b6fb73a22415296` from the
 [`dekopon-agents/tracing` fork](https://github.com/dekopon-agents/tracing), the source
@@ -207,7 +209,7 @@ Declare shared versions and path dependencies in the root `Cargo.toml`; commit `
 
 GitHub Actions are pinned by full commit SHA. Required check names such as `test (Rust)` are branch-protection contexts: renaming a job without coordinating the repository setting leaves a permanently pending required check. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>` when those tools are available. Do not change branch protection, publish crates, create a release, or add credentials without explicit maintainer authorization; an execution contract the owner approved gives it for what it lists.
 
-Expensive validation runs on pull requests, with both ARM64 and x86-64 lanes of the [memory-optimized Wasmtime](#memory-optimized-wasmtime) check also running after merge on matching main pushes; the x86-64 lane is excluded from PR runs. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them, a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`, and a native `macos-15` lane runs only `cargo test -p dekopon-broker-protocol`, the one crate that receives `SCM_RIGHTS` descriptors; the required `quality (stable)` context aggregates all five lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. The package-archive lane runs one `cargo package --locked --no-verify` invocation with `-p` for every public crate in `.github/release-crates.txt` when manifests, build scripts, explicit package inputs, WIT, or publication machinery change; it checks packaging and pins, not an archive rebuild, which first happens at `cargo publish` in the Release workflow. Release metadata validation runs for ordinary Rust and changelog changes.
+Expensive validation runs on pull requests (`pull_request`) and merge queue groups (`merge_group`), with both ARM64 and x86-64 lanes of the [memory-optimized Wasmtime](#memory-optimized-wasmtime) check also running after merge on matching main pushes; the x86-64 lane is excluded from PR runs. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them, a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`, and a native `macos-15` lane runs only `cargo test -p dekopon-broker-protocol`, the one crate that receives `SCM_RIGHTS` descriptors; the required `quality (stable)` context aggregates all five lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. The package-archive lane runs one `cargo package --locked --no-verify` invocation with `-p` for every public crate in `.github/release-crates.txt` when manifests, build scripts, explicit package inputs, WIT, or publication machinery change; it checks packaging and pins, not an archive rebuild, which first happens at `cargo publish` in the Release workflow. Release metadata validation runs for ordinary Rust and changelog changes.
 
 The optional `memory-lab` workflow runs the pinned memory harness's deterministic fake-profile
 scenarios against the exact pull-request head SHA on `pull_request`, filtered to
@@ -243,6 +245,12 @@ The tag-triggered release performs only the release-specific tag/version, change
 Publishing a release additionally runs `.github/workflows/homebrew-tap.yml`, which renders `dekopon-agents/homebrew-tap`'s formula with `.github/scripts/render-homebrew-formula.py`. That script reads the release's asset list and its published `.sha256` sidecars, so the formula's platform blocks follow whatever a release shipped and never a list held in the workflow; a target it cannot map to a Homebrew `on_macos`/`on_linux` block fails the job rather than disappearing from the formula. Its hand-maintained lists are `EXECUTABLES`, the binaries every archive carries, and `RETIRED`, naming targets a past release shipped that the tap must stop offering, so an immutable older release cannot reintroduce a platform the project has dropped. Pushing to another repository needs a credential `GITHUB_TOKEN` cannot provide: the job mints a short-lived installation token from a GitHub App via the `TAP_APP_ID` and `TAP_APP_PRIVATE_KEY` repository secrets, and skips with a warning when either is absent or when the App is not installed on the tap, since both are the same unfinished operator setup. The one-time App setup is in the root [`README.md`](../README.md#homebrew-tap-automation).
 
 Neither that workflow nor `.github/workflows/container-image.yml` triggers on `release: published`. `release.yml` publishes with `GITHUB_TOKEN`, and GitHub does not create workflow runs from events raised by that token, so the event is dispatched to nothing: neither workflow produces a run at all, rather than a failed or skipped one. Both are `workflow_call` reusable workflows that `release.yml` invokes as jobs with `needs: github-release`, which is what guarantees they see a release with its assets attached; both keep a `workflow_dispatch` with a `tag` input as the manual recovery path. A reusable workflow reads `github.event_name` and `github.ref` from its caller, so neither may branch on its own event name; each branches on whether its `tag` input is set.
+
+On tag pushes, the container workflow returns its registry-verified `digest`. The release run's
+`release-digests` job exposes `digest` (stock) and `optimized-digest` (Wasmtime optimization)
+outputs and lists both in its summary. After both image publications succeed, it appends their
+full image tags and `sha256:…` digests to the generated GitHub release notes under **Container
+images**, preserving the existing notes. Manual recovery does not append release notes.
 
 ### Memory-optimized Wasmtime
 
@@ -426,6 +434,82 @@ and an extraction that reads nothing fails rather than passing silently. Emittin
 therefore means adding it, backticked, to that document in the same change. Grep `docs/` and `crates/*/README.md` for every event identifier renamed or removed. This is why
 `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and
 `agent.improvement.refused` appear there.
+
+### macOS Homebrew compatibility
+
+The manual [`macos-compat.yml`](../.github/workflows/macos-compat.yml) lane uses an ARM64
+`macos-15` runner and installs Dekopon and `cassette` from the real Homebrew tap. It records the
+tap revision and installed binaries, requires the pinned versions and ARM64 Mach-O architecture,
+and runs [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py) with `--launchd`. It does not
+build the checkout or substitute downloaded executables for the Homebrew installation.
+
+The helper loads checksum-pinned JSONPlaceholder and GitHub components. Actual
+[`cassette` replay](https://github.com/dekopon-agents/cassette/blob/v0.1.0/README.md) supplies authored
+synthetic HTTP responses; it makes no upstream requests. An HTTP fixture independently
+verifies the broker's synthetic bearer credential before forwarding only the request's Accept
+header to replay. Replay ignores Authorization and therefore cannot prove injection by itself.
+
+The real Slack Agent adapter connects to the bounded loopback HTTP/WebSocket fixture in
+[`slack_socket_fixture.py`](../ci/slack_socket_fixture.py). This exercises Socket Mode protocol,
+not the in-process [Fauxlack transport](gatewayd.md#fauxlack-tests-only) or a real Slack workspace.
+The fixture's WebSocket dependency is pinned by version, wheel URL and SHA-256 in
+[`macos-compat-requirements.txt`](../ci/macos-compat-requirements.txt).
+
+The test requires these observable results:
+
+- The gateway shell wrapper loads fake model/app/bot values from a private `credentials.env`;
+  the broker separately loads its literal private `credentialsPath` YAML. No daemon dotenv
+  feature or environment substitution is assumed.
+- Owner and colleague channel mentions reach real broker policy and read-only GitHub execution,
+  then produce threaded Slack replies. Unmapped and denied senders, and a mapped room without a
+  grant, produce no model or provider requests.
+- A local transport turn completes a provider read; an out-of-scope HTTP request is refused.
+- Working status identifies the initiating member and clears to active; native Stop cancels a held model
+  request without a provider call or normal answer. Every sent Socket Mode envelope is acknowledged.
+- The four fake credentials are absent from checks, logs, model inputs, tool results and replies;
+  each endpoint receives only its expected credential. Exact call counts and broker execution
+  records identify the loaded provider artifacts.
+
+With `--launchd`, the helper discovers an existing `gui/<uid>` or `user/<uid>` domain, starts two
+uniquely named jobs, observes clean daemon exits and confirms their removal. It never uses sudo,
+creates accounts or falls back silently to foreground execution. Each job clears inherited
+environment variables before starting its binary or wrapper. Cleanup removes private temporary
+files only after complete success; a failure retains them and reports their path for diagnosis.
+
+To run the same helper from a checkout on an Apple Silicon Mac with Homebrew installed:
+
+```console
+brew tap dekopon-agents/tap
+brew trust dekopon-agents/tap
+brew install dekopon-agents/tap/dekopon dekopon-agents/tap/cassette
+fixture_dir="$(mktemp -d)"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder/releases/download/v0.7.0/jsonplaceholder-provider.wasm \
+  --output "$fixture_dir/jsonplaceholder-provider.wasm"
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  https://github.com/dekopon-agents/dekopon-provider-gh/releases/download/v0.11.1/gh-provider.wasm \
+  --output "$fixture_dir/gh-provider.wasm"
+python3 -m venv "$fixture_dir/venv"
+"$fixture_dir/venv/bin/python" -m pip install --require-hashes --no-deps \
+  -r ci/macos-compat-requirements.txt
+"$fixture_dir/venv/bin/python" ci/macos-compat-smoke.py --launchd \
+  --bin-dir "$(brew --prefix dekopon)/bin" \
+  --provider "$fixture_dir/jsonplaceholder-provider.wasm" \
+  --gh-provider "$fixture_dir/gh-provider.wasm" \
+  --cassette-bin "$(brew --prefix cassette)/bin/cassette"
+```
+
+The helper refuses a mismatched daemon version or component checksum. A tap update therefore
+needs an explicit compatibility review and pin update, not an automatic skip. Validate changes
+with `python3 -m py_compile ci/macos-compat-smoke.py ci/slack_socket_fixture.py` and
+`actionlint .github/workflows/macos-compat.yml`; execute the helper with the selected release.
+
+Omitting `--launchd` runs the same fixtures with foreground processes, including on Linux. That
+does not establish launchd coverage. Both modes use one UID and synthetic services: they do not
+prove production UID isolation, system LaunchDaemons, Gatekeeper, sleep/logout/reboot recovery,
+Slack plan entitlements, real GitHub permissions or OpenRouter billing. No administrator account
+setup or live API secrets are required. The lane is separate from required PR checks; use
+[manual dispatch](run-on-mac.md#manual-homebrew-compatibility-check) for hosted Mac evidence.
 
 ### OpenObserve OTLP end-to-end test
 

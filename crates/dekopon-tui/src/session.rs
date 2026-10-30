@@ -20,7 +20,8 @@ use dekopon_agent::{
     },
     progress::ProgressSink,
     prompt::{
-        CancellationProbe, History, HistoryLimits, PromptLimits, SessionInputs, run_prompt_session,
+        CancellationProbe, ConversationTurn, History, HistoryLimits, PromptLimits,
+        ReplyDisposition, SessionInputs, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -319,6 +320,7 @@ pub async fn connect(
 pub fn smoke_claim() -> ChatScopeClaim {
     ChatScopeClaim {
         participant: None,
+        github: None,
         transport: "console-smoke".parse().unwrap_or_else(|_| unreachable!()),
         kind: ChatTransportKind::Local,
         conversation: Conversation {
@@ -634,8 +636,7 @@ impl AgentSession {
 /// blocking task, so the whole session runs on one and reports back through the channel rather than
 /// being made `async`.
 ///
-/// Consumes and returns `history` because the loop needs `&mut` to it for the whole session; the
-/// caller takes it back with this turn recorded, whether the turn succeeded or failed.
+/// The caller takes `history` back with this turn recorded, whether the turn succeeded or failed.
 ///
 /// # Errors
 ///
@@ -726,8 +727,18 @@ pub async fn run_turn(
             .with_cancellation(&stop)
             .with_progress(progress);
 
-        let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
-            .map_err(|error| crate::report::chain(&error));
+        let (result, captured) =
+            run_prompt_session(model.as_ref(), &runtime, inputs, &history.replay());
+        if let Some(captured) = &captured {
+            let answer = match &result {
+                Ok(outcome) if outcome.disposition == ReplyDisposition::Send => {
+                    Some(outcome.answer.as_str())
+                }
+                Ok(_) | Err(_) => None,
+            };
+            history.record(ConversationTurn::from_captured(captured, answer));
+        }
+        let outcome = result.map_err(|error| crate::report::chain(&error));
         if events
             .send(SessionEvent::Finished(Box::new(outcome)))
             .is_err()

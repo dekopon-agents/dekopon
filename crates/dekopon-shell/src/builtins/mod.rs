@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 
 use crate::{CapabilityInvoker, limits::Budget};
 
+pub(crate) mod awk;
+
 pub(crate) mod cap;
 pub(crate) mod encode;
 pub(crate) mod jobs;
@@ -18,6 +20,7 @@ pub(crate) struct CommandResult {
     pub status: ExitCode,
     pub suppress_newline: bool,
     pub retained: Vec<dekopon_process::RetainedBytes>,
+    pub output: Option<crate::interp::stage_out::StageOut>,
 }
 
 impl CommandResult {
@@ -27,6 +30,7 @@ impl CommandResult {
             status: ExitCode::SUCCESS,
             suppress_newline: false,
             retained: Vec::new(),
+            output: None,
         }
     }
 
@@ -36,6 +40,7 @@ impl CommandResult {
             status,
             suppress_newline: false,
             retained: Vec::new(),
+            output: None,
         }
     }
 
@@ -104,6 +109,7 @@ pub(crate) struct BuiltinContext<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Builtin {
+    Awk,
     Echo,
     Printf,
     Test,
@@ -133,6 +139,7 @@ pub(crate) enum Builtin {
 impl Builtin {
     pub(crate) const fn name(self) -> &'static str {
         match self {
+            Self::Awk => "awk",
             Self::Echo => "echo",
             Self::Printf => "printf",
             Self::Test => "test",
@@ -161,6 +168,7 @@ impl Builtin {
     }
     pub(crate) const fn help(self) -> &'static str {
         match self {
+            Self::Awk => "-F SEP -v NAME=VALUE",
             Self::Echo => misc::ECHO_HELP,
             Self::Printf => "",
             Self::Test => misc::TEST_HELP,
@@ -193,6 +201,7 @@ impl Builtin {
 
 pub(crate) fn lookup(name: &str) -> Option<Builtin> {
     match name {
+        "awk" => Some(Builtin::Awk),
         "echo" => Some(Builtin::Echo),
         "printf" => Some(Builtin::Printf),
         "test" => Some(Builtin::Test),
@@ -224,6 +233,7 @@ pub(crate) fn lookup(name: &str) -> Option<Builtin> {
 #[cfg(test)]
 pub(crate) fn names() -> Vec<&'static str> {
     let mut names = [
+        Builtin::Awk,
         Builtin::Echo,
         Builtin::Printf,
         Builtin::Test,
@@ -462,6 +472,31 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn cat(
+        context: &mut BuiltinContext<'_>,
+        arguments: &[String],
+        input: Option<Value>,
+    ) -> Result<CommandResult, CommandFailure> {
+        assert!(arguments.is_empty());
+        let input = crate::value::display(&input.unwrap_or(Value::Null));
+        let reader = dekopon_process::pipe::PipeReader::from_bytes(
+            input.into_bytes(),
+            None,
+            crate::interp::telemetry::stage_read,
+        );
+        let outcome = crate::interp::run_with_tree(
+            "cat",
+            None,
+            Some(reader),
+            context.invoker,
+            *context.budget.tree().limits(),
+            context.budget.tree(),
+        );
+        let mut result = CommandResult::value(Value::String(outcome.output)).without_newline();
+        result.status = outcome.exit_code;
+        Ok(result)
+    }
+
     pub(crate) fn run_builtin(
         builtin: Run,
         arguments: &[&str],
@@ -521,6 +556,7 @@ mod tests {
     fn the_registry_covers_every_documented_builtin() {
         let expected = [
             "[",
+            "awk",
             "base64",
             "cap",
             "cat",
@@ -638,7 +674,7 @@ mod tests {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum RejectedCommand {
     Eval,
     Exec,
@@ -812,7 +848,8 @@ impl Builtin {
         match self {
             Self::Grep => text::stream::grep(arguments),
             Self::Sed => text::stream::sed(arguments),
-            Self::Echo
+            Self::Awk
+            | Self::Echo
             | Self::Printf
             | Self::Test
             | Self::TestBracket
@@ -859,7 +896,8 @@ impl Builtin {
             Self::Sort => {
                 text::extra::run_parsed(text::extra::sort(arguments)?.0, reader, budget, emit)
             }
-            Self::Echo
+            Self::Awk
+            | Self::Echo
             | Self::Printf
             | Self::Test
             | Self::TestBracket
