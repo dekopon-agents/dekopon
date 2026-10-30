@@ -14,6 +14,8 @@ The model proposes; a separate broker authorizes and executes provider effects.
 - Select other contracts from the [area index](docs/README.md#change-a-specific-area);
   do not read every document by default or copy its inventory here.
 - Follow [CONTRIBUTING.md](CONTRIBUTING.md#change-guidelines) for implementation and review conventions.
+- Write or change documentation with the [`succinct-docs` skill](.claude/skills/succinct-docs/SKILL.md)
+  under the [Documentation](#documentation) rules.
 - This file and the documents it links are the whole contract. A cloud agent in a bare checkout has
   no owner memories, machine instructions or sibling repositories, and needs none: fetch what a
   gate needs (`ci/fetch-external-provider-components.sh`), and name every gate you could not run.
@@ -124,6 +126,29 @@ Audits and plans default to over-building, and the owner reels them back. Before
 - Follow the [PR checklist](docs/development.md#before-opening-a-pull-request); required CI and review precede merge.
   The review is a human's, or under an owner-approved plan a fresh adversarial reviewer's.
   Automated agents never approve their own changes: the reviewer did not write the change.
+
+## Documentation
+
+Docs serve skilled engineers and coding agents: the fewest words that get them running correctly.
+Write and review every doc change with the [`succinct-docs` skill](.claude/skills/succinct-docs/SKILL.md),
+which holds the rubric. These rules are hard; a doc change that breaks one is not merged.
+
+- **Current tree only.** Describe what the code does now; future work keeps its Committed direction
+  or Exploration label. No history, "previously", migration steps, Dekopon version minimums,
+  deprecation or compatibility guidance. `CHANGELOG.md` is the only history, and `docs/upgrading.md`
+  holds only the current release's upgrade and rollback steps. Name the current key, never the old
+  one, except in those steps.
+- **No receipts.** No CI run IDs, OS or Homebrew patch versions, observed call counts or "we
+  tested". What a CI lane proves is stated once, in its section of `docs/development.md`.
+- **One fact, one owner.** State a fact in the doc the [area
+  index](docs/README.md#change-a-specific-area) gives it; elsewhere link to the precise heading.
+- **Verified blocks.** Every command and config block is checked against the code or a released
+  binary; a prose edit leaves blocks byte-identical.
+- **No backsliding.** A doc change never lowers the file's rubric score, and a new doc scores at
+  least 40 of 50. A fresh reviewer scores it before merge.
+- **Deployment positioning.** Kubernetes is the preferred deployment; the Mac path serves people
+  moving from OpenClaw or Hermes. The root README, `docs/README.md` and the website's `/deploy/`
+  link both before their first section, Kubernetes first.
 
 ## Rust guidelines
 
