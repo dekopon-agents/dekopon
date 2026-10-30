@@ -25,7 +25,7 @@ The configuration file must be a regular non-symlink file owned by the daemon's 
 
 ## Environment file
 
-Added in 0.74.0. Both serving daemons accept `--env-file PATH`, a private file of variables
+Both serving daemons accept `--env-file PATH`, a private file of variables
 loaded before serving; [`dekopon-brokerd`](../crates/dekopon-brokerd/README.md#environment-file)
 reads it the same way.
 
@@ -1699,7 +1699,7 @@ a canonical transport and conversation claim, a storage constraint, and Cedar co
 conversation-derived scope values are `channel := conversation.id` and
 `conversation := conversation.key()`, so a Slack channel and a non-thread Discord channel keep the
 namespaces they had in 0.13, while WhatsApp, Telegram topics, and Discord threads change shape and
-start empty ([upgrading.md](upgrading.md)). Otherwise recent/search, the `memory` word, the prompt note, durable
+start empty ([`CHANGELOG.md`](../CHANGELOG.md#0140---2026-09-13)). Otherwise recent/search, the `memory` word, the prompt note, durable
 recording, and namespace creation are all absent.
 
 When present, the model may retrieve on demand:

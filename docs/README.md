@@ -31,14 +31,14 @@ Read in this order:
 9. [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — the host, policy, credential, and provider-lifecycle authority boundary, with status called out per slice.
 10. [`secrets.md`](secrets.md) — public inert DRNs, separate `secret.use` authorization, the owner-only private map, executable source adapters, exact HTTP sinks, and rotation and reflection limits.
 11. [`1password-eso.md`](1password-eso.md) — how a secret reaches a deployed daemon through 1Password and External Secrets, including the Kubernetes projection boundary the direct secret-map adapter handles separately.
-12. [`operations.md`](operations.md) and [`upgrading.md`](upgrading.md) — running a deployment and moving it between releases. `operations.md` indexes the per-crate operational contracts, including where broker audit lives; `upgrading.md` records the breaking configuration migrations and the restart order.
+12. [`operations.md`](operations.md) and [`upgrading.md`](upgrading.md) — running a deployment and moving it between releases. `operations.md` indexes the per-crate operational contracts, including where broker audit lives; `upgrading.md` holds the current release's upgrade and rollback steps, including the restart order.
 13. [`roadmap.md`](roadmap.md) — intended sequence, not a claim that a component exists.
 
 ## Build a provider
 
 **Status: Current; pre-production.** A Dekopon provider is executable WebAssembly Component code, not a native plugin, configuration file, or separate process. Its imports state structural requirements; only the selected host decides which interfaces exist.
 
-Start with the [`dekopon-provider-sdk` README](../crates/dekopon-provider-sdk/README.md) and [`dekopon-provider-sdk-testkit` README](../crates/dekopon-provider-sdk-testkit/README.md). For version transitions, read [`upgrading.md`](upgrading.md) sections “Provider streams (0.31.0)”, “Host time and entropy (0.32.0)” and “Managed provider precompile (0.32.0)”.
+Start with the [`dekopon-provider-sdk` README](../crates/dekopon-provider-sdk/README.md) and [`dekopon-provider-sdk-testkit` README](../crates/dekopon-provider-sdk-testkit/README.md). For changes between releases, read [`CHANGELOG.md`](../CHANGELOG.md).
 
 | Need | Start here |
 |---|---|
@@ -69,7 +69,7 @@ Keep the host, SDK, HTTP and storage facades, provider WIT, HTTP WIT, storage WI
 | Operator auth parsing, rendering, or exit codes | [`cli.md`](cli.md) | Records the operator contract. |
 | Agent, capability, or provider resource fields, or what a catalog value actually decides | [`catalog.md`](catalog.md) | Records every `v1alpha1` field, its consumer, and which fields are reserved and read by nothing. |
 | Running a deployment: startup refusals, where broker audit lives, draining, or where an operational contract lives | [`operations.md`](operations.md) | Indexes the per-crate operational contracts by operator question rather than by crate. |
-| Moving a deployment between releases, or a breaking configuration change | [`upgrading.md`](upgrading.md) | Records the migrations the changelog only names, the lockstep rule, and the restart order. |
+| Upgrading or rolling back a deployment, or a change that needs an operator step to upgrade | [`upgrading.md`](upgrading.md) | Holds the current release's upgrade and rollback steps, the lockstep rule, and the restart order. |
 | Getting a ChatGPT subscription credential into a cluster | [`chatgpt-credential.md`](chatgpt-credential.md) | Records why an interactive login cannot run in a pod, and the seed-once lifecycle that follows from a rotating refresh token. |
 | Model request types, ChatGPT wire JSON, prompt caching, provider retention, chat memory, or memory frameworks | [`inference.md`](inference.md) | Separates request and cache hints, bounded replay, and durable on-demand turns from undocumented subscription behavior and exploratory memory. |
 | Prompt tools and sandboxed scripts | [`dekopon-agent`](../crates/dekopon-agent/README.md) and [`dekopon-shell`](../crates/dekopon-shell/README.md) | Shared orchestration, language, limits, and authority-free dispatch. |

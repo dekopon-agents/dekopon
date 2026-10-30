@@ -69,16 +69,18 @@ every score below 5.
 - Failure symptoms and the log or event that shows them.
 - Upgrade and rollback steps for the current release.
 - What CI proves and what it does not.
-- Every heading another file links to, including links from `CHANGELOG.md` and from the website
-  repository (`dekopon-agents/dekopon-agents.github.io`, `src/`). Fetch the website repository to
-  grep it, or name that check as not run.
+- Every heading another file links to, including links from the website repository
+  (`dekopon-agents/dekopon-agents.github.io`, `src/`); fetch it to grep, or name that check as not
+  run. Code strings that name a doc ("see docs/upgrading.md" in an error) are inbound references
+  too: the doc must still answer them. Headings that only `CHANGELOG.md` links to may go when the
+  current-tree rule deletes their section; those links land on the page top.
 - Text that gates or packaging read: every backticked `audit.event` name in `observability.md`;
   READMEs that ship in release archives (root, brokerd, gatewayd, console) must read on their own.
 
 ## Procedure
 
-1. **Map the doc.** List its headings and every inbound link to them. Read the owning docs it
-   restates.
+1. **Map the doc.** List its headings and every inbound link to them, including code strings that
+   name the file. Read the owning docs it restates.
 2. **Score it** against the rubric.
 3. **Rewrite.**
    - Open with the purpose and the plan.
@@ -88,7 +90,9 @@ every score below 5.
      owner already states the fact.
    - Code and config blocks stay byte-identical unless one is wrong. Compare them with
      `git show HEAD:<file>` before finishing. A wrong block is a separate, verified fix.
-4. **Check every changed claim** against its source and against the failure modes below.
+4. **Check every claim a section keeps**, not only the ones you change, against its source and
+   the failure modes below. Describe CI from the workflow step that runs it, not from a script's
+   header or another doc.
 5. **Run the gates** in [development.md#documentation-gates](../../../docs/development.md#documentation-gates)
    and `git diff --check`. The repository has no link checker: check every relative link and anchor
    you touched with a short script over the target's headings using GitHub's slug rules.
@@ -122,5 +126,11 @@ Each of these shipped in a draft and was caught only by review.
 - **Concurrent editors drift.** Two editors on docs that share facts each assume the other keeps a
   fact. Rewrite one doc at a time; split a very large doc into disjoint section ranges with one
   reviewer for the whole.
+- **Carried-over text is wrong.** A rewrite kept three false chart claims from the old text because
+  only changed claims were checked.
+- **A conditional step disappears.** Cutting the old upgrade notes dropped "set `image.tag` or
+  `image.digest` to the new release", the one step a pinned deployment needs.
+- **An error message loses its explanation.** An error says "see docs/upgrading.md"; deleting the
+  section it relied on left the pointer answering nothing.
 - **History creeps back.** Another session re-added a migration section and CI run receipts days
   after a pass removed them. The rules live in `AGENTS.md` so every session sees them.
