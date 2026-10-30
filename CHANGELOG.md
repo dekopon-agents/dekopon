@@ -7,6 +7,30 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.75.0] - 2026-10-30
+
+### Changed
+
+- ChatGPT login and token refresh run on the async HTTP client; ureq is removed
+- The Slack review-channel example lists the fine-grained PAT permissions GitHub offers, says `gh pr checks` fails on private repositories without a `githubApp` credential, and warns against classic PATs.
+- The Slack examples describe PAT rotation without a restart, the busy and unmapped-member replies, the expected `check` warnings and accepted placeholders, and link the specific Mac runbook steps in order.
+- The Mac runbook gives commands for the service accounts, directories, credential files, plists, upgrade and rollback, and its checks use the chosen example's route (a DM for the starter, a channel mention for the review channel).
+- The Mac runbook installs with `brew install dekopon-agents/tap/dekopon` and `brew pin dekopon` instead of whole-tap trust, and recommends macOS 15 or later.
+- The manual macOS compatibility check pins the Homebrew tap commit, records the Homebrew and macOS versions, and also proves a direct message on the channel-only Slack route is ignored, an unmentioned owner follow-up is answered, and a `${GITHUB_TOKEN}` in the broker PAT stays literal.
+- The generated Homebrew formula's caveats link to the release README install section instead of the conditional-write example.
+- The Mac runbook starts the gateway with `--env-file /usr/local/etc/dekopon/gateway/credentials.env` from its launchd plist instead of a shell wrapper that sources the file.
+
+### Fixed
+
+- The Mac runbook no longer claims the gateway retries an absent broker at boot or that OpenRouter limits appear as startup errors, and names the log stream holding each daemon's exit reason.
+- The generated Homebrew formula passes the `brew style` line-length check.
+
+## [dekopon-chart-0.62.0] - 2026-10-30
+
+### Changed
+
+- Chart 0.62.0 targets core v0.75.0 and renders the `v0.75.0` image tag.
+
 ## [0.74.0] - 2026-10-30
 
 ### Added

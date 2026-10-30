@@ -1,7 +1,7 @@
 # Upgrade to the current release
 
-This page moves a deployment to 0.74.0, or back to 0.73.0, without ever running a mixed daemon
-pair. Follow [every upgrade](#every-upgrade), then the [0.74.0 steps](#0740);
+This page moves a deployment to 0.75.0, or back to 0.74.0, without ever running a mixed daemon
+pair. Follow [every upgrade](#every-upgrade), then the [0.75.0 steps](#0750);
 [`CHANGELOG.md`](../CHANGELOG.md) records what each release changed.
 
 ## Every upgrade
@@ -21,7 +21,7 @@ daemon will serve, before starting either daemon on it
 ones, check before stopping anything, as [on a Mac](run-on-mac.md#upgrade-and-rollback).
 
 A check that exits 1 lists every problem the new release refuses. Fix the configuration as the
-current docs describe, apply the [0.74.0 steps](#0740) and check again; start nothing until both
+current docs describe, apply the [0.75.0 steps](#0750) and check again; start nothing until both
 checks exit 0. A broker refusal of `chatMemory` routes is fixed as
 [optional provider storage and chat memory](../crates/dekopon-brokerd/README.md#optional-provider-storage-and-chat-memory)
 describes.
@@ -48,8 +48,8 @@ not answer; while it drains, its sessions still call the broker.
 - Run `helm upgrade` from `oci://ghcr.io/dekopon-agents/charts/dekopon` with `--version` set to the
   chart version in [Install](kubernetes.md#install), not the application version
   ([two version numbers](kubernetes.md#two-version-numbers)).
-- Values that set `image.tag` or `image.digest` keep that image: set it to `v0.74.0`,
-  `v0.74.0-wasmtime-optimization` or that release's digest.
+- Values that set `image.tag` or `image.digest` keep that image: set it to `v0.75.0`,
+  `v0.75.0-wasmtime-optimization` or that release's digest.
 - The pod runs both daemons from one image, is replaced with `Recreate`, and starts the broker
   first and stops it last ([what it deploys](kubernetes.md#what-it-deploys)). Its `precompile`
   init container does step 3's precompile on every pod start.
@@ -74,16 +74,9 @@ pair and that configuration. There is no reverse data migration:
   hooks are `pre-install,pre-upgrade`. Roll back with `helm upgrade` at the previous chart version
   and values to run them.
 
-## 0.74.0
+## 0.75.0
 
-**Upgrade from 0.73.0.** No configuration change is needed. Both serving daemons accept an optional
-`--env-file PATH` ([gateway](gatewayd.md#environment-file),
-[broker](../crates/dekopon-brokerd/README.md#environment-file)); the chart passes none.
+**Upgrade from 0.74.0.** No configuration change is needed.
 
-**Roll back to 0.73.0.**
-
-- Remove `--env-file` from every launch command and set its variables in the daemon's environment
-  instead: a 0.73.0 daemon refuses the option.
-- Nothing else needs undoing: 0.74.0 changes no configuration, stored format or wire frame.
-- 0.73.0 lacks the Wasmtime 49.0.5 fixes for RUSTSEC-2026-0422, RUSTSEC-2026-0423 and
-  RUSTSEC-2026-0424.
+**Roll back to 0.74.0.** Nothing needs undoing: no configuration, credential-file, stored-format or
+wire change.

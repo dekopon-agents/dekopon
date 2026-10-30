@@ -46,30 +46,30 @@ release archive or bottle.
 
 ### Prebuilt archives
 
-Verify and unpack the [0.74.0 release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.74.0)
+Verify and unpack the [0.75.0 release](https://github.com/dekopon-agents/dekopon/releases/tag/v0.75.0)
 archive. It holds both daemons, the optional console and reference documents.
 
 ```console
-gh release download v0.74.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.74.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.74.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.75.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.75.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.75.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.74.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.74.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.75.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.75.0-aarch64-apple-darwin.tar.gz
 ```
 
 On the first install, stage the pair in a versioned, root-owned directory at the paths the service
 templates use:
 
 ```console
-sudo install -d -o root -g wheel -m 0755 /usr/local/lib/dekopon/0.74.0
+sudo install -d -o root -g wheel -m 0755 /usr/local/lib/dekopon/0.75.0
 sudo install -o root -g wheel -m 0755 \
-  dekopon-0.74.0-aarch64-apple-darwin/dekopon-brokerd \
-  dekopon-0.74.0-aarch64-apple-darwin/dekopon-gatewayd \
-  /usr/local/lib/dekopon/0.74.0/
+  dekopon-0.75.0-aarch64-apple-darwin/dekopon-brokerd \
+  dekopon-0.75.0-aarch64-apple-darwin/dekopon-gatewayd \
+  /usr/local/lib/dekopon/0.75.0/
 test ! -e /usr/local/lib/dekopon/current && \
   test ! -L /usr/local/lib/dekopon/current && \
-  sudo ln -s /usr/local/lib/dekopon/0.74.0 /usr/local/lib/dekopon/current
+  sudo ln -s /usr/local/lib/dekopon/0.75.0 /usr/local/lib/dekopon/current
 /usr/local/lib/dekopon/current/dekopon-brokerd --version
 /usr/local/lib/dekopon/current/dekopon-gatewayd --version
 ```
@@ -126,7 +126,7 @@ Build from source only if you maintain a Rust toolchain, with the compiler pinne
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
 cd dekopon
-git checkout v0.74.0
+git checkout v0.75.0
 cargo install --locked --path crates/dekopon-brokerd
 cargo install --locked --path crates/dekopon-gatewayd
 ```
@@ -138,7 +138,7 @@ The [development guide](development.md) owns build checks.
 Create the Slack app and a dedicated OpenRouter key, choose one model, and collect three secrets.
 
 1. Create the app from the
-   [released Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml)
+   [released Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.75.0/examples/slack/manifest-agent.yaml)
    and get its `xapp-…` and `xoxb-…` tokens with the
    [Slack setup guide](../examples/slack/README.md#create-the-app-and-credentials). The workspace
    plan and admin policy must allow Slack's Agent features; otherwise choose the
