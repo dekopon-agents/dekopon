@@ -18,7 +18,6 @@ use tokio::{
 
 use crate::{FrameLimits, MAX_DESCRIPTORS_PER_FRAME, ProtocolError, read_frame, write_frame};
 
-// rustix panics on truncated cmsg data on macOS, so this buffer exceeds either kernel's single-message limit rather than the five-descriptor wire cap.
 const MAX_KERNEL_DESCRIPTORS_PER_MESSAGE: usize = 512;
 
 /// Every read receives ancillary data even off the frame prefix; typed callers must reject
@@ -30,6 +29,10 @@ pub struct DescriptorStream {
     receive_error: Option<ProtocolError>,
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) descriptor_limit: usize,
+    #[cfg(test)]
+    pub(crate) receive_capacity: usize,
+    #[cfg(test)]
+    pub(crate) delivered_inodes: Vec<u64>,
 }
 
 impl DescriptorStream {
@@ -41,6 +44,10 @@ impl DescriptorStream {
             receive_error: None,
             #[cfg(all(test, target_os = "linux"))]
             descriptor_limit: MAX_DESCRIPTORS_PER_FRAME,
+            #[cfg(test)]
+            receive_capacity: MAX_KERNEL_DESCRIPTORS_PER_MESSAGE,
+            #[cfg(test)]
+            delivered_inodes: Vec::new(),
         }
     }
 
@@ -122,7 +129,11 @@ impl DescriptorStream {
     fn receive(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let mut space = [MaybeUninit::uninit();
             rustix::cmsg_space!(ScmRights(MAX_KERNEL_DESCRIPTORS_PER_MESSAGE))];
-        let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+        #[cfg(test)]
+        let capacity = rustix::cmsg_space!(ScmRights(self.receive_capacity));
+        #[cfg(not(test))]
+        let capacity = space.len();
+        let mut ancillary = RecvAncillaryBuffer::new(&mut space[..capacity]);
         #[cfg(target_os = "linux")]
         let flags = RecvFlags::CMSG_CLOEXEC;
         #[cfg(not(target_os = "linux"))]
@@ -142,6 +153,13 @@ impl DescriptorStream {
                 descriptors.extend(rights);
             }
         }
+        #[cfg(test)]
+        self.delivered_inodes.extend(
+            descriptors
+                .iter()
+                .filter_map(|descriptor| rustix::fs::fstat(descriptor).ok())
+                .map(|stat| stat.st_ino),
+        );
         // macOS has no MSG_CMSG_CLOEXEC, so every received descriptor must be secured before it is
         // exposed.
         #[cfg(not(target_os = "linux"))]
@@ -157,7 +175,6 @@ impl DescriptorStream {
         let descriptor_limit = self.descriptor_limit;
         #[cfg(not(all(test, target_os = "linux")))]
         let descriptor_limit = MAX_DESCRIPTORS_PER_FRAME;
-        // Unreachable with the kernel-sized buffer; retained as untested defence in depth.
         let error = if message.flags.contains(ReturnFlags::CTRUNC) {
             Some(ProtocolError::DescriptorsTruncated)
         } else if self.received.len() + descriptors.len() > descriptor_limit {

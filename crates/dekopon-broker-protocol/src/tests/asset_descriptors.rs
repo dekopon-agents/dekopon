@@ -211,6 +211,71 @@ async fn two_hundred_descriptors_arrive_untruncated_on_linux() {
     assert_eq!(received.len(), 200);
 }
 
+#[test]
+fn a_truncated_descriptor_receive_is_refused_and_leaves_none_open() {
+    const CHILD: &str = "DEKOPON_TRUNCATED_DESCRIPTORS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::asset_descriptors::a_truncated_descriptor_receive_is_refused_and_leaves_none_open",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("isolated descriptor count test");
+        assert!(status.success());
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            use std::{collections::BTreeSet, os::unix::fs::MetadataExt as _};
+
+            let (writer, reader) = UnixStream::pair().expect("socket pair");
+            let mut reader = DescriptorStream::new(reader);
+            reader.receive_capacity = 2;
+            let directory = tempfile::tempdir().expect("fixture directory");
+            let files: Vec<_> = (0..MAX_DESCRIPTORS_PER_FRAME)
+                .map(|index| {
+                    std::fs::File::create(directory.path().join(index.to_string()))
+                        .expect("distinct fixture")
+                })
+                .collect();
+            let sent: Vec<_> = files.iter().map(inode).collect();
+            raw_frame(&writer, &[0, 0, 0, 2, b'{', b'}'], &files).await;
+            drop(files);
+            assert!(matches!(
+                reader
+                    .read_frame::<serde_json::Value>(FrameLimits::default())
+                    .await,
+                Err(ProtocolError::DescriptorsTruncated)
+            ));
+            let open: BTreeSet<_> = std::fs::read_dir("/dev/fd")
+                .expect("fd directory")
+                .filter_map(|entry| std::fs::metadata(entry.ok()?.path()).ok())
+                .map(|metadata| metadata.ino())
+                .filter(|inode| sent.contains(inode))
+                .collect();
+            let delivered: BTreeSet<_> = reader.delivered_inodes.iter().copied().collect();
+            let undelivered: BTreeSet<_> = sent
+                .iter()
+                .copied()
+                .filter(|inode| !delivered.contains(inode))
+                .collect();
+            assert!(!delivered.is_empty() && !undelivered.is_empty());
+            assert!(
+                open.is_disjoint(&delivered),
+                "delivered descriptors left open: delivered {delivered:?}, open {open:?}"
+            );
+            #[cfg(target_os = "macos")]
+            assert_eq!(open, undelivered);
+            #[cfg(target_os = "linux")]
+            assert!(open.is_empty());
+        });
+}
+
 #[tokio::test]
 async fn too_many_outgoing_descriptors_are_refused_before_writing() {
     let (writer, _reader) = UnixStream::pair().expect("socket pair");
