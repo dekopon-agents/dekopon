@@ -145,7 +145,7 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 
 For installation, runtime identities, private mounts, and upgrades, use the
 [Kubernetes guide](kubernetes.md). A bare `emptyDir` does not supply the required ownership and modes;
-the guide explains the [init copy boundary](kubernetes.md#why-an-init-container-and-not-a-volume-mount)
+the guide explains the [init copy boundary](kubernetes.md#the-broker-init-container)
 and [chart-owned paths](kubernetes.md#paths-the-chart-owns).
 
 ## Publication
