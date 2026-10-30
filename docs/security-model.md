@@ -219,7 +219,7 @@ OTLP trace and log fields carry prompts, model responses, command arguments and 
   during descriptor receipt (Linux uses atomic `MSG_CMSG_CLOEXEC`). Broker policy and HTTP grants still decide effects; descriptor
   access covers only references in this invocation, not the whole metadata table. No byte expansion
   or old route capability-name allowlist remains. Old route opt-ins are refused at configuration
-  load rather than silently ignored; see [upgrading](upgrading.md#asset-handles-0180).
+  load rather than silently ignored.
 - **Attachment does not authorize delivery.** Successful typed outputs join the gateway's bounded
   LRU without a copy; their declared labels are authoritative and decoded-prefix mismatches log only
   metadata. Only broker-approved sends enter a request-local reply queue, bounded to four new sends
@@ -344,7 +344,7 @@ The canonical conversation enters Cedar context, as the
 record `context.conversation.{kind, container, id, thread}`; `container` and `thread` are optional
 there, so an ordinary policy reading either without a `has` guard fails strict validation at load, while a
 0.13 statement still guarding the retired `context.channel` loads and quietly stops matching
-([`upgrading.md`](upgrading.md)). What is reserved is what the owner declared: a
+([`CHANGELOG.md`](../CHANGELOG.md#0140---2026-09-13)). What is reserved is what the owner declared: a
 constraint set carries a `route:` of `chatMemoryRecord`, `chatMemoryRecent`, or `chatMemorySearch`,
 and legacy capability, run, resolve, and invoke operations omit and refuse exactly those capabilities and
 every command word of the provider they name. Naming a capability `memory.chat.export` or a

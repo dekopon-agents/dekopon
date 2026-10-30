@@ -32,7 +32,7 @@ components or credentials, invokes nothing, and initializes no telemetry.
 
 ## Environment file
 
-Added in 0.74.0. Serving accepts `--env-file PATH` with the grammar, file policy and precedence of
+Serving accepts `--env-file PATH` with the grammar, file policy and precedence of
 the [gateway's environment file](../../docs/gatewayd.md#environment-file); `probe`, `provider` and
 `check` refuse it with exit 2 before opening anything. The broker reads tuning and `OTEL_*`
 variables from it. It reads no credential from its environment: a `GITHUB_TOKEN` line is an unread

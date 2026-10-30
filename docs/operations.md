@@ -36,7 +36,7 @@ daemon sends them: [`crates/dekopon-brokerd/README.md`](../crates/dekopon-broker
 | What does shutdown actually do, and how long may it take? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) — signals, draining, and the grace that must cover one host deadline plus two frame deadlines |
 | Why does startup take so long, and can a restart skip recompiling every component? | [`dekopon-brokerd` § Compilation cache and the concurrent memory budget](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget) — managed providers boot from verified, mapped cwasm under the provider store. `provider sync` publishes compiled artifacts; run `provider precompile` to fill, repair and prune the cache before a broker boot. A missing index refuses startup; `compileOnLoad: true` bypasses the cache |
 | In what order do I restart the two daemons? | [`upgrading.md`](upgrading.md#restart-the-broker-first-and-stop-it-last) |
-| Configuration changed between versions — what do I edit? | [`upgrading.md`](upgrading.md) |
+| Configuration changed between versions — what do I edit? | [`upgrading.md`](upgrading.md#check-the-configuration-with-the-new-release) |
 | Can I run a newer broker against an older gateway? | No. [`dekopon-brokerd` contract § Version and compatibility](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) |
 
 ### Authority, policy, and credentials

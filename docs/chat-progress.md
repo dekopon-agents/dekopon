@@ -368,7 +368,7 @@ Auto can temporarily suppress fallback prose without visible typing. WhatsApp of
 editable progress, stream, or button.
 
 `indicators` replaces `liveness` rather than extending it. The old spelling is a startup
-refusal naming `liveness:` — no alias, no migration read, no warning-and-continue. [`upgrading.md`](upgrading.md) records the rename and the name it replaced.
+refusal naming `liveness:` — no alias, no migration read, no warning-and-continue.
 
 ## Telemetry
 

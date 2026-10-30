@@ -25,7 +25,7 @@ Rubric values. Replace every ? before filing.
 State: not started | designed (a settled design, nothing built) | partly shipped (cite the PR) |
   shipped (close the issue instead)
 Breaking: no, or yes (scope) when the change gets a CHANGELOG "Breaking (scope)" bullet and a
-  docs/upgrading.md section. Scopes: config, broker protocol, provider SDK, API, audit records,
+  docs/upgrading.md step. Scopes: config, broker protocol, provider SDK, API, audit records,
   behavior (a deleted guarantee)
 Effort: S  one PR, one crate, under ~300 changed lines (#246)
         M  a few crates, ~300-1,500 lines (#252)
