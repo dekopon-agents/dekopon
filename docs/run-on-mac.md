@@ -26,8 +26,9 @@ Then work in order:
 6. Set up [sleep, logs, updates and recovery](#sleep-logs-updates-and-recovery).
 7. Pass [acceptance](#acceptance-before-switching) before replacing another agent.
 
-Out of scope: Docker Desktop ([container guide](container-image.md)), the same-user
-[local transport](gatewayd.md#local-development-transport) and [subscription authentication](cli.md).
+Out of scope: Docker Desktop ([container guide](container-image.md)),
+[subscription authentication](cli.md) and the same-user
+[local transport](gatewayd.md#local-development-transport), which trusts the caller's declared subject.
 
 ## Install
 
@@ -261,12 +262,13 @@ sudo -u _dekopon_broker -e /usr/local/etc/dekopon/broker/broker-credentials.yaml
 ```
 
 `sudo -e` keeps the owner and `0600`; plain `sudo vi` can leave a root-owned file. Never put a
-secret on a command line.
+secret on a command line. The PAT file's contents are in the
+[recipe](../examples/slack-github/README.md#keep-the-github-pat-in-the-broker).
 
 The gateway loads `credentials.env` itself with [`--env-file`](gatewayd.md#environment-file). The
 file's contract:
 
-- It holds only the three `export` lines from [Prepare Slack and the model](#prepare-slack-and-the-model),
+- It holds the three `export` lines from [Prepare Slack and the model](#prepare-slack-and-the-model),
   with their fixed names and single quotes. Values are literal; nothing expands `$`. The PAT and
   every other provider credential belong to the broker.
 - It uses Unix (LF) line endings, because the [`check --probe`](#check-before-installing-a-service)
@@ -291,7 +293,7 @@ owns the file's contents, the PAT's permissions and its rotation.
 - The broker reads no credential from its environment, and the file expands no `${...}`. Its plist
   needs no `EnvironmentVariables` or `--env-file`; `GITHUB_TOKEN` in a plist or a sourced `.env`
   does nothing.
-- Rotate without a restart: edit the file with the `sudo -u _dekopon_broker -e` line above. The
+- Rotate without a restart: with the gateway running, edit the file with the `sudo -u _dekopon_broker -e` line above. The
   broker's `stdout.log` shows `broker_reload_applied`, or `broker_reload_refused` if it kept the
   old PAT; then fix the file before the next restart.
 - A broader PAT alone grants no extra Dekopon capability; broker capabilities and Cedar grants
@@ -376,7 +378,7 @@ sudo -u _dekopon_gateway /usr/local/lib/dekopon/current/dekopon-gatewayd \
    first request: a DM for the harmless starter, an @-mention in the mapped channel for the review
    channel. The review channel routes no DMs; an unrouted message gets no reply and no
    default-level log line.
-2. Confirm a threaded reply, the usage in OpenRouter and the decision in the broker's `stdout.log`.
+2. Confirm a threaded reply, the usage in OpenRouter and the decision in the broker's terminal output.
 3. Confirm an unmapped sender gets no model call.
 4. Stop the gateway, then the broker.
 

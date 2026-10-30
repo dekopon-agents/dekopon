@@ -70,7 +70,7 @@ the automatic Metadata access
   public repositories, and neither the instructions nor `allowedHosts` pin one repository.
 
 Create `/usr/local/etc/dekopon/broker/broker-credentials.yaml` with the runbook's
-[credential-file commands](../../docs/run-on-mac.md#prepare-the-broker-and-gateway), replacing only
+[credential-file commands](../../docs/run-on-mac.md#credential-files), replacing only
 the placeholder with the PAT. Never put the PAT in Git or on a command line.
 
 ```yaml
@@ -107,7 +107,7 @@ runbook's [install commands](../../docs/run-on-mac.md#prepare-the-broker-and-gat
 | `replace-with-exact-openrouter-model-id` | One exact OpenRouter model ID that supports tools |
 
 [Allow a sender](../slack/README.md#allow-a-sender) shows where Slack displays the IDs. `check`
-accepts every placeholder, so confirm none remain; only the gateway's
+accepts the sample Slack IDs and the model placeholder, so confirm none remain; only the gateway's
 [`check --probe`](../../docs/run-on-mac.md#check-before-installing-a-service) proves the model ID.
 
 Save `/usr/local/etc/dekopon/broker/broker.yaml`:
@@ -358,7 +358,7 @@ authorization. Then accept:
    restart recovery and the OpenRouter spending limit; `check` proves none of them.
 
 Keep the daemon pair, provider Wasm and checksum, policy and configuration together for
-[rollback](../../docs/run-on-mac.md#sleep-logs-updates-and-recovery).
+[rollback](../../docs/run-on-mac.md#upgrade-and-rollback).
 
 ## Optional owner review comments
 

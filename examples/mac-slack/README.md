@@ -58,7 +58,7 @@ runbook's [install commands](../../docs/run-on-mac.md#prepare-the-broker-and-gat
 | `t0123abc`, `u0123abc` | Slack workspace and member IDs, lowercased ([Allow a sender](../slack/README.md#allow-a-sender)); names and email addresses are not IDs |
 | `replace-with-exact-openrouter-model-id` | One exact OpenRouter model ID that supports tool calls ([model settings](../../docs/gatewayd.md#openrouter-model-settings)) |
 
-`check` accepts every placeholder, so confirm none remain.
+`check` accepts the sample Slack IDs and the model placeholder, so confirm none remain.
 
 Save `/usr/local/etc/dekopon/broker/broker.yaml`:
 
@@ -238,4 +238,4 @@ running it as `_dekopon_gateway` is not the cross-UID check. Start the gateway, 
 2. A second, unmapped sender gets no model-backed reply.
 
 Keep the binaries, provider checksum and these files together for
-[rollback](../../docs/run-on-mac.md#sleep-logs-updates-and-recovery).
+[rollback](../../docs/run-on-mac.md#upgrade-and-rollback).

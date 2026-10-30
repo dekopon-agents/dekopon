@@ -470,7 +470,7 @@ broker's bearer credential. The real Slack Agent adapter speaks Socket Mode to t
 - Owner and colleague channel mentions, and the owner's unmentioned follow-up in their thread, pass
   real broker policy and get threaded read-only GitHub replies.
 - Unmapped and denied senders, and a mapped room without a grant, cause no model or provider
-  request. The owner's direct message on the channel-only route logs an unrouted
+  request. The owner's direct message matches no channel-only route; it logs an unrouted
   `gateway_message_ignored` debug record and gets no model or provider request, Slack reply or
   status.
 - On the local transport, a provider read completes, an out-of-scope HTTP request is refused, and

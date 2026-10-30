@@ -88,7 +88,8 @@ After changing bot scopes, select **Reinstall to Workspace** so they take effect
 
 ### Export the credentials
 
-Export both under the variable names `gatewayd.yaml` references:
+Export both under the variable names `gatewayd.yaml` references. On a Mac, put them in the
+gateway's `credentials.env` instead ([credential files](../../docs/run-on-mac.md#credential-files)):
 
 ```console
 export DEKOPON_GATEWAYD_SLACK_APP_TOKEN=xapp-...
