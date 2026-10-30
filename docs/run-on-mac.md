@@ -111,11 +111,12 @@ Slack, OpenRouter or GitHub credentials and does not build replacement daemon bi
 [development instructions](development.md#macos-homebrew-compatibility) for exact coverage,
 fixture pins and a local command.
 
-The initial [2026-10-30 process-only hosted run](https://github.com/dekopon-agents/dekopon/actions/runs/40996222822)
-passed on macOS 15.8.2 / ARM64: the tap installed Dekopon 0.72.0, both configuration checks and
-the broker probe passed, and the turn completed with two model-fixture requests, one authorized
-provider GET, the expected reply and clean daemon shutdown. This verifies the Homebrew process
-path at that release; it does not replace the service and live-integration acceptance checks below.
+The [2026-10-30 hosted run](https://github.com/dekopon-agents/dekopon/actions/runs/41001761127)
+passed on macOS 15.8.2 / ARM64 with Homebrew Dekopon 0.72.0 and cassette 0.1.0. Both daemons ran
+in `gui/501`; the check observed nine model-fixture requests, three credential-bound provider
+GETs, owner/colleague Slack replies, sender/room denials and cancellation through native Stop.
+Credential checks, clean exits and removal of both owned launchd jobs passed. This verifies the
+current-user fixture path at those releases, not the production service and live integrations below.
 
 A maintainer can run the registered workflow manually from the default branch:
 
