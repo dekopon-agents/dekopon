@@ -106,7 +106,6 @@ impl CredentialFile {
     }
 
     #[cfg(test)]
-
     pub(crate) fn with_endpoints(
         auth_path: &Path,
         timeout: Duration,
