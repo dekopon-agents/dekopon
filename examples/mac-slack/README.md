@@ -1,9 +1,10 @@
-# Slack and OpenRouter on a Mac
+# Slack Agent and OpenRouter on a Mac
 
 This is a narrow starter for the [Mac runbook](../../docs/run-on-mac.md): one Slack sender,
 one OpenRouter model, and one read-only tool that fetches synthetic JSONPlaceholder posts.
-It grants no GitHub, host-shell, file, or provider-write access. Add useful providers later with
-their own reviewed grants; this example establishes that the installation can answer and run a tool.
+It grants no GitHub, host-shell, file, or provider-write access. To start with useful PR reviews,
+use the [owner-and-colleague review-channel guide](../slack-github/README.md). This smaller example
+first establishes that the installation can answer and run a tool without a GitHub PAT.
 
 The example targets **Dekopon 0.72.0** and **JSONPlaceholder provider 0.7.0**. Both released Linux
 daemons passed the configuration checks, broker probe, and a local-transport turn with that
@@ -137,12 +138,11 @@ broker:
 transports:
   - name: slack
     kind: slackSocketMode
-    experience: classic
+    experience: agent
     indicators:
       mode: native
       reaction: {working: auto, seen: off}
-      progress: message
-      cancelButton: true
+      progress: auto
     appTokenEnv: DEKOPON_GATEWAYD_SLACK_APP_TOKEN
     botTokenEnv: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
 models:
@@ -188,10 +188,18 @@ Choose one exact OpenRouter model ID that supports tool calls. The configuration
 does not pin an upstream provider. Add a supported `routing.only` list only if you need that
 restriction; [OpenRouter settings](../../docs/gatewayd.md#openrouter-model-settings) describe the fields.
 
-Create the Slack app from the classic [0.72.0 manifest](https://github.com/dekopon-agents/dekopon/blob/v0.72.0/examples/slack/manifest.yaml), then obtain the
+Create the Slack app from the [0.72.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.72.0/examples/slack/manifest-agent.yaml), then obtain the
 `xapp-…` app token with `connections:write` and the installed bot's `xoxb-…` token using the
 [Slack setup](../slack/README.md). The manifest enables more features than this DM-only route uses. Its scopes do not grant a sender
 broker permission, and no channel route is enabled here. No public listener is needed.
+
+The workspace plan/admin policy must allow Slack's Agent features. This configuration requests
+native Working/Stop status and can fall back to the working reaction if that surface is unavailable.
+Fallback does not change `experience: agent` or make Agent features available on an unsupported
+workspace. DMs are thread-scoped; continue the bot's reply thread to retain the same conversation.
+Do not set `cancelButton`: Agent mode uses Slack's own Stop control. If you deliberately install
+the classic manifest instead, set `experience: classic`; that is a different profile, not Agent
+API parity.
 
 Put those two values and `OPENROUTER_API_KEY` in the gateway service's private environment source
 from the Mac runbook, using the exact names above. The YAML contains variable names, never tokens.

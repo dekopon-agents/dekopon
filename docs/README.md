@@ -6,7 +6,8 @@ Start with [`design.md`](design.md). It carries the [constitution](design.md#con
 
 ### Install and run
 
-- [Run on a Mac](run-on-mac.md): native installation, Slack/OpenRouter, launchd, budgets and recovery
+- [Run on a Mac](run-on-mac.md): native installation, Slack Agent/OpenRouter, broker PATs, launchd, budgets and recovery
+- [Slack Agent review channel](../examples/slack-github/README.md): owner/colleague GitHub profiles, read-only PR analysis and optional publishing
 - [Run on Kubernetes](kubernetes.md): Helm and ArgoCD installation, credentials, storage, and upgrades
 - [Operations](operations.md): startup refusals, audit, shutdown, and the detailed daemon contracts
 

@@ -433,6 +433,45 @@ therefore means adding it, backticked, to that document in the same change. Grep
 `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and
 `agent.improvement.refused` appear there.
 
+### macOS Homebrew compatibility
+
+The manual [`macos-compat.yml`](../.github/workflows/macos-compat.yml) lane uses an ARM64
+`macos-15` runner and installs `dekopon-agents/tap/dekopon` from the real Homebrew tap. It records
+the tap revision and installed binaries, requires the pinned daemon version and ARM64 Mach-O
+architecture, and runs [`ci/macos-compat-smoke.py`](../ci/macos-compat-smoke.py). It does not build
+the checkout or substitute downloaded executables for the Homebrew installation.
+
+The helper loads one checksum-pinned JSONPlaceholder component, checks minimal configuration,
+starts the real broker and gateway, and sends a local-transport turn with an explicit synthetic
+subject. A local model fixture proposes one provider read, and a local API fixture returns synthetic data. The
+check requires the tool result and final answer, verifies the observed request counts, and shuts
+down its processes and temporary files. Daemon subprocesses receive a small explicit environment
+with a synthetic model key; they do not inherit the runner's credentials.
+
+To run the same helper from a checkout on an Apple Silicon Mac with Homebrew installed:
+
+```console
+brew tap dekopon-agents/tap
+brew trust dekopon-agents/tap
+brew install dekopon-agents/tap/dekopon
+fixture_dir="$(mktemp -d)"
+gh release download v0.7.0 --repo dekopon-agents/dekopon-provider-jsonplaceholder \
+  --pattern jsonplaceholder-provider.wasm --dir "$fixture_dir"
+python3 ci/macos-compat-smoke.py --bin-dir "$(brew --prefix dekopon)/bin" \
+  --provider "$fixture_dir/jsonplaceholder-provider.wasm"
+```
+
+The helper refuses a mismatched daemon version or component checksum. A tap update therefore
+needs an explicit compatibility review and pin update, not an automatic skip. Validate changes
+with `python3 -m py_compile ci/macos-compat-smoke.py` and
+`actionlint .github/workflows/macos-compat.yml`; execute the helper with the selected release.
+
+This is a same-UID read-only process smoke, not the production credential boundary. It does not
+exercise Slack Agent APIs, OpenRouter billing, GitHub credentials, launchd, Gatekeeper, sleep,
+logout or reboot. No administrator account setup or live API secrets are required. It is separate
+from required PR checks: [manual dispatch](run-on-mac.md#manual-homebrew-compatibility-check)
+works only after GitHub registers the workflow on the default branch.
+
 ### OpenObserve OTLP end-to-end test
 
 For daemon telemetry, OpenObserve example, or observability CI changes, run:

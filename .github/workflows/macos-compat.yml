@@ -1,0 +1,64 @@
+name: macOS compatibility
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  homebrew-smoke:
+    name: Homebrew ARM64 process smoke
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_ANALYTICS: "1"
+      DEKOPON_EXPECTED_VERSION: "0.72.0"
+    steps:
+      - name: Check out the smoke helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the released native formula from the tap
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          brew update
+          brew tap dekopon-agents/tap
+          brew trust dekopon-agents/tap
+          brew install dekopon-agents/tap/dekopon
+          prefix=$(brew --prefix dekopon)
+          tap_commit=$(git -C "$(brew --repository dekopon-agents/tap)" rev-parse HEAD)
+          {
+            printf '### Homebrew installation\n\n'
+            printf 'Runner: %s, architecture: %s\n\n' "$RUNNER_OS" "$(uname -m)"
+            printf 'Tap commit: %s\n\n' "$tap_commit"
+            printf 'Installed prefix: %s\n\n' "$prefix"
+            brew list --versions dekopon
+            for binary in dekopon-brokerd dekopon-gatewayd; do
+              test "$("$prefix/bin/$binary" --version)" = "$binary $DEKOPON_EXPECTED_VERSION"
+              file "$prefix/bin/$binary"
+              file "$prefix/bin/$binary" | grep -Eq 'Mach-O 64-bit executable arm64'
+              "$prefix/bin/$binary" --version
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch the pinned public provider component
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder/releases/download/v0.7.0/jsonplaceholder-provider.wasm \
+            --output "$RUNNER_TEMP/jsonplaceholder-provider.wasm"
+
+      - name: Check configuration, start daemons and complete a local tool turn
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ci/macos-compat-smoke.py \
+            --bin-dir "$(brew --prefix dekopon)/bin" \
+            --provider "$RUNNER_TEMP/jsonplaceholder-provider.wasm" \
+            | tee -a "$GITHUB_STEP_SUMMARY"

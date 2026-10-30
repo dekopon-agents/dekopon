@@ -1,7 +1,8 @@
 # Slack setup
 
 For a native Mac installation with a budgeted OpenRouter key, start with
-[Run on a Mac](../../docs/run-on-mac.md) and its [read-only Slack starter](../mac-slack/README.md).
+[Run on a Mac](../../docs/run-on-mac.md), then choose the [Slack Agent review channel](../slack-github/README.md)
+for owner/colleague GitHub profiles and a broker-held PAT, or the [harmless Agent DM starter](../mac-slack/README.md).
 This page owns the Slack app and token setup.
 
 This directory contains the Slack app profiles also used by the

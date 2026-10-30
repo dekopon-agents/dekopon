@@ -57,7 +57,8 @@ There is no catalog operator CLI and no general invocation CLI. Secret sources n
 ## Install
 
 - **Mac:** [Run Dekopon on a Mac](docs/run-on-mac.md) covers native installation,
-  the Slack/OpenRouter starter, spending limits, launchd, and update/recovery checks.
+  Slack Agent setup, [GitHub review-channel profiles](examples/slack-github/README.md),
+  broker-held PATs, spending limits, launchd, and update/recovery checks.
 - **Kubernetes:** [Deploy Dekopon on Kubernetes](docs/kubernetes.md) covers the Helm chart,
   ArgoCD, configuration and credentials, storage, upgrades, and shutdown ordering.
 
