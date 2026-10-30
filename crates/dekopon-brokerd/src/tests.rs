@@ -37,6 +37,19 @@ pub(super) fn write_owner_only(path: &Path, contents: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
 }
 
+pub(crate) async fn candidate_or_refusal(
+    config_path: &Path,
+    mode: super::Mode<'_>,
+) -> (Option<super::Candidate>, super::CheckReport) {
+    let (loaded, report) = super::load_candidate(config_path, mode).await;
+    let candidate = match loaded {
+        Some(super::Loaded::Candidate(candidate)) => Some(*candidate),
+        Some(super::Loaded::Unchanged) => panic!("this load expects a candidate or a refusal"),
+        None => None,
+    };
+    (candidate, report)
+}
+
 pub(super) fn write_config(path: &Path, document: &serde_json::Value) {
     dekopon_broker_host::enable_test_component_memoization();
     write_owner_only(
@@ -1879,7 +1892,7 @@ async fn broker_projection_does_not_relax_owner_only_source_rules() {
     std::os::unix::fs::symlink("..data/broker.yaml", &path).unwrap();
     for report in [
         super::check(&path, None, None).await,
-        super::load_candidate(&path, Mode::Boot).await.1,
+        candidate_or_refusal(&path, Mode::Boot).await.1,
     ] {
         assert!(
             report.problems.iter().any(|problem| matches!(
@@ -1907,14 +1920,14 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     let mut document = attested_document(current_uid());
     document["identities"].as_array_mut().unwrap().truncate(1);
     write_config(&path, &document);
-    let (active, report) = super::load_candidate(&path, Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&path, Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.expect("boot candidate");
     let digest = active.ready.broker.policy_digest().to_owned();
 
     document["serverLimits"] = json!({"maxConnections": 12});
     write_config(&path, &document);
-    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    let (rejected, report) = candidate_or_refusal(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(problem,
         BrokerdError::RestartRequired { categories } if categories == &["serverLimits"])));
@@ -1922,14 +1935,14 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     document.as_object_mut().unwrap().remove("serverLimits");
     write_config(&path, &document);
     write_owner_only(&root.path().join("cli-probe.wasm"), b"not a component");
-    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    let (rejected, report) = candidate_or_refusal(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(problem,
         BrokerdError::RestartRequired { categories } if categories == &["providers"])));
     write_owner_only(&root.path().join("cli-probe.wasm"), &component);
 
     write_owner_only(&cedar, b"not cedar");
-    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    let (rejected, report) = candidate_or_refusal(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
@@ -1941,7 +1954,7 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     write_owner_only(&cedar, format!("{POLICIES}\n@id(\"unrecognized\") permit(principal in Dekopon::Group::\"strangers\", action, resource);\n").as_bytes());
     document["capabilities"]["cli-probe"]["constraints"] = json!({});
     write_config(&path, &document);
-    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    let (rejected, report) = candidate_or_refusal(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(problem,
         BrokerdError::Policy { source: PolicyBuildError::UnknownGroup { group, .. } } if group == "strangers")));
@@ -1952,7 +1965,7 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     document["capabilities"] = probe_capabilities();
     document["identities"][0]["attestor"] = json!({"namespaces": []});
     write_config(&path, &document);
-    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    let (rejected, report) = candidate_or_refusal(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
@@ -1971,7 +1984,7 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::prelude::*;
     let capture = dekopon_test_support::CaptureLayer::new();
-    let (next, report) = super::load_candidate(&path, Mode::Reload(&active))
+    let (next, report) = candidate_or_refusal(&path, Mode::Reload(&active))
         .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
         .await;
     assert!(report.problems.is_empty(), "{report:?}");
@@ -2020,7 +2033,7 @@ impl ResidentFixture {
         document["assets"] = json!({"rootPath": "assets", "maxInFlightBytes": 1_048_576});
         configure(root.path(), &mut document);
         write_config(&path, &document);
-        let (active, report) = super::load_candidate(&path, super::Mode::Boot).await;
+        let (active, report) = candidate_or_refusal(&path, super::Mode::Boot).await;
         assert!(report.problems.is_empty(), "{report:?}");
         let live = root.path().join("assets/live");
         write_owner_only(&live, b"active asset");
@@ -2049,7 +2062,7 @@ async fn broker_generation_only_applies_on_matched_commit_and_abort_clears_prepa
         format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
     );
     let (next, report) =
-        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+        candidate_or_refusal(&fixture.path, super::Mode::Reload(&fixture.active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let next_digest = next.unwrap().digest;
     let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
@@ -2298,7 +2311,7 @@ async fn invalid_credential_name_never_enters_reload_or_boot_diagnostics() {
     );
     write_owner_only(&credential, invalid.as_bytes());
     let (candidate, report) =
-        super::load_candidate(&broker.config(), super::Mode::Reload(&owner.active())).await;
+        candidate_or_refusal(&broker.config(), super::Mode::Reload(&owner.active())).await;
     assert!(candidate.is_none());
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
@@ -2345,7 +2358,7 @@ async fn generation_with_credentials(
         &credential,
         credentials(&broker.directory.path().canonicalize().unwrap()).as_bytes(),
     );
-    let (candidate, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    let (candidate, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let owner = super::Coordination::new(broker.config(), candidate.expect("boot generation"));
     (broker, credential, owner)
@@ -2550,7 +2563,7 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
             .len()
     };
     async {
-        let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+        let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
         assert!(report.problems.is_empty(), "{report:?}");
         assert_eq!(reported(), 1, "boot reports the record");
         let owner = super::Coordination::new(broker.config(), active.unwrap());
@@ -2575,6 +2588,145 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
     .await;
+}
+
+#[tokio::test]
+async fn an_unchanged_poll_keeps_the_active_generation_without_preparing_a_broker() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use dekopon_broker_protocol::GenerationOutcome;
+
+    let (_broker, credential, owner) = generation_with_private_credential().await;
+    let reads = super::private_read_witness::TrackedRead::new(&credential);
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&prepares);
+    let active = owner.active();
+    let digest = active.digest.clone();
+    let uid = current_uid();
+    super::BEFORE_BROKER_PREPARE
+        .scope(
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            async {
+                for _ in 0..2 {
+                    assert_eq!(
+                        owner.prepare(&digest, uid).await,
+                        (digest.clone(), GenerationOutcome::Active)
+                    );
+                }
+                assert_eq!(prepares.load(Ordering::SeqCst), 0);
+                assert_eq!(reads.count(), 2, "one trusted private read per poll");
+                assert!(Arc::ptr_eq(&owner.active(), &active));
+                assert!(owner.state.lock().prepared.is_none());
+                write_owner_only(
+                    &credential,
+                    b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-after-long-enough\n",
+                );
+                assert_eq!(
+                    owner.prepare(&digest, uid).await,
+                    (digest.clone(), GenerationOutcome::Prepared)
+                );
+                assert_eq!(prepares.load(Ordering::SeqCst), 1);
+            },
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn same_byte_unmanaged_provider_made_writable_refuses_instead_of_answering_active() {
+    use dekopon_broker_protocol::GenerationOutcome;
+
+    let fixture = ResidentFixture::boot().await;
+    let digest = fixture.active.digest.clone();
+    let provider = fixture.root.path().join("cli-probe.wasm");
+    let owner = super::Coordination::new(fixture.path.clone(), fixture.active);
+    let uid = current_uid();
+    assert_eq!(
+        owner.prepare(&digest, uid).await,
+        (digest.clone(), GenerationOutcome::Active)
+    );
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o666)).unwrap();
+    let (refused, report) =
+        super::load_candidate(&fixture.path, super::Mode::Reload(&owner.active())).await;
+    assert!(refused.is_none());
+    assert!(
+        report.problems.iter().any(|problem| matches!(
+            problem,
+            super::BrokerdError::Socket(socket::SocketError::InsecureFile { .. })
+        )),
+        "{report:?}"
+    );
+    assert_eq!(
+        owner.prepare(&digest, uid).await,
+        (digest.clone(), GenerationOutcome::Refused)
+    );
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        owner.prepare(&digest, uid).await,
+        (digest.clone(), GenerationOutcome::Active)
+    );
+}
+
+#[tokio::test]
+async fn a_fragment_edit_after_unchanged_polls_prepares_and_commits() {
+    use dekopon_broker_protocol::GenerationOutcome;
+
+    let uid = current_uid();
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = root.path().join("broker.d");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm")).unwrap();
+    write_owner_only(&root.path().join("cli-probe.wasm"), &component);
+    let mut host = attested_document(uid);
+    let object = host.as_object_mut().unwrap();
+    let principals = object.remove("principals").unwrap();
+    object.remove("capabilities");
+    object.remove("policiesPath");
+    object.insert("providers".to_owned(), json!(["../cli-probe.wasm"]));
+    object.insert(
+        "identities".to_owned(),
+        json!([{
+            "uid": uid,
+            "principal": "dekopon-gatewayd",
+            "actor": {"type": "service", "principal": "dekopon-gatewayd"},
+            "attestor": {}
+        }]),
+    );
+    write_config(&directory.join("host.yaml"), &host);
+    write_config(
+        &directory.join("people.yaml"),
+        &json!({"apiVersion": config::CONFIG_API_VERSION, "principals": principals}),
+    );
+    let mut probe = json!({
+        "apiVersion": config::CONFIG_API_VERSION,
+        "capabilities": probe_capabilities()
+    });
+    write_config(&directory.join("probe.yaml"), &probe);
+    write_owner_only(&directory.join("probe.cedar"), POLICIES.as_bytes());
+    let (active, report) = candidate_or_refusal(&directory, super::Mode::Boot).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let owner = super::Coordination::new(directory.clone(), active.expect("fragment boot"));
+    let digest = owner.active().digest.clone();
+    assert_eq!(
+        owner.prepare(&digest, uid).await,
+        (digest.clone(), GenerationOutcome::Active)
+    );
+    probe["capabilities"]["cli-probe"]["constraints"]["timeoutMs"] = json!(20_000);
+    write_config(&directory.join("probe.yaml"), &probe);
+    let (next, outcome) = owner.prepare(&digest, uid).await;
+    assert_eq!(outcome, GenerationOutcome::Prepared);
+    assert_ne!(next, digest);
+    assert_eq!(owner.commit(&next, uid), GenerationOutcome::Applied);
+    assert_eq!(
+        owner.prepare(&next, uid).await,
+        (next.clone(), GenerationOutcome::Active)
+    );
 }
 
 #[tokio::test]
@@ -2726,7 +2878,7 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
     write_owner_only(&bindings, map("a.example.test").as_bytes());
     let credential_reads = super::private_read_witness::TrackedRead::new(&credentials);
     let binding_reads = super::private_read_witness::TrackedRead::new(&bindings);
-    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     assert_eq!(credential_reads.count(), 1, "boot credentials read once");
     assert_eq!(binding_reads.count(), 1, "boot secret map read once");
@@ -2818,7 +2970,7 @@ async fn boot_digest_ignores_core_tags_secret_values_and_tagged_secret_keys() {
             &credentials,
             format!("apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    {secret}\n").as_bytes(),
         );
-        let (candidate, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+        let (candidate, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
         assert!(report.problems.is_empty(), "{report:?}");
         digests.push(candidate.expect("validated boot candidate").digest);
     }
@@ -2897,7 +3049,7 @@ async fn a_second_serve_observes_edited_configuration_without_claiming_preparati
         &broker.directory.path().join("policies.cedar"),
         format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
     );
-    let (expected, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    let (expected, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let expected = expected.unwrap().digest;
     let second = broker.serve(std::future::pending());
@@ -2944,7 +3096,7 @@ async fn captured_old_broker_leg_retains_its_grant_after_new_policy_activates() 
 
     let fixture = ManagedBroker::gateway();
     fixture.publish_lock('1');
-    let (active, report) = super::load_candidate(&fixture.config(), super::Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&fixture.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.unwrap();
     let old_policy = active.ready.broker.policy_digest().to_owned();
@@ -2978,7 +3130,7 @@ async fn captured_old_broker_leg_retains_its_grant_after_new_policy_activates() 
             .as_bytes(),
     );
     let (next, report) =
-        super::load_candidate(&fixture.config(), super::Mode::Reload(&active)).await;
+        candidate_or_refusal(&fixture.config(), super::Mode::Reload(&active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let digest = next.unwrap().digest;
     let claim = Attestation::for_subject(
@@ -3096,7 +3248,7 @@ async fn peer_identity_edit_is_published_with_the_broker_generation() {
     };
     let fixture = ManagedBroker::gateway();
     fixture.publish_lock('1');
-    let (active, report) = super::load_candidate(&fixture.config(), super::Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&fixture.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let task = fixture.serve(async {
@@ -3118,7 +3270,7 @@ async fn peer_identity_edit_is_published_with_the_broker_generation() {
     document["identities"][0]["attestor"] = json!({"namespaces": ["slack.other"]});
     write_config(&fixture.config(), &document);
     let (next, report) =
-        super::load_candidate(&fixture.config(), super::Mode::Reload(&active.unwrap())).await;
+        candidate_or_refusal(&fixture.config(), super::Mode::Reload(&active.unwrap())).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let digest = next.unwrap().digest;
     assert_eq!(
@@ -3147,7 +3299,7 @@ async fn a_valid_policy_reload_prepares_with_an_active_storage_writer() {
         format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
     );
     let (prepared, report) =
-        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+        candidate_or_refusal(&fixture.path, super::Mode::Reload(&fixture.active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     assert!(
         prepared.is_some(),
@@ -3163,7 +3315,7 @@ async fn a_refused_policy_reload_keeps_the_live_asset() {
     let fixture = ResidentFixture::boot().await;
     write_owner_only(&fixture.cedar, b"not cedar");
     let (prepared, report) =
-        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+        candidate_or_refusal(&fixture.path, super::Mode::Reload(&fixture.active)).await;
     assert!(prepared.is_none());
     assert_eq!(fs::read(&fixture.live).unwrap(), b"active asset");
     assert!(report.problems.iter().any(|problem| matches!(
@@ -3181,7 +3333,7 @@ async fn changed_storage_refuses_without_creating_the_candidate_root() {
     fixture.document["storage"]["rootPath"] = json!("other-storage");
     write_config(&fixture.path, &fixture.document);
     let (prepared, report) =
-        super::load_candidate(&fixture.path, super::Mode::Reload(&fixture.active)).await;
+        candidate_or_refusal(&fixture.path, super::Mode::Reload(&fixture.active)).await;
     assert!(prepared.is_none());
     assert!(matches!(report.problems.as_slice(),
         [BrokerdError::RestartRequired { categories }] if categories == &["storage"]));
@@ -3224,7 +3376,7 @@ async fn check_distinguishes_an_unreadable_secret_map_from_an_unset_key() {
                         if policy == "checkout-secret" && required == secret)));
             }
             None => {
-                let boot_report = super::load_candidate(&fixture.path, super::Mode::Boot)
+                let boot_report = candidate_or_refusal(&fixture.path, super::Mode::Boot)
                     .await
                     .1;
                 for report in [report, boot_report] {
@@ -3284,7 +3436,7 @@ async fn check_reads_secret_names_but_boot_and_reload_validate_private_sources()
     let mut document = attested_document(current_uid());
     document["identities"].as_array_mut().unwrap().truncate(1);
     write_config(&path, &document);
-    let (active, report) = super::load_candidate(&path, Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&path, Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.unwrap();
     write_owner_only(
@@ -3301,8 +3453,8 @@ async fn check_reads_secret_names_but_boot_and_reload_validate_private_sources()
         "{checked:?}"
     );
     for report in [
-        super::load_candidate(&path, Mode::Boot).await.1,
-        super::load_candidate(&path, Mode::Reload(&active)).await.1,
+        candidate_or_refusal(&path, Mode::Boot).await.1,
+        candidate_or_refusal(&path, Mode::Reload(&active)).await.1,
     ] {
         assert!(
             report
@@ -3339,7 +3491,7 @@ async fn check_reads_secret_names_but_boot_and_reload_validate_private_sources()
     write_config(&path, &document);
     let checked = super::check(&path, None, None).await;
     assert!(checked.problems.is_empty(), "{checked:?}");
-    let (rejected, report) = super::load_candidate(&path, Mode::Reload(&active)).await;
+    let (rejected, report) = candidate_or_refusal(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(
         report.problems.iter().any(|problem| matches!(problem,
@@ -3374,7 +3526,7 @@ async fn check_and_boot_refuse_request_shapes_from_the_same_policy_file() {
         write_config(&config_path, &document);
         for report in [
             super::check(&config_path, None, None).await,
-            super::load_candidate(&config_path, Mode::Boot).await.1,
+            candidate_or_refusal(&config_path, Mode::Boot).await.1,
         ] {
             assert!(
                 report.problems.iter().any(|problem| matches!(
@@ -3679,7 +3831,7 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     )
     .expect("restrict socket parent");
     write_owner_only(&credentials, b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: api-token\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.com]\n    secret: conditional-write-fixture-only\n");
-    let (candidate, boot_report) = super::load_candidate(&path, super::Mode::Boot).await;
+    let (candidate, boot_report) = candidate_or_refusal(&path, super::Mode::Boot).await;
     assert!(boot_report.problems.is_empty(), "{boot_report:?}");
     let candidate = candidate.expect("serving conditional-write configuration");
     assert_eq!(
@@ -3832,7 +3984,7 @@ impl ManagedBroker {
 async fn lock_only_replacement_keeps_reload_candidate_on_the_active_registry() {
     let broker = ManagedBroker::new();
     broker.publish_lock('1');
-    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.expect("managed provider boot candidate");
     let loaded = active.provider_lock.as_ref().expect("active provider lock");
@@ -3842,8 +3994,11 @@ async fn lock_only_replacement_keeps_reload_candidate_on_the_active_registry() {
         .await
         .unwrap();
     assert_ne!(current, loaded.digest);
-    let (next, report) =
-        super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
+    write_owner_only(
+        &broker.directory.path().join("policies.cedar"),
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    let (next, report) = candidate_or_refusal(&broker.config(), super::Mode::Reload(&active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let next = next.expect("lock-only change belongs to lock_watch, not reload refusal");
     assert_eq!(
@@ -3861,17 +4016,16 @@ async fn restart_required_managed_edit_never_loads_another_provider() {
     use tracing_subscriber::prelude::*;
     let broker = ManagedBroker::new();
     broker.publish_lock('1');
-    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let mut document: serde_json::Value =
         serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
     document["serverLimits"] = json!({"maxConnections": 12});
     write_config(&broker.config(), &document);
     let capture = dekopon_test_support::CaptureLayer::new();
-    let (_, report) =
-        super::load_candidate(&broker.config(), super::Mode::Reload(&active.unwrap()))
-            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-            .await;
+    let (_, report) = candidate_or_refusal(&broker.config(), super::Mode::Reload(&active.unwrap()))
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
     assert!(report.problems.iter().any(|problem| matches!(problem,
         super::BrokerdError::RestartRequired { categories } if categories == &["serverLimits"])));
     assert!(
@@ -3885,12 +4039,15 @@ async fn restart_required_managed_edit_never_loads_another_provider() {
 async fn reload_uses_active_managed_registry_without_the_lock_file() {
     let broker = ManagedBroker::new();
     broker.publish_lock('1');
-    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.expect("managed boot candidate");
     fs::remove_file(broker.lock()).unwrap();
-    let (next, report) =
-        super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
+    write_owner_only(
+        &broker.directory.path().join("policies.cedar"),
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    let (next, report) = candidate_or_refusal(&broker.config(), super::Mode::Reload(&active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     assert!(next.is_some());
 }
@@ -3899,7 +4056,7 @@ async fn reload_uses_active_managed_registry_without_the_lock_file() {
 async fn reload_uses_active_managed_registry_without_pruned_old_blob() {
     let broker = ManagedBroker::new();
     broker.publish_lock('1');
-    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.expect("managed boot candidate");
     fs::remove_file(
@@ -3910,8 +4067,11 @@ async fn reload_uses_active_managed_registry_without_pruned_old_blob() {
             .join(format!("{}.wasm", broker.component_digest)),
     )
     .unwrap();
-    let (next, report) =
-        super::load_candidate(&broker.config(), super::Mode::Reload(&active)).await;
+    write_owner_only(
+        &broker.directory.path().join("policies.cedar"),
+        format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
+    );
+    let (next, report) = candidate_or_refusal(&broker.config(), super::Mode::Reload(&active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     assert!(next.is_some());
 }
@@ -3920,7 +4080,7 @@ async fn reload_uses_active_managed_registry_without_pruned_old_blob() {
 async fn managed_to_direct_provider_checks_candidate_manifest() {
     let broker = ManagedBroker::new();
     broker.publish_lock('1');
-    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let mut document: serde_json::Value =
         serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
@@ -3932,7 +4092,7 @@ async fn managed_to_direct_provider_checks_candidate_manifest() {
     );
     write_config(&broker.config(), &document);
     let (_, report) =
-        super::load_candidate(&broker.config(), super::Mode::Reload(&active.unwrap())).await;
+        candidate_or_refusal(&broker.config(), super::Mode::Reload(&active.unwrap())).await;
     assert!(
         report
             .problems
@@ -3956,7 +4116,7 @@ async fn socket_generation_handshake_observes_only_confirmed_activation() {
     }]);
     write_config(&broker.config(), &document);
     broker.publish_lock('1');
-    let (active, report) = super::load_candidate(&broker.config(), super::Mode::Boot).await;
+    let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let task = broker.serve(std::future::pending());
     broker.ready(&task).await;
@@ -3968,7 +4128,7 @@ async fn socket_generation_handshake_observes_only_confirmed_activation() {
         format!("{POLICIES}\n@id(\"new\") permit(principal, action, resource);\n").as_bytes(),
     );
     let (next, report) =
-        super::load_candidate(&broker.config(), super::Mode::Reload(&active.unwrap())).await;
+        candidate_or_refusal(&broker.config(), super::Mode::Reload(&active.unwrap())).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let digest = next.unwrap().digest;
     assert_ne!(old, digest);
