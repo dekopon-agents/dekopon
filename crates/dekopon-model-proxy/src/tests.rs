@@ -179,6 +179,8 @@ fn models(
             backend: "codex",
             reserve: Tokens(10),
             upstream: Upstream::Codex {
+                refresh: dekopon_model::chatgpt::RefreshClient::new(Duration::from_secs(2), &[])
+                    .unwrap(),
                 endpoint: endpoint.to_owned(),
                 credential,
             },
@@ -571,9 +573,7 @@ async fn a_codex_request_is_forced_unstored_and_must_stream() {
     let directory = tempfile::TempDir::new().unwrap();
     let path = directory.path().join("auth.json");
     std::fs::write(&path, r#"{"version":1,"access":"synthetic-access","refresh":"synthetic","expiresAt":18446744073709551615,"accountId":"acct-1"}"#).unwrap();
-    let credential = Arc::new(
-        dekopon_model::chatgpt::CredentialFile::open(&path, Duration::from_secs(2), &[]).unwrap(),
-    );
+    let credential = Arc::new(dekopon_model::chatgpt::CredentialFile::open(&path).unwrap());
     let mut steps = vec![Step::Write(
         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n".to_vec(),
     )];

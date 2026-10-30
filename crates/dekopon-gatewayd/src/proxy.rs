@@ -230,12 +230,16 @@ fn build_with(
                 ..
             } => Upstream::Codex {
                 endpoint: CODEX_ENDPOINT.to_owned(),
+                refresh: dekopon_model::chatgpt::RefreshClient::new(
+                    std::time::Duration::from_millis(*timeout_ms),
+                    model.ca_bundles(),
+                )
+                .map_err(|source| ProxyStartError::Codex {
+                    model: name.clone(),
+                    source: Box::new(source),
+                })?,
                 credential: credentials
-                    .chatgpt_credential(
-                        auth_file.as_deref(),
-                        std::time::Duration::from_millis(*timeout_ms),
-                        model.ca_bundles(),
-                    )
+                    .chatgpt_credential(auth_file.as_deref())
                     .map_err(|source| ProxyStartError::Codex {
                         model: name.clone(),
                         source: Box::new(source),

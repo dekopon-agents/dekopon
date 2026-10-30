@@ -32,7 +32,7 @@ use axum::{
 use bytes::Bytes;
 use dekopon_core::{AgentId, Redacted};
 use dekopon_model::{
-    chatgpt::CredentialFile,
+    chatgpt::{CredentialFile, RefreshClient},
     wire::{Field, PeekError, RequestPeek},
 };
 use dekopon_model_token_governor::{
@@ -70,6 +70,7 @@ pub enum Upstream {
     Codex {
         endpoint: String,
         credential: Arc<CredentialFile>,
+        refresh: RefreshClient,
     },
     OpenRouter {
         endpoint: String,
@@ -488,13 +489,17 @@ async fn send(
             .send()
             .await
             .map_err(SendError::Request),
-        Upstream::Codex { credential, .. } => {
+        Upstream::Codex {
+            credential,
+            refresh,
+            ..
+        } => {
             let request = request
                 .header("originator", "dekopon")
                 .header("openai-beta", "responses=experimental")
                 .header(header::ACCEPT, "text/event-stream");
             let retry = request.try_clone();
-            let current = codex_credential(credential, None).await?;
+            let current = codex_credential(credential, refresh, None).await?;
             let response = request
                 .bearer_auth(current.access.expose())
                 .header("chatgpt-account-id", &current.account_id)
@@ -504,7 +509,8 @@ async fn send(
             match retry {
                 Some(retry) if response.status() == StatusCode::UNAUTHORIZED => {
                     drop(response);
-                    let refreshed = codex_credential(credential, Some(current.access)).await?;
+                    let refreshed =
+                        codex_credential(credential, refresh, Some(current.access)).await?;
                     retry
                         .bearer_auth(refreshed.access.expose())
                         .header("chatgpt-account-id", &refreshed.account_id)
@@ -520,11 +526,12 @@ async fn send(
 
 async fn codex_credential(
     credential: &Arc<CredentialFile>,
+    refresh: &RefreshClient,
     rejected: Option<Redacted<String>>,
 ) -> Result<dekopon_model::chatgpt::ResolvedCredential, SendError> {
     match rejected {
-        Some(rejected) => credential.force_refresh(&rejected).await,
-        None => credential.current().await,
+        Some(rejected) => credential.force_refresh(refresh, &rejected).await,
+        None => credential.current(refresh).await,
     }
     .map_err(SendError::Credential)
 }

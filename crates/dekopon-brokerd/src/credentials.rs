@@ -20,7 +20,7 @@ use dekopon_broker::{
 use dekopon_broker_host::BoundCredential;
 use dekopon_core::{FileHygieneError, FileTier, Redacted, error_chain, read_trusted_file};
 use dekopon_http_host::ConfigurationError;
-use dekopon_model::chatgpt::{ChatGptError, CredentialFile, RefreshOutcome};
+use dekopon_model::chatgpt::{ChatGptError, CredentialFile, RefreshClient, RefreshOutcome};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -353,6 +353,13 @@ fn resolve_entry(
                         ChatGptSubscriptionCredential {
                             name,
                             credential,
+                            refresh: RefreshClient::new(REFRESH_TIMEOUT, &[]).map_err(
+                                |source| {
+                                    vec![format!(
+                                        "could not build ChatGPT refresh client: {source}"
+                                    )]
+                                },
+                            )?,
                             destinations: entry.destinations,
                         },
                     )))
@@ -537,7 +544,7 @@ fn open_auth_file(
             auth_file.display()
         ));
     }
-    let credential = CredentialFile::open(auth_file, REFRESH_TIMEOUT, &[]).map_err(|source| {
+    let credential = CredentialFile::open(auth_file).map_err(|source| {
         format!(
             "credential {name:?} authFile {} is not a Dekopon ChatGPT credential: {}",
             auth_file.display(),
@@ -574,6 +581,7 @@ fn parent_is_owner_writable(parent: &Path) -> bool {
 struct ChatGptSubscriptionCredential {
     name: String,
     credential: Arc<CredentialFile>,
+    refresh: RefreshClient,
     destinations: Vec<String>,
 }
 
@@ -600,7 +608,12 @@ impl RefreshingCredential for ChatGptSubscriptionCredential {
             outcome = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
         );
-        let resolved = match self.credential.current().instrument(span.clone()).await {
+        let resolved = match self
+            .credential
+            .current(&self.refresh)
+            .instrument(span.clone())
+            .await
+        {
             Ok(resolved) => resolved,
             Err(source) => {
                 span.record("outcome", "failed");

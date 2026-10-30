@@ -1,5 +1,5 @@
 use crate::{
-    chatgpt::{ChatGptError, CredentialFile, ResolvedCredential, resolve_auth_path},
+    chatgpt::{ChatGptError, CredentialFile, RefreshClient, ResolvedCredential, resolve_auth_path},
     control::TurnControl,
     diagnostic::DiagnosticSecrets,
     error::{
@@ -35,6 +35,7 @@ pub struct CodexClient {
     identity: parking_lot::RwLock<ModelKey>,
     credential: Arc<CredentialFile>,
     http: InferenceHttp,
+    refresh: RefreshClient,
     endpoint: String,
     loopback: bool,
 }
@@ -49,8 +50,7 @@ impl CodexClient {
         let model = model.into();
         Self::validate(&model, timeout)?;
         let path = resolve_auth_path(auth_path).map_err(AuthError::Credential)?;
-        let credential = CredentialFile::open(&path, timeout, extra_ca_bundles)
-            .map_err(AuthError::Credential)?;
+        let credential = CredentialFile::open(&path).map_err(AuthError::Credential)?;
         Self::configured(
             model,
             Arc::new(credential),
@@ -96,12 +96,14 @@ impl CodexClient {
         endpoint: String,
         extra_ca_bundles: &[dekopon_core::Redacted<String>],
     ) -> Result<Self, InferenceError> {
+        let refresh = RefreshClient::new(timeout, extra_ca_bundles)?;
         Ok(Self {
             name: model.clone(),
             identity: parking_lot::RwLock::new(ModelKey::new(crate::model::Backend::Codex, &model)),
             model,
             credential,
-            http: InferenceHttp::new(timeout, extra_ca_bundles)?,
+            http: refresh.http.clone(),
+            refresh,
             endpoint,
             loopback: false,
         })
@@ -135,8 +137,8 @@ impl CodexClient {
         Self::validate(&model, timeout)?;
         let path = resolve_auth_path(auth_path).map_err(AuthError::Credential)?;
         let endpoint = endpoints.responses.clone();
-        let credential = CredentialFile::with_endpoints(&path, timeout, endpoints)
-            .map_err(AuthError::Credential)?;
+        let credential =
+            CredentialFile::with_endpoints(&path, endpoints).map_err(AuthError::Credential)?;
         Self::configured(
             model,
             Arc::new(credential),
@@ -163,8 +165,12 @@ impl CodexClient {
         control
             .run(async {
                 match mode {
-                    RefreshMode::IfNeeded => self.credential.current().await,
-                    RefreshMode::Forced(rejected) => self.credential.force_refresh(&rejected).await,
+                    RefreshMode::IfNeeded => self.credential.current(&self.refresh).await,
+                    RefreshMode::Forced(rejected) => {
+                        self.credential
+                            .force_refresh(&self.refresh, &rejected)
+                            .await
+                    }
                 }
             })
             .await

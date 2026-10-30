@@ -155,13 +155,14 @@ fn main() -> Result<(), ExampleError> {
     )]
     let runtime = tokio::runtime::Runtime::new()?;
     let (_cancel, receiver) = tokio::sync::watch::channel(false);
+    let client = Arc::new(client);
     let model = BlockingModel::new(
-        Arc::new(client),
+        Arc::clone(&client),
         runtime.handle().clone(),
         receiver,
         timeout,
     );
-    let outcome = runtime.block_on(runtime.spawn_blocking(move || {
+    let result = runtime.block_on(runtime.spawn_blocking(move || {
         run_prompt_session(
             &model,
             &SyntheticRuntime,
@@ -178,14 +179,86 @@ fn main() -> Result<(), ExampleError> {
             &[],
         )
         .0
-    }))??;
+    }));
+    let outcome = finish_comparison(&runtime, result, client.drain_credentials())?;
     println!("{}", outcome.answer);
     Ok(())
+}
+
+fn finish_comparison<T>(
+    runtime: &tokio::runtime::Runtime,
+    result: Result<Result<T, dekopon_agent::prompt::PromptError>, tokio::task::JoinError>,
+    drain: impl std::future::Future<Output = ()>,
+) -> Result<T, ExampleError> {
+    runtime.block_on(drain);
+    Ok(result??)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparison_drains_pending_work_before_returning_success_or_either_error() {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owner: this regression, dropped on return; bound: one runtime"
+        )]
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut failed_session = tokio::task::JoinSet::<()>::new();
+        {
+            let _entered = runtime.enter();
+            failed_session.spawn(std::future::pending());
+        }
+        failed_session.abort_all();
+        let join_error = runtime
+            .block_on(failed_session.join_next())
+            .unwrap()
+            .unwrap_err();
+        let results = [
+            Ok(Ok(())),
+            Ok(Err(dekopon_agent::prompt::PromptError::Cancelled)),
+            Err(join_error),
+        ];
+        for (index, result) in results.into_iter().enumerate() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let persisted = temp.path().join("persisted");
+            let destination = persisted.clone();
+            let (release, accepted) = tokio::sync::oneshot::channel();
+            let mut pending = tokio::task::JoinSet::new();
+            {
+                let _entered = runtime.enter();
+                pending.spawn(async move {
+                    accepted.await.unwrap();
+                    tokio::fs::write(destination, b"synthetic rotation")
+                        .await
+                        .unwrap();
+                });
+            }
+            assert!(!persisted.exists());
+            let outcome = finish_comparison(&runtime, result, async move {
+                release.send(()).unwrap();
+                while let Some(result) = pending.join_next().await {
+                    result.unwrap();
+                }
+            });
+            assert!(
+                persisted.exists(),
+                "pending persistence must finish before returning case {index}"
+            );
+            match index {
+                0 => assert!(outcome.is_ok()),
+                1 => assert!(matches!(
+                    outcome,
+                    Err(ExampleError::Prompt(
+                        dekopon_agent::prompt::PromptError::Cancelled
+                    ))
+                )),
+                2 => assert!(matches!(outcome, Err(ExampleError::Join(_)))),
+                _ => unreachable!(),
+            }
+        }
+    }
 
     fn parse(arguments: &[&str]) -> Result<Arguments, ExampleError> {
         Arguments::parse_from(arguments.iter().map(|value| (*value).to_owned()))

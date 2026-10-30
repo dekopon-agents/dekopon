@@ -22,6 +22,7 @@ pub(crate) fn record_phase(phase: FailurePhase) {
     tracing::Span::current().record("error.phase", phase.as_str());
 }
 
+#[derive(Clone)]
 pub(crate) struct InferenceHttp {
     client: reqwest::Client,
 }
