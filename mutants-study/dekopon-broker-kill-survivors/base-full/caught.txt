@@ -1,3 +1,6 @@
+crates/dekopon-broker/src/lib.rs:1146:39: replace > with == in SecretCatalog::validate
+crates/dekopon-broker/src/lib.rs:1146:39: replace > with >= in SecretCatalog::validate
+crates/dekopon-broker/src/lib.rs:1187:54: replace > with < in AttestorGrant::validate
 crates/dekopon-broker/src/lib.rs:1361:16: replace match guard context .attested_subject() .is_some_and(|subject| subject.kind() == PrincipalKind::Person) with true in turn_started_by
 crates/dekopon-broker/src/lib.rs:1361:16: replace match guard context .attested_subject() .is_some_and(|subject| subject.kind() == PrincipalKind::Person) with false in turn_started_by
 crates/dekopon-broker/src/lib.rs:2104:17: delete field evaluation from struct Refusal expression in Broker<A>::authorize_invocation
@@ -7,6 +10,8 @@ crates/dekopon-broker/src/lib.rs:2295:25: delete field principal from struct Pol
 crates/dekopon-broker/src/lib.rs:2309:37: replace && with || in Broker<A>::evaluate
 crates/dekopon-broker/src/lib.rs:2309:16: delete ! in Broker<A>::evaluate
 crates/dekopon-broker/src/lib.rs:2950:32: delete ! in Broker<A>::resolve_context
+crates/dekopon-broker/src/lib.rs:3271:42: replace > with == in Broker<A>::curate_memory_input
+crates/dekopon-broker/src/lib.rs:3271:42: replace > with < in Broker<A>::curate_memory_input
 crates/dekopon-broker/src/lib.rs:4130:51: replace == with != in Broker<A>::execute
 crates/dekopon-broker/src/lib.rs:4740:9: replace DenyingPrincipal::as_str -> &'static str with ""
 crates/dekopon-broker/src/lib.rs:4740:9: replace DenyingPrincipal::as_str -> &'static str with "xyzzy"

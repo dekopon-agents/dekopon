@@ -15,11 +15,9 @@ crates/dekopon-broker/src/lib.rs:1128:9: replace SecretCatalog::authority_bindin
 crates/dekopon-broker/src/lib.rs:1134:9: replace SecretCatalog::validate -> Result<(), BrokerBuildError> with Ok(())
 crates/dekopon-broker/src/lib.rs:1151:17: replace || with && in SecretCatalog::validate
 crates/dekopon-broker/src/lib.rs:1147:17: replace || with && in SecretCatalog::validate
-crates/dekopon-broker/src/lib.rs:1146:39: replace > with == in SecretCatalog::validate
 crates/dekopon-broker/src/lib.rs:1146:39: replace > with < in SecretCatalog::validate
-crates/dekopon-broker/src/lib.rs:1146:39: replace > with >= in SecretCatalog::validate
 crates/dekopon-broker/src/lib.rs:1187:54: replace > with == in AttestorGrant::validate
-crates/dekopon-broker/src/lib.rs:1187:54: replace > with < in AttestorGrant::validate
+crates/dekopon-broker/src/lib.rs:1187:54: replace > with >= in AttestorGrant::validate
 crates/dekopon-broker/src/lib.rs:1201:58: replace && with || in AttestorGrant::validate
 crates/dekopon-broker/src/lib.rs:1270:9: replace IdentityDirectory::principals -> impl Iterator<Item =&PrincipalId> with ::std::iter::empty()
 crates/dekopon-broker/src/lib.rs:1452:9: replace || with && in validate_set_constraints
@@ -27,15 +25,16 @@ crates/dekopon-broker/src/lib.rs:1463:26: replace || with && in validate_set_con
 crates/dekopon-broker/src/lib.rs:1469:31: replace || with && in validate_set_constraints
 crates/dekopon-broker/src/lib.rs:1850:9: replace AuditError::category -> &'static str with ""
 crates/dekopon-broker/src/lib.rs:1850:9: replace AuditError::category -> &'static str with "xyzzy"
+crates/dekopon-broker/src/lib.rs:2041:17: replace || with && in Broker<A>::with_chat_memory
+crates/dekopon-broker/src/lib.rs:2040:17: replace || with && in Broker<A>::with_chat_memory
+crates/dekopon-broker/src/lib.rs:2039:17: replace || with && in Broker<A>::with_chat_memory
 crates/dekopon-broker/src/lib.rs:2071:9: replace Broker<A>::capability_uses_storage -> bool with true
 crates/dekopon-broker/src/lib.rs:2071:9: replace Broker<A>::capability_uses_storage -> bool with false
 crates/dekopon-broker/src/lib.rs:2073:66: replace || with && in Broker<A>::capability_uses_storage
-crates/dekopon-broker/src/lib.rs:2104:17: delete field evaluation from struct Refusal expression in Broker<A>::authorize_invocation
 crates/dekopon-broker/src/lib.rs:2163:33: replace |= with &= in Broker<A>::bind_secret_use
 crates/dekopon-broker/src/lib.rs:2172:17: delete field evaluation from struct Refusal expression in Broker<A>::bind_secret_use
-crates/dekopon-broker/src/lib.rs:2267:17: delete field allowed from struct PolicyDecision expression in Broker<A>::evaluate
-crates/dekopon-broker/src/lib.rs:2275:17: delete field context from struct PolicyRequest expression in Broker<A>::evaluate
-crates/dekopon-broker/src/lib.rs:2295:25: delete field principal from struct PolicyRequest expression in Broker<A>::evaluate
+crates/dekopon-broker/src/lib.rs:2231:33: delete field errors_present from struct PolicyDecision expression in Broker<A>::evaluate
+crates/dekopon-broker/src/lib.rs:2232:33: delete field refusal from struct PolicyDecision expression in Broker<A>::evaluate
 crates/dekopon-broker/src/lib.rs:2430:21: replace && with || in Broker<A>::reachable_providers
 crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![], BTreeMap::new())
 crates/dekopon-broker/src/lib.rs:2572:9: replace Broker<A>::capability_ceiling -> (Vec<AvailableCapability>, Vec<String>, BTreeMap<String, String>,) with (vec![], vec![], BTreeMap::from_iter([(String::new(), String::new())]))
@@ -69,8 +68,6 @@ crates/dekopon-broker/src/lib.rs:3139:12: delete ! in Broker<A>::canonical_autho
 crates/dekopon-broker/src/lib.rs:3243:37: replace == with != in Broker<A>::prepare_storage_grant
 crates/dekopon-broker/src/lib.rs:3262:9: replace Broker<A>::curate_memory_input -> Result<(), &'static str> with Ok(())
 crates/dekopon-broker/src/lib.rs:3271:46: replace && with || in Broker<A>::curate_memory_input
-crates/dekopon-broker/src/lib.rs:3271:42: replace > with == in Broker<A>::curate_memory_input
-crates/dekopon-broker/src/lib.rs:3271:42: replace > with < in Broker<A>::curate_memory_input
 crates/dekopon-broker/src/lib.rs:3271:42: replace > with >= in Broker<A>::curate_memory_input
 crates/dekopon-broker/src/lib.rs:3284:51: replace == with != in Broker<A>::curate_memory_input
 crates/dekopon-broker/src/lib.rs:3288:43: replace && with || in Broker<A>::curate_memory_input
