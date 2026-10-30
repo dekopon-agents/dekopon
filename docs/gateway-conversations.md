@@ -103,8 +103,10 @@ Each admitted turn runs one session through five steps. On a `oneShot` route
      [liveness](gateway-liveness.md#liveness-progress-and-stopping-a-run), or the `failed` template:
      appended to a streamed partial answer, otherwise as a fresh reply after removing any progress
      message. Failure detail goes to `gateway_session_failed` (`category`), never to chat.
-   - A stop finalizes the progress message in place.
-   - Empty output, with no text and no images, is sent and recorded as `[empty response]`.
+   - A stop finalizes the progress message in place, except that a steer staged after the post gets
+     a fresh reply; follow turns post nothing.
+   - A successful turn with empty text and no delivered image posts `[empty response]`, which durable
+     memory records; an empty answer with nothing queued gets the empty-answer stop line.
    - A follow turn posts no failure line or partial answer. When capability work went unreported,
      every turn posts `The agent attempted capability work but could not report the result. Check the audit before retrying.`
    - A follow batch or an inherited Slack Agent continuation may call `decline_chat_reply` before
