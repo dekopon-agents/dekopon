@@ -1,30 +1,38 @@
 # Slack Agent and OpenRouter on a Mac
 
-This is a narrow starter for the [Mac runbook](../../docs/run-on-mac.md): one Slack sender,
-one OpenRouter model, and one read-only tool that fetches synthetic JSONPlaceholder posts.
-It grants no GitHub, host-shell, file, or provider-write access. To start with useful PR reviews,
-use the [owner-and-colleague review-channel guide](../slack-github/README.md). This smaller example
-first establishes that the installation can answer and run a tool without a GitHub PAT.
+This recipe gives one Slack sender a DM agent on the [Mac installation](../../docs/run-on-mac.md),
+with one OpenRouter model and one read-only tool that fetches synthetic JSONPlaceholder posts. It
+proves the installation answers and runs a tool before you add a GitHub PAT; for PR reviews, use
+the [review-channel recipe](../slack-github/README.md).
 
-The example targets **Dekopon 0.74.0** and **JSONPlaceholder provider 0.7.0**. These files pass
-`check` with the released Linux 0.74.0 daemons and that component; that proves nothing about macOS
-services, Slack or OpenRouter. Complete the Mac runbook's
-[acceptance checks](../../docs/run-on-mac.md#acceptance-before-switching) before switching another
-bot off. Use the [0.74.0 source](https://github.com/dekopon-agents/dekopon/tree/v0.74.0) for the
-matching contracts; `main` can be ahead of the release.
+- It grants no GitHub, host-shell, file or provider-write access and needs no provider API key.
+- It pins Dekopon 0.74.0 and JSONPlaceholder provider 0.7.0. Read contracts from the
+  [0.74.0 source](https://github.com/dekopon-agents/dekopon/tree/v0.74.0), not `main`.
+- These files pass `check` on the released Linux 0.74.0 daemons with provider 0.7.0; that proves
+  nothing about macOS services, Slack or OpenRouter.
 
-## Accounts, files, and one provider
+Apply it in this order:
 
-First [install](../../docs/run-on-mac.md#install) the two daemons and prepare the service accounts
-and directories in the [Mac runbook](../../docs/run-on-mac.md#prepare-the-broker-and-gateway).
-This example expects `_dekopon_broker` and `_dekopon_gateway` to have distinct UIDs and the shared
-IPC group described there.
-The broker owns `/usr/local/etc/dekopon/broker/`; the gateway owns
-`/usr/local/etc/dekopon/gateway/`. Each directory is private to its service account.
-The shared socket is `/usr/local/var/run/dekopon/broker.sock`.
+1. Follow the runbook from [Install](../../docs/run-on-mac.md#install) through the accounts,
+   directories and `credentials.env` in
+   [Prepare the broker and gateway](../../docs/run-on-mac.md#prepare-the-broker-and-gateway).
+   Create the Slack app from the
+   [0.74.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml)
+   with [Slack setup](../slack/README.md#create-the-app-and-credentials).
+2. Here, create five files, each mode `0600`, then [check them](#validate-and-accept):
+   - in `/usr/local/etc/dekopon/broker/`, owned by `_dekopon_broker`:
+     `jsonplaceholder-provider.wasm`, `broker.yaml` and `policies.cedar`;
+   - in `/usr/local/etc/dekopon/gateway/`, owned by `_dekopon_gateway`: `agents.yaml` and
+     `gateway.yaml`.
+3. In the runbook, [check in the foreground](../../docs/run-on-mac.md#check-before-installing-a-service),
+   then [run with launchd](../../docs/run-on-mac.md#run-with-launchd).
+4. Here, [accept](#validate-and-accept), then complete the runbook's
+   [acceptance](../../docs/run-on-mac.md#acceptance-before-switching) before switching another bot
+   off.
 
-The Homebrew `dekopon` formula does not install this provider. In a private download directory,
-using a recent GitHub CLI that includes `gh attestation`:
+## Install the released provider
+
+Download, verify and install the pinned component in a private working directory:
 
 ```console
 gh release download v0.7.0 --repo dekopon-agents/dekopon-provider-jsonplaceholder \
@@ -36,19 +44,23 @@ sudo install -o _dekopon_broker -g "$(id -gn _dekopon_broker)" -m 0600 \
   jsonplaceholder-provider.wasm /usr/local/etc/dekopon/broker/jsonplaceholder-provider.wasm
 ```
 
-The [provider release](https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder/releases/tag/v0.7.0)
-is separate from the application release. Use these component bytes with the constraints below;
-older provider README examples use fields that 0.74.0 rejects. There is no need for Docker, an OCI
-registry client, a Rust build, or a provider API key for this starter.
+Use the [0.7.0 release](https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder/releases/tag/v0.7.0)
+with the constraints below; older provider README examples use fields that 0.74.0 rejects.
 
-## Broker configuration and policy
+## Configure the broker
 
-Save these as the named files. Replace `BROKER_UID` and `GATEWAY_UID` with the numeric output of
-`id -u _dekopon_broker` and `id -u _dekopon_gateway`. Replace `t0123abc` and `u0123abc` everywhere
-with the lowercased Slack workspace and member IDs from the [Slack setup](../slack/README.md).
-These are IDs, not names or email addresses.
+Replace these placeholders in all four configuration files before installing them with the
+runbook's [install commands](../../docs/run-on-mac.md#prepare-the-broker-and-gateway):
 
-`/usr/local/etc/dekopon/broker/broker.yaml`:
+| Placeholder | Value |
+|---|---|
+| `BROKER_UID`, `GATEWAY_UID` | Output of `id -u _dekopon_broker` and `id -u _dekopon_gateway` |
+| `t0123abc`, `u0123abc` | Slack workspace and member IDs, lowercased ([Allow a sender](../slack/README.md#allow-a-sender)); names and email addresses are not IDs |
+| `replace-with-exact-openrouter-model-id` | One exact OpenRouter model ID that supports tool calls ([model settings](../../docs/gatewayd.md#openrouter-model-settings)) |
+
+`check` accepts every placeholder, so confirm none remain.
+
+Save `/usr/local/etc/dekopon/broker/broker.yaml`:
 
 ```yaml
 apiVersion: dekopon.dev/brokerd/v1alpha1
@@ -82,12 +94,13 @@ capabilities:
             allowPlaintextLoopback: false
 ```
 
-Keep the gateway peer principal literally `dekopon-gatewayd`: 0.74.0 uses that name and its
-attestor grant for the gateway's startup/reload handshake. Another name can pass offline checks
-and still fail boot with `peer is not the reconciliation owner`. The separate `broker-operator`
-entry lets a health probe authenticate as the broker's own UID; it grants no provider call.
+- Keep `dekopon-gatewayd` as written: the gateway's startup and reload handshake requires that
+  name and its attestor grant. Another name passes `check` and fails boot with
+  `peer is not the reconciliation owner`.
+- `broker-operator` lets the health probe authenticate as the broker's own UID; it grants no
+  provider call.
 
-`/usr/local/etc/dekopon/broker/policies.cedar`:
+Save `/usr/local/etc/dekopon/broker/policies.cedar`:
 
 ```cedar
 @id("operator-may-prompt")
@@ -104,14 +117,14 @@ when { context has agent && context.agent == "home-assistant"
     && context has via && context.via == "dekopon-gatewayd" };
 ```
 
-The prompt permission and the provider permission are separate. The component also knows how to
-create a synthetic post, but this broker grants only GET. Removing every provider does not make a
-chat-only bot: the broker refuses an empty provider set, and the gateway refuses an empty
-capability grant before calling the model.
+- The prompt permit and the provider permit are separate grants. The component can also create a
+  synthetic post; the broker grants only GET.
+- Keep the tool: the broker refuses an empty provider set and the gateway refuses a sender with
+  no granted capability, so there is no chat-only variant.
 
-## Gateway catalog and configuration
+## Configure the gateway
 
-`/usr/local/etc/dekopon/gateway/agents.yaml`:
+Save `/usr/local/etc/dekopon/gateway/agents.yaml`:
 
 ```yaml
 apiVersion: dekopon.dev/v1alpha1
@@ -127,7 +140,7 @@ spec:
 status: Ready
 ```
 
-`/usr/local/etc/dekopon/gateway/gateway.yaml`:
+Save `/usr/local/etc/dekopon/gateway/gateway.yaml`:
 
 ```yaml
 apiVersion: dekopon.dev/gatewayd/v1alpha1
@@ -183,72 +196,46 @@ metering:
 shutdownGraceMs: 120000
 ```
 
-Choose one exact OpenRouter model ID that supports tool calls. The configuration uses the native
-`openrouter` client; do not add `endpoint` or `stream` fields to this model kind. Disabling fallback
-does not pin an upstream provider. Add a supported `routing.only` list only if you need that
-restriction; [OpenRouter settings](../../docs/gatewayd.md#openrouter-model-settings) describe the fields.
+- The only route is DMs from the mapped sender; no channel route exists. Slack scopes grant a
+  sender no broker permission.
+- Agent DMs are thread-scoped: reply in the bot's thread to keep the conversation.
+- The gateway's `credentials.env` holds the two Slack tokens and `OPENROUTER_API_KEY` under the
+  names above; the YAML holds only variable names.
+- Set a spending limit on the OpenRouter key before starting the service
+  ([budget](../../docs/run-on-mac.md#prepare-slack-and-the-model)). The 100,000-token daily
+  `metering` limit counts raw input plus output, is not a dollar cap, can settle above its
+  estimate, and starts empty after a restart because no telemetry restore is configured.
+- The six-turn window lives in memory, expires after 15 idle minutes and is lost on restart. No
+  journal, background summary or attachment retention is configured.
 
-Create the Slack app from the [0.74.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml), then obtain the
-`xapp-…` app token with `connections:write` and the installed bot's `xoxb-…` token using the
-[Slack setup](../slack/README.md). The manifest enables more features than this DM-only route uses. Its scopes do not grant a sender
-broker permission, and no channel route is enabled here. No public listener is needed.
+## Validate and accept
 
-The workspace plan/admin policy must allow Slack's Agent features. This configuration requests
-native Working/Stop status and can fall back to the working reaction if that surface is unavailable.
-Fallback does not change `experience: agent` or make Agent features available on an unsupported
-workspace. DMs are thread-scoped; continue the bot's reply thread to retain the same conversation.
-Do not set `cancelButton`: Agent mode uses Slack's own Stop control. If you deliberately install
-the classic manifest instead, set `experience: classic`; that is a different profile, not Agent
-API parity.
-
-Put those two values and `OPENROUTER_API_KEY` in the gateway service's private `credentials.env`
-from the [Mac runbook](../../docs/run-on-mac.md#prepare-slack-and-the-model), using the exact
-names above. The YAML contains variable names, never tokens.
-Set an OpenRouter key spending limit before starting the service. The local 100,000-token rolling
-limit is an additional guard, not a dollar cap: it counts raw input plus output, can settle above
-an estimate, and starts empty after a restart. No telemetry-backed restore is configured here.
-
-The six-turn window is in memory and expires after the default 15-minute idle timeout. A restart
-forgets it; this starter writes no journal, runs no background summaries, and retains no attachments.
-The gateway check's warnings that persistent memory has no journal and that it reads the three
-variables at boot are expected for this bounded starter.
-
-## Check, start, and accept
-
-Make broker configuration and policy files owned by `_dekopon_broker`, gateway configuration and
-catalog files owned by `_dekopon_gateway`, and all four files mode `0600`. Keep both directories
-mode `0700`. The shared IPC directory has different permissions; follow the
-[Mac runbook](../../docs/run-on-mac.md#prepare-the-broker-and-gateway) rather than making either
-private configuration directory group-readable.
+Check both files as their owners:
 
 ```console
 sudo -u _dekopon_broker /usr/local/lib/dekopon/current/dekopon-brokerd check /usr/local/etc/dekopon/broker/broker.yaml
 sudo -u _dekopon_gateway /usr/local/lib/dekopon/current/dekopon-gatewayd check /usr/local/etc/dekopon/gateway/gateway.yaml
 ```
 
-The commands use the versioned installation selected by the Mac runbook. The checks load the provider and validate authored configuration and policy. They do not prove
-runtime directory permissions, socket access, credentials, or network connectivity. Both accept
-the sample IDs `t0123abc` and `u0123abc` and the model placeholder as valid values, so confirm none
-remain. With the OpenRouter key loaded as in the
-[runbook's checks](../../docs/run-on-mac.md#check-before-installing-a-service),
-`dekopon-gatewayd check … --probe` sends a small paid tool-call canary that proves the model ID; it
-does not exercise Slack or the broker.
+The checks load the provider and validate configuration and policy; they prove nothing about
+directory permissions, socket access, credentials or network. Expected warnings: persistent memory
+has no journal, and the gateway reads three variables at boot. The runbook's
+[`check --probe`](../../docs/run-on-mac.md#check-before-installing-a-service) sends one small paid
+tool-call request that proves the model ID; it exercises neither Slack nor the broker.
 
-Start the broker through the [Mac runbook](../../docs/run-on-mac.md#check-before-installing-a-service),
+Start the broker through the [runbook](../../docs/run-on-mac.md#check-before-installing-a-service),
 then probe as its owner:
 
 ```console
 sudo -u _dekopon_broker /usr/local/lib/dekopon/current/dekopon-brokerd probe --socket /usr/local/var/run/dekopon/broker.sock
 ```
 
-Success is exit status 0 with no output. The probe has no `--server-uid` option and expects the
-server UID to equal its own effective UID; running it as `_dekopon_gateway` is not the cross-UID
-acceptance check. Start the gateway, then have the authorized Slack user send the bot a DM asking it
-to test the installed tool. Expect a post title, a successful `jsonplaceholder.posts.get` broker
-execution record, and matching usage in OpenRouter. A second, unmapped Slack sender must receive
-no model-backed response.
+Exit status 0 with no output is healthy. The probe expects the server's UID to equal its own, so
+running it as `_dekopon_gateway` is not the cross-UID check. Start the gateway, then accept:
 
-Finally perform the Mac runbook's service restart, reboot/login, sleep, and spending-limit
-[checks](../../docs/run-on-mac.md#acceptance-before-switching).
-Retain the installed binaries, provider checksum, and these configuration files together for
-rollback. This example migrates no OpenClaw configuration, history, skills, or credentials.
+1. The mapped sender DMs the bot asking it to test the installed tool. Expect a post title, a
+   successful `jsonplaceholder.posts.get` broker execution record, and matching OpenRouter usage.
+2. A second, unmapped sender gets no model-backed reply.
+
+Keep the binaries, provider checksum and these files together for
+[rollback](../../docs/run-on-mac.md#sleep-logs-updates-and-recovery).
