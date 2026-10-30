@@ -474,8 +474,12 @@ mod tests {
             }
         ));
         fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+        let shared = tempfile::Builder::new()
+            .tempfile_in(PathBuf::from("/tmp").canonicalize().unwrap())
+            .unwrap();
+        fs::write(shared.path(), b"KEY=v\n").unwrap();
         assert!(matches!(
-            EnvFile::load(&path, uid.wrapping_add(1)).unwrap_err(),
+            EnvFile::load(shared.path(), uid.wrapping_add(1)).unwrap_err(),
             EnvFileError::File {
                 source: FileHygieneError::WrongOwner { .. }
             }
