@@ -63,18 +63,23 @@ transport fills them:
 | [WhatsApp](../crates/dekopon-gatewayd/src/transport/whatsapp.rs) | `waba_id:phone_number_id` | sender | none |
 | [GitHub](../crates/dekopon-gatewayd/src/transport/github.rs) | owner | `owner.repo` | issue, pull request or discussion number, else [`repository`](../crates/dekopon-core/src/github.rs) |
 | [Fauxlack](../crates/dekopon-gatewayd/src/transport/fauxlack.rs) | server | channel | thread |
-| [local](../crates/dekopon-gatewayd/src/transport/local.rs) | the caller's; default none | the caller's; default `dev` | the caller's; default none |
+| [local](../crates/dekopon-gatewayd/src/transport/local.rs) | the caller's; default none | the caller's; default `dev` | none ([validated](../crates/dekopon-broker-protocol/src/conversation.rs)) |
 
 This `forbid` limits pull-request comments to one Slack thread:
 
 ```cedar
 @id("comments-stay-in-one-thread")
 forbid(principal, action == Dekopon::Action::"gh.pull-request.comment", resource)
-unless { context has conversation && context.conversation has thread
+unless { context has transportKind && context.transportKind == "slack"
+      && context has conversation && context.conversation has container
+      && context.conversation has thread
+      && context.conversation.container == "t0123abcd"
+      && context.conversation.id == "c0123abcd"
       && context.conversation.thread == "1761900000.000100" };
 ```
 
-It fences that capability only, not the agent's Slack replies.
+A timestamp is unique only within a channel, so the fence pins the channel too. It
+fences that capability only, not the agent's Slack replies.
 
 ## `secret.use` and public DRNs
 
