@@ -17,7 +17,7 @@ include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 native-test = ["dekopon-http-host/native-test"]
 
 [dependencies]
-wasmparser = { version = "=0.259.0", default-features = false, features = ["component-model"] }
+wasmparser = { version = "=0.262.0", default-features = false, features = ["component-model"] }
 parking_lot.workspace = true
 getrandom.workspace = true
 dekopon-capability.workspace = true
