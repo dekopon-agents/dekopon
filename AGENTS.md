@@ -85,6 +85,28 @@ Audits and plans default to over-building, and the owner reels them back. Before
   first; the chart fix rides the next release.
 - **Recommend; don't enumerate.** Bring one proposal plus the few decisions only the owner can make.
 
+## Designing contracts
+
+How the owner shapes names, config keys, grammars and policy. Bring a design already shaped this way.
+
+- **Familiar over clever.** Prefer a shape engineers already know (colon-delimited, ARN-style
+  names; `*` as a whole-field wildcard) over a private grammar that needs escapes.
+- **Humans first.** What people type and paste must work: accept mixed case and normalize, keep a
+  service's own ids verbatim, default to readable names, and make stable numeric ids an opt-in.
+- **Every field earns its place.** Ask what checks a field. A field or label nothing checks is
+  noise; delete it.
+- **Say it once, where it belongs.** Each fact lives in the one file that owns it: constraint sets
+  and the secret map say how, Cedar says who. A design that restates config in policy, or repeats a
+  key on every capability, is not done.
+- **Safe defaults, opt-in paranoia.** The common case needs no grant or declaration, and an owner
+  may narrow it. Gate only the act that carries authority, such as a model naming a secret.
+- **Decide now what would force a rewrite; ignore what would not.** Name the foreseeable changes
+  that would break a format and settle them up front; cut speculative gates and checks.
+- **Fail forward in one move.** Prefer a reset over a permanent second spelling, a one-shot
+  cutover over a dual-read window, and one release over several.
+- **Explain the mechanism before asking.** Show real config before and after and what each field
+  does; the owner decides from examples, not abstractions.
+
 ## Change and verify
 
 - The RPi deploys the [memory-optimized Wasmtime build](docs/development.md#memory-optimized-wasmtime) on ARM64, and CI tests it on ARM64 and x86-64; stock Wasmtime remains the default everywhere else.
