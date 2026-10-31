@@ -119,7 +119,7 @@ x509-parser = { version = "0.18.1", default-features = false }
 # wit-bindgen's generated code must agree with the wasm-tools CLI and with Wasmtime's component
 # model crates. History: #206; #191 is the lone wit-bindgen bump that could not build.
 wasmtime ={ version = "49.0.3", default-features = false, features = ["component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
-wit-bindgen = { version = "0.62.0", default-features = false, features = ["bitflags", "macros", "realloc"] }
+wit-bindgen = { version = "0.63.0", default-features = false, features = ["bitflags", "macros", "realloc"] }
 
 dekopon-agent = { version = "=0.75.0", path = "crates/dekopon-agent" }
 dekopon-broker = { version = "=0.75.0", path = "crates/dekopon-broker" }
