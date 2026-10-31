@@ -93,6 +93,8 @@ schemars = "1.2.2"
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
+serde-value = "0.7.0"
+serde_path_to_error = "0.1.20"
 serde_yaml = { package = "serde_yaml_ng", version = "0.10.0" }
 sha2 = "0.11.0"
 stacker = "0.1.25"
