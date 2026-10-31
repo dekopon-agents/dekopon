@@ -25,12 +25,26 @@ use tracing_subscriber::{
 
 use crate::ExporterSettings;
 
+#[cfg(unix)]
+#[path = "log_file.rs"]
+mod log_file;
+
+#[cfg(all(unix, feature = "cli"))]
+pub use log_file::LogFileArgs;
+#[cfg(unix)]
+pub use log_file::{LogFile, LogFileError, LogFileOperation};
+
 const EXPORTER_DIAGNOSTICS_OFF: &str = "opentelemetry=off";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum ConsoleWriter {
     Stdout(&'static str),
     Stderr,
+    #[cfg(unix)]
+    File {
+        thread: &'static str,
+        log: LogFile,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,23 +63,27 @@ pub enum ConsoleFilter {
     Directive(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Console {
     pub format: ConsoleFormat,
     pub writer: ConsoleWriter,
     pub filter: ConsoleFilter,
 }
 
-impl Console {
-    fn layer(self, writer: BoxMakeWriter) -> Box<dyn Layer<Registry> + Send + Sync> {
-        let filter = match self.filter {
+impl ConsoleFormat {
+    fn layer(
+        self,
+        filter: ConsoleFilter,
+        writer: BoxMakeWriter,
+    ) -> Box<dyn Layer<Registry> + Send + Sync> {
+        let filter = match filter {
             ConsoleFilter::Environment(default) => {
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default))
             }
             ConsoleFilter::Directive(directive) => EnvFilter::new(directive),
         };
-        match self.format {
-            ConsoleFormat::Json => fmt::layer()
+        match self {
+            Self::Json => fmt::layer()
                 .json()
                 .flatten_event(true)
                 .with_current_span(true)
@@ -78,7 +96,7 @@ impl Console {
                 .with_writer(writer)
                 .with_filter(filter)
                 .boxed(),
-            ConsoleFormat::Text {
+            Self::Text {
                 ansi,
                 target,
                 timestamps,
@@ -98,7 +116,36 @@ impl Console {
     }
 }
 
-type ConsoleOutput = Box<dyn io::Write + Send>;
+enum ConsoleOutput {
+    Stream(Box<dyn io::Write + Send>),
+    #[cfg(unix)]
+    File(LogFile),
+}
+
+impl ConsoleOutput {
+    fn write_counted(&mut self, line: &[u8], dropped: &AtomicU64) {
+        match self {
+            Self::Stream(output) => {
+                if output.write_all(line).is_err() {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            #[cfg(unix)]
+            Self::File(log) => {
+                if log.write_line(line).is_err() {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                // Written straight to the file: a tracing event here would re-enter the sink.
+                if let Some(notice) = log.take_notice()
+                    && log.write_line(&notice.line()).is_err()
+                {
+                    log.keep_notice(notice);
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
 
 thread_local! {
     static CONSOLE_WRITER_THREAD: Cell<bool> = const { Cell::new(false) };
@@ -156,9 +203,7 @@ impl ConsoleSink {
                             reported = total;
                         }
                     }
-                    if output.write_all(&line).is_err() {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                    }
+                    output.write_counted(&line, &dropped);
                     bytes.fetch_sub(line.len(), Ordering::Relaxed);
                 }
                 match completed.send(()) {
@@ -205,8 +250,13 @@ impl io::Write for &ConsoleSink {
                     }
                 }
             }
-            ConsoleState::Direct(output) => {
+            ConsoleState::Direct(ConsoleOutput::Stream(output)) => {
                 output.write_all(line)?;
+                return Ok(line.len());
+            }
+            #[cfg(unix)]
+            ConsoleState::Direct(output @ ConsoleOutput::File(_)) => {
+                output.write_counted(line, &self.dropped);
                 return Ok(line.len());
             }
             ConsoleState::Closed => {}
@@ -399,21 +449,33 @@ impl Install {
 
     pub fn install(self) -> Result<TelemetryGuard, InstallError> {
         let Self {
-            console,
+            console:
+                Console {
+                    format,
+                    writer,
+                    filter,
+                },
             extra,
             traces,
             logs,
             shutdown_timeout,
         } = self;
 
-        let (writer, console_worker) = match console.writer {
+        let (writer, console_worker) = match writer {
             ConsoleWriter::Stdout(thread_name) => {
-                let (sink, worker) = ConsoleSink::new(thread_name, Box::new(io::stdout()))?;
+                let (sink, worker) =
+                    ConsoleSink::new(thread_name, ConsoleOutput::Stream(Box::new(io::stdout())))?;
                 (BoxMakeWriter::new(sink), Some(worker))
             }
             ConsoleWriter::Stderr => (BoxMakeWriter::new(io::stderr), None),
+            #[cfg(unix)]
+            ConsoleWriter::File { thread, log } => {
+                let (sink, worker) = ConsoleSink::new(thread, ConsoleOutput::File(log))?;
+                (BoxMakeWriter::new(sink), Some(worker))
+            }
         };
-        let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![console.layer(writer)];
+        let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> =
+            vec![format.layer(filter, writer)];
         layers.extend(extra);
         let tracer_provider = traces.map(|traces| {
             let tracer = traces.provider.tracer(traces.tracer_name);
@@ -691,13 +753,13 @@ mod tests {
         let (written, writes) = std::sync::mpsc::sync_channel(super::ConsoleSink::MAX_LINES + 2);
         let (sink, worker) = super::ConsoleSink::new(
             "test-stdout",
-            Box::new(StalledOutput {
+            super::ConsoleOutput::Stream(Box::new(StalledOutput {
                 output: output.clone(),
                 started: Some(started),
                 release: released,
                 written,
                 dispatch: None,
-            }),
+            })),
         )
         .expect("console writer spawned");
         assert_eq!(worker.handle.thread().name(), Some("test-stdout"));
@@ -751,13 +813,13 @@ mod tests {
         let (written, _writes) = std::sync::mpsc::sync_channel(4);
         let (sink, worker) = super::ConsoleSink::new(
             "test-stdout",
-            Box::new(StalledOutput {
+            super::ConsoleOutput::Stream(Box::new(StalledOutput {
                 output: output.clone(),
                 started: Some(started),
                 release: released,
                 written,
                 dispatch: None,
-            }),
+            })),
         )
         .expect("console writer spawned");
         let state = Arc::clone(&sink.state);
@@ -801,13 +863,13 @@ mod tests {
         let (dispatch_sender, dispatch_receiver) = std::sync::mpsc::sync_channel(1);
         let (sink, worker) = super::ConsoleSink::new(
             "test-stdout",
-            Box::new(StalledOutput {
+            super::ConsoleOutput::Stream(Box::new(StalledOutput {
                 output: output.clone(),
                 started: Some(started),
                 release: released,
                 written,
                 dispatch: Some(dispatch_receiver),
-            }),
+            })),
         )
         .expect("console writer spawned");
         let state = Arc::clone(&sink.state);
@@ -888,6 +950,145 @@ mod tests {
         assert!(lines[1].get("github.actor.id").is_none());
         assert!(lines[1].get("github.repository.names").is_none());
         assert!(lines[1].get("github.deliveries").is_none());
+    }
+
+    #[cfg(unix)]
+    fn file_sink(log: super::LogFile) -> (super::ConsoleSink, TelemetryGuard) {
+        let (sink, worker) = super::ConsoleSink::new("test-log", super::ConsoleOutput::File(log))
+            .expect("console writer spawned");
+        (sink, console_guard(worker))
+    }
+
+    #[cfg(unix)]
+    fn file_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .expect("log file")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("JSON record"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn squatted_backup(directory: &std::path::Path) {
+        let squatter = directory.join("gateway.log.1");
+        std::fs::create_dir(&squatter).unwrap();
+        std::fs::write(squatter.join("occupied"), b"x").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_one_rename_warning(lines: &[serde_json::Value]) {
+        let warnings: Vec<_> = lines
+            .iter()
+            .filter(|line| line["audit.event"] == "telemetry.console.rotation.failed")
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["level"], "WARN");
+        assert_eq!(warnings[0]["console.rotation.step"], "rename");
+        assert_eq!(warnings[0]["error.kind"], "IsADirectory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_log_file_receives_the_bytes_the_stdout_sink_writes() {
+        use crate::install::log_file::tests::{directory, open};
+        let directory = directory();
+        let path = directory.root.join("gateway.log");
+        let stream = Output::default();
+        let (stream_sink, stream_worker) = super::ConsoleSink::new(
+            "test-stdout",
+            super::ConsoleOutput::Stream(Box::new(stream.clone())),
+        )
+        .expect("console writer spawned");
+        let (file_sink, file_guard) = file_sink(open(&path, 1 << 20, 1));
+        for sink in [stream_sink, file_sink] {
+            let layer = tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .without_time()
+                .with_writer(sink);
+            tracing::subscriber::with_default(registry().with(layer), || {
+                tracing::info!(sequence = 1, text = "a \"quoted\" line");
+                tracing::warn!(sequence = 2, "second");
+            });
+        }
+        console_guard(stream_worker)
+            .shutdown()
+            .expect("stream drained");
+        file_guard.shutdown().expect("file drained");
+        assert_eq!(std::fs::read(&path).unwrap(), *stream.0.lock());
+        assert_eq!(json_lines(&stream).len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_failure_on_the_writer_thread_is_written_once_before_shutdown_returns() {
+        use crate::install::log_file::tests::{directory, open};
+        let directory = directory();
+        let path = directory.root.join("gateway.log");
+        let log = open(&path, 1, 1);
+        squatted_backup(&directory.root);
+        let (sink, guard) = file_sink(log);
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(sink);
+        tracing::subscriber::with_default(registry().with(layer), || {
+            for sequence in 0..4 {
+                tracing::info!(sequence);
+            }
+            guard.shutdown().expect("console drained");
+        });
+        let lines = file_lines(&path);
+        assert_eq!(lines.len(), 5);
+        assert_one_rename_warning(&lines);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_failure_after_shutdown_is_written_once_without_tracing() {
+        use crate::install::log_file::tests::{directory, open};
+        let directory = directory();
+        let path = directory.root.join("gateway.log");
+        let log = open(&path, 1, 1);
+        squatted_backup(&directory.root);
+        let (sink, guard) = file_sink(log);
+        let layer = tracing_subscriber::fmt::layer()
+            .json()
+            .flatten_event(true)
+            .with_writer(sink);
+        tracing::subscriber::with_default(registry().with(layer), || {
+            guard.shutdown().expect("console drained");
+            for sequence in 0..3 {
+                tracing::info!(sequence);
+            }
+        });
+        let lines = file_lines(&path);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[1]["sequence"], 1);
+        assert_one_rename_warning(&lines[2..3]);
+        assert_eq!(lines[3]["sequence"], 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_record_written_directly_is_dropped_and_counted() {
+        use std::io::Write as _;
+
+        use crate::install::log_file::tests::{directory, open};
+        let directory = directory();
+        let path = directory.root.join("gateway.log");
+        let (sink, guard) = file_sink(open(&path, 1 << 20, 1));
+        let dropped = Arc::clone(&sink.dropped);
+        let state = Arc::clone(&sink.state);
+        guard.shutdown().expect("console drained");
+        assert!(matches!(
+            &*state.lock(),
+            super::ConsoleState::Direct(super::ConsoleOutput::File(_))
+        ));
+        let record = vec![b'x'; super::ConsoleSink::MAX_BYTES + 1];
+        assert_eq!((&sink).write(&record).unwrap(), record.len());
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
 
     fn wait_until_console_is_closed(state: &Mutex<super::ConsoleState>) {

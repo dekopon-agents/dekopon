@@ -33,6 +33,8 @@ pub struct Cli {
     /// Private KEY=VALUE file loaded before serving; options and inherited variables win.
     #[arg(long, value_name = "PATH")]
     pub env_file: Option<PathBuf>,
+    #[command(flatten)]
+    pub log: dekopon_telemetry::LogFileArgs,
     /// Operator command; absent means serve the gateway.
     #[command(subcommand)]
     pub command: Option<Command>,
