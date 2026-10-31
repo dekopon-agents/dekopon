@@ -288,8 +288,18 @@ impl LogFile {
             }
             self.len = 0;
         }
-        self.file.write_all(record)?;
-        self.len += size;
+        let mut rest = record;
+        while !rest.is_empty() {
+            match self.file.write(rest) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => {
+                    self.len += written as u64;
+                    rest = rest.get(written..).unwrap_or_default();
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -589,6 +599,57 @@ pub(super) mod tests {
             self.phase = super::Phase::AwaitingReplacement;
             between();
             self.replace();
+        }
+    }
+
+    #[test]
+    fn a_partial_write_before_an_error_counts_toward_the_ceiling() {
+        const CHILD: &str = "DEKOPON_LOG_FILE_PARTIAL_WRITE";
+        if let Some(root) = std::env::var_os(CHILD) {
+            return partial_write_then_recovery(Path::new(&root));
+        }
+        let directory = directory();
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' XFSZ; exec \"$0\" \"$@\"")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "install::log_file::tests::a_partial_write_before_an_error_counts_toward_the_ceiling",
+                "--test-threads=1",
+            ])
+            .env(CHILD, &directory.root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn partial_write_then_recovery(root: &Path) {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        const MIB: usize = 1024 * 1024;
+        let path = root.join("gateway.log");
+        let mut log = open(&path, RECORD_LIMIT, 1);
+        let unlimited = getrlimit(Resource::Fsize);
+        setrlimit(
+            Resource::Fsize,
+            Rlimit {
+                current: Some(MIB as u64),
+                maximum: unlimited.maximum,
+            },
+        )
+        .unwrap();
+        let error = log
+            .write_line(&record(b'p', 2 * MIB))
+            .expect_err("cut at the size limit");
+        setrlimit(Resource::Fsize, unlimited).unwrap();
+        assert_eq!(error.raw_os_error(), Some(libc::EFBIG));
+        assert_eq!(fs::metadata(&path).unwrap().len(), MIB as u64);
+        for _ in 0..8 {
+            log.write_line(&record(b'q', MIB)).unwrap();
+            for entry in fs::read_dir(root).unwrap() {
+                assert!(entry.unwrap().metadata().unwrap().len() <= RECORD_LIMIT);
+            }
+            assert!(set_bytes(root) <= ceiling(RECORD_LIMIT, 1));
         }
     }
 

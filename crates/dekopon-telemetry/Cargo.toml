@@ -54,6 +54,7 @@ libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 opentelemetry_sdk.workspace = true
+rustix.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
 
