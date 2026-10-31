@@ -14,7 +14,8 @@ The model proposes; a separate broker authorizes and executes provider effects.
 - The code is the reference for keys, fields, defaults, events and errors: read the types,
   `dekopon-gatewayd check`, `dekopon-brokerd check` and `--help`, not a doc.
 - Follow [CONTRIBUTING.md](CONTRIBUTING.md#change-guidelines) for implementation and review conventions.
-- Write documentation only under the [Documentation](#documentation) rules.
+- Write documentation only under the [Documentation](#documentation) rules, then make what survives
+  clear with the [`succinct-docs` skill](.claude/skills/succinct-docs/SKILL.md).
 - This file and the documents it links are the whole contract. A cloud agent in a bare checkout has
   no owner memories, machine instructions or sibling repositories, and needs none: fetch what a
   gate needs (`ci/fetch-external-provider-components.sh`), and name every gate you could not run.
@@ -147,7 +148,7 @@ Docs are for humans: what a principal engineer cannot derive from the code. Agen
 Everything else is the code, `check` and `--help`. Errors are loud and name the key.
 
 1. **Budget.** Tracked Markdown, except the files the `docs` CI job excludes (`CHANGELOG.md`, this
-   file and fixtures), stays within the word budget that job enforces, with at most seven Markdown
+   file, agent skills and fixtures), stays within the word budget that job enforces, with at most seven Markdown
    files in `docs/`. A change over budget cuts as much as it adds, or cites the owner's raise.
 2. **Whole file first.** A pull request that touches a doc gives it a KEEP, MERGE or DELETE verdict
    in its body before any line is edited.

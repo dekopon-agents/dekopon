@@ -296,7 +296,7 @@ jobs:
             echo "docs/ holds $docs files; the limit is 7 (AGENTS.md#documentation)" >&2
             exit 1
           fi
-          words=$(git ls-files -z -- '*.md' ':(exclude)CHANGELOG.md' ':(exclude)AGENTS.md' \
+          words=$(git ls-files -z -- '*.md' ':(exclude)CHANGELOG.md' ':(exclude)AGENTS.md' ':(exclude).claude/*' \
             ':(exclude)crates/*/examples/eval/*' ':(exclude)examples/catalog/skills/*' \
             ':(exclude)crates/*/tests/fixtures/*' | xargs -0 cat | wc -w)
           printf 'documentation: %d of %d words\n' "$words" "$budget"
