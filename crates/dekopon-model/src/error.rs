@@ -119,7 +119,6 @@ pub struct ProviderFailure {
     pub code: Option<String>,
     pub request_id: Option<String>,
     pub retry_after: Option<std::time::Duration>,
-    /// Response status; a failure event in an HTTP-200 stream retains 200.
     pub status: Option<u16>,
     pub diagnostic: String,
     #[source]
@@ -168,7 +167,6 @@ pub enum TransportFailure {
     #[error("{context}")]
     Http {
         context: ProviderFailure,
-        /// The client failure with its URL removed.
         #[source]
         source: reqwest::Error,
     },

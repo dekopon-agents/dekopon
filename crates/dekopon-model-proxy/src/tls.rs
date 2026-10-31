@@ -55,8 +55,6 @@ pub enum TlsError {
     Config(#[source] rustls::Error),
 }
 
-/// Requires a client certificate that chains to the configured CA and carries `identity` as a URI
-/// SAN; any other certificate fails the handshake.
 #[derive(Debug)]
 struct JailVerifier {
     inner: Arc<dyn ClientCertVerifier>,
@@ -191,8 +189,6 @@ fn stamp(files: &TlsFiles) -> Stamp {
     })
 }
 
-/// Rebuilds the TLS configuration when cert-manager rotates the mounted files, checked by mtime
-/// on each accept, so a renewed certificate needs no restart.
 struct Reloading {
     files: TlsFiles,
     identity: String,
@@ -256,9 +252,6 @@ impl Listener {
         self.tcp.local_addr()
     }
 
-    /// Serves until `shutdown` resolves, then aborts every connection; a stream cut there settles
-    /// its admission as cancelled. Past `max_connections` one more connection waits in the kernel
-    /// backlog until one closes.
     pub async fn serve(
         self,
         router: Router,

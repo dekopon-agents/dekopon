@@ -75,12 +75,8 @@ impl WakeReasonView {
     }
 }
 
-/// Bounds the tool result since agent instructions can be arbitrarily large; an oversized view
-/// returns a fixed diagnostic with none of the actual content, not a partial or unbounded copy.
 pub const MAX_AGENT_CONFIG_TOOL_BYTES: usize = 128 * 1024;
 
-/// Effect and risk are overwritten by the broker from the owner's constraint set, not the provider;
-/// there is no input schema, since a model learns a provider from its own --help.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveCapabilityView {
@@ -126,9 +122,6 @@ pub struct SkillView {
     pub resources: Vec<String>,
 }
 
-/// Deliberately has no field for a principal, subject, policy source or ID, execution constraint,
-/// legacy credential map, model endpoint, chat token, or broker path, so an embedder cannot
-/// accidentally populate one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentConfigView {

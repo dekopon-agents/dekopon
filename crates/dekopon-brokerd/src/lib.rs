@@ -1,6 +1,3 @@
-//! The server derives caller identity exclusively from Unix peer credentials and trusted
-//! owner-controlled configuration; wire payloads are always untrusted invocation proposals.
-
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -208,8 +205,6 @@ where
     }
 }
 
-/// Where `check` resolves a configuration's `providerSet`: the operator's provider set, synced into
-/// a private directory that keeps the lock and blob store between checks.
 #[derive(Debug)]
 pub struct CheckProviders {
     pub provider_set: PathBuf,
@@ -226,7 +221,6 @@ pub struct CheckReport {
     pub peak_rss_bytes: Option<u64>,
 }
 
-/// Check reads only DRNs from the secret map; it never opens secret sources or resolves values.
 pub async fn check(
     config_path: impl AsRef<Path>,
     providers: Option<CheckProviders>,
@@ -275,8 +269,6 @@ enum Mode<'a> {
     },
 }
 
-/// Only boot opens the storage host and asset directory: opening takes the root's writer lock and
-/// empties the asset root, both of which the serving candidate owns while a reload is prepared.
 enum Residents<'a> {
     Open,
     Borrow(&'a Candidate),
@@ -508,8 +500,6 @@ impl Coordination {
     }
 }
 
-/// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
-/// did not is reported as skipped.
 #[expect(
     clippy::too_many_lines,
     reason = "independent validation stages aggregate failures before preparing a candidate"
@@ -834,8 +824,6 @@ async fn boot_runtime(
     })
 }
 
-/// A changed `storage` or `assets` already refuses as restart-required, so the rest of the
-/// candidate is validated against a scratch host and no asset directory instead of opening either.
 async fn reload_runtime(
     config: &mut ResolvedConfig,
     uid: u32,
@@ -969,8 +957,6 @@ struct PrivateInputs {
     fingerprint: PrivateFingerprint,
 }
 
-/// Held only in memory and never logged or sent: it tells a same-digest credential rotation from
-/// an unchanged reload poll without any private byte leaving the broker.
 #[derive(PartialEq, Eq)]
 struct PrivateFingerprint([u8; 32]);
 
@@ -998,8 +984,6 @@ impl PrivateFingerprint {
 
 const MAX_RAW_SOURCE_BYTES: u64 = 16 << 20;
 
-/// In memory only, never logged or sent: it covers private bytes and exists to tell one refused
-/// candidate from another.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RawCandidate([u8; 32]);
 
@@ -1098,8 +1082,6 @@ fn scratch_host(
     Ok(Some(host))
 }
 
-/// Provider storage is opened in a throwaway directory so storage-backed constraints and chat
-/// memory are validated against a real host without touching the configured root.
 fn scratch_storage(
     storage: &StorageConfig,
 ) -> Result<(tempfile::TempDir, dekopon_storage_host::StorageHost), BrokerdError> {
@@ -1173,8 +1155,6 @@ fn validate_unmanaged_providers(
     Ok(())
 }
 
-/// Every problem found before the broker is built is returned together; the policy and the
-/// constraint sets are independent, so one refusing does not hide the other.
 #[expect(
     clippy::too_many_lines,
     reason = "reshaped by the unit that next rewrites this"
@@ -1448,12 +1428,9 @@ fn build_policy(
     }
 }
 
-/// Never leaves this process: a check builds no server, so no request can carry it.
 const UNCHECKED_CREDENTIAL: &str = "dekopon-check-placeholder";
 const UNCHECKED_DESTINATION: &str = "credential.check.invalid";
 
-/// Stands in for each credential the constraint sets can select, bound to exactly the hosts that
-/// select it, so `Broker::start` still proves every other credential rule.
 fn unchecked_credentials(
     sets: &BTreeMap<CapabilityId, ConstraintSet>,
     agents: &BTreeMap<AgentId, AgentBindingConfig>,

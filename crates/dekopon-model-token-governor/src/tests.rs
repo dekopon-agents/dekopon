@@ -252,7 +252,6 @@ fn restore_never_clamps_history_to_boot() {
     assert_eq!(budget.statuses(at(expires))[0].1.used, Tokens(10));
 }
 
-/// splitmix64, so the sequence is the same on every run.
 struct Seeded(u64);
 
 impl Seeded {

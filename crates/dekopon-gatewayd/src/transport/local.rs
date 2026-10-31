@@ -1,6 +1,3 @@
-//! The caller-declared subject is only a claim: the broker still needs an attestor grant and owner
-//! mapping to resolve it, and the socket's 0600 mode restricts access to the owner's UID.
-
 use parking_lot::Mutex;
 use std::{
     collections::BTreeMap,
@@ -680,8 +677,6 @@ fn shown_text(text: &StreamedText) -> String {
     shown
 }
 
-/// These socket checks are kept rather than simplified because a socket another user could reach or
-/// replace would let them forge the subject claim this transport trusts.
 fn bind(path: &Path) -> Result<(UnixListener, SocketGuard), TransportError> {
     let uid = rustix::process::geteuid().as_raw();
     let parent = path

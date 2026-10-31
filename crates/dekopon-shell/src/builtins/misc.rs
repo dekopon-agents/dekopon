@@ -168,10 +168,6 @@ pub(crate) fn test_bracket(
     evaluate_test("[", rest)
 }
 
-/// Evaluates the curated `test` expression grammar.
-///
-/// File tests (`-f`, `-d`, `-e`, `-r`, `-w`, `-x`) are absent: there is no filesystem, so accepting
-/// them would answer a question this shell cannot ask.
 pub(crate) fn evaluate_test(
     command: &str,
     arguments: &[String],

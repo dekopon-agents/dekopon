@@ -32,7 +32,6 @@ pub enum AuthError {
     ChatGpt(#[from] ChatGptError),
     #[error("refusing to print ChatGPT credentials without --expose-credential")]
     ExposeNotAcknowledged,
-    /// Standard output is a terminal, which keeps the credential after the command exits.
     #[error(
         "refusing to print ChatGPT credentials to a terminal; redirect or pipe the output (for example `| kubectl apply -f -`), or pass --allow-terminal to accept a live refresh token in your scrollback"
     )]
@@ -80,8 +79,6 @@ async fn execute_chatgpt(command: &ChatGptAuthCommand) -> Result<CommandResult, 
     Ok(CommandResult::Auth(ModelAuthStatus::chatgpt(status)))
 }
 
-/// Both gates are checked before the credential file is opened, so a refused export never even
-/// reads the secret.
 fn export(
     auth_file: Option<&Path>,
     format: ExportFormat,
@@ -106,8 +103,6 @@ fn export(
     Ok(CommandResult::CredentialExport(Redacted::new(document)))
 }
 
-/// The required flag covers intent; this gate covers destination, since even a genuine export
-/// should not leave a live token in terminal scrollback, a tmux capture, or a screen share.
 fn guard_destination(is_terminal: bool, allow_terminal: bool) -> Result<(), AuthError> {
     if is_terminal && !allow_terminal {
         return Err(AuthError::TerminalDestination);

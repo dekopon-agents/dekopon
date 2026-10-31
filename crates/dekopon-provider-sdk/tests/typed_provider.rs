@@ -44,7 +44,6 @@ enum Verb {
     },
     /// Count the characters of the text
     Count {
-        /// The text to count
         text: String,
         /// A secret to present as a bearer token
         #[arg(long)]

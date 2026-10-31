@@ -1,6 +1,3 @@
-//! Constructs deliberately dropped, such as subshells, process substitution, and eval, have no
-//! representation here, so no evaluator path can accidentally implement one.
-
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,16 +36,12 @@ pub enum AndOr {
     Or,
 }
 
-/// A pipe hands the single structured value produced by the left command to the right as its
-/// implicit input; this is jq-style value piping, not byte-stream piping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pipeline {
     pub commands: Vec<Command>,
     pub negated: bool,
 }
 
-/// A compound stage (if/for/while/case/group) runs in the current scope, not a subshell, so a
-/// variable a piped while loop assigns is still set afterward, the opposite of bash.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
     Simple(SimpleCommand),
@@ -92,12 +85,7 @@ impl Stream {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RedirectTarget {
-    /// Not files: the buffer store lives for exactly one script execution and is unreachable from
-    /// any real path; the reserved name DEV_NULL discards.
-    Buffer {
-        append: bool,
-        target: Word,
-    },
+    Buffer { append: bool, target: Word },
     Stream(Stream),
 }
 
@@ -237,8 +225,6 @@ pub enum Modifier {
     },
 }
 
-/// Operand tests share code with test and [, so they cannot disagree on what -z or -lt means;
-/// unlike [, an unquoted expansion here is always one word even with embedded spaces.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Conditional {
     Test(ConditionalTest),
@@ -250,8 +236,6 @@ pub enum Conditional {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConditionalTest {
     pub words: Vec<Word>,
-    /// This operand is a bash glob; a metacharacter is rejected by name at parse time when
-    /// constant, or at expansion otherwise, and this flag tracks which applies.
     pub check_right_pattern: bool,
 }
 

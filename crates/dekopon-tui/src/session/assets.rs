@@ -63,7 +63,6 @@ impl ConsoleAssets {
         Ok(id)
     }
 
-    /// Decode only an operator-entered, bounded standard-base64 literal; never store encoded text.
     pub fn attach_base64(&self, mime: &str, encoded: &str) -> Result<u64, String> {
         let valid_mime = mime.len() <= 127
             && !mime.is_empty()

@@ -1,9 +1,3 @@
-//! Rendering tests over a `TestBackend`, which is a terminal only in the sense that it has a size.
-//!
-//! These assert on what reaches the buffer rather than on how it looks: that hostile text cannot
-//! carry a control sequence into a frame, that a secret is not drawn, and that each pane says the
-//! thing an operator would otherwise have to guess.
-
 #![allow(
     clippy::unwrap_used,
     clippy::disallowed_methods,
@@ -41,7 +35,6 @@ fn console(agents: Vec<Agent>) -> App {
     )
 }
 
-/// Renders one frame and returns everything drawn, as text.
 fn frame(app: &App) -> String {
     let mut terminal =
         Terminal::new(TestBackend::new(140, 34)).expect("a test backend always builds");

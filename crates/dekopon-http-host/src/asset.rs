@@ -10,8 +10,6 @@ use std::{
 use tempfile::TempPath;
 use thiserror::Error;
 
-/// These variants are deliberately sanitized so they can cross the provider boundary without
-/// leaking paths or internal state.
 #[derive(Debug, Error)]
 pub enum AssetIoError {
     #[error("broker asset byte budget is exhausted")]
@@ -187,8 +185,6 @@ impl Drop for Reservation {
     }
 }
 
-/// Field order matters here: the file closes and unlinks before its accounting is released, since
-/// fields drop in declaration order.
 #[derive(Debug)]
 pub struct Spool {
     sink: Sink,
@@ -249,8 +245,6 @@ impl Spool {
     }
 }
 
-/// The file is already unlinked from disk, but its byte budget stays charged until broker ownership
-/// of it ends.
 #[derive(Debug)]
 pub struct AssetFile {
     file: File,
@@ -259,8 +253,6 @@ pub struct AssetFile {
 }
 
 impl AssetFile {
-    /// Callers must only use positional reads on this descriptor, since it may be shared
-    /// concurrently with other readers.
     pub fn file(&self) -> &File {
         &self.file
     }

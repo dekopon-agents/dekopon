@@ -2,8 +2,6 @@ use std::error::Error;
 
 use crate::attribute::TRUNCATION_MARKER;
 
-/// The top message only names the layer, not the cause; dropping the chain is how a retry loop logs
-/// a failure with no reason.
 pub fn error_chain(error: &dyn Error) -> String {
     let mut rendered = error.to_string();
     let mut source = error.source();

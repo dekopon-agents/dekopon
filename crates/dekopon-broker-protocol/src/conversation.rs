@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::ChatTransportKind;
 
-/// A DM with a thread coordinate stays DirectMessage kind, since Slack roots a thread on every DM
-/// turn and a Thread kind there would make DMs unmatchable.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ConversationKind {
@@ -61,9 +59,6 @@ impl fmt::Debug for Conversation {
 }
 
 impl Conversation {
-    /// This exact value fills every conversation_id slot, including cancel requests, session
-    /// registry, admission key, gateway key, and storage namespace, so they use one derivation
-    /// instead of several that could disagree.
     #[must_use]
     pub fn key(&self) -> String {
         match &self.thread {
@@ -72,9 +67,6 @@ impl Conversation {
         }
     }
 
-    /// Needs the transport kind since a Discord thread is itself a channel addressed directly,
-    /// while Slack addresses the channel plus a separate thread_ts; guessing wrong misdirects the
-    /// reply.
     #[must_use]
     pub fn api_channel(&self, kind: ChatTransportKind) -> &str {
         match (kind, &self.thread) {
@@ -90,8 +82,6 @@ impl Conversation {
             && self.thread.as_deref().is_none_or(bounded_scope_part)
     }
 
-    /// Slack ids skip the leading-letter check because multi-person DMs are G-prefixed on old
-    /// workspaces and C-prefixed on new ones, so a strict prefix rule would reject real traffic.
     #[must_use]
     #[expect(
         clippy::wildcard_enum_match_arm,
@@ -323,8 +313,6 @@ pub struct ConversationMatch {
 }
 
 impl ConversationMatch {
-    /// Never matches on the thread coordinate, since naming one specific thread in a grant is
-    /// deliberately impossible; kind: thread claims every thread under the parent id instead.
     #[must_use]
     pub fn matches(&self, conversation: &Conversation) -> bool {
         self.kind.contains(conversation.kind)
@@ -451,7 +439,6 @@ fn canonical_github_id(value: &str) -> bool {
     })
 }
 
-/// `waba:phoneNumberId`, the pair Meta authenticates a Cloud API delivery under.
 pub(crate) fn canonical_whatsapp_container(value: &str) -> bool {
     let mut parts = value.split(':');
     parts.next().is_some_and(canonical_meta_decimal)

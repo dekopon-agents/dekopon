@@ -6,11 +6,9 @@ use schemars::generate::SchemaGenerator;
 use schemars::{JsonSchema, Schema, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// A string whose UTF-8 representation fits within `MAX` bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bounded<const MAX: usize>(String);
 
-/// A value exceeds its UTF-8 byte bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TooLong;
 
@@ -23,7 +21,6 @@ impl fmt::Display for TooLong {
 impl std::error::Error for TooLong {}
 
 impl<const MAX: usize> Bounded<MAX> {
-    /// Refuses text longer than `MAX` UTF-8 bytes.
     pub fn new(text: impl Into<String>) -> Result<Self, TooLong> {
         let text = text.into();
         if text.len() > MAX {
@@ -32,7 +29,6 @@ impl<const MAX: usize> Bounded<MAX> {
         Ok(Self(text))
     }
 
-    /// The bounded text.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -73,7 +69,6 @@ impl<const MAX: usize> JsonSchema for Bounded<MAX> {
     }
 }
 
-/// A string cut at a UTF-8 character boundary when it exceeds `MAX` bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Truncated<const MAX: usize> {
     text: String,
@@ -81,7 +76,6 @@ pub struct Truncated<const MAX: usize> {
 }
 
 impl<const MAX: usize> Truncated<MAX> {
-    /// Cuts text to at most `MAX` UTF-8 bytes without splitting a character.
     #[must_use]
     pub fn new(text: impl AsRef<str>) -> Self {
         let text = text.as_ref();
@@ -95,13 +89,11 @@ impl<const MAX: usize> Truncated<MAX> {
         }
     }
 
-    /// The text after any cut.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.text
     }
 
-    /// Whether construction discarded any bytes.
     #[must_use]
     pub fn was_cut(&self) -> bool {
         self.was_cut

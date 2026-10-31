@@ -27,8 +27,6 @@ pub(crate) struct PriorAsset {
     pub pin: Option<Rung>,
 }
 
-/// One record's place in the previous turn's projection, kept in the conversation slot so the
-/// next turn changes only what entered or left.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PriorRecord {
     pub record: RecordId,
@@ -69,8 +67,6 @@ pub(crate) struct Projected {
 
 const EARLIER: &str = "[gateway: earlier conversation]";
 
-/// The rungs a record can replay at, most detailed first: native, each generated summary from the
-/// deepest part down, then metadata.
 fn ladder(head: &Head) -> Vec<Rung> {
     let mut rungs = vec![Rung::Native];
     rungs.extend(generated(head).into_iter().rev().map(Rung::Summary));
@@ -232,8 +228,6 @@ fn asset_positions(
         .map(move |asset| (asset.item, at))
 }
 
-/// Verbatim steps within the record's share: text items first, then exchanges, cutting only
-/// result text; an argument that does not fit, or is not an object, becomes `{"cut":N}`.
 fn native(
     file: &Arc<File>,
     head: &Head,
@@ -698,8 +692,6 @@ fn assemble(
     })
 }
 
-/// The record a decider is asked about this turn: the oldest older record with no choice, all
-/// slots final and at least one generated summary.
 pub(crate) fn decider_candidate(records: &[Head], hot_turns: usize) -> Option<&Head> {
     let hot_from = records.len().saturating_sub(hot_turns.max(1));
     records[..hot_from].iter().find(|head| {

@@ -4,13 +4,8 @@ use dekopon_model::{ModelText, error::InferenceError};
 
 use crate::prompt::PromptError;
 
-/// Matches the embedding gateway's own outbound-answer bound (8 KiB), since a progress surface
-/// never needs more text than the reply itself; deltas past it still reach the trace, just not this
-/// sink.
 pub(crate) const STREAMED_TEXT_BOUND_BYTES: usize = 8 * 1024;
 
-/// A command word is provider-authored, so it is untrusted text on its way to a person's screen
-/// even though it is not itself a credential path.
 const MAX_COMMAND_WORD_CHARS: usize = 32;
 const MAX_NOTE_CHARS: usize = 100;
 const NOTE_FORMAT_CHARACTERS: &[char] = &[
@@ -37,8 +32,6 @@ pub enum ProgressEvent {
         eta: Option<Duration>,
     },
     TextDelta {
-        /// Never reasoning or tool-call arguments, only visible answer text; cumulative_chars lets
-        /// a driver enforce its own length ceiling without re-accumulating deltas itself.
         turn: u32,
         text: ModelText,
         cumulative_chars: usize,
@@ -62,7 +55,6 @@ pub enum ProgressEvent {
     },
     Attachment {
         index: u32,
-        /// IANA media type, fixed by validation rather than by what the provider claimed.
         media_type: String,
         bytes: u64,
     },
@@ -244,8 +236,6 @@ pub enum CancelSource {
     Budget { limit: BudgetLimit },
 }
 
-/// Synchronous by design so a progress sink can never slow the session down; an implementation must
-/// record what it needs, hand the rest off, and never block, await, or fail.
 pub trait ProgressSink: Send + Sync {
     fn emit(&self, event: ProgressEvent);
 }

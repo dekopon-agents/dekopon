@@ -1,11 +1,3 @@
-//! Capability metadata and invocation-state types for Dekopon.
-//!
-//! The central API distinction is between [`ProposedInvocation`] and
-//! [`AuthorizedInvocation`]. A model-facing tool call can create only the former. The
-//! latter has private fields and can be produced only by the broker-oriented transition
-//! in this crate. The broker-owned execution boundary creates and consumes this state;
-//! its serialized representation is inert audit/evidence data, not transferable authority.
-//!
 //! ```compile_fail
 //! use dekopon_capability::{AuthorizedInvocation, ExecutionConstraints, ProposedInvocation};
 //!
@@ -19,9 +11,6 @@
 //!     };
 //! }
 //! ```
-//!
-//! Serialized authorization state cannot be decoded into executable authority:
-//!
 //! ```compile_fail
 //! use dekopon_capability::AuthorizedInvocation;
 //! use serde::de::DeserializeOwned;
@@ -32,9 +21,6 @@
 //!     require_deserializable::<AuthorizedInvocation>();
 //! }
 //! ```
-//!
-//! Authorization is also intentionally single-use at the type boundary:
-//!
 //! ```compile_fail
 //! use dekopon_capability::AuthorizedInvocation;
 //!
@@ -44,9 +30,6 @@
 //!     require_clone::<AuthorizedInvocation>();
 //! }
 //! ```
-//!
-//! Rust visibility is defense in depth. It is not a substitute for process isolation,
-//! authenticated broker messages, authorization policy, or credential separation.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -102,8 +85,6 @@ pub struct Permission {
     pub resource: Option<String>,
 }
 
-/// Not Deserialize: the broker converts this from a separate wire type only after authenticating
-/// the envelope, so no caller can decode one directly.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProposedInvocation {
@@ -175,8 +156,6 @@ pub const MAX_HTTP_HOST_BYTES: usize = 512;
 pub const MAX_HTTP_METHOD_BYTES: usize = 64;
 
 impl HttpConstraints {
-    /// This is the one definition of the grant's entry grammar; validating here catches a bad grant
-    /// before it silently denies every call at runtime.
     pub fn validate(&self) -> Result<(), HttpConstraintsError> {
         if self.allowed_hosts.is_empty() {
             return Err(HttpConstraintsError::NoHosts);
@@ -583,7 +562,6 @@ impl<'de> Deserialize<'de> for StorageRetention {
 pub struct StorageConstraints {
     pub interface: StorageInterface,
     pub access: StorageAccess,
-    /// Owner configuration chooses scope; a provider argument cannot select storage identity.
     pub scope: StorageScope,
     #[serde(default)]
     pub retention: StorageRetention,
@@ -658,10 +636,8 @@ pub struct AssetConstraints {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionConstraints {
     pub timeout_ms: u64,
-    /// Its absence means no HTTP host calls are permitted at all, not unrestricted access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpConstraints>,
-    /// HTTP and storage grants are mutually exclusive; a capability cannot combine both in v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageConstraints>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -707,8 +683,6 @@ impl AuthorizationReceipt {
     }
 }
 
-/// Not Clone or Deserialize: the broker creates and consumes this once, and its serialized form
-/// must never be treated as a reusable bearer grant.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
@@ -775,7 +749,6 @@ pub struct Evidence {
     pub kind: String,
     pub digest: String,
     pub media_type: String,
-    /// This is only a durable reference; secrets must never be embedded in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
 }
@@ -822,8 +795,6 @@ pub enum AuthorizationError {
     InvalidSecretUse(#[from] SecretUseGrantError),
 }
 
-/// Public so a separate broker adapter can own the transition, but construction authenticates
-/// nothing; never drive this directly from model-provided data.
 pub mod broker {
     use dekopon_core::{PrincipalId, ProviderId};
 

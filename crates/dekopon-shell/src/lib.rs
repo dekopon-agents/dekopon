@@ -1,63 +1,3 @@
-//! A sandboxed, bash-flavored scripting language whose commands dispatch to Dekopon capabilities.
-//!
-//! Capability calls go through [`CapabilityInvoker`]. `jq` runs in a worker executable supplied by
-//! the embedder, with an address-space limit on Linux; the worker is killed on deadline or cancel.
-//!
-//! # What this is for
-//!
-//! Exposing one model-facing tool schema per provider capability bloats a system prompt and forces
-//! a model into many small round trips. A single scripting tool lets a model express a multi-step
-//! plan — loops, conditionals, functions, JSON handling — in one tool call. The "commands" in that
-//! script are builtins and the command words loaded providers contribute, each of which proposes a
-//! capability invocation; `jq` alone uses a worker process.
-//!
-//! # Safety model
-//!
-//! The shell is a native tree-walking evaluator, with bounds enforced in [`limits`]:
-//!
-//! - a step budget covering statements, loop iterations, function calls, arithmetic nodes, and
-//!   values pulled from a `jq` filter,
-//! - one run-time nesting depth that function calls, `$( )` substitutions, `${ }` expansions and
-//!   compound commands share, because each recurses on the native stack,
-//! - independent output byte and line ceilings with head-and-tail truncation,
-//! - a wall-clock deadline, re-read on every step and around every capability call,
-//! - a capability-invocation ceiling that is deliberately separate from the step budget,
-//! - a cumulative ceiling on the value bytes a script may materialize, which is what bounds memory
-//!   for a script that is cheap in steps and expensive in bytes. `jq` also has a worker address-space
-//!   limit on Linux.
-//!
-//! One bound is *not* in [`limits`], because it applies before any budget exists: the parser caps
-//! grammar nesting depth at a fixed ceiling. Parsing is recursive and runs on the native stack, so
-//! without it a few kilobytes of nested `$( $( ... ) )` aborts the host process instead of
-//! returning a [`ScriptOutcome`].
-//!
-//! The variable namespace is seeded only from the script's own assignments. This interpreter never
-//! reads the host process environment — including through `jq`, whose standard library exports an
-//! `env` filter that is deliberately not linked.
-//!
-//! A `jq` filter that does not yield is killed with its worker at the deadline or on cancel.
-//!
-//! # Observability
-//!
-//! Each script run opens one `shell.script` span carrying the totals for the whole run, and every
-//! command word inside it opens a `shell.command` span — no events — carrying the command word
-//! whoever wrote it, its resolution kind, its argv, the value piped into it, what it produced, its
-//! exit code, and a stable outcome label. The argv, stdin, and output are each bounded by
-//! `dekopon_core::bounded_attribute` beside a byte total. A trace therefore reads as the ordered
-//! list of commands a script actually executed rather than as one opaque "a script ran" entry.
-//!
-//! A model-authored `while` loop can execute tens of thousands of command words inside one tool
-//! call, and every one of them gets its span; the `shell.script` span's counters give the totals in
-//! constant size beside them.
-//!
-//! This crate depends on `tracing` and nothing else for that. It knows no exporter, no collector,
-//! and no telemetry protocol; the embedding binary's own subscriber decides where these go. The
-//! dependency does not compromise the synchronous design constraint below — `tracing` imposes no
-//! async runtime and is routinely used from fully synchronous code — but it does mean spans may
-//! leave the process, so `interp::telemetry` documents exactly which fields a command carries.
-//!
-//! # Example
-//!
 //! ```
 //! use std::io::Write;
 //!
@@ -161,7 +101,6 @@ pub struct CapabilityDescription {
     pub description: String,
 }
 
-/// The stream ends one provider invocation runs on: stdin only when something is piped in.
 #[derive(Debug)]
 pub struct Streams {
     pub stdin: Option<std::os::fd::OwnedFd>,
@@ -169,8 +108,6 @@ pub struct Streams {
 }
 
 impl Streams {
-    /// Writes `value` to stdout as the shell displays it, one line, for an invoker that answers
-    /// in-process; a closed reader exits 141 as a provider would.
     #[must_use]
     pub fn reply(self, value: &Value) -> CapabilityCallResult {
         use std::io::Write;
@@ -192,7 +129,6 @@ impl Streams {
 pub enum CapabilityCallResult {
     Succeeded,
     SucceededWithStderr(String),
-    /// The provider ran and exited nonzero, its own failure rather than the host's.
     Exited {
         status: std::num::NonZeroU8,
         stderr: String,
@@ -202,8 +138,6 @@ pub enum CapabilityCallResult {
     },
     Failed {
         error: String,
-        /// The provider's own code and message are rendered after the classification, not instead
-        /// of it, since a class alone can't tell a model whether to retry, wait, or stop.
         detail: Option<ProviderFailureDetail>,
     },
     NotFound,
@@ -219,10 +153,7 @@ pub enum CommandRun {
     Failed {
         message: String,
     },
-    /// A run that failed before the provider could answer is reported like an errored capability,
-    /// not a usage error, since telling the model to fix its argv would be wrong.
     Errored {
-        /// This names the cause of failure and must never be a filesystem path.
         message: String,
     },
     Denied {
@@ -478,8 +409,6 @@ impl ScriptOutcome {
 pub struct ChildStdin(pipe::PipeReader<StageObservation>);
 
 impl ChildStdin {
-    /// Adopt the socket before anything writes to its peer: macOS refuses the read timeout on a
-    /// socket whose peer has already closed.
     pub fn adopt(socket: std::os::unix::net::UnixStream) -> std::io::Result<Self> {
         pipe::PipeReader::from_socket(socket, None, crate::interp::telemetry::stage_read).map(Self)
     }

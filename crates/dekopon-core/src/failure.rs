@@ -8,8 +8,6 @@ pub const MAX_FAILURE_CODE_BYTES: usize = 128;
 
 pub const MAX_FAILURE_MESSAGE_BYTES: usize = 1024;
 
-/// Provider-authored and untrusted; bounded on both construction and decode so no peer can inflate
-/// it, and it carries no authority over the broker's classification.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderFailureDetail {
@@ -49,8 +47,6 @@ where
     bound_on_decode(deserializer, MAX_FAILURE_MESSAGE_BYTES)
 }
 
-/// Cuts rather than refuses: rejecting a message one byte over the bound would cost the caller the
-/// only record that the invocation failed at all.
 fn bound_on_decode<'de, D>(deserializer: D, maximum: usize) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,

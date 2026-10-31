@@ -4384,8 +4384,6 @@ fn upper_proposal(text: &str) -> ResponseEnvelope {
     )
 }
 
-/// A real Unix socket, not an in-memory duplex, is used because the client authenticates the server
-/// by socket ownership and peer UID before a byte is written.
 #[allow(
     clippy::let_underscore_must_use,
     reason = "the stub's observation channel is unbounded and its reply goes to a socket the test \
@@ -4529,7 +4527,6 @@ pub(crate) fn text_of(text: &dekopon_model::text::Text) -> String {
     }
 }
 
-/// A request message as role and text, with journal slices read from their file.
 pub(crate) fn message_text(message: &ModelMessage) -> (String, String) {
     use dekopon_model::replay::ReplayMessage;
     match message {
@@ -4595,7 +4592,6 @@ pub(crate) fn append_captured(
         .id
 }
 
-/// Splits a v3 journal file into its tagged lines, parsing each as JSON.
 pub(crate) fn journal_lines(path: &Path) -> Vec<Value> {
     fs::read_to_string(path)
         .expect("journal file")
@@ -10676,8 +10672,6 @@ fn direct_message(user: &str, ts: &str, text: &str) -> Value {
     })
 }
 
-/// Slack sends thread_ts only on replies inside a thread; the message that starts one arrives
-/// without it.
 fn channel_message(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Value {
     let mut event = json!({
         "type": "message",
@@ -16257,8 +16251,6 @@ impl ChatDriver for ParkedReplyDriver {
     }
 }
 
-/// Real time, not a paused clock, is used because the test doubles park blocking threads joined in
-/// a way that panics under a paused clock on this runtime.
 const WALL_CLOCK: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug)]
@@ -16299,8 +16291,6 @@ impl CancelOrigin {
         }
     }
 
-    /// A shutdown's abort only schedules cancellation; the guard marking a session cancelled runs
-    /// later, when the runtime actually drops the task.
     async fn landed(self, session: &tokio::task::JoinHandle<()>) {
         if !matches!(self, Self::Operator) {
             return;

@@ -91,7 +91,6 @@ impl GeneratedImage {
             }
         }
     }
-    /// This does blocking I/O and must be called off the async worker thread, the same as bytes().
     pub fn decoded_len(&self) -> Result<usize, BlobError> {
         match self.encoding {
             AssetEncoding::Identity => Ok(self.data.len()),
@@ -150,8 +149,6 @@ impl Read for BlobReader<'_> {
 }
 
 pub trait GeneratedAssetStore: Send + Sync {
-    /// A failure here happens after the provider effect already occurred, so callers must not retry
-    /// automatically.
     fn register(
         &self,
         descriptor: OwnedFd,

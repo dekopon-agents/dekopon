@@ -1,4 +1,3 @@
-//! Regression coverage for the 0.31 descriptor/proposal seam, without external artifacts.
 use std::{
     io::{Read as _, Write as _},
     sync::{

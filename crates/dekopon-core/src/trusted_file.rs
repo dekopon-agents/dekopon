@@ -210,9 +210,6 @@ pub fn check_trusted_ancestors(
     Ok(())
 }
 
-/// This blocks and must be wrapped in spawn_blocking from async code; the length is checked twice
-/// because the file can grow between the metadata check and the read. `O_NONBLOCK` lets a FIFO
-/// open at once so the descriptor check refuses it.
 pub fn read_trusted_file(
     path: &Path,
     expected_uid: u32,
@@ -410,8 +407,6 @@ mod tests {
         assert_eq!(error.path(), link);
     }
 
-    /// TMPDIR resolves through /var to /private/var on macOS, so fixtures must start from the
-    /// already-resolved path since a symlinked ancestor is refused by design.
     fn resolved_root() -> (TempDir, PathBuf) {
         let root = tempfile::tempdir().expect("temporary directory");
         let resolved = root

@@ -34,7 +34,6 @@ pub enum ProjectionError {
 }
 
 impl Projection {
-    /// Only a claim: [`Projection::resolve`] decides whether it holds.
     #[must_use]
     pub fn is_claimed(entry: &Path) -> bool {
         entry.parent().is_some_and(|root| {
@@ -139,8 +138,6 @@ impl Projection {
         self.owner
     }
 
-    /// Call after the last read from [`Projection::target`]: an unchanged `..data` link means
-    /// every read came from one generation.
     pub fn confirm(&self) -> Result<(), ProjectionError> {
         let data = self.root.join(DATA_LINK);
         let current = fs::read_link(&data).map_err(|source| ProjectionError::Io {

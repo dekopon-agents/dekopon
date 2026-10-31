@@ -244,7 +244,6 @@ impl Anchor {
     pub(crate) fn same_thread(&self, other: &Self) -> bool {
         self.same_channel(other) && self.conversation.thread == other.conversation.thread
     }
-    /// A local reply target is a connection number that a restart hands to another client.
     pub(crate) fn from_inbound(message: &InboundMessage, agent: &AgentId) -> Option<Self> {
         if matches!(message.reply, ReplyTarget::Local { .. }) {
             return None;
@@ -252,8 +251,6 @@ impl Anchor {
         Self::for_job(message, agent)
     }
 
-    /// A job ends inside the process that started it, so a local connection number is still the
-    /// client it names.
     pub(crate) fn for_job(message: &InboundMessage, agent: &AgentId) -> Option<Self> {
         Some(Self {
             transport: message.transport.parse().ok()?,
@@ -704,7 +701,6 @@ impl WakeRegistrar for SessionWakes {
     }
 }
 
-/// Runs on a blocking thread: the probe leg and the interpreter both block.
 pub(crate) fn run_tick(
     tick: Tick,
     store: &WakeStore,

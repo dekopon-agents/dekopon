@@ -99,24 +99,18 @@ struct SearchInput {
     /// One Rust-regex pattern or one fixed literal, enforced at 1–4,096 decoded UTF-8 bytes. PCRE2 look-around and backreferences are unsupported.
     #[schemars(length(min = 1, max = 4096))]
     pattern: String,
-    /// Regex syntax, or one literal fixed string.
     #[serde(default)]
     mode: SearchMode,
     #[serde(default)]
     case: CaseMode,
-    /// Require ripgrep word-boundary matching; cannot be combined with line.
     #[serde(default)]
     word: bool,
-    /// Require a whole LF-delimited line; cannot be combined with word or multiline.
     #[serde(default)]
     line: bool,
-    /// Permit explicit matches across LF. Dot still excludes LF unless the Rust pattern enables s; cannot be combined with line or invert.
     #[serde(default)]
     multiline: bool,
-    /// Select non-matching lines; incompatible with multiline.
     #[serde(default)]
     invert: bool,
-    /// Both counts are required when context is supplied; defaults to zero lines on both sides.
     #[serde(default)]
     context: Context,
     /// Maximum returned selected records, not occurrences or context records.

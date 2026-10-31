@@ -1,4 +1,3 @@
-//! Bounded line transport over the same shell dispatcher as the interactive console.
 use std::{
     fs::File,
     io::{self, Read as _},
@@ -97,7 +96,6 @@ async fn read_line<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> io::Resul
     }
 }
 
-/// Drains the turn's events to channel close, then joins it without giving up the handle.
 async fn complete(
     app: &mut App,
     turn: &mut RunningTurn,
@@ -110,7 +108,6 @@ async fn complete(
     (&mut turn.handle).await
 }
 
-/// Stops a timed-out turn through the broker cancel, aborting it only once the grace runs out.
 async fn cancel_turn(running: &mut Option<RunningTurn>, stop: &StopFlag, grace: Duration) {
     let Some(turn) = running.as_mut() else {
         return;
@@ -126,10 +123,6 @@ async fn cancel_turn(running: &mut Option<RunningTurn>, stop: &StopFlag, grace: 
     stop.reset();
 }
 
-/// Run the selected agent and accept at most 64 sequential commands. No input is echoed.
-/// READY is emitted only after a successful hop; END follows event drain and task join.
-/// # Errors
-/// Returns bounded input, output or session failures.
 pub async fn run(
     app: App,
     client: BrokerClient,

@@ -34,13 +34,9 @@ use thiserror::Error;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
-/// Category targets run at the standard level.
 #[cfg(unix)]
 const OTEL_LOG_FILTER: &str = "job=debug,meter=info";
 
-/// This bounds exit separately from the shutdown grace, since cancelling a session doesn't stop
-/// non-preemptible blocking work already in flight; anything still running past this timeout is
-/// left to die with the process.
 #[cfg(unix)]
 const BLOCKING_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 

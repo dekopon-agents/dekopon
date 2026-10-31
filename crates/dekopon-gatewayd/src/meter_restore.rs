@@ -11,8 +11,6 @@ const MIN_BUCKET: Duration = Duration::from_secs(60);
 const MAX_BUCKETS: u32 = 500;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const TERMS_SIZE: u32 = 1_000;
-/// A clock earlier than this has not been synced yet (the Pi has no RTC), so restore would query
-/// the wrong window.
 const CLOCK_FLOOR: UnixMillis = UnixMillis(1_790_000_000_000);
 
 #[derive(Debug, Error)]
@@ -97,8 +95,6 @@ pub(crate) fn spawn(
     }
 }
 
-/// Runs once per boot: waits out the ingest lag, queries the history before boot, and swaps the
-/// restored meters in, or keeps the live ones and warns.
 pub(crate) async fn restore_once(
     metering: Arc<Metering>,
     config: RestoreConfig,
@@ -421,7 +417,6 @@ pub(crate) fn parse_quickwit(body: &[u8]) -> Result<Vec<HistoryRow>, RestoreErro
     Ok(rows)
 }
 
-/// Both stores sum into f64, which is exact below 2^53.
 fn tokens(sum: Option<f64>) -> u64 {
     match sum {
         Some(value) if value.is_finite() && value > 0.0 => value as u64,
@@ -429,7 +424,6 @@ fn tokens(sum: Option<f64>) -> u64 {
     }
 }
 
-/// `YYYY-MM-DDTHH:MM:SS[.fraction][Z]`, read as UTC.
 fn utc_millis(text: &str) -> Option<i64> {
     let text = text.trim_end_matches('Z');
     let (date, time) = text.split_once(['T', ' '])?;
@@ -463,7 +457,6 @@ fn utc_millis(text: &str) -> Option<i64> {
     Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1_000 + millis)
 }
 
-/// Howard Hinnant's `days_from_civil`: <https://howardhinnant.github.io/date_algorithms.html>.
 const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);

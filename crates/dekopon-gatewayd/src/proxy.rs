@@ -32,8 +32,6 @@ pub struct ProxyConfig {
     pub guests: BTreeMap<String, GuestConfig>,
 }
 
-/// Each connection briefly holds two copies of a body of up to 8 MiB, so 16 keeps request bodies
-/// under 256 MiB together.
 const DEFAULT_MAX_CONNECTIONS: usize = 16;
 
 const fn default_max_connections() -> usize {
@@ -275,7 +273,6 @@ fn build_with(
     )?))
 }
 
-/// Binds the listener and spawns it into `tasks`, whose owner aborts it at shutdown.
 pub(crate) async fn listen(
     proxy: &ResolvedProxy,
     router: axum::Router,

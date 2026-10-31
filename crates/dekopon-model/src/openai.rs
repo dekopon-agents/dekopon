@@ -337,8 +337,6 @@ struct ChatRequest<'a> {
     tool_choice: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
-    /// Never set stream to Some(false); only Some(true) or None keep wire compatibility for
-    /// endpoints unaware of this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -385,9 +383,6 @@ struct StreamOptions {
     include_usage: bool,
 }
 
-/// Kept separate from ModelMessage, whose Serialize is the redacted audit rendering, because when
-/// they were one type a base64 attachment was one careless to_string away from being logged
-/// forever.
 #[derive(Debug, Serialize)]
 pub(crate) struct WireMessage<'a> {
     #[serde(skip)]
@@ -712,8 +707,6 @@ pub(crate) fn replay_transcript(
     state.into_turn(secrets)
 }
 
-/// Every field is optional and every absence tolerated, since being OpenAI-compatible is a claim,
-/// not a spec: llama.cpp, Ollama, vLLM, and other proxies each omit or null a different one.
 #[derive(Debug, Deserialize)]
 struct ChatChunk {
     #[serde(default)]
@@ -945,8 +938,6 @@ impl ChatStream {
     }
 }
 
-/// Must derive the host exactly as the transport does: Uri::host ignores userinfo, so an authority
-/// like 127.0.0.1:80@evil.test actually connects to evil.test despite looking like loopback.
 fn allows_bearer_token(endpoint: &str) -> bool {
     let Ok(uri) = endpoint.parse::<http::Uri>() else {
         return false;

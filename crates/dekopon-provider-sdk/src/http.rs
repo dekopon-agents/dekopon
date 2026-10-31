@@ -56,7 +56,6 @@ impl Header {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Request {
     pub method: String,
-    /// Absolute request URI. The broker performs authoritative URI and policy validation.
     pub uri: String,
     pub headers: Vec<Header>,
     pub body: Vec<u8>,
@@ -176,8 +175,6 @@ pub enum HttpErrorCode {
 }
 
 impl HttpErrorCode {
-    /// Returns the WIT contract's stable error-code name rather than the Rust variant name, since a
-    /// provider's stringified error must match the wire contract, not this crate's naming.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -241,8 +238,6 @@ impl fmt::Display for BuildError {
 
 impl Error for BuildError {}
 
-/// Calling this confers no authority; the host validates the request against the current authorized
-/// invocation and may refuse it with Denied.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn send(request: Request) -> Result<Response, HttpError> {
     let request = bindings::dekopon::http1_1_0::client::Request {
@@ -278,8 +273,6 @@ pub(crate) fn send(request: Request) -> Result<Response, HttpError> {
         })
 }
 
-/// Grants no authority; the broker enforces HTTP and asset bounds and must have its asset directory
-/// configured before it will spool a response.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn stream(request: StreamedRequest<'_>) -> Result<StreamedResponse, HttpError> {
     use bindings::dekopon::http1_1_0::client as wit;

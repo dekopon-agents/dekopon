@@ -1,6 +1,3 @@
-//! The envelope is acknowledged before processing begins because Slack resends after about three
-//! seconds while a session runs much longer; a bounded ring absorbs the redeliveries.
-
 use parking_lot::Mutex;
 use std::{
     collections::{HashSet, VecDeque},
@@ -41,16 +38,11 @@ use crate::{
 
 const DEDUP_CAPACITY: usize = 1024;
 const OWNED_THREAD_CAPACITY: usize = 1024;
-/// file_share, thread_broadcast, and me_message count as new requests because each carries ordinary
-/// user-typed text or an attachment, unlike edits, deletions, or joins.
 const REQUEST_SUBTYPES: [&str; 3] = ["file_share", "me_message", "thread_broadcast"];
 const MAX_ATTACHMENTS: usize = 10;
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 const SLACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// A liveness call must never inherit the final reply/file client's general 30-second wait.
 const LIVENESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-/// Slack pings roughly every 30 seconds, so 90 seconds of silence means a connection died without
-/// TCP reporting it; the same deadline also bounds opening a socket.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(90);
 const LIVENESS_REACTION: &str = "tangerine";
 const PROGRESS_MAX_CHARS: usize = 4_000;
@@ -614,8 +606,6 @@ impl SlackTransport {
         }))
     }
 
-    /// app_mention carries no channel_type, so assuming channel there would mint a direct or group
-    /// message as a channel that no route or grant would then match.
     async fn channel_kind(
         &mut self,
         channel: &str,
@@ -2007,8 +1997,6 @@ fn pending_assets(files: &Value) -> Vec<PendingAsset> {
         .collect()
 }
 
-/// Redirects are normally refused so a bearer token cannot be forwarded elsewhere; since Slack's
-/// downloads do redirect, this transport follows exactly one hop to a known host itself.
 const SLACK_FILE_HOSTS: [&str; 2] = ["files.slack.com", "slack.com"];
 
 impl AssetFetcher for SlackReplier {
@@ -2076,8 +2064,6 @@ impl SlackReplier {
     }
 }
 
-/// The URL is parsed, not prefix-matched, so files.slack.com.evil.test cannot be mistaken for
-/// Slack, and the default port is required so no other listener can impersonate one.
 pub(crate) fn is_slack_file_url(url: &str, endpoint: &str) -> bool {
     let (Ok(url), Ok(endpoint)) = (reqwest::Url::parse(url), reqwest::Url::parse(endpoint)) else {
         return false;

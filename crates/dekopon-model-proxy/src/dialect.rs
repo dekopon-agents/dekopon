@@ -75,14 +75,10 @@ impl Dialect {
         json_response(problem.status(), &body)
     }
 
-    /// A rule of the guest's sandbox, worded so a client prints it as a rule, not an outage.
     pub(crate) fn sandbox(self, problem: Problem, rule: &str) -> Response {
         self.error(problem, &format!("{SANDBOX} {rule}"))
     }
 
-    /// A wait becomes the dialect's throttling error with `retry-after`; a request that can never
-    /// fit is a plain invalid request, never worded as "prompt is too long", which Claude Code
-    /// reads as a compaction trigger.
     pub(crate) fn refusal(self, refusal: &Refusal) -> Response {
         let message = refusal.for_guest().to_string();
         match refusal.retry_after() {

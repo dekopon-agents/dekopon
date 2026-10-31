@@ -345,8 +345,6 @@ fn escape_while_browsing_stops_a_running_turn() {
     assert!(app.transcript.turns()[0].stop_requested);
 }
 
-/// A controlled broker-command seam: first invocation remains in flight until released by the
-/// harness. A cancelled next proposal is refused before it reaches the simulated broker.
 struct BlockingCommands {
     started: mpsc::Sender<()>,
     release: Mutex<mpsc::Receiver<()>>,
@@ -767,7 +765,6 @@ fn busy_shell_refuses_second_submission_and_escape_requests_stop_while_typing() 
     assert_eq!(app.mode, Mode::Composing);
 }
 
-/// A socket that answers each connection with the next canned frame, as brokerd would.
 fn fake_broker(responses: Vec<Value>) -> (tempfile::TempDir, BrokerClient) {
     use std::os::unix::fs::PermissionsExt as _;
     let directory = tempfile::tempdir().unwrap();
@@ -834,7 +831,6 @@ async fn hop(app: &mut App, client: &BrokerClient) {
     .await;
 }
 
-/// Every row of one drawn frame, so a test reads what the operator would.
 fn drawn(app: &App) -> String {
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
     terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();

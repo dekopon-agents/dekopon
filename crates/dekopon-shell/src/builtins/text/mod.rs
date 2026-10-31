@@ -1,7 +1,3 @@
-//! Without -E, a pattern matches literally and unescaped regex syntax is rejected by name instead
-//! of being silently treated as literal text, so a script can never mistake literal matching for a
-//! regex that ran.
-
 use regex_bites::{Regex, RegexBuilder};
 
 use crate::builtins::CommandFailure;
@@ -52,8 +48,6 @@ pub(crate) fn literal_pattern(command: &str, pattern: &str) -> Result<String, Co
     Ok(literal)
 }
 
-/// An odd number of trailing backslashes escapes the dollar sign as a literal character; an even
-/// number leaves it as the end anchor it appears to be.
 pub(crate) fn ends_with_anchor(pattern: &str) -> bool {
     if !pattern.ends_with('$') {
         return false;
@@ -68,16 +62,10 @@ pub(crate) fn ends_with_anchor(pattern: &str) -> bool {
 
 const EXTENDED_PATTERN_MAX_BYTES: usize = 1024;
 
-/// The compiled pattern size limit is set far below the regex engine's own ten-megabyte default
-/// because these patterns are untrusted, model-authored input running inside a resource-bounded
-/// sandbox.
 const EXTENDED_PATTERN_SIZE_LIMIT: usize = 64 * 1024;
 
 const EXTENDED_PATTERN_NEST_LIMIT: u32 = 16;
 
-/// Case-insensitive matching under the extended flag folds ASCII characters only, since the
-/// underlying regex engine has no Unicode case folding, making it narrower than the literal path's
-/// case-insensitive matching, never wider.
 pub(crate) fn extended_pattern(
     command: &str,
     pattern: &str,

@@ -1,5 +1,3 @@
-//! The tab bar, the status line, and the keybinding overlay.
-
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -11,7 +9,6 @@ use ratatui::{
 use super::Theme;
 use crate::app::{App, Pane};
 
-/// Shows the represented identity separately from the authenticated console peer.
 pub fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let agent = app
         .session
@@ -57,7 +54,6 @@ pub fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-/// Draws the pane tabs.
 pub fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut spans = Vec::with_capacity(Pane::ORDER.len() * 2);
     for pane in Pane::ORDER {
@@ -78,8 +74,6 @@ pub fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Draws the status lines: the notice across the full width, then the facts that must never be a
-/// guess. A notice that still does not fit is an error summary; `e` opens its full report.
 pub fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let [left, right] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -113,12 +107,10 @@ pub fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-/// The credential file's own name, which is the part that says whose credential this is.
 fn credential_label(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Draws the keybinding overlay.
 pub fn draw_help(frame: &mut Frame<'_>) {
     let area = centered(frame.area(), 72, 20);
     frame.render_widget(Clear, area);
@@ -174,7 +166,6 @@ pub fn draw_help(frame: &mut Frame<'_>) {
     );
 }
 
-/// The full report as sanitised lines, wrapped and never cut short.
 fn error_paragraph(app: &App) -> Paragraph<'static> {
     let text = app
         .last_error
@@ -189,7 +180,6 @@ fn error_paragraph(app: &App) -> Paragraph<'static> {
     .wrap(Wrap { trim: false })
 }
 
-/// How far the error pane can scroll at the current terminal size.
 #[must_use]
 pub fn error_max_scroll(app: &App) -> u16 {
     let (width, height) = app.shell_viewport;
@@ -199,7 +189,6 @@ pub fn error_max_scroll(app: &App) -> u16 {
     u16::try_from(rows.saturating_sub(visible)).unwrap_or(u16::MAX)
 }
 
-/// The last error, full-screen. No side borders, so a terminal selection copies clean text.
 pub fn draw_error(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     frame.render_widget(Clear, area);
@@ -222,7 +211,6 @@ pub fn draw_error(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
-/// Centres a fixed-size box, clamped to what the terminal actually has.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);

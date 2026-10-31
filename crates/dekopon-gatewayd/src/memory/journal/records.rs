@@ -925,8 +925,6 @@ impl Window {
     }
 }
 
-/// The record's original as one text: each text item on its own line, and each exchange as a
-/// tool line followed by its request and result. Opaque reasoning is never read.
 pub(crate) fn record_text(
     file: &File,
     head: &Head,
@@ -1015,7 +1013,6 @@ pub(crate) fn record_text(
     })
 }
 
-/// Streams a stored JSON string's escaped bytes as their decoded UTF-8, through one buffer.
 pub(crate) fn decode_escaped(
     file: &File,
     offset: u64,

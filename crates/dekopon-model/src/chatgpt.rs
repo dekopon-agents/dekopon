@@ -87,7 +87,6 @@ impl RefreshClient {
     }
 }
 
-/// Do not duplicate refresh-and-persist; its primitives live in `dekopon_core::private_file` and a second sequence risks replaying a rotated token.
 pub struct CredentialFile {
     admission: Arc<Semaphore>,
     tasks: Mutex<JoinSet<()>>,
@@ -141,9 +140,6 @@ impl CredentialFile {
         })
     }
 
-    /// Still returns Ok with the in-memory token as RotatedUnsaved when persisting fails after a
-    /// refresh, since the provider already invalidated the old token and erroring would strand the
-    /// only working credential.
     pub async fn current(
         self: &Arc<Self>,
         client: &RefreshClient,
@@ -184,14 +180,10 @@ impl CredentialFile {
         }
     }
 
-    /// The credential lock must not be held across a request; holding it while streaming would
-    /// serialize every caller on one client.
     fn snapshot(&self) -> ChatGptCredentials {
         self.credentials.lock().clone()
     }
 
-    /// install() must only be called while holding the refresh lock, since publication must finish
-    /// before another caller can rotate or adopt.
     fn install(&self, credentials: &ChatGptCredentials) {
         let mut stored = self.credentials.lock();
         *stored = credentials.clone();
@@ -273,7 +265,6 @@ impl CredentialFile {
         }
     }
 
-    /// The file lock spans HTTP and persistence because replaying a spent refresh token can revoke its family.
     async fn refresh_locked(
         self: &Arc<Self>,
         lock: PrivateFileLock,
@@ -435,8 +426,6 @@ pub fn status(auth_path: Option<&Path>) -> Result<ChatGptAuthStatus, ChatGptErro
     })
 }
 
-/// `logout()` must also sweep abandoned `.tmp-<pid>` siblings, since they hold the same plaintext
-/// tokens the main credential file does.
 pub fn logout(auth_path: Option<&Path>) -> Result<PathBuf, ChatGptError> {
     let path = resolve_auth_path(auth_path)?;
     sweep_stale_temporaries(&path, None);
@@ -468,8 +457,6 @@ impl ChatGptCredentialExport {
     }
 }
 
-/// Nothing in export_credentials() itself enforces it; every caller must gate the call behind an
-/// explicit operator instruction and a warning.
 pub fn export_credentials(
     auth_path: Option<&Path>,
 ) -> Result<ChatGptCredentialExport, ChatGptError> {
@@ -911,8 +898,6 @@ impl AuthPathEnvironment {
         }
     }
 
-    /// Requires an absolute path, since save_credentials would happily write to a relative one,
-    /// silently landing the refresh token in whatever directory the process started in.
     fn resolve(&self, file_name: &str) -> Result<PathBuf, ChatGptError> {
         let resolved = if let Some(path) = &self.environment {
             path.clone()
@@ -937,8 +922,6 @@ impl AuthPathEnvironment {
     }
 }
 
-/// An empty exported value counts as unset, since otherwise an empty XDG_CONFIG_HOME would resolve
-/// to a relative path instead of falling through to HOME.
 fn exported_path(value: Option<OsString>) -> Option<PathBuf> {
     value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
@@ -954,8 +937,6 @@ fn needs_refresh(credentials: &ChatGptCredentials) -> Result<bool, ChatGptError>
     Ok(unix_time()? >= refresh_at)
 }
 
-/// adopt_stored_credentials() must only be called while the refresh lock is held, or adoption could
-/// race a concurrent rotation.
 fn adopt_stored_credentials(path: &Path, credentials: &mut ChatGptCredentials) -> bool {
     let Ok(stored) = load_credentials(path) else {
         return false;
@@ -1149,9 +1130,6 @@ pub enum ChatGptError {
     Protocol(String),
     #[error("ChatGPT login failed: {0}")]
     Login(String),
-    /// invalid_grant, refresh_token_reused, refresh_token_invalidated, and refresh_token_expired
-    /// mean the token family is dead and need a new device login; any other code, or a codeless
-    /// 5xx, is the endpoint's problem.
     #[error("ChatGPT token endpoint returned HTTP {status}: {detail}")]
     TokenRefused {
         status: u16,

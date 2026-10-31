@@ -5,8 +5,6 @@ use clap::{
     error::{ContextKind, ContextValue, ErrorKind},
 };
 
-/// Every Clap error a daemon prints passes here: a value that may have come from the environment
-/// is never echoed, because value parsers repeat their input.
 #[must_use]
 pub fn render_cli_error(error: clap::Error, mut command: Command) -> ExitCode {
     command.build();

@@ -22,8 +22,6 @@ use crate::{
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-/// The OpenAI Responses API refuses a cap below 16, so a smaller one would fail every
-/// OpenAI-backed route for the cap alone.
 const PROBE_OUTPUT_TOKENS: NonZeroU32 = NonZeroU32::MIN.saturating_add(15);
 
 #[derive(Clone, Debug)]

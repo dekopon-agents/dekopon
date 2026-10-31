@@ -5,8 +5,6 @@ use thiserror::Error;
 
 const TRACE_ID_HEX_DIGITS: usize = 32;
 
-/// A trace ID carries no authority: two runs sharing one are correlated, not authorized to each
-/// other, and it is chosen by whoever opened the trace.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TraceId([u8; 16]);
 

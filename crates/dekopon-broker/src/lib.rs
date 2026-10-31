@@ -1,19 +1,3 @@
-//! Deny-by-default authorization, execution, evidence, and audit core for Dekopon.
-//!
-//! This crate is broker-owned machinery. A transport supplies an [`AuthenticatedContext`] derived
-//! from trusted peer identity, never payload claims. [`Broker`] asks a `dekopon-policy`
-//! [`PolicyEngine`] whether that context may act, binds an allow to the owner-authored
-//! [`ConstraintSet`] for the requested capability, creates a single-use authorization, executes it
-//! through `dekopon-broker-host`, and records metadata-only audit events.
-//!
-//! Authorization and execution constraints are deliberately separate concerns. Cedar decides *who
-//! may do what*; the constraint catalog decides *how narrowly the broker will then do it*, and it
-//! is validated against loaded provider manifests, the component host's own ceilings, and the
-//! credential store at startup. A policy edit therefore cannot widen a timeout, an output ceiling,
-//! an HTTP destination, or a credential binding.
-//!
-//! Trusted context is intentionally not deserializable from a request payload:
-//!
 //! ```compile_fail
 //! use dekopon_broker::AuthenticatedContext;
 //! use serde::de::DeserializeOwned;
@@ -290,8 +274,6 @@ impl AuthenticatedContext {
         Self::build(principal, actor, None, None, None)
     }
 
-    /// `via` is the deny-by-default hinge for attested authority: a policy rule for direct peers
-    /// (`via` absent) can never match an attested context, and vice versa.
     pub fn attested(
         principal: PrincipalId,
         actor: Actor,
@@ -385,8 +367,6 @@ pub struct AssetInvocationResult {
     pub assets: dekopon_broker_host::asset::AssetOutputs,
 }
 
-/// This route is the operator's explicit declaration, not a naming convention: only constraint-set
-/// membership marks the reserved chat-memory surface, no capability or provider name does.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -446,9 +426,6 @@ impl fmt::Display for CapabilityRoute {
     }
 }
 
-/// A constraint set is not a grant: Cedar policy decides reachability, this only bounds how
-/// narrowly an already-permitted capability executes, so editing policy alone can't widen execution
-/// bounds.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ConstraintSet {
@@ -463,9 +440,6 @@ pub struct ConstraintSet {
     pub provider: ProviderId,
     pub effect: EffectKind,
     pub risk: RiskLevel,
-    /// Credentials bind per capability rather than per provider to block a confused-deputy attack
-    /// where the same provider component performs a different operation than the one that
-    /// authorized it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
     pub constraints: ExecutionConstraints,
@@ -502,14 +476,8 @@ pub enum Leniency {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartupWarning {
-    UnroutedConstraintSet {
-        capability: CapabilityId,
-    },
-    /// Invocation is denied unconstrained-capability before Cedar is even consulted, so an
-    /// unbounded policy grant is unreachable rather than merely unbounded.
-    UnconstrainedCapability {
-        capability: CapabilityId,
-    },
+    UnroutedConstraintSet { capability: CapabilityId },
+    UnconstrainedCapability { capability: CapabilityId },
 }
 
 impl StartupWarning {
@@ -573,9 +541,6 @@ impl ConstraintCatalog {
         })
     }
 
-    /// Keyed by the agent the broker derived from the attestation, never a caller claim: an agent
-    /// rebinds a credential name its capabilities already use, so one capability can reach a
-    /// different organization's token per agent.
     #[must_use]
     pub fn with_agent_credentials(
         mut self,
@@ -819,9 +784,6 @@ impl ConstraintCatalog {
     }
 }
 
-/// Resolved after authorization and before the execution context is built, so a refresh never
-/// appears in evidence; concurrent resolutions of the same credential must be serialized or the
-/// refresh token family is revoked.
 #[async_trait]
 pub trait RefreshingCredential: Send + Sync + fmt::Debug {
     fn destinations(&self) -> &[String];
@@ -834,10 +796,7 @@ pub enum CredentialRefreshError {
     #[error("the credential's authorization is gone and must be renewed by an operator")]
     ReauthorizationRequired,
     #[error("the credential could not be refreshed ({category})")]
-    Unavailable {
-        /// Low-cardinality failure class, never a message derived from credential material.
-        category: &'static str,
-    },
+    Unavailable { category: &'static str },
 }
 
 impl CredentialRefreshError {
@@ -881,8 +840,6 @@ impl From<Arc<dyn RefreshingCredential>> for StoredCredential {
 }
 
 impl StoredCredential {
-    /// The Refreshing arm must reuse the same coverage comparison Fixed uses, or a covered host
-    /// could later be refused.
     fn covers(&self, allowed_host: &str) -> bool {
         match self {
             Self::Fixed(credential) => credential.covers(allowed_host),
@@ -1225,8 +1182,6 @@ impl AttestorGrant {
     }
 }
 
-/// This directory alone decides identity from an authenticated subject; unmapped subjects fail
-/// closed and principals are never minted on demand.
 #[derive(Debug, Default)]
 pub struct IdentityDirectory {
     mappings: BTreeMap<ExternalSubject, PrincipalId>,
@@ -1305,8 +1260,6 @@ fn space_subject(scope: &ChatScopeClaim) -> Option<ExternalSubject> {
         .ok()
 }
 
-/// Every value here comes from the broker's own authenticated-context view; caller-supplied
-/// proposal input is deliberately excluded so no policy can be made to depend on it.
 fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
     PolicyContext {
         via: context.via().map(|via| via.as_str().to_owned()),
@@ -1371,7 +1324,6 @@ fn turn_started_by(context: &AuthenticatedContext) -> Option<TurnStartedBy> {
     })
 }
 
-/// A watch probe runs unattended every tick, so it may only read, whatever owner policy permits.
 fn probe_permits(context: &AuthenticatedContext, effect: EffectKind) -> bool {
     context
         .chat_scope()
@@ -1406,9 +1358,6 @@ fn validate_trusted_metadata(
     Ok(())
 }
 
-/// This is the load-bearing check requiring every allowedHosts entry verbatim in the credential's
-/// destinations; it also proves every per-agent override, since an unproven one would surface only
-/// as a runtime mismatch when a caller first matches it.
 fn validate_set_credential(
     capability_id: &CapabilityId,
     set: &ConstraintSet,
@@ -1487,9 +1436,9 @@ pub enum RouteConflict {
         route: CapabilityRoute,
         capabilities: Vec<CapabilityId>,
     },
-    /// The chat-memory surface belongs to one provider, all of it or none: a split would let one
-    /// provider hold the write half of a conversation another provider reads back.
-    SplitProvider { providers: Vec<ProviderId> },
+    SplitProvider {
+        providers: Vec<ProviderId>,
+    },
     MissingChatStorage {
         capability: CapabilityId,
         route: CapabilityRoute,
@@ -1820,8 +1769,6 @@ impl AuditLog for InMemoryAuditLog {
     }
 }
 
-/// Every decision is already logged in the live trace before any sink runs; this sink keeps nothing
-/// else, so losing the log exporter loses the audit trail entirely, by design.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TraceOnlyAuditLog;
 
@@ -2072,8 +2019,6 @@ where
             .is_some_and(|set| set.constraints.storage.is_some() || set.route.is_chat_memory())
     }
 
-    /// The serving decision before any secret use is bound; `dekopon-brokerd check --workflows`
-    /// relies on it being the decision `invoke` makes.
     pub fn authorize_invocation(
         &self,
         context: &AuthenticatedContext,
@@ -2339,8 +2284,6 @@ where
         )
     }
 
-    /// This is the session gate: permitting a principal to talk to an agent is its own explicit
-    /// policy statement, not a side effect of holding any capability.
     fn authorize_agent_prompt(
         &self,
         context: &AuthenticatedContext,
@@ -2361,8 +2304,6 @@ where
         )
     }
 
-    /// Every capability listing filters this same set of Cedar evaluations, so what is listed can
-    /// never diverge from what an invocation would actually be authorized to do.
     fn authorized_sets(
         &self,
         context: &AuthenticatedContext,
@@ -2388,9 +2329,6 @@ where
         self.reachable_command_words(context, &self.authorized_sets(context))
     }
 
-    /// Same reachability as `command_words`: a word's `--help` page is visible only where the
-    /// word itself is, since a page naming a provider this sender cannot reach would describe a
-    /// surface that was never offered.
     #[must_use]
     pub fn command_word_help(&self, context: &AuthenticatedContext) -> BTreeMap<String, String> {
         let words = self.command_words(context);
@@ -2449,8 +2387,6 @@ where
         words
     }
 
-    /// Ungated by design: running a word only produces a proposal or rendered text and authorizes
-    /// nothing; real authorization happens later, at the invocation that follows.
     #[expect(
         clippy::too_many_arguments,
         reason = "reshaped by the unit that next rewrites this"
@@ -2579,7 +2515,6 @@ where
         (capabilities, words, help)
     }
 
-    /// Display only: the gateway labels a shared-scope turn with it and decides nothing from it.
     #[must_use]
     pub fn display_principal(&self, subject: &ExternalSubject) -> Option<PrincipalId> {
         self.identities.resolve(subject).cloned()
@@ -4379,9 +4314,6 @@ fn risk_tag(value: RiskLevel) -> u8 {
     }
 }
 
-/// Every field here is a semantic authority input: changing any one re-keys retained storage under
-/// a fresh generation, and the set is deliberately complete across capability, provider bytes,
-/// effect, risk, credential, and constraints.
 fn encode_capability_authority(
     encoded: &mut AuthorityEncoder,
     capability: &CapabilityId,
@@ -4636,8 +4568,6 @@ const CONSOLE_REAL_SCOPE_REASON: &str = "console-real-scope-denied";
 pub const CONSOLE_REAL_SCOPE_REFUSAL: &str = "dekopon sandbox: console sessions cannot attest a real conversation; use --smoke-conversation or the authenticated gateway";
 const CONSOLE_SMOKE_DOMAIN: &[u8] = b"dekopon-console-smoke-v1\0";
 
-/// Slack ids render upper-cased because the attestation carries them lower-cased and the Web API
-/// takes them as Slack issued them.
 fn render_chat_slots(
     http: Option<&HttpConstraints>,
     scope: Option<&ChatScopeClaim>,
@@ -5612,9 +5542,6 @@ impl BrokerError {
         matches!(self, Self::Storage { source } if source.namespace_reset())
     }
 
-    /// This class is for an exhaustion no resubmission can ever outlast, since the bounded audit
-    /// log never evicts; OutcomeAudit is deliberately excluded here since its unaudited-outcome
-    /// classification must not be weakened to this one.
     #[must_use]
     pub const fn capacity_failure_code(&self) -> Option<&'static str> {
         match self {
@@ -5635,9 +5562,6 @@ impl BrokerError {
         }
     }
 
-    /// Some means provider execution may already have run with no terminal audit record, so the
-    /// request must never be resubmitted under any identifier since that could duplicate a
-    /// non-idempotent effect; None means resubmission is safe.
     #[must_use]
     pub const fn unaudited_outcome(&self) -> Option<&InvocationId> {
         match self {

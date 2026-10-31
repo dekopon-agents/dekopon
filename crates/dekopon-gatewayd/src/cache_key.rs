@@ -1,6 +1,3 @@
-//! A prompt cache key is a routing hint only, never an access-control boundary; every message still
-//! opens its own attested broker leg regardless of a shared key.
-
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read as _, Write as _},
@@ -50,7 +47,6 @@ impl Reset {
     }
 }
 
-/// Holds only the keyed MAC state, so the secret bytes have no field to print or serialize.
 #[derive(Clone)]
 pub(crate) struct CacheKeySecret(Hmac<Sha256>);
 
@@ -78,7 +74,6 @@ impl CacheKeySecret {
         Ok(Self::from_bytes(bytes))
     }
 
-    /// HMAC zero-pads a short key to the block size, so this is exactly HMAC under the 32 bytes.
     pub(crate) fn from_bytes(bytes: [u8; SECRET_BYTES]) -> Self {
         let mut block = [0_u8; 64];
         block[..SECRET_BYTES].copy_from_slice(&bytes);
@@ -91,8 +86,6 @@ impl CacheKeySecret {
         finish(CONVERSATION_PREFIX, mac)
     }
 
-    /// Sharing one cache key across every sender on a route is safe because the shared prefix is
-    /// only the common agent instructions and tools, never anything sender-specific.
     pub(crate) fn for_route(&self, agent: &AgentId, transport: &str, route_index: usize) -> String {
         let mut mac = self.lane(ROUTE_PREFIX);
         for part in [
@@ -136,7 +129,6 @@ fn read(path: &Path) -> Result<[u8; SECRET_BYTES], Reset> {
     <[u8; SECRET_BYTES]>::try_from(bytes.as_slice()).map_err(|_wrong_length| Reset::Malformed)
 }
 
-/// The rename publishes the secret whole, so a crash mid-write never leaves a short file in place.
 fn write(path: &Path, bytes: &[u8; SECRET_BYTES]) -> io::Result<()> {
     let staging = path.with_extension("secret.tmp");
     if let Err(error) = fs::remove_file(&staging)

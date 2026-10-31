@@ -15,7 +15,6 @@ mod durable_bindings {
 }
 
 pub mod jsonl {
-    //! Curated JSONL operations. Writes take effect per host call without invocation-wide rollback.
 
     use std::{error::Error, fmt};
 
@@ -162,7 +161,6 @@ pub mod durable_files {
 
     use super::durable_bindings::dekopon::storage::durable_files as wit;
 
-    /// Validated open intent. At least one of read or write must be selected.
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     #[expect(
         clippy::struct_excessive_bools,

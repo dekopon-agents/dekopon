@@ -99,8 +99,6 @@ pub fn validate_owned_file(path: &Path, expected_uid: u32) -> Result<(), SocketE
     Ok(())
 }
 
-/// Callers must canonicalize the path themselves before calling this; it walks the path as given
-/// rather than canonicalizing again.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"

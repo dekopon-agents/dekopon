@@ -16,9 +16,6 @@ pub struct ModelTool {
     pub parameters: Value,
 }
 
-/// Debug and Serialize summarize bytes rather than rendering them, since every message here passes
-/// through the audit log and an embedded base64 screenshot there would be enormous,
-/// sender-supplied, and permanent.
 #[derive(Clone, PartialEq)]
 pub enum ContentPart {
     Text(String),
@@ -68,8 +65,6 @@ impl Serialize for ContentPart {
     }
 }
 
-/// MessageContent must stay serde untagged; tagging it would change the wire and audit-log shape of
-/// every existing record.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -231,7 +226,6 @@ impl ModelMessage {
         }
     }
 
-    /// Request-size estimate in bytes; journal slices count by their lengths and are never read.
     #[must_use]
     pub fn encoded_len(&self) -> usize {
         match self {
@@ -593,8 +587,6 @@ impl fmt::Debug for AssistantTurn {
     }
 }
 
-/// Passed per request rather than stored on the client, since gateway sessions share a pooled
-/// client and a value captured in a constructor would silently mislabel every later conversation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompletionOptions {
     prompt_cache_key: Option<String>,
@@ -602,8 +594,6 @@ pub struct CompletionOptions {
 }
 
 impl CompletionOptions {
-    /// This is a cache-routing hint only, not an access-control boundary; the full conversation is
-    /// still sent and an endpoint that ignores it returns the same answer at full price.
     #[must_use]
     pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
         let key = key.into();
@@ -633,8 +623,6 @@ pub trait ChatModel: Send + Sync {
         ModelKey::new(Backend::OpenAiCompatible, "portable")
     }
 
-    /// Returning ControlFlow::Break from on_event cancels only the local exchange; it never
-    /// guarantees the pooled connection itself closes.
     fn complete(
         &self,
         messages: &[ModelMessage],
@@ -649,8 +637,6 @@ pub fn assistant_message(turn: &AssistantTurn) -> ModelMessage {
     ModelMessage::assistant(turn)
 }
 
-/// Sized large enough for a typical OpenAI-shaped error object but small enough that an endpoint
-/// answering with an HTML error page can't push a megabyte into a log line.
 pub(crate) const MAX_ERROR_BODY_BYTES: u64 = 16 * 1024;
 
 pub(crate) fn sanitize_diagnostic(value: &str) -> String {

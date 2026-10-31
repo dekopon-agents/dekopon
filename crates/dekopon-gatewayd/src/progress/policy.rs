@@ -1,6 +1,3 @@
-//! This task is the only writer of the terminal message once a session starts, since two tasks
-//! editing one message would race with no ordering between them.
-
 use std::{
     sync::{
         Arc,
@@ -35,8 +32,6 @@ use crate::{
 
 const MAX_CONSECUTIVE_FAILURES: u8 = 2;
 const MAX_EDITS: u32 = 60;
-/// Two seconds bounds a hung endpoint rather than a slow one; this task is single-tasked, so
-/// replies otherwise wait behind a typing indicator as long as the socket is held.
 pub(super) const CALL_DEADLINE: Duration = Duration::from_secs(2);
 const DEADLINE_MISSED: &str = "deadline";
 
@@ -238,8 +233,6 @@ impl Breaker {
         self.observed(transport, primitive, category, MAX_CONSECUTIVE_FAILURES);
     }
 
-    /// A deadline miss, unlike an error, may mean the post still lands later, so retrying would
-    /// create a second message; one miss trips this rung instead of two.
     fn orphaned(&mut self, transport: &str, primitive: &'static str) {
         self.observed(transport, primitive, DEADLINE_MISSED, 1);
     }
@@ -1234,8 +1227,6 @@ fn ended(partial: &str, ending: &str) -> String {
     format!("{partial}\n\n{ending}")
 }
 
-/// Single-tasked with one writer; nothing but this call's own deadline ever cancels an in-flight
-/// call, since a dropped HTTP future cannot retract bytes already sent.
 async fn run(
     pending: Pending,
     mut events: mpsc::Receiver<QueuedEvent>,

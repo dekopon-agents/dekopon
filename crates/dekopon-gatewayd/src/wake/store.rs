@@ -749,8 +749,6 @@ impl WakeStore {
         state.wakes.iter().map(|wake| wake.next_at).min()
     }
 
-    /// A due watch is leased by moving its next check forward in the same write, so a slow tick
-    /// can never be leased twice.
     pub(crate) fn take_due(&self, now: SystemTime) -> Result<Due, WakeStoreError> {
         self.mutate(
             |_| WakeOperation::Expired,

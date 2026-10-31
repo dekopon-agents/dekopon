@@ -212,15 +212,10 @@ pub enum ExportFormat {
     Raw,
 }
 
-/// Validates a Kubernetes object name as an RFC 1123 DNS subdomain.
-///
-/// The API server would reject a bad name anyway, but only after the manifest — and the credential
-/// inside it — had already been printed and piped somewhere.
 fn dns_subdomain(value: &str) -> Result<String, String> {
     dns_name(value, 253, true)
 }
 
-/// Validates a namespace as an RFC 1123 DNS label, which is a subdomain without dots.
 fn dns_label(value: &str) -> Result<String, String> {
     dns_name(value, 63, false)
 }

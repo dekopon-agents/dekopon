@@ -1,7 +1,3 @@
-//! Conversation assets through broker-owned handles, never bytes in model-facing JSON.
-//!
-//! These imports are available only during an authorized `invoke`, not `run-command`.
-
 use std::{error::Error, fmt};
 
 pub(crate) mod bindings {
@@ -17,37 +13,23 @@ pub use wit::{Encoding, Info};
 
 const CHUNK_BYTES: usize = dekopon_core::asset::MAX_ASSET_CHUNK_BYTES;
 
-/// Stable failure classes returned by the broker asset host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetErrorCode {
-    /// The reference was not passed with this invocation.
     UnknownReference,
-    /// The invocation does not grant this operation.
     Denied,
-    /// This turn has no sends remaining.
     SendsExhausted,
-    /// A sent asset cannot be removed.
     AlreadySent,
-    /// This handle does not support positional reads.
     NotSeekable,
-    /// The writer does not contain canonical encoded bytes.
     InvalidEncoding,
-    /// An asset or invocation byte bound was exceeded.
     TooLarge,
-    /// The broker's in-flight budget or disk is exhausted.
     OverBudget,
-    /// This invocation has already attached five assets.
     TooManyAssets,
-    /// The broker has no asset directory configured.
     Unconfigured,
-    /// Asset I/O failed.
     Io,
-    /// The broker encountered an internal failure.
     Internal,
 }
 
 impl AssetErrorCode {
-    /// Returns the WIT enum name for this class.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -73,12 +55,9 @@ impl fmt::Display for AssetErrorCode {
     }
 }
 
-/// A bounded failure returned across the asset component boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssetError {
-    /// Stable machine-readable class.
     pub code: AssetErrorCode,
-    /// Bounded provider-safe detail.
     pub message: String,
 }
 
@@ -113,7 +92,6 @@ impl From<wit::Error> for AssetError {
     }
 }
 
-/// A single-pass input or spooled HTTP response. Dropping it releases the host resource.
 #[derive(Debug)]
 pub struct Handle(HandleBacking);
 
@@ -140,7 +118,6 @@ impl Handle {
         Self(HandleBacking::Wit(handle))
     }
 
-    /// Owns a bounded native test response; dropping the handle releases its bytes.
     #[cfg(all(feature = "native-test", not(target_arch = "wasm32")))]
     pub fn from_test_bytes(bytes: Vec<u8>) -> Result<Self, AssetError> {
         if bytes.len() > CHUNK_BYTES {
@@ -188,7 +165,6 @@ impl Handle {
         }
     }
 
-    /// Returns metadata, never asset bytes.
     pub fn info(&self) -> Info {
         match &self.0 {
             HandleBacking::Wit(handle) => handle.info(),
@@ -205,28 +181,23 @@ impl Handle {
         }
     }
 
-    /// Reads at most 64 KiB of decoded bytes from this handle's cursor. Zero means EOF.
     pub fn read(&self, buffer: &mut [u8]) -> Result<usize, AssetError> {
         read_into(buffer, |len| self.read_bytes(None, len))
     }
 
-    /// Reads at most 64 KiB of decoded bytes at a decoded offset, without moving the cursor.
     pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize, AssetError> {
         read_into(buffer, |len| self.read_bytes(Some(offset), len))
     }
 
-    /// Reads the remaining decoded bytes, reserving the stored length when known.
     pub fn read_all(&self) -> Result<Vec<u8>, AssetError> {
         read_all_with(self.info().stored_bytes, |len| self.read_bytes(None, len))
     }
 }
 
-/// An output under construction. Dropping an unattached writer discards its file.
 #[derive(Debug)]
 pub struct Writer(wit::Writer);
 
 impl Writer {
-    /// Appends bytes in host calls of at most 64 KiB. An empty slice makes no host call.
     pub fn write_all(&self, bytes: &[u8]) -> Result<(), AssetError> {
         write_all_with(bytes, |chunk| self.0.write(chunk).map_err(Into::into))
     }

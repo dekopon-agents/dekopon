@@ -214,7 +214,6 @@ pub struct Decider {
     pub require_probabilities: bool,
 }
 
-/// The route-level memory keys that override the agent's; each is optional on both.
 #[derive(Clone, Debug, Default)]
 pub struct KnobOverrides {
     pub hot_turns: Option<NonZeroUsize>,

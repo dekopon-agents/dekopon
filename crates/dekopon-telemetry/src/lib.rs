@@ -1,6 +1,3 @@
-//! Ingest credentials are read only from OTEL_EXPORTER_OTLP_HEADERS by the SDK itself; this crate
-//! never accepts a token as an argument or attaches one to a span or log field.
-
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
     test,

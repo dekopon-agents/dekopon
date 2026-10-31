@@ -29,8 +29,6 @@ impl ModelText {
         self.0.push_str(&delta.0);
     }
 
-    /// Truncates by character count, not bytes, since slicing UTF-8 at an arbitrary byte offset
-    /// panics if it lands inside a multi-byte character.
     #[must_use]
     pub fn truncated(&self, max_chars: usize) -> Self {
         match self.0.char_indices().nth(max_chars) {

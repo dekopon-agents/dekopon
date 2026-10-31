@@ -1,4 +1,3 @@
-//! Real Unix broker + pure Wasm provider + loopback model/OTLP. No external requests or credentials.
 use super::*;
 use dekopon_agent::prompt::History;
 use dekopon_model::{blocking::BlockingModel, inference::ModelClient, openai::OpenAiClient};

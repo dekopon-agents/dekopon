@@ -43,8 +43,6 @@ impl From<&str> for RawAnswer {
     }
 }
 
-/// Stored as plain text, not ModelMessages, because a remembered system message, an orphaned tool
-/// result, or provider-specific replay state would each corrupt a later request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConversationTurn {
     user: String,
@@ -138,8 +136,6 @@ impl ConversationTurn {
     }
 }
 
-/// Kept transport-neutral as text because provider-specific replay state, like ChatGPT's encrypted
-/// reasoning, silently disappears with no error when replayed against a different backend.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct History {
     turns: Vec<ConversationTurn>,

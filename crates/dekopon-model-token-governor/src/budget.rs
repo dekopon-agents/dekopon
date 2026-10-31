@@ -72,8 +72,6 @@ impl Budget {
         }
     }
 
-    /// The meter with the longest wait names the refusal, and a meter the request can never fit
-    /// outranks every wait.
     #[must_use]
     pub fn explain(&self, now: UnixMillis, want: Tokens) -> Option<Refusal> {
         let mut worst: Option<(&Meter, Retry)> = None;
@@ -133,8 +131,6 @@ impl Budget {
         self.live_since_boot = None;
     }
 
-    /// Builds fresh meters from `history`, which starts at `since`, then replays the charges seen
-    /// live since boot on top; reservations stay on the budget, so calls in flight are unaffected.
     pub fn restore(
         &mut self,
         since: UnixMillis,
@@ -192,7 +188,6 @@ impl Refusal {
 }
 
 impl Refusal {
-    /// The same refusal for a guest's model client, in the third person.
     #[must_use]
     pub const fn for_guest(&self) -> GuestRefusal<'_> {
         GuestRefusal(self)
@@ -287,7 +282,6 @@ const UNITS: [(u64, &str); 4] = [
     (1, "second"),
 ];
 
-/// A window length as an adjective, "5-hour", in its coarsest exact unit.
 struct Span(Duration);
 
 impl fmt::Display for Span {
@@ -301,7 +295,6 @@ impl fmt::Display for Span {
     }
 }
 
-/// A wait rounded up to the coarsest whole unit it reaches: "15 minutes", "3 hours".
 struct Rounded(Duration);
 
 impl fmt::Display for Rounded {

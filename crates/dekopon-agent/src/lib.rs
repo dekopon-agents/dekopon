@@ -110,8 +110,6 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
     }
 }
 
-/// Direct leg runs first because it is unauthorized by construction (its linker is import-free, so
-/// it cannot reach anything); the broker leg is only for what direct mode provably cannot do: I/O.
 pub struct SessionInvoker<D> {
     pub direct: D,
     pub broker: Option<Box<dyn CapabilityInvoker + Send + Sync>>,
@@ -309,8 +307,6 @@ pub enum BrokerLegError {
     DuplicateCapabilities { capabilities: String },
 }
 
-/// A client of brokerd's authorization path, never a participant: it only submits proposals and
-/// reports back the broker's decision; an attested leg's claimed subject is still not authority.
 #[cfg(unix)]
 pub struct BrokerLeg {
     client: BrokerClient,
@@ -495,8 +491,6 @@ fn call_outcome(result: &CapabilityCallResult) -> ToolOutcome {
     }
 }
 
-/// A duplicate capability identifier is refused, naming every repeat at once, rather than silently
-/// kept as a last-wins entry, matching the broker's own refusal of duplicate routes at startup.
 #[cfg(unix)]
 fn snapshot(
     capabilities: Vec<dekopon_broker_protocol::AvailableCapability>,

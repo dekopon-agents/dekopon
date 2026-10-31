@@ -4,8 +4,6 @@ pub const ACCEPT_BACKOFF_MS: u64 = 100;
 
 pub const MAX_ACCEPT_BACKOFF_MS: u64 = 1_000;
 
-/// Restarting is expensive here: every provider recompiles under Cranelift before the socket
-/// rebinds, taking minutes, so only truly fatal errors should stop the daemon.
 #[cfg(unix)]
 pub fn retryable_accept_error(error: &io::Error) -> Option<&'static str> {
     match error.raw_os_error()? {

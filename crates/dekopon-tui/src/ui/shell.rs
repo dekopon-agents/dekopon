@@ -1,5 +1,3 @@
-//! Manual scripts and their results in one wrapped, pageable transcript.
-
 use ratatui::{
     Frame,
     layout::Rect,
@@ -66,7 +64,6 @@ fn max_top(app: &App) -> usize {
         .saturating_sub(height as usize)
 }
 
-/// Pages by visible rows, including rows created by wrapping wide or Unicode content.
 pub fn page(app: &mut App, direction: isize) {
     let end = max_top(app);
     let top = app.shell_top.unwrap_or(end).min(end);
@@ -79,12 +76,10 @@ pub fn page(app: &mut App, direction: isize) {
     app.shell_top = (next != end).then_some(next);
 }
 
-/// Jumps to the first visual row.
 pub fn home(app: &mut App) {
     app.shell_top = Some(0);
 }
 
-/// Draws the command, output, and editable trailing prompt in the same viewport.
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = Block::bordered().inner(area);
     let height = inner.height as usize;

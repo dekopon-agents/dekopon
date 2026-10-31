@@ -1,6 +1,3 @@
-//! Purely advisory: nothing changes because a model asked. Offered on every session; the
-//! model-authored text it records goes to telemetry like everything else (goal 2).
-
 use std::fmt;
 
 use dekopon_model::model::{ModelMessage, ModelTool, ModelToolCall};
@@ -85,8 +82,6 @@ pub struct ImprovementSuggestion {
     pub confidence: SuggestionConfidence,
 }
 
-/// Fields are plain strings, not typed enums, so a bad token or oversized value becomes a refusal
-/// the model can fix, not a decode failure that ends the session.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSuggestion {
@@ -279,7 +274,6 @@ fn validate(raw: RawSuggestion) -> Result<ImprovementSuggestion, (&'static str, 
     })
 }
 
-/// Trims, strips control characters that could forge log structure, and enforces one bound.
 fn bounded(
     field: &'static str,
     value: &str,

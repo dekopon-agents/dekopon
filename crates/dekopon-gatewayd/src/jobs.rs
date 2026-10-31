@@ -235,9 +235,6 @@ impl Jobs {
         })
     }
 
-    /// Every ending passes through here exactly once. The permit is released under the table lock
-    /// once the row is final, so a freed slot never finds its predecessor still `running` and a
-    /// waiter that sees the row finished can start the next job at capacity.
     fn finish(&self, run: &JobRun, ended: Ended, permit: OwnedSemaphorePermit) {
         let id = run.id;
         let mut table = self.table.lock();
@@ -504,8 +501,6 @@ struct Ended {
     ending: Ending,
 }
 
-/// Owns the row from admission to its one `finish`; dropped unfinished, it fails the row so a
-/// panicking or never-spawned job cannot leave it `running` or hold its permit.
 pub(crate) struct JobRun {
     jobs: Arc<Jobs>,
     id: JobId,

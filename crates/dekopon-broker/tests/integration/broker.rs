@@ -2260,7 +2260,6 @@ async fn secret_policy_denial_and_source_failure_have_distinct_audited_outcomes(
     }
 }
 
-/// The secret [`basic_secret_broker`] resolves; at least the 16 bytes the native sink requires.
 const BASIC_SECRET: &[u8] = b"drn-secret-never-visible";
 
 fn basic_fetch_argv(uri: &str) -> Vec<String> {

@@ -16,8 +16,6 @@ pub use threads::{ShellThreads, ThreadName, ThreadPermit};
 pub use tree::{CallBudget, RetainedBytes, TreeContext};
 
 pub const DEFAULT_MAX_STEPS: u64 = 100_000;
-/// Function calls, `$( )`, `${ }` and compound commands all recurse on the native stack against
-/// this one depth; 32 keeps the deepest measured script inside a 2 MiB thread even in a debug build.
 pub const DEFAULT_MAX_RECURSION_DEPTH: u32 = 32;
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2_000;

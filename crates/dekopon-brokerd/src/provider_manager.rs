@@ -1,6 +1,3 @@
-//! Network access happens only behind explicit provider-manager commands; daemon startup never
-//! constructs a registry client.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -530,8 +527,6 @@ pub(crate) async fn load_locked_sources(
         .map(|(sources, _)| sources)
 }
 
-/// The digest covers the exact bytes the sources were decoded from, so a replacement after this read
-/// still differs.
 pub(crate) async fn load_locked_digest(
     lock_path: &Path,
     store_path: &Path,
@@ -1954,8 +1949,6 @@ async fn verify_component_file(
     Ok(())
 }
 
-/// These provider-state files are group-readable like broker.yaml; the real bar is that nobody else
-/// can rewrite them.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
@@ -2034,8 +2027,6 @@ fn validate_directory(
     Ok(())
 }
 
-/// Canonicalizes from path inclusive so aliases like macOS's /var -> /private/var resolve before
-/// the caller's own symlink check.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
@@ -2270,8 +2261,6 @@ fn url_authority(url: &Url) -> Result<String, ProviderManagerError> {
     })
 }
 
-/// list, load_optional_lock, and ensure_locked_blob match on this exact reason string to treat
-/// missing state differently from other I/O failures.
 const READ_PROVIDER_STATE: &str = "could not read provider state";
 const INSPECT_STORE_PATH: &str = "could not inspect provider store path";
 const SCAN_STORE_DIRECTORY: &str = "could not inspect provider store directory";

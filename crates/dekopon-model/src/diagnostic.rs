@@ -5,7 +5,6 @@ use crate::{
     model::{strip_controls, truncate_diagnostic},
 };
 
-/// Borrow both credentials across Codex's one resend; never copy or format the secrets.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct DiagnosticSecrets<'a> {
     current: Option<&'a Redacted<String>>,
@@ -25,7 +24,6 @@ impl<'a> DiagnosticSecrets<'a> {
         self
     }
 
-    /// In-scope credentials, longest first: a rotated token can extend the old one.
     fn tokens(self) -> impl Iterator<Item = &'a str> {
         let mut tokens = [self.current, self.previous].map(|token| {
             token
@@ -44,7 +42,6 @@ impl<'a> DiagnosticSecrets<'a> {
         truncate_diagnostic(text)
     }
 
-    /// Sanitizes a body the reader cut short, which may end inside a credential.
     pub(crate) fn sanitize_truncated(self, bytes: &[u8]) -> String {
         let stripped: Vec<u8> = bytes
             .iter()

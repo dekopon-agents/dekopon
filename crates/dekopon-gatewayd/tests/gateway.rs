@@ -512,8 +512,6 @@ impl Audit {
             .collect()
     }
 
-    /// The gateway's own receipt record carries the inbound text by design, but broker records must
-    /// never contain any of it.
     fn broker_records(&self) -> Vec<String> {
         self.capture
             .records()
@@ -747,8 +745,6 @@ async fn boot_shared(responses: Vec<Value>) -> Fixture {
     .await
 }
 
-/// Timing this race is unreliable, since an instant answer can finish before a second caller's line
-/// is written; the hold makes mid-run a fact, not a bet on scheduling.
 #[derive(Clone)]
 struct ModelHold(Arc<(Mutex<bool>, Condvar, tokio::sync::Notify)>);
 
@@ -1572,8 +1568,6 @@ async fn a_progress_message_carries_the_run_and_becomes_the_answer_in_place() {
     fixture.shutdown().await;
 }
 
-/// Without the grant check gating the progress line, a model could inject arbitrary text onto the
-/// chat surface simply by naming a fake capability.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capability_identifier_the_model_invented_never_reaches_the_progress_line() {
     const PLANTED_MARKER: &str = "zarquon";
@@ -1603,8 +1597,6 @@ async fn a_capability_identifier_the_model_invented_never_reaches_the_progress_l
     fixture.shutdown().await;
 }
 
-/// Uses real time, not a paused tokio clock, since a paused clock only auto-advances on a park
-/// nothing wakes it from, which never happens here.
 #[tokio::test(flavor = "multi_thread")]
 async fn keep_alive_ticks_edit_one_message_until_the_budget_stops_them() {
     let _audit = Audit::exclusive().await;

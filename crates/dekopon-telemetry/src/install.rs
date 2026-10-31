@@ -25,8 +25,6 @@ use tracing_subscriber::{
 
 use crate::ExporterSettings;
 
-/// This is appended to every OTLP filter so these SDK-internal failure logs are never re-exported,
-/// which would otherwise loop when the receiver is down.
 const EXPORTER_DIAGNOSTICS_OFF: &str = "opentelemetry=off";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,8 +338,6 @@ struct LogExport {
     filter: String,
 }
 
-/// The OTLP span layer installs before the log bridge deliberately, so an entered span has already
-/// activated the OpenTelemetry context the log bridge correlates against.
 pub struct Install {
     console: Console,
     extra: Option<Box<dyn Layer<Registry> + Send + Sync>>,

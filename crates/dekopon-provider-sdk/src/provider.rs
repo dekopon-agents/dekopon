@@ -41,57 +41,34 @@ use crate::{
     ProviderCapability, ProviderId, ProviderManifest, RiskLevel, SecretUseProposal,
 };
 
-/// A provider: its identity, command words, argv grammar and the capabilities it exports.
 pub trait Provider: Sized + 'static {
-    /// The provider identifier; each capability id is derived as `ID.NAME`.
     const ID: &'static str;
-    /// The words that reach this provider from a model's script.
     const COMMAND_WORDS: &'static [&'static str];
-    /// The operator- and model-facing description.
     const DESCRIPTION: &'static str;
-    /// The argv grammar; help, version and usage errors are rendered from it.
     type Args: clap::Parser;
-    /// The exported capabilities, as a tuple of up to 64.
     type Capabilities: Capabilities<Self>;
 
-    /// Maps parsed arguments to one capability proposal or a usage error; it runs before
-    /// authorization, so it is pure and reaches no import. `stdin_piped` says whether input is
-    /// piped in; the input itself is read by the capability through [`stdin`].
     fn propose(args: Self::Args, stdin_piped: bool) -> Result<Proposal<Self>, Usage>;
 }
 
-/// One capability of a provider.
 pub trait Capability: Sized + 'static {
-    /// The provider that lists this capability.
     type Provider: Provider;
-    /// The name after the provider id in the capability id.
     const NAME: &'static str;
-    /// The model- and operator-facing description.
     const DESCRIPTION: &'static str;
-    /// Effect classification.
     const EFFECT: EffectKind;
-    /// Coarse risk classification.
     const RISK: RiskLevel;
-    /// The input; its JSON Schema is the capability's `inputSchema`.
     type Input: DeserializeOwned + Serialize + JsonSchema;
-    /// The imports the capability is granted for one authorized call.
     type Needs: Needs;
-    /// The capability's own failures.
     type Error: Failure;
 
-    /// Runs one authorized call, writing its output to `out`; a failure exits with its
-    /// [`Code`]'s status and its display text on stderr.
     fn run(input: Self::Input, needs: Self::Needs, out: &mut Stdout) -> Result<(), Self::Error>;
 }
 
-/// The imports a capability is granted; `()` grants none.
-///
 /// ```compile_fail
 /// use dekopon_provider_sdk::provider::Http;
 /// let unauthorized = Http { private: () };
 /// ```
 pub trait Needs: sealed::Needs {
-    /// The import interfaces required by this need.
     const IMPORTS: ImportSet;
 }
 
@@ -99,39 +76,26 @@ impl Needs for () {
     const IMPORTS: ImportSet = ImportSet::EMPTY;
 }
 
-/// A set of guest import interfaces declared by a capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImportSet(u16);
 
 impl ImportSet {
-    /// No guest imports.
     pub const EMPTY: Self = Self(0);
-    /// Buffered and asset-backed HTTP requests.
     pub const HTTP: Self = Self(1);
-    /// Broker wall clock.
     pub const CLOCK: Self = Self(2);
-    /// Per-provider settings.
     pub const SETTINGS: Self = Self(4);
-    /// JSONL storage.
     pub const JSONL: Self = Self(8);
-    /// Durable file storage.
     pub const DURABLE_FILES: Self = Self(16);
-    /// Conversation assets.
     pub const ASSETS: Self = Self(32);
-    /// Invocation-relative monotonic time.
     pub const MONOTONIC: Self = Self(64);
-    /// OS entropy.
     pub const RANDOM: Self = Self(128);
-    /// Child shell scripts run by the gateway.
     pub const SPAWN: Self = Self(256);
 
-    /// Combines two declarations without granting either one.
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
-    /// Whether all imports in `other` were declared.
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -161,9 +125,7 @@ need_tuples!(
     N19, N18, N17, N16, N15, N14, N13, N12, N11, N10, N9, N8, N7, N6, N5, N4, N3, N2, N1
 );
 
-/// A capability failure reported to the model: a stable code and its display text.
 pub trait Failure: fmt::Display {
-    /// The stable machine code for this failure.
     fn code(&self) -> Code;
 }
 
@@ -173,14 +135,10 @@ impl Failure for Infallible {
     }
 }
 
-/// A failure code: lowercase ASCII letters and digits in hyphen-separated words, and the exit
-/// status a capability failing with it reports, 1 unless the code names its own.
-///
 /// ```compile_fail
 /// const BAD: dekopon_provider_sdk::provider::Code =
 ///     dekopon_provider_sdk::provider::Code::new("Not Kebab");
 /// ```
-///
 /// ```compile_fail
 /// const ZERO: dekopon_provider_sdk::provider::Code =
 ///     dekopon_provider_sdk::provider::Code::new("zero").exiting(0);
@@ -192,21 +150,13 @@ pub struct Code {
 }
 
 impl Code {
-    /// The capability id names no capability the provider lists.
     pub const UNKNOWN_CAPABILITY: Self = Self::new("unknown-capability");
-    /// The input does not match the capability's input type; a usage error.
     pub const INVALID_INPUT: Self = Self::new("invalid-input").exiting(2);
-    /// The operator's settings do not match the capability's settings type.
     pub const INVALID_SETTINGS: Self = Self::new("invalid-settings");
-    /// This import requires execution through the real component host.
     pub const COMPONENT_HARNESS_REQUIRED: Self = Self::new("component-harness-required");
-    /// A usage error, exit status 2: declined arguments, or piped input that is required but empty.
     pub const USAGE: Self = Self::new("usage").exiting(2);
-    /// The proposal input could not be serialized.
     pub const SERIALIZATION_FAILED: Self = Self::new("serialization-failed");
 
-    /// Panics unless `code` is hyphen-separated lowercase words, so an invalid code in a `const`
-    /// is a compile error.
     #[must_use]
     pub const fn new(code: &'static str) -> Self {
         let bytes = code.as_bytes();
@@ -231,8 +181,6 @@ impl Code {
         }
     }
 
-    /// The same code exiting with `status`; panics on 0, so a zero status in a `const` is a
-    /// compile error.
     #[must_use]
     pub const fn exiting(self, status: u8) -> Self {
         let Some(status) = NonZeroU8::new(status) else {
@@ -241,31 +189,23 @@ impl Code {
         Self { status, ..self }
     }
 
-    /// The code as it appears on the wire.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         self.name
     }
 
-    /// The exit status of an invocation failing with this code.
     #[must_use]
     pub const fn status(self) -> NonZeroU8 {
         self.status
     }
 }
 
-/// The failures the SDK reports itself, with static messages that never echo the input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SdkFailure {
-    /// The capability id names no capability the provider lists.
     UnknownCapability,
-    /// The input does not match the capability's input type.
     InvalidInput,
-    /// The operator's settings do not match the capability's settings type.
     InvalidSettings,
-    /// Native execution cannot supply storage or asset imports.
     ComponentHarnessRequired,
-    /// The proposal input could not be serialized.
     SerializationFailed,
 }
 
@@ -295,19 +235,16 @@ impl Failure for SdkFailure {
     }
 }
 
-/// A provider's refusal of parsed arguments, reported to the model as a usage error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Usage(Cow<'static, str>);
 
 impl Usage {
-    /// A usage error with `message` shown to the model.
     #[must_use]
     pub fn new(message: impl Into<Cow<'static, str>>) -> Self {
         Self(message.into())
     }
 }
 
-/// One capability proposal; it grants nothing, since the broker authorizes it separately.
 pub struct Proposal<P: Provider> {
     capability: &'static str,
     input: Result<Value, serde_json::Error>,
@@ -316,7 +253,6 @@ pub struct Proposal<P: Provider> {
 }
 
 impl<P: Provider> Proposal<P> {
-    /// A proposal to run `C` with `input`, naming no secret use.
     #[must_use]
     pub fn to<C: Capability<Provider = P>>(input: C::Input) -> Self {
         Self {
@@ -327,7 +263,6 @@ impl<P: Provider> Proposal<P> {
         }
     }
 
-    /// The proposal naming a secret use, which is untrusted intent the broker authorizes.
     #[must_use]
     pub fn with_secret_use(self, secret_use: SecretUseProposal) -> Self {
         Self {
@@ -337,9 +272,7 @@ impl<P: Provider> Proposal<P> {
     }
 }
 
-/// The capabilities a provider lists: a tuple of up to 64 [`Capability`] types.
 pub trait Capabilities<P: Provider>: sealed::Capabilities<P> {
-    /// The union of imports declared by the capabilities in this tuple.
     const IMPORTS: ImportSet;
 }
 
@@ -480,25 +413,17 @@ fn run<C: Capability>(input: &str, out: &mut Stdout) -> Result<(), stdio::Exit> 
     C::run(input, needs, out).map_err(|error| stdio::Exit::from(&error))
 }
 
-/// Why an input schema cannot be published.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchemaFault {
-    /// An object schema accepts properties it does not list; use `#[serde(deny_unknown_fields)]`.
     Open,
-    /// A subschema is a reference, which inlining could not resolve (a recursive type).
     Reference,
 }
 
-/// Why a manifest cannot be derived from a provider's declarations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestError {
-    /// The provider id or a derived capability id is invalid.
     Identifier(IdentifierError),
-    /// A capability's input schema is not closed and inline.
     Schema {
-        /// The capability name.
         capability: &'static str,
-        /// What is wrong with the schema.
         fault: SchemaFault,
     },
 }
@@ -524,7 +449,6 @@ impl fmt::Display for ManifestError {
 
 impl std::error::Error for ManifestError {}
 
-/// The manifest derived from `P`'s declarations, or why it cannot be derived.
 pub fn manifest<P: Provider>() -> Result<ProviderManifest, ManifestError> {
     Ok(ProviderManifest {
         api_version: ProviderApiVersion::V1Alpha1,
@@ -559,8 +483,6 @@ fn dispatch<P: Provider>(
         .unwrap_or_else(|| Err(stdio::Exit::from(&SdkFailure::UnknownCapability)))
 }
 
-/// Parses `argv`, the words after the command word, and renders help or a usage error or
-/// returns the provider's proposal.
 #[must_use]
 pub fn command<P: Provider>(argv: &[String], stdin_piped: bool) -> CommandRunOutcome {
     let mut grammar = P::Args::command().no_binary_name(true);

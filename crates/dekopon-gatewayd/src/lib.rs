@@ -1,7 +1,3 @@
-//! The daemon holds no provider authority; every effect is submitted to dekopon-brokerd as an
-//! attested proposal, and nothing from chat, including the agent's own instructions, can assert
-//! identity or widen a grant.
-
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -603,8 +599,6 @@ impl std::fmt::Display for Stage {
     }
 }
 
-/// Runs the validation `run` runs, then stops: the broker socket is never contacted, no model login
-/// or journal is read, and a credential variable is read only to probe a model's vendor.
 pub async fn check(
     config_path: impl AsRef<Path>,
     catalog_path: Option<&Path>,
@@ -627,8 +621,6 @@ pub(crate) struct Candidate {
     pub(crate) prepared: Option<Prepared>,
 }
 
-/// Every stage whose inputs loaded runs, so one report names every problem; a stage whose inputs
-/// did not is reported as skipped. `Check` reads no credential and builds no transport.
 pub(crate) async fn load_candidate(
     config_path: &Path,
     catalog_path: Option<&Path>,

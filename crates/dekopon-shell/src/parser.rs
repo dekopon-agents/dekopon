@@ -19,8 +19,6 @@ use crate::{
     lexer::{Lexer, Token, TokenKind},
 };
 
-/// Without this ceiling, deeply nested command substitution overflows the native stack and aborts
-/// the process with SIGABRT, which no script error can report.
 const MAX_NESTING_DEPTH: u32 = 64;
 
 const MAX_ARITHMETIC_TOKENS: usize = 4_096;
@@ -831,8 +829,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// `]` is deliberately absent from this table: only `[` opens a character class, so `[ab]` is still
-/// caught by its bracket while a lone `a]` is left alone.
 const CASE_METACHARACTERS: &[char] = &['*', '?', '['];
 
 pub(crate) fn pattern_metacharacter(text: &str) -> Option<char> {
@@ -926,7 +922,6 @@ enum ArithSymbol {
     Rejected(Refusal),
 }
 
-/// Operator spellings, longest first so `&&` is never mistaken for a rejected bitwise `&`.
 const ARITH_SYMBOLS: &[(&str, ArithSymbol)] = &[
     ("**", ArithSymbol::Rejected(Refusal::ArithmeticPower)),
     ("++", ArithSymbol::Rejected(Refusal::ArithmeticIncrement)),

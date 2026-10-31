@@ -294,8 +294,6 @@ pub fn read_decoded(
 }
 
 impl BufferedHttpClient {
-    /// stream() must apply exactly the same grant and credential checks as send(), or the two
-    /// request paths could diverge in what they allow.
     pub async fn stream(
         &mut self,
         request: StreamedRequest,

@@ -66,8 +66,6 @@ pub const MAX_SECRET_USERNAME_LENGTH: usize = 256;
 
 pub const PROVIDER_COMPONENT_EXTENSION: &str = "wasm";
 
-/// Must mirror dekopon-shell's own builtin and reserved-word tables exactly; a bidirectional test
-/// fails the build if the two disagree.
 pub const RESERVED_COMMAND_WORDS: &[&str] = &[
     ".", ":", "[", "[[", "]]", "awk", "base64", "bg", "break", "cap", "case", "cat", "continue",
     "cut", "declare", "do", "done", "echo", "elif", "else", "esac", "eval", "exec", "exit",
@@ -257,8 +255,6 @@ identifier!(
 );
 identifier!(GroupId, "group", "A validated principal group identifier.");
 
-/// A DRN is deliberately inert: knowing or copying one grants no authority; the actual backend
-/// location stays in the broker's private secret map.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SecretDrn(String);
@@ -367,8 +363,6 @@ pub enum SecretDrnError {
     TooLong { length: usize, maximum: usize },
 }
 
-/// Deliberately has no serialization and no public way back to an owned byte vector; ordinary
-/// rendering reveals neither content nor length.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SecretBytes(Vec<u8>);
 
@@ -406,8 +400,6 @@ impl fmt::Display for SecretSinkKind {
     }
 }
 
-/// Untrusted intent only; never authority and never passed to a provider, since the broker must
-/// separately authorize secret.use against an owner-authored binding.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum SecretUseProposal {
@@ -634,8 +626,6 @@ pub struct CommandWordConflict {
     pub kind: CommandWordConflictKind,
 }
 
-/// Reports every conflict rather than silently picking a winner for the operator, and reports all
-/// of them at once so one fix pass suffices.
 #[must_use]
 pub fn command_word_conflicts(declared: &[(String, Vec<String>)]) -> Vec<CommandWordConflict> {
     use std::collections::BTreeMap;

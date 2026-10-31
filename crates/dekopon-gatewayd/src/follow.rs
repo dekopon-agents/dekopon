@@ -176,8 +176,6 @@ pub(crate) struct FollowTable {
     sweeping: AtomicBool,
 }
 
-/// An invite accepted in memory during a turn; its marker is written after delivery, and only
-/// while it is still the key's newest marker.
 #[must_use]
 pub(crate) struct PendingFollow {
     table: Arc<FollowTable>,
@@ -283,8 +281,6 @@ impl FollowTable {
         }
     }
 
-    /// Never takes `disk`: `refresh` and `leave` hold it across the journal lock, so a `stay`
-    /// that took it could wait behind another conversation's maintenance.
     pub(crate) fn stay(
         self: &Arc<Self>,
         key: &str,

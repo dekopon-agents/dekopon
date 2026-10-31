@@ -1,32 +1,10 @@
-//! Rendering-time redaction and terminal-control sanitisation.
-//!
-//! Two different jobs, deliberately in one module because every string this console draws needs
-//! both and forgetting either is the same class of mistake.
-//!
-//! **Redaction.** Provider credentials never reach this process: the broker resolves a symbolic
-//! `credential:` name from its owner-only credentials file and injects the value inside its native
-//! HTTP engine, after guest-header validation. The model, the script, the component, and the
-//! invocation input all see nothing. So this is not credential redaction — it is a guard against
-//! the secrets a *model* writes or a *provider* returns: an `Authorization` header a script
-//! assembled by hand, a token pasted into a turn, a row in a query result.
-//!
-//! **Sanitisation.** A pull-request title and an issue body are attacker-controlled text arriving
-//! through a read-only capability. Drawn raw into a terminal they can move the cursor, repaint
-//! earlier lines, or set a scroll region — so every borrowed string is stripped before it reaches a
-//! buffer, exactly as `dekopon`'s table renderer already strips its cells.
-
 use dekopon_core::redaction_marker;
 use serde_json::{Map, Value};
 
-/// One array index, rendered without a fallible formatter.
 fn itoa(index: usize) -> String {
     index.to_string()
 }
 
-/// Object keys whose value is a secret whatever it looks like.
-///
-/// Matched case-insensitively against the whole key, after `-`/`_` are folded out, so `api_key`,
-/// `apiKey`, and `API-KEY` are one entry rather than three that can drift apart.
 const SECRET_KEYS: &[&str] = &[
     "apikey",
     "authorization",
@@ -41,14 +19,8 @@ const SECRET_KEYS: &[&str] = &[
     "token",
 ];
 
-/// Shortest run this module will call a credential.
-///
-/// Below it the shapes stop being distinctive — `sk-` followed by four characters is as likely to
-/// be a SKU as a key — and a redactor that fires on ordinary text teaches an operator to stop
-/// reading its markers.
 const MIN_SECRET_LENGTH: usize = 20;
 
-/// Whether one object key names a secret.
 fn key_is_secret(key: &str) -> bool {
     let folded: String = key
         .chars()
@@ -58,7 +30,6 @@ fn key_is_secret(key: &str) -> bool {
     SECRET_KEYS.contains(&folded.as_str())
 }
 
-/// Whether a run of characters could be the body of a credential.
 fn is_secret_body(value: &str) -> bool {
     value.len() >= MIN_SECRET_LENGTH
         && value
@@ -66,16 +37,10 @@ fn is_secret_body(value: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
-/// Characters a credential is made of, and therefore what bounds one inside a longer string.
-///
-/// `.`, `+`, `/`, and `=` are in the set because a JWT and a base64 blob need them, which is also
-/// why an identifier like `gh.pull-request.read` arrives here as one run rather than three — and
-/// why the JWT rule below insists on three *long* segments, so ordinary dotted names do not match.
 fn is_token_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '+' | '/' | '=')
 }
 
-/// Whether one run of token characters is a credential on its own.
 fn run_is_secret(run: &str) -> bool {
     for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "sk-"] {
         if let Some(body) = run.strip_prefix(prefix)
@@ -94,7 +59,6 @@ fn run_is_secret(run: &str) -> bool {
             .all(|segment| segment.len() >= 16 && is_secret_body(segment))
 }
 
-/// Whether a scheme word means the run after it is the credential.
 fn scheme_introduces_secret(word: &str) -> bool {
     matches!(
         word.to_ascii_lowercase().as_str(),
@@ -102,11 +66,6 @@ fn scheme_introduces_secret(word: &str) -> bool {
     )
 }
 
-/// Replaces every credential inside one string, or answers `None` when there was none.
-///
-/// Run-level rather than whole-value: a provider result is very often a sentence with a token in
-/// it, and replacing the sentence would hide the part an operator needed to read. The marker lands
-/// exactly where the secret was, so the shape of the text survives its removal.
 fn redact_text(text: &str) -> Option<String> {
     let mut output = String::with_capacity(text.len());
     let mut previous_run: Option<String> = None;
@@ -148,45 +107,31 @@ fn redact_text(text: &str) -> Option<String> {
     found.then_some(output)
 }
 
-/// One redaction applied while rendering, retained so a reveal can undo exactly that one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Redaction {
-    /// Dotted path to the redacted scalar, such as `headers.authorization` or `rows.0.token`.
     pub path: String,
-    /// Why it was redacted, so the pane can say which rule fired.
     pub reason: RedactionReason,
 }
 
-/// Which rule redacted a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RedactionReason {
-    /// The key named a secret.
     Key,
-    /// The value had the shape of one.
     Shape,
 }
 
-/// A redacted rendering of one JSON value, plus what was hidden to produce it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Redacted {
-    /// The value with every secret scalar replaced by its marker.
     pub value: Value,
-    /// Every redaction applied, in document order.
     pub redactions: Vec<Redaction>,
 }
 
 impl Redacted {
-    /// Whether anything was hidden.
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.redactions.is_empty()
     }
 }
 
-/// Redacts every secret scalar in one JSON value.
-///
-/// Every redaction is reported rather than only the first: an operator reading a tool call needs to
-/// know the payload carried three secrets, not that it carried at least one.
 #[must_use]
 pub fn redact(value: &Value) -> Redacted {
     let mut redacted = Redacted::default();
@@ -266,19 +211,8 @@ fn walk(
     }
 }
 
-/// Replacement drawn where a control character was removed.
-///
-/// Visible rather than silent: text that was tampered with should look tampered with, and a line
-/// that quietly loses characters is one an operator compares against the real thing and misreads.
 const CONTROL_REPLACEMENT: char = '\u{fffd}';
 
-/// Strips terminal control sequences from borrowed text before it reaches a buffer.
-///
-/// Tabs and newlines survive — a renderer decides what to do with those — while every other
-/// control character, the whole C1 range, and the bidirectional overrides become one replacement
-/// character each. The C1 range matters because a lone `0x9b` is a control sequence introducer on
-/// terminals that accept eight-bit controls, and the overrides matter because they can reorder a
-/// rendered line without changing a byte of its content.
 #[must_use]
 pub fn sanitize(text: &str) -> String {
     text.chars()
@@ -293,7 +227,6 @@ pub fn sanitize(text: &str) -> String {
         .collect()
 }
 
-/// Sanitises and collapses text into one displayable line.
 #[must_use]
 pub fn sanitize_line(text: &str) -> String {
     sanitize(text).replace(['\n', '\t'], " ")

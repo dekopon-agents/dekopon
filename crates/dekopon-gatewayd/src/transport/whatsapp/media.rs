@@ -1,5 +1,3 @@
-//! No webhook or model content ever chooses a credential sink.
-
 use std::{net::IpAddr, time::Instant};
 
 use tracing::Instrument as _;
@@ -41,7 +39,6 @@ pub(super) fn inbound_image(image: &Value) -> Option<PendingAsset> {
     })
 }
 
-/// Fixed local reason only, never service text, an expiring URL, or a credential.
 pub(super) fn failure(reason: &str) -> TransportError {
     tracing::warn!(
         event = "gateway_whatsapp_media_refused",
@@ -320,8 +317,6 @@ impl AssetFetcher for WhatsappDriver {
     }
 }
 
-/// Resolved addresses are exactly what reqwest connects to, not a separate preflight lookup that
-/// could be redone later; only the two fixed WhatsApp hosts resolve at all.
 pub(super) struct WhatsappResolver;
 impl Resolve for WhatsappResolver {
     fn resolve(&self, name: Name) -> Resolving {

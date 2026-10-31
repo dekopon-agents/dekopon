@@ -1,6 +1,3 @@
-//! This interpreter is native Rust, not Wasm, so there is no fuel meter, memory ceiling, or engine
-//! deadline to fall back on; every bound a script can exhaust must be owned and enforced here.
-
 use std::{collections::VecDeque, time::Duration};
 
 use dekopon_process::{LimitExceeded, Limits, RetainedBytes, TreeContext};
@@ -41,9 +38,6 @@ impl Budget {
         }
     }
 
-    /// This is the only backstop against an infinite loop; the deadline is re-read every step
-    /// rather than sampled, since a script can spend minutes in very few steps and a sampled clock
-    /// would leave it unbounded.
     pub fn charge_step(&mut self) -> Result<(), LimitExceeded> {
         self.tree.charge_step()?;
         self.check_deadline()
@@ -62,9 +56,6 @@ impl Budget {
         self.tree.remaining()
     }
 
-    /// Capability calls are budgeted independently of steps, since one script can loop to drive
-    /// many calls where a single model tool call drives exactly one today, and that amplification
-    /// needs its own ceiling.
     pub fn charge_capability_call(&mut self) -> Result<(), LimitExceeded> {
         self.tree.calls().charge()
     }
@@ -94,9 +85,6 @@ impl Budget {
     }
 }
 
-/// Byte and line ceilings are independent so one oversized line cannot slip past a line-count-only
-/// limit; when either trips, both head and tail are kept, since head-only truncation would hide the
-/// final result.
 #[derive(Debug)]
 pub struct OutputBuffer {
     max_bytes: usize,
@@ -247,8 +235,6 @@ impl OutputBuffer {
     }
 }
 
-/// The truncation marker counts against the budget itself, so appending it after clamping cannot
-/// push a line back over the ceiling and get it dropped entirely.
 fn clamp_line(line: &str, maximum: usize) -> String {
     if line.len() <= maximum {
         return line.to_owned();

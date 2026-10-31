@@ -1,6 +1,3 @@
-//! Conversation text is never forwarded to the broker, so it stays out of the privileged process;
-//! only the gateway's own journal writes it to disk, and only when an operator configures one.
-
 use parking_lot::Mutex;
 use std::{
     collections::HashMap,
@@ -27,8 +24,6 @@ enum ConversationAudience {
     Shared,
 }
 
-/// The transport, agent, and audience together stop two agents or installations from sharing
-/// history; the key has no Debug so a subject or native conversation id can't leak into a log span.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct ConversationKey {
     space: dekopon_core::SpaceKey,
@@ -137,8 +132,6 @@ impl ConversationKey {
     }
 }
 
-/// What a conversation slot replays: a journal-recall route keeps only the previous turn's
-/// projection report, and every other route keeps its own window of user and answer text.
 #[derive(Clone, Debug)]
 pub(crate) enum Window {
     Journal { prior: Vec<PriorRecord> },
@@ -243,15 +236,11 @@ struct StoreState {
     slots: HashMap<ConversationKey, Slot>,
 }
 
-/// The lease and asset token only bound this generation's history and assets; neither authorizes
-/// running a capability, and both go stale once a fresh grant, idle check, or eviction replaces the
-/// generation.
 pub(crate) struct ConversationSeed<'a> {
     pub window: Window,
     pub cache_key: String,
     pub assets: AssetAccess,
     pub lease: ConversationLease<'a>,
-    /// True only for the call that created this generation, which alone restores recalled assets.
     pub created: bool,
 }
 
@@ -413,7 +402,6 @@ impl ConversationStore {
             .for_route(&route.agent, &route.transport, route.route_index)
     }
 
-    /// Whether `begin` would continue a window already in memory, making a recall pointless.
     pub fn resident(
         &self,
         key: &ConversationKey,
@@ -555,8 +543,6 @@ impl ConversationStore {
         had_history
     }
 
-    /// Keep this test-only: exposing the count in production telemetry would give the conversation
-    /// store one more way to be observed.
     #[cfg(test)]
     pub fn tracked(&self) -> usize {
         self.state
@@ -605,8 +591,6 @@ fn allocate_generation(state: &mut StoreState) -> u64 {
     generation
 }
 
-/// Debug is hand-written so it prints only counts and byte totals, never the conversation text,
-/// pending keys, or identifiers a derived implementation would print.
 impl fmt::Debug for ConversationStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self.state.lock();

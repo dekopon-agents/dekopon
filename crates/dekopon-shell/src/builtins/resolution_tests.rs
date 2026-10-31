@@ -207,9 +207,6 @@ mod reserved {
         }
     }
 
-    /// This crate's word tables and the core crate's reserved command word list must agree in both
-    /// directions, or a provider could claim a name the shell secretly shadows, or an unused
-    /// reservation could block a provider's own name forever.
     #[test]
     fn the_reserved_list_matches_the_shells_own_tables() {
         let live = builtins::names()

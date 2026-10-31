@@ -1,7 +1,3 @@
-//! This lives beside transport credentials in the gateway, not the broker, because resolving an
-//! attachment reference is reading already-authenticated data, not deciding whether an effect may
-//! happen.
-
 mod storage;
 pub(crate) use storage::{Publication, Retention, StoredKey};
 use storage::{RefetchOutcome, StoreFailure};
@@ -40,8 +36,6 @@ use crate::{conversation::ConversationKey, transport::AssetFetcher};
 
 pub(crate) const MAX_ASSETS_PER_MESSAGE: usize = 32;
 
-/// Debug omits the source field because Slack private URLs and Discord signed CDN URLs function as
-/// bearer capabilities, not safe-to-log metadata.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AssetRef {
     pub id: u64,
@@ -135,8 +129,6 @@ impl fmt::Debug for AssetSourceRef {
     }
 }
 
-/// Asset publication and lookup share the same gate as invalidation, so an asset operation either
-/// finishes before invalidation or observes the retired generation afterward, never a mix.
 pub(crate) struct AssetFence {
     gate: Mutex<()>,
     active: AtomicBool,
@@ -169,8 +161,6 @@ impl AssetFence {
     }
 }
 
-/// A generation number is never reused for the life of its conversation and asset stores, so an
-/// asset id from a retired generation can never alias one from its replacement.
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct AssetStateKey {
     conversation: ConversationKey,
@@ -1286,8 +1276,6 @@ enum Retry {
     Refetch,
 }
 
-/// Dropping the task's attempt, by completion, abort or panic, is how the store observes that the
-/// download ended.
 struct Attempt {
     ticket: Ticket,
     outcome: RefetchOutcome,

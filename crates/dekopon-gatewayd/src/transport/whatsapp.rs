@@ -1,7 +1,3 @@
-//! The webhook verifies Meta's signature over the raw body before parsing, and only acknowledges
-//! once a whole delivery is enqueued. A Meta webhook retry redelivers a message the gateway
-//! already accepted; exactly-once delivery is not a goal, so the retry gets a second reply.
-
 mod media;
 #[cfg(test)]
 pub(crate) mod tests_media;
@@ -122,8 +118,6 @@ impl Refusal {
     }
 }
 
-/// The webhook is public and unauthenticated, so logging every refusal risks a flood while logging
-/// none hides a broken secret; each reason logs once per window instead.
 struct RefusalLog {
     windows: [Option<Instant>; Refusal::COUNT],
     suppressed: [u64; Refusal::COUNT],
@@ -171,8 +165,6 @@ struct QueuedDelivery {
 }
 
 impl WhatsappTransport {
-    /// An empty app secret would be an HMAC key anyone can guess, so every credential must arrive
-    /// non-empty.
     #[expect(
         clippy::too_many_arguments,
         reason = "reshaped by the unit that next rewrites this"

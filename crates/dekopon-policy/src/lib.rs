@@ -1,51 +1,3 @@
-//! Bounded, deterministic Cedar authorization adapter for the Dekopon broker.
-//!
-//! This crate is the only place Cedar appears in the workspace. It wraps `cedar-policy` behind an
-//! API with three properties the broker depends on:
-//!
-//! 1. **Startup-fixed policies.** A [`PolicyEngine`] parses policies once and strictly validates
-//!    ordinary policies against the declared world. Guarded HTTP request forbids bypass the
-//!    schema validator and evaluate schemaless at the per-request Cedar point.
-//! 2. **Deny-by-default at every layer.** Empty policy text is valid and permits nothing. A policy
-//!    naming an unknown action, entity type, principal, or provider refuses construction. An
-//!    evaluation error at decision time denies.
-//! 3. **Explainable without leaking.** A decision carries the identifiers of the policies that
-//!    determined it and a flag saying whether Cedar reported evaluation errors. Policy text
-//!    reaches a caller only through construction errors, never through a decision. The one
-//!    decision-time text is [`PolicyDecision::refusal`], which describes a request that never
-//!    reached a policy at all.
-//!
-//! Execution constraints deliberately live outside Cedar. Cedar answers "may this principal do
-//! this?"; how narrowly the broker then executes it — timeouts, output ceilings, HTTP destinations,
-//! credential binding — stays in owner-authored constraint sets validated against loaded provider
-//! manifests. Keeping them apart means a policy edit can never widen an execution bound.
-//!
-//! # Entity model
-//!
-//! Everything lives in the `Dekopon` namespace:
-//!
-//! - `Dekopon::Principal::"<principal-id>"` — enumerated from the deployment's peers and mapped
-//!   principals, each a member of its configured `Dekopon::Group::"<group-id>"` entities.
-//! - `Dekopon::Provider::"<provider-id>"` — enumerated from loaded manifests; the resource of every
-//!   capability action.
-//! - `Dekopon::Agent::"<agent-id>"` — the resource type of [`AGENT_PROMPT_ACTION`]. Instances are
-//!   matched by UID and are deliberately not enumerated, because the agent catalog belongs to the
-//!   gateway rather than the broker.
-//! - `Dekopon::Secret::"drn:..."` — canonical public DRNs from the owner-only private map; the
-//!   resource of [`SECRET_USE_ACTION`].
-//! - `Dekopon::Action::"<capability-id>"` — one action per loaded capability, plus fixed
-//!   `agent.prompt` and, when secrets exist, `secret.use` actions. Each capability is in the
-//!   `"<provider>:*"` action group, and read-only ones also in `"<provider>:read-only"`.
-//!
-//! # Context
-//!
-//! Capability actions carry `{ via, agent, subject?, effect, risk }`;
-//! `agent.prompt` carries routing fields only. `secret.use` adds exact capability/provider/sink
-//! fields beside the authenticated routing context. The public DRN is strongly typed untrusted
-//! proposal data and remains inert without an owner binding. Invocation policy excludes message
-//! content and arbitrary provider JSON; only bounded, representable outgoing HTTP facts enter
-//! `context.request` at the per-request decision point.
-//!
 //! ```
 //! use dekopon_core::{CapabilityId, PrincipalId, ProviderId};
 //! use dekopon_policy::{PolicyContext, PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld};
@@ -246,9 +198,6 @@ impl PolicyWorld {
         groups
     }
 
-    /// An undeclared name is kept as a phantom rather than dropping its policy, since dropping it
-    /// would silently revoke the policy's other grants too; a phantom can never authorize
-    /// execution.
     #[must_use]
     fn with_phantoms(&self, unresolved: &[UnresolvedName]) -> Self {
         let mut world = self.clone();
@@ -506,8 +455,6 @@ pub struct PolicyDecision {
     pub allowed: bool,
     pub determining_policy_ids: Vec<String>,
     pub erroring_policy_ids: Vec<String>,
-    /// A stable flag rather than the error text, since a denial explanation must not become a
-    /// channel for policy source or entity data on a per-request path.
     pub errors_present: bool,
     pub refusal: Option<String>,
     pub opaque_body: Option<OpaqueBody>,
@@ -877,8 +824,6 @@ enum RequestError {
     Schema { message: String },
 }
 
-/// Cedar names policies positionally, which shifts as policies are added and is not stable for
-/// audit, so the @id annotation is used as the stable name instead.
 fn apply_annotated_ids(policies: &PolicySet) -> Result<PolicySet, PolicyBuildError> {
     let mut renamed = PolicySet::new();
     let mut seen = BTreeSet::new();
@@ -979,8 +924,6 @@ fn entity_uid(type_name: &EntityTypeName, id: &str) -> EntityUid {
     EntityUid::from_type_name_and_id(type_name.clone(), EntityId::new(id))
 }
 
-/// Agent identifiers are not checked against a catalog; the broker matches by UID, so a typo'd
-/// agent name still validates and then simply matches nothing, denying every session.
 fn classify_policies(
     policies: &PolicySet,
     world: &PolicyWorld,
@@ -1367,8 +1310,6 @@ pub enum PolicyBuildError {
     },
     #[error("policy entity store could not be built: {message}")]
     Entities { message: String },
-    /// The digest hashes Cedar's structural JSON, not source text, so two spellings of one policy
-    /// fingerprint identically; falling back to source text would abandon that property silently.
     #[error("policy {policy} could not be canonicalized for the policy digest: {message}")]
     Digest { policy: String, message: String },
 }

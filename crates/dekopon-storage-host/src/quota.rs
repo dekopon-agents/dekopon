@@ -408,8 +408,6 @@ impl Reservation {
         self.finalized = true;
     }
 
-    /// Releasing this headroom after an unreadable syscall failure could let another namespace
-    /// spend bytes still occupied on disk.
     pub(crate) fn retain_after_unknown(mut self) {
         self.finalized = true;
     }
