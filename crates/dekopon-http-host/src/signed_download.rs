@@ -65,6 +65,19 @@ impl DownloadError {
             Self::Internal => "internal",
         }
     }
+
+    const fn byte_limit(self) -> Option<super::ByteLimitExceeded> {
+        match self {
+            Self::ResponseTooLarge(exceeded) => exceeded,
+            Self::Denied
+            | Self::RedirectRefused
+            | Self::RequestLimit
+            | Self::Timeout
+            | Self::Incomplete
+            | Self::Storage
+            | Self::Internal => None,
+        }
+    }
 }
 
 impl From<HttpError> for DownloadError {
@@ -374,6 +387,8 @@ impl BufferedHttpClient {
             "dekopon.http.response.accounted_bytes" = tracing::field::Empty,
             "error.code" = tracing::field::Empty,
             "error.message" = tracing::field::Empty,
+            "dekopon.http.byte_limit.key" = tracing::field::Empty,
+            "dekopon.http.byte_limit.bytes" = tracing::field::Empty,
             outcome = tracing::field::Empty
         );
         let index = self.evidence.len();
@@ -486,6 +501,11 @@ impl BufferedHttpClient {
         if let Some(error) = failure {
             span.record("error.code", error.label());
         }
+        let byte_limit = failure.and_then(DownloadError::byte_limit);
+        if let Some(exceeded) = byte_limit {
+            span.record("dekopon.http.byte_limit.key", exceeded.key.as_str());
+            span.record("dekopon.http.byte_limit.bytes", exceeded.limit);
+        }
         span.in_scope(|| {
             tracing::info!(target: "dekopon_http_host::audit", {
             audit.event = "accounting.http.request",
@@ -495,7 +515,10 @@ impl BufferedHttpClient {
             "dekopon.http.request.accounted_bytes" = evidence.map(|value| value.request_bytes),
             "dekopon.http.response.accounted_bytes" = evidence.map(|value| value.response_bytes),
             "error.code" = failure.map(DownloadError::label),
-            "error.message" = failure.map(tracing::field::display), outcome,
+            "error.message" = failure.map(tracing::field::display),
+            "dekopon.http.byte_limit.key" = byte_limit.map(|exceeded| exceeded.key.as_str()),
+            "dekopon.http.byte_limit.bytes" = byte_limit.map(|exceeded| exceeded.limit),
+            outcome,
             }, "accounting.http.request")
         });
     }
@@ -513,6 +536,8 @@ impl BufferedHttpClient {
             "http.response.status_code" = tracing::field::Empty,
             "dekopon.http.response.accounted_bytes" = tracing::field::Empty,
             "error.code" = tracing::field::Empty,
+            "dekopon.http.byte_limit.key" = tracing::field::Empty,
+            "dekopon.http.byte_limit.bytes" = tracing::field::Empty,
             outcome = tracing::field::Empty
         );
         destination.span = span.clone();
@@ -1901,6 +1926,80 @@ mod tests {
                 .unwrap()
                 .contains("private-signed-query")
         );
+    }
+
+    #[tokio::test]
+    async fn a_signed_download_over_max_response_bytes_records_its_key_on_api_and_storage_requests()
+    {
+        use dekopon_test_support::{CaptureLayer, Record};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let api_over = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8192\r\nConnection: close\r\n\r\n{}",
+            "x".repeat(8192)
+        );
+        for storage_over in [false, true] {
+            let capture = CaptureLayer::workspace();
+            let result = async {
+                let (destination, _storage) = fake_storage(vec![b'x'; 70000], 2).await;
+                let response = if storage_over {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        destination.uri.expose()
+                    )
+                } else {
+                    api_over.clone()
+                };
+                let (uri, ceilings, _api) = tls_api(response.into_bytes()).await;
+                let mut parent = authenticated_api(&uri, ceilings);
+                parent.grant.as_mut().unwrap().max_response_bytes = 4096;
+                parent.signed_download_destination = Some(destination);
+                let root = tempfile::tempdir().unwrap();
+                parent
+                    .signed_download(
+                        uri,
+                        Window::Tail(65536),
+                        &AssetDirectory::new(root.path().to_owned(), 131072),
+                    )
+                    .await
+                    .map(|_| ())
+            }
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await;
+            assert!(matches!(
+                result,
+                Err(DownloadError::ResponseTooLarge(Some(_)))
+            ));
+            let span_field = |name, value| {
+                capture.records().iter().any(|record| {
+                    matches!(
+                        record,
+                        Record::Span {
+                            name: "http.request",
+                            ..
+                        }
+                    ) && record.field(name) == Some(value)
+                })
+            };
+            assert!(span_field(
+                "dekopon.http.byte_limit.key",
+                "maxResponseBytes"
+            ));
+            assert!(span_field("dekopon.http.byte_limit.bytes", "4096"));
+            assert_eq!(
+                capture
+                    .events_where(
+                        "dekopon_http_host::audit",
+                        &[
+                            ("audit.event", "accounting.http.request"),
+                            ("dekopon.http.byte_limit.key", "maxResponseBytes"),
+                            ("dekopon.http.byte_limit.bytes", "4096"),
+                        ],
+                    )
+                    .len(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
