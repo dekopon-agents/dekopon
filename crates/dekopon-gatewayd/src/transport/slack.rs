@@ -583,8 +583,9 @@ impl SlackTransport {
             conversation,
             message_id: MessageId::Native(ts.to_owned()),
             text: projection.text,
+            control_text: Some(projection.control),
             assets: projection.assets,
-            addressed: is_shared.then_some(explicitly_addressed),
+            addressed: Some(explicitly_addressed),
             thread_continuation,
             reply: ReplyTarget::Slack {
                 channel: channel.to_owned(),
@@ -1864,12 +1865,15 @@ impl OwnedThreads {
 
 struct SlackProjection {
     text: String,
+    control: String,
     assets: Vec<PendingAsset>,
     asset_overflow: bool,
 }
 
 fn project_message(message: &Value) -> SlackProjection {
-    let mut text = decode_slack_text(message["text"].as_str().unwrap_or_default());
+    let raw = message["text"].as_str().unwrap_or_default();
+    let mut text = decode_slack_text(raw);
+    let mut control = raw.to_owned();
     let top_files = message["files"].as_array();
     let mut assets = pending_assets(&message["files"]);
     let mut file_count = top_files.map_or(0, Vec::len);
@@ -1888,36 +1892,42 @@ fn project_message(message: &Value) -> SlackProjection {
         let author = label(forward["author_id"].as_str());
         let channel = label(forward["channel_id"].as_str());
         let time = label(forward["ts"].as_str().filter(|ts| canonical_timestamp(ts)));
-        let quoted = forward["text"]
+        let raw_quoted = forward["text"]
             .as_str()
-            .filter(|text| !text.trim().is_empty())
-            .map(decode_slack_text)
-            .or_else(|| {
-                Some(forward_blocks(&forward["blocks"])).filter(|text| !text.trim().is_empty())
-            });
+            .filter(|text| !text.trim().is_empty());
+        let quoted = raw_quoted.map(decode_slack_text).or_else(|| {
+            Some(forward_blocks(&forward["blocks"])).filter(|text| !text.trim().is_empty())
+        });
         let nested_files = forward["files"].as_array();
         file_count += nested_files.map_or(0, Vec::len);
         let remaining = MAX_ATTACHMENTS.saturating_sub(assets.len());
         let forwarded = pending_assets(&forward["files"]);
         assets.extend(forwarded.into_iter().take(remaining));
-        text.push_str(&format!(
+        let opening = format!(
             "\n[quoted Slack forward — author: {author}; channel: {channel}; time: {time}]"
-        ));
+        );
+        text.push_str(&opening);
+        control.push_str(&opening);
         match quoted {
             Some(quoted) => {
                 text.push('\n');
                 text.push_str(&quoted);
+                control.push('\n');
+                control.push_str(raw_quoted.unwrap_or(&quoted));
             }
             None if nested_files.is_none_or(Vec::is_empty) => {
                 text.push_str("\n[forwarded content unavailable]");
+                control.push_str("\n[forwarded content unavailable]");
             }
             None => {}
         }
         text.push_str("\n[/quoted Slack forward]");
+        control.push_str("\n[/quoted Slack forward]");
     }
 
     SlackProjection {
         text: bound_inbound(&text),
+        control: bound_inbound(&control),
         assets,
         asset_overflow: file_count > MAX_ATTACHMENTS,
     }
@@ -3643,7 +3653,7 @@ mod driver_tests {
             .expect("readable")
             .expect("a direct message is routable");
         assert_eq!(inbound.text, format!("<@{BOT_USER}> answer me"));
-        assert!(inbound.addressed.is_none());
+        assert_eq!(inbound.addressed, Some(false));
         assert!(inbound.thread_continuation.is_none());
     }
 

@@ -222,6 +222,7 @@ impl LocalTransport {
                 received.record("message.id", message_id.as_str());
                 record_conversation(&received, &request.conversation);
                 let message = InboundMessage {
+                    control_text: None,
                     pull_request_links: None,
                     transport: name.clone(),
                     transport_kind: ChatTransportKind::Local,
@@ -241,11 +242,8 @@ impl LocalTransport {
                     folded: Vec::new(),
                     asset_overflow: false,
                 };
-                if inbound
-                    .send(TransportEvent::Message(Box::new(message)))
-                    .await
-                    .is_err()
-                {
+                let sent = inbound.send(TransportEvent::Message(Box::new(message)));
+                if sent.await.is_err() {
                     break;
                 }
             }

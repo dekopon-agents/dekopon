@@ -603,13 +603,13 @@ impl Gateway {
                 .is_some_and(|route| route.follow)
             && transport::is_stop_word(
                 self.identities.get(&message.transport),
-                &message.text,
+                message.control_text(),
                 &["mute".to_owned()],
             );
         if follow_mute
             || transport::is_stop_word(
                 self.identities.get(&message.transport),
-                &message.text,
+                message.control_text(),
                 &generation.stop_words,
             )
         {

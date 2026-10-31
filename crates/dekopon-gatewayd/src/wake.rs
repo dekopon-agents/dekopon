@@ -343,6 +343,7 @@ impl Anchor {
             );
         }
         InboundMessage {
+            control_text: None,
             pull_request_links: None,
             transport: self.transport.to_string(),
             transport_kind: self.kind,
