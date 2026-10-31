@@ -31,7 +31,7 @@ impl Handle {
 }
 
 struct Entry {
-    subject: ExternalSubject,
+    subject: Subject,
     handle: Handle,
     leg: Arc<BrokerLeg>,
 }
@@ -41,7 +41,7 @@ pub(super) struct Table {
 }
 
 impl Table {
-    pub(super) fn new(subject: ExternalSubject, leg: Arc<BrokerLeg>) -> Self {
+    pub(super) fn new(subject: Subject, leg: Arc<BrokerLeg>) -> Self {
         Self {
             entries: vec![Entry {
                 subject,
@@ -306,7 +306,7 @@ pub(super) struct Inputs {
     pub gate: SessionGate,
     pub key: AdmissionKey,
     pub cancellation: SessionCancellation,
-    pub asker: ExternalSubject,
+    pub asker: Subject,
     pub table: Option<Arc<Mutex<Table>>>,
     pub identifiers: IdSequence,
     pub assets: Arc<SessionAssets>,
@@ -403,7 +403,7 @@ impl Drop for InFlight {
 async fn authorize(
     inputs: &Inputs,
     table: &Arc<Mutex<Table>>,
-    joined: &mut BTreeSet<ExternalSubject>,
+    joined: &mut BTreeSet<Subject>,
     mode: DrainMode,
 ) -> Batch {
     let messages = {
@@ -436,7 +436,7 @@ async fn authorize(
             .lock()
             .entries
             .iter()
-            .find(|entry| entry.subject == message.subject)
+            .find(|entry| &entry.subject == message.subject.name())
             .map(|entry| (Arc::clone(&entry.leg), Some(entry.handle)));
         let (leg, handle) = match existing {
             Some(existing) => existing,
@@ -461,7 +461,7 @@ async fn authorize(
                     Some(handle) => {
                         let leg = Arc::new(with_jobs(inputs, &message, handle.bind(leg), handle));
                         table.entries.push(Entry {
-                            subject: message.subject.clone(),
+                            subject: message.subject.name().clone(),
                             handle,
                             leg: Arc::clone(&leg),
                         });
@@ -475,12 +475,12 @@ async fn authorize(
             return Batch::Sealed(Seal::Stopped);
         }
         let principal = leg.principal().cloned();
-        let join = if joined.insert(message.subject.clone()) {
+        let join = if joined.insert(message.subject.name().clone()) {
             Some(join_line(&leg))
         } else {
             None
         };
-        if message.subject != inputs.asker {
+        if message.subject.name() != &inputs.asker {
             participant_admission(
                 &message,
                 "steered",

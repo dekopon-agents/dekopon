@@ -7,7 +7,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dekopon_broker_protocol::{BrokerClient, Conversation, ConversationKind, GenerationOutcome};
-use dekopon_core::{ExternalSubject, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
+use dekopon_core::{MAX_RENDERED_PROBLEMS, Subject, bounded_problems, error_chain};
 use dekopon_model_proxy::{CurrentProxy, ModelProxy};
 use dekopon_model_token_governor::Metering;
 use sha2::{Digest, Sha256};
@@ -83,7 +83,7 @@ impl CurrentGeneration {
         &self,
         transport: &str,
         conversation: &Conversation,
-        subject: &ExternalSubject,
+        subject: &Subject,
         event: GithubEvent,
     ) -> bool {
         self.0
@@ -640,7 +640,7 @@ impl Gateway {
             let request = CancelRequest {
                 transport: message.transport.clone(),
                 conversation_id: message.conversation.key(),
-                subject: message.subject.canonical(),
+                subject: message.subject.name().canonical(),
                 via: dekopon_agent::CancelVia::StopReply,
             };
             let stopped = self.runner.gate.cancel(&request);
@@ -737,7 +737,7 @@ impl Gateway {
                 &route.conversation,
                 &message.conversation.key(),
             );
-            follow_pending.cancel(&key, &message.subject);
+            follow_pending.cancel(&key, message.subject.name());
         }
         if message.conversation.kind != ConversationKind::DirectMessage
             && !addressed
@@ -868,7 +868,7 @@ impl Gateway {
                 .github_route(
                     &message.transport,
                     &message.conversation,
-                    &message.subject,
+                    message.subject.name(),
                     batch.lead().event,
                 )
                 .is_some(),
@@ -920,7 +920,7 @@ impl Gateway {
                     }
                 }
                 let generation = active.load_full();
-                if !generation.routes.github_route(&message.transport, &message.conversation, &message.subject, event.event).is_some_and(|current| current.agent == route.agent) {
+                if !generation.routes.github_route(&message.transport, &message.conversation, message.subject.name(), event.event).is_some_and(|current| current.agent == route.agent) {
                     session::record_admission(&message, "ignored", 0, Some("subscription-route-lost"));
                     ticket.answer(transport::github::Acked::Ignored);
                     return;

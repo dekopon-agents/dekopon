@@ -207,12 +207,14 @@ string_fact!(RepoFullName, |v: &str| v.split_once('/').is_some_and(
         && owner.len() <= 39
         && !repo.is_empty()
         && repo.len() <= 100
+        && repo != "."
+        && repo != ".."
         && owner
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && repo
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 ));
 string_fact!(GithubLogin, |v: &str| !v.is_empty()
     && v.len() <= 64

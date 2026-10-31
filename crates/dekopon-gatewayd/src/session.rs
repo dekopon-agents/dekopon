@@ -28,7 +28,7 @@ use dekopon_broker_protocol::{
     ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED,
     InvocationOutcome, InvocationResult, SessionRefusal,
 };
-use dekopon_core::{ExternalSubject, PrincipalId};
+use dekopon_core::{AttestedSubject, PrincipalId, Subject};
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
     blocking::BlockingModel,
@@ -438,7 +438,7 @@ impl TurnParticipation {
 
 struct Running {
     participation: TurnParticipation,
-    subject: dekopon_core::ExternalSubject,
+    subject: dekopon_core::Subject,
     cancellation: SessionCancellation,
     steering: Steering,
     aborts: u8,
@@ -452,7 +452,7 @@ struct Running {
 impl Running {
     fn new(route: &BoundRoute, message: &InboundMessage) -> Self {
         Self {
-            subject: message.subject.clone(),
+            subject: message.subject.name().clone(),
             cancellation: SessionCancellation::new(),
             steering: route.steering,
             aborts: 0,
@@ -646,7 +646,7 @@ impl SessionGate {
                 return Admit::Full(message, receipts);
             }
             let participant = running.participation == TurnParticipation::Ordinary
-                && message.subject != running.subject
+                && message.subject.name() != &running.subject
                 && participants::native_chat(&message)
                 && match running.mapping {
                     participants::Mapping::Mapped => true,
@@ -657,7 +657,7 @@ impl SessionGate {
                 running.steers.push_back(message);
                 return Admit::Steered(receipts);
             }
-            if message.subject == running.subject
+            if message.subject.name() == &running.subject
                 && match message.message_id {
                     MessageId::Native(_) => participants::native_chat(&message),
                     MessageId::Job { .. } => true,
@@ -683,7 +683,7 @@ impl SessionGate {
             let kind = if running.participation == TurnParticipation::Ordinary
                 && running.mapping == participants::Mapping::Pending
                 && participants::native_chat(&message)
-                && message.subject != running.subject
+                && message.subject.name() != &running.subject
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
             {
                 FollowUpKind::MappingPending
@@ -775,7 +775,7 @@ impl SessionGate {
         };
         let before = running.steers.len() + running.follow_ups.len();
         running.steers.retain(|message| {
-            let keep = message.subject.canonical() != request.subject;
+            let keep = message.subject.name().canonical() != request.subject;
             if !keep {
                 for receipt in &message.constituents {
                     crate::collection::disposition(receipt, "stopped");
@@ -784,7 +784,7 @@ impl SessionGate {
             keep
         });
         running.follow_ups.retain_mut(|followup| {
-            let keep = followup.message.subject.canonical() != request.subject;
+            let keep = followup.message.subject.name().canonical() != request.subject;
             if !keep {
                 for receipt in followup.receipts.0.drain(..) {
                     crate::collection::disposition(&receipt, "stopped");
@@ -944,7 +944,7 @@ impl SessionAdmission {
                     }
                 }
                 next.route = route;
-                running.subject = next.message.subject.clone();
+                running.subject = next.message.subject.name().clone();
                 running.cancellation = SessionCancellation::new();
                 running.steering = next.route.steering;
                 running.aborts = 0;
@@ -1190,7 +1190,7 @@ struct Delta {
 }
 
 struct Names {
-    principals: HashMap<ExternalSubject, PrincipalId>,
+    principals: HashMap<Subject, PrincipalId>,
     scope: MemoryScope,
 }
 
@@ -1398,15 +1398,18 @@ impl Recall<'_> {
     ) -> Names {
         let mut principals = HashMap::new();
         if let Some(sender) = self.sender {
-            principals.insert(self.message.subject.clone(), sender.clone());
+            principals.insert(self.message.subject.name().clone(), sender.clone());
         }
         let claims = messages
             .iter()
-            .filter(|message| !message.from_bot && message.subject != self.message.subject)
+            .filter(|message| !message.from_bot && &message.subject != self.message.subject.name())
             .map(|message| &message.subject)
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter_map(|subject| chat_claim_for(self.route, self.message, subject.clone()).ok())
+            .filter_map(|subject| {
+                let past = AttestedSubject::one(subject.clone()).ok()?;
+                chat_claim_for(self.route, self.message, past).ok()
+            })
             .collect::<Vec<_>>();
         if !claims.is_empty()
             && let Ok(client) = self.runner.broker.leg_client()
@@ -1414,7 +1417,7 @@ impl Recall<'_> {
             let client = &client;
             let lookups = futures_util::stream::iter(claims)
                 .map(|claim| async move {
-                    let subject = claim.subject.clone();
+                    let subject = claim.subjects.name().clone();
                     let surface = client.session_surface(Some(claim)).await.ok()?;
                     Some((subject, surface.principal?))
                 })
@@ -1522,7 +1525,7 @@ fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> Conversatio
         | MemoryPolicy::Persistent(MemoryWindow {
             scope: MemoryScope::PrivateConversation,
             ..
-        }) => Some(&message.subject),
+        }) => Some(message.subject.name()),
     };
     ConversationKey::of(
         &route.agent,
@@ -2202,7 +2205,7 @@ async fn session_turn(
                         conversation.id = message.conversation.id.as_str(),
                         conversation.thread =
                             message.conversation.thread.as_deref().unwrap_or_default(),
-                        subject = message.subject.canonical(),
+                        subject = message.subject.name().canonical(),
                         reason = "unmapped-subject",
                         admission.trigger = quiet.then_some("pull-request-link"),
                         "gateway.session.rejected"
@@ -2226,7 +2229,7 @@ async fn session_turn(
                         conversation.id = message.conversation.id.as_str(),
                         conversation.thread =
                             message.conversation.thread.as_deref().unwrap_or_default(),
-                        subject = message.subject.canonical(),
+                        subject = message.subject.name().canonical(),
                         reason = "agent-denied",
                         admission.trigger = quiet.then_some("pull-request-link"),
                         "gateway.session.rejected"
@@ -2336,7 +2339,7 @@ async fn session_turn(
                 .unwrap_or_default(),
             conversation.id = message.conversation.id.as_str(),
             conversation.thread = message.conversation.thread.as_deref().unwrap_or_default(),
-            subject = message.subject.canonical(),
+            subject = message.subject.name().canonical(),
             reason = "unauthorized",
             "gateway.session.rejected"
         );
@@ -2836,7 +2839,7 @@ async fn session_turn(
     let leg = Arc::new(leg);
     let participant_table = mapped_participants.then(|| {
         Arc::new(Mutex::new(participants::Table::new(
-            message.subject.clone(),
+            message.subject.name().clone(),
             Arc::clone(&leg),
         )))
     });
@@ -2848,7 +2851,7 @@ async fn session_turn(
             gate: runner.gate.clone(),
             key: (message.transport.clone(), message.conversation.key()),
             cancellation: cancellation.clone(),
-            asker: message.subject.clone(),
+            asker: message.subject.name().clone(),
             identifiers: identifiers.clone(),
             table: participant_table.clone(),
             assets: Arc::clone(&assets),
@@ -3833,7 +3836,7 @@ fn chat_claim(route: &BoundRoute, message: &InboundMessage) -> Result<Attestatio
 fn chat_claim_for(
     route: &BoundRoute,
     message: &InboundMessage,
-    subject: ExternalSubject,
+    subject: AttestedSubject,
 ) -> Result<Attestation, SessionError> {
     let transport = message
         .transport
@@ -4384,7 +4387,7 @@ mod inventory_prompt_tests {
             &"reviewer".parse().unwrap(),
             "dev",
             "fitted",
-            &"tel.15550000001".parse().unwrap(),
+            &"drn:tel:number::15550000001".parse().unwrap(),
         );
         let store = AssetStore::new(8, crate::ONE_SHOT_ASSET_IDLE);
         store.assets_for(

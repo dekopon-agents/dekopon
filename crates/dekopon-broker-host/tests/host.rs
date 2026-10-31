@@ -1671,14 +1671,17 @@ async fn a_waiting_namespace_lease_never_stalls_timers_or_a_distinct_namespace()
     };
     let storage = StorageHost::open(&root, limits).expect("storage host");
     let held = storage
-        .grant(probe_storage_grant("lease-held", "slack.t0123abc.uone"))
+        .grant(probe_storage_grant(
+            "lease-held",
+            "drn:slack:user:t0123abc:uone",
+        ))
         .expect("held grant");
 
     let competing_host = storage.clone();
     let mut competing = tokio::task::spawn_blocking(move || {
         competing_host.grant(probe_storage_grant(
             "lease-competing",
-            "slack.t0123abc.uone",
+            "drn:slack:user:t0123abc:uone",
         ))
     });
     tokio::time::timeout(
@@ -1690,7 +1693,10 @@ async fn a_waiting_namespace_lease_never_stalls_timers_or_a_distinct_namespace()
 
     let distinct_host = storage.clone();
     let distinct = tokio::task::spawn_blocking(move || {
-        distinct_host.grant(probe_storage_grant("lease-distinct", "slack.t0123abc.utwo"))
+        distinct_host.grant(probe_storage_grant(
+            "lease-distinct",
+            "drn:slack:user:t0123abc:utwo",
+        ))
     });
     // Racing `distinct` against `competing` proves the invariant without an absolute wall-clock
     // cutoff that shrinks under CI scheduling noise; `competing` cannot hang past its own
@@ -1797,7 +1803,7 @@ async fn a_grant_outside_the_configured_shared_namespace_never_runs() {
                     StorageAccess::ReadWrite,
                     StorageScope::Agent,
                     "provider-test".parse().expect("agent"),
-                    "slack.t0123abc.u9xyz".parse().expect("subject"),
+                    "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
                     "slack",
                     "probe-transport",
                     "c0123abc",
@@ -1919,7 +1925,7 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
                 access,
                 StorageScope::PrivateConversation,
                 "provider-test".parse().expect("agent"),
-                "slack.t0123abc.u9xyz".parse().expect("subject"),
+                "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
                 "slack",
                 "probe-transport",
                 "c0123abc",

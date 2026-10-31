@@ -10,7 +10,7 @@ use std::{
 use dekopon_agent::wake::{WakeId, WakeRefusal, WakeSummary, WatchSummary};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, TraceParent};
 use dekopon_core::github::{GithubEvent, GithubEventName, GithubThread};
-use dekopon_core::{AgentId, ExternalSubject};
+use dekopon_core::{AgentId, AttestedSubject, Subject, SubjectKind};
 use dekopon_shell::{CapabilityInvoker, Interpreter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -176,7 +176,7 @@ pub(crate) struct Fired {
 
 impl Fired {
     pub(crate) fn is_space(&self) -> bool {
-        self.anchor.subject().kind() == dekopon_core::PrincipalKind::Space
+        self.anchor.subject().principal_kind() == dekopon_core::PrincipalKind::Space
     }
     pub(crate) const fn id(&self) -> WakeId {
         self.id
@@ -514,7 +514,13 @@ impl WakeStore {
                 .create(parent)?;
         }
         let wakes = match File::open(&config.path) {
-            Ok(file) => read(file)?,
+            Ok(file) => {
+                let (wakes, rewrite) = read(file)?;
+                if rewrite.happened() {
+                    rewrite_legacy(&config.path, &wakes, rewrite)?;
+                }
+                wakes
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error.into()),
         };
@@ -541,7 +547,7 @@ impl WakeStore {
         now: SystemTime,
         schedule: Schedule,
     ) -> Result<WakeSummary, WakeRefusal> {
-        let run_as = match anchor.subject().kind() {
+        let run_as = match anchor.subject().principal_kind() {
             dekopon_core::PrincipalKind::Person
             | dekopon_core::PrincipalKind::Repository
             | dekopon_core::PrincipalKind::Service => None,
@@ -641,7 +647,7 @@ impl WakeStore {
         Ok(summary)
     }
 
-    pub(crate) fn cancel(&self, subject: &ExternalSubject, id: WakeId) -> Result<(), WakeRefusal> {
+    pub(crate) fn cancel(&self, subject: &Subject, id: WakeId) -> Result<(), WakeRefusal> {
         let found = self.mutate(
             |_| WakeOperation::Expired,
             |wakes| {
@@ -665,7 +671,7 @@ impl WakeStore {
         }
     }
 
-    pub(crate) fn list(&self, subject: &ExternalSubject, now: SystemTime) -> Vec<WakeSummary> {
+    pub(crate) fn list(&self, subject: &Subject, now: SystemTime) -> Vec<WakeSummary> {
         let state = self.state.lock();
         state
             .wakes
@@ -816,7 +822,9 @@ struct Line {
     id: u32,
     transport: String,
     kind: ChatTransportKind,
-    subject: ExternalSubject,
+    subject: Subject,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject_id: Option<Subject>,
     conversation: Conversation,
     reply: ReplyTarget,
     agent: AgentId,
@@ -858,7 +866,8 @@ impl From<&Wake> for Line {
             id: wake.id.0,
             transport: anchor.transport.to_string(),
             kind: anchor.kind,
-            subject: anchor.subject.clone(),
+            subject: anchor.subject.name().clone(),
+            subject_id: anchor.subject.id_form().cloned(),
             conversation: anchor.conversation.clone(),
             reply: anchor.reply.clone(),
             agent: anchor.agent.clone(),
@@ -909,7 +918,11 @@ impl Line {
                     reply => reply,
                 },
                 kind: self.kind,
-                subject: self.subject,
+                subject: match self.subject_id {
+                    Some(id) => AttestedSubject::paired(self.subject, id),
+                    None => AttestedSubject::one(self.subject),
+                }
+                .ok()?,
                 conversation: self.conversation,
                 agent: self.agent,
                 scheduled_in: self.scheduled_in,
@@ -983,18 +996,93 @@ fn subscription_matches(wake: &Wake, agent: &AgentId, event: &GithubEvent) -> bo
     }
 }
 
-fn read(file: File) -> Result<Vec<Wake>, WakeStoreError> {
+#[derive(Clone, Copy, Default)]
+struct Rewrite {
+    rewritten: usize,
+    dropped_github: usize,
+}
+
+impl Rewrite {
+    const fn happened(self) -> bool {
+        self.rewritten > 0 || self.dropped_github > 0
+    }
+}
+
+fn read(file: File) -> Result<(Vec<Wake>, Rewrite), WakeStoreError> {
     let mut wakes = Vec::new();
+    let mut rewrite = Rewrite::default();
     for (index, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
-        wakes.push(
-            serde_json::from_str::<Line>(&line)
-                .ok()
-                .and_then(Line::wake)
-                .ok_or(WakeStoreError::Corrupt { line: index + 1 })?,
-        );
+        let corrupt = WakeStoreError::Corrupt { line: index + 1 };
+        if let Some(wake) = serde_json::from_str::<Line>(&line)
+            .ok()
+            .and_then(Line::wake)
+        {
+            wakes.push(wake);
+            continue;
+        }
+        match legacy_line(&line).ok_or(corrupt)? {
+            Legacy::Wake(wake) => {
+                rewrite.rewritten += 1;
+                wakes.push(*wake);
+            }
+            Legacy::Github => rewrite.dropped_github += 1,
+        }
     }
-    Ok(wakes)
+    Ok((wakes, rewrite))
+}
+
+enum Legacy {
+    Wake(Box<Wake>),
+    Github,
+}
+
+fn legacy_line(line: &str) -> Option<Legacy> {
+    let mut value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let fields = value.as_object_mut()?;
+    let legacy = fields.get("subject")?.as_str()?;
+    let mut segments = legacy.split('.');
+    let (service, first, second) = (segments.next()?, segments.next()?, segments.next());
+    if segments.next().is_some() {
+        return None;
+    }
+    let subject = match (service, second) {
+        ("github", _) => return Some(Legacy::Github),
+        ("slack", Some(id)) if id.starts_with(['c', 'g']) => {
+            Subject::new(SubjectKind::SlackChannel, first, id)
+        }
+        ("slack", Some(id)) => Subject::new(SubjectKind::SlackUser, first, id),
+        ("fauxlack", Some(id)) if id.starts_with('c') => {
+            Subject::new(SubjectKind::FauxlackChannel, first, id)
+        }
+        ("fauxlack", Some(id)) => Subject::new(SubjectKind::FauxlackUser, first, id),
+        ("discord", None) => Subject::new(SubjectKind::DiscordUser, "", first),
+        ("discord", Some(channel)) => Subject::new(SubjectKind::DiscordChannel, first, channel),
+        ("telegram", None) => Subject::new(SubjectKind::TelegramUser, "", first),
+        ("whatsapp", None) => Subject::new(SubjectKind::WhatsappNumber, "", first),
+        ("tel", None) => Subject::new(SubjectKind::TelNumber, "", first),
+        _ => return None,
+    }
+    .ok()?;
+    fields.insert("subject".to_owned(), subject.canonical().into());
+    serde_json::from_value::<Line>(value)
+        .ok()
+        .and_then(Line::wake)
+        .map(|wake| Legacy::Wake(Box::new(wake)))
+}
+
+fn rewrite_legacy(path: &Path, wakes: &[Wake], rewrite: Rewrite) -> Result<(), WakeStoreError> {
+    let mut kept = path.as_os_str().to_owned();
+    kept.push(".pre-drn");
+    fs::copy(path, PathBuf::from(kept))?;
+    write(path, wakes)?;
+    tracing::info!(
+        event = "wake.store.rewritten",
+        rewritten = rewrite.rewritten,
+        dropped_github = rewrite.dropped_github,
+        "wake.store.rewritten"
+    );
+    Ok(())
 }
 
 fn write(path: &Path, wakes: &[Wake]) -> Result<(), WakeStoreError> {

@@ -74,8 +74,8 @@ fn conversation(
     }
 }
 
-fn subject() -> dekopon_core::ExternalSubject {
-    "slack.t0123abc.u9xyz"
+fn subject() -> dekopon_core::Subject {
+    "drn:slack:user:t0123abc:u9xyz"
         .parse()
         .expect("valid subject fixture")
 }
@@ -870,7 +870,10 @@ fn protocol_version_constant_wire_form_and_display_agree() {
 fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
     let scope = scope();
     let session = Attestation::for_chat(
-        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        dekopon_core::AttestedSubject::one(
+            "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+        )
+        .expect("subject"),
         "reviewer".parse().expect("agent"),
         scope.clone(),
     );
@@ -924,13 +927,12 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
 #[test]
 #[expect(clippy::too_many_lines, reason = "one long test scenario")]
 fn one_canonical_conversation_form_decides_every_transport() {
-    let sender =
-        |value: &str| -> dekopon_core::ExternalSubject { value.parse().expect("subject fixture") };
-    let fauxlack_user = sender("fauxlack.acme.ualice");
-    let slack_user = sender("slack.t0123abc.u9xyz");
-    let discord_user = sender("discord.578258790881951745");
-    let telegram_user = sender("telegram.5551234");
-    let whatsapp_user = sender("whatsapp.16034700182");
+    let sender = |value: &str| -> dekopon_core::Subject { value.parse().expect("subject fixture") };
+    let fauxlack_user = sender("drn:fauxlack:user:acme:ualice");
+    let slack_user = sender("drn:slack:user:t0123abc:u9xyz");
+    let discord_user = sender("drn:discord:user::578258790881951745");
+    let telegram_user = sender("drn:telegram:user::5551234");
+    let whatsapp_user = sender("drn:whatsapp:number::16034700182");
 
     for (transport, subject, conversation, key) in [
         (
@@ -2000,8 +2002,15 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
         user: "hello".to_owned(),
         assistant: DeliveredAnswer("hi".to_owned()),
     };
-    let unattested = Attestation::for_subject(subject(), agent());
-    let chat = Attestation::for_chat(subject(), agent(), scope());
+    let unattested = Attestation::for_subject(
+        dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
+        agent(),
+    );
+    let chat = Attestation::for_chat(
+        dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
+        agent(),
+        scope(),
+    );
     for (expected, envelope) in [
         ("capabilities", RequestEnvelope::capabilities(None)),
         (
@@ -2100,7 +2109,7 @@ fn the_previous_protocol_version_and_its_retired_operation_tags_both_fail_to_dec
     );
 
     for retired in [
-        json!({"operation": "capabilitiesFor", "subject": "slack.t0123abc.u9xyz", "agent": "reviewer"}),
+        json!({"operation": "capabilitiesFor", "subject": "drn:slack:user:t0123abc:u9xyz", "agent": "reviewer"}),
         json!({"operation": "capabilitiesForChat", "claim": {}}),
         json!({"operation": "resolveCommand", "word": "memory", "argv": []}),
         json!({"operation": "resolveCommandForChat", "claim": {}, "word": "memory", "argv": []}),
@@ -2122,21 +2131,31 @@ fn the_previous_protocol_version_and_its_retired_operation_tags_both_fail_to_dec
 #[test]
 fn a_claim_binds_to_its_proposal_and_holds_no_identifier_without_one() {
     let identifier = invocation().id;
-    let unbound = Attestation::for_chat(subject(), agent(), scope());
+    let unbound = Attestation::for_chat(
+        dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
+        agent(),
+        scope(),
+    );
     assert!(unbound.invocation.is_none());
     assert!(!unbound.binds(&identifier));
 
     let bound = unbound.bound_to(identifier.clone());
     assert!(bound.binds(&identifier));
     assert!(!bound.binds(&"invoke-other".parse().expect("valid invocation fixture")));
-    assert_eq!(bound.subject, unbound.subject);
+    assert_eq!(bound.subjects.name(), unbound.subjects.name());
     assert_eq!(bound.scope, unbound.scope);
 
-    assert!(Attestation::for_subject(subject(), agent()).is_well_formed());
+    assert!(
+        Attestation::for_subject(
+            dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
+            agent()
+        )
+        .is_well_formed()
+    );
     assert!(unbound.is_well_formed());
     assert!(
         !Attestation::for_chat(
-            subject(),
+            dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
             agent(),
             ChatScopeClaim {
                 participant: None,
@@ -2309,7 +2328,11 @@ async fn a_refused_attested_surface_is_a_stable_failure_rather_than_an_empty_ans
 
     let client = BrokerClient::new(&socket, uid, limits).expect("valid client limits");
     let refused = client
-        .session_surface(Some(Attestation::for_chat(subject(), agent(), scope())))
+        .session_surface(Some(Attestation::for_chat(
+            dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
+            agent(),
+            scope(),
+        )))
         .await
         .expect_err("a refused attestation is not an answer");
     server.await.expect("server fixture exits");
@@ -2953,7 +2976,7 @@ fn a_known_refusal_with_an_invalid_principal_is_malformed() {
 
 #[test]
 fn a_github_thread_is_a_number_or_the_repository() {
-    let subject = dekopon_core::ExternalSubject::github("owner", "repo").unwrap();
+    let subject = dekopon_core::Subject::github_repo("owner", "repo").unwrap();
     for (thread, allowed) in [
         ("72d3162e-cc78-11e3-81ab-4c9367dc0958", false),
         ("07", false),
@@ -3251,7 +3274,7 @@ fn canonical_conversation_text_refuses_what_is_not_canonical() {
 
 #[test]
 fn a_telegram_thread_conversation_requires_a_thread_part() {
-    let subject: dekopon_core::ExternalSubject = "telegram.5551234".parse().expect("subject");
+    let subject: dekopon_core::Subject = "drn:telegram:user::5551234".parse().expect("subject");
     let without = conversation(ConversationKind::Thread, None, "-1001234", None);
     let with = conversation(ConversationKind::Thread, None, "-1001234", Some("7"));
     assert!(!without.is_canonical_for(ChatTransportKind::Telegram, &subject));

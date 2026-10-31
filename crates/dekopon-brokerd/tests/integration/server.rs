@@ -31,8 +31,8 @@ use dekopon_brokerd::{
 };
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, SecretUseProposal,
+    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel,
+    SecretUseProposal, Subject,
 };
 use dekopon_process::{CallBudget, ExitCode, JobId, JobSummary, JobWait, Limits, TreeContext};
 use dekopon_shell::{
@@ -241,11 +241,11 @@ async fn broker_over_mapped<'a, A: AuditLog>(
     )
 }
 
-const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
+const SLACK_SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
 
-fn subject() -> ExternalSubject {
+fn subject() -> Subject {
     SLACK_SUBJECT
-        .parse::<ExternalSubject>()
+        .parse::<Subject>()
         .expect("canonical subject fixture")
 }
 
@@ -264,12 +264,15 @@ fn agent(name: &str) -> AgentId {
 }
 
 fn session() -> Attestation {
-    Attestation::for_subject(subject(), agent("chat-agent"))
+    Attestation::for_subject(
+        dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
+        agent("chat-agent"),
+    )
 }
 
 fn attestor_grant() -> AttestorGrant {
     AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+        namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
     }
 }
 
@@ -304,7 +307,7 @@ async fn console_real_scope_capabilities_name_the_sandbox_remedy() {
     let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client");
     let real = Attestation::for_chat(
-        subject(),
+        dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
         agent("chat-agent"),
         ChatScopeClaim {
             participant: None,
@@ -327,7 +330,10 @@ async fn console_real_scope_capabilities_name_the_sandbox_remedy() {
         .expect_err("real scope refused");
     assert!(error.to_string().contains("dekopon sandbox:"), "{error}");
     let unknown = Attestation::for_chat(
-        "slack.t0123abc.unknown".parse().expect("subject"),
+        dekopon_core::AttestedSubject::one(
+            "drn:slack:user:t0123abc:unknown".parse().expect("subject"),
+        )
+        .expect("subject"),
         agent("chat-agent"),
         real.scope.expect("scope"),
     );
@@ -984,7 +990,7 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
         .expect("connect to the fixture socket");
     let envelope = RequestEnvelope::invoke(
         Some(Attestation {
-            subject: subject(),
+            subjects: dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
             agent: agent("chat-agent"),
             scope: None,
             invocation: Some(
@@ -1153,11 +1159,11 @@ async fn github_repo_prompt_grant_is_enforced_on_the_broker_socket() {
     let listener = bind_fixture(&socket_path);
     let mappings = IdentityDirectory::new([
         (
-            ExternalSubject::github("owner", "repo").unwrap(),
+            Subject::github_repo("owner", "repo").unwrap(),
             "repo-principal".parse().unwrap(),
         ),
         (
-            ExternalSubject::github("owner", "other").unwrap(),
+            Subject::github_repo("owner", "other").unwrap(),
             "other-principal".parse().unwrap(),
         ),
     ])
@@ -1186,7 +1192,10 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
         MappedPeer {
             context: context("caller"),
             attestor: Some(AttestorGrant {
-                namespaces: Some(vec!["github.owner".into()]),
+                namespaces: Some(vec![
+                    "drn:github:repo:owner:*".parse().unwrap(),
+                    "drn:github:repo-id::*".parse().unwrap(),
+                ]),
             }),
         },
     );
@@ -1197,7 +1206,7 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
     let client = BrokerClient::new(&socket_path, uid, limits.frame).unwrap();
     let github_claim = |repo: &str, thread: &str| {
         Attestation::for_chat(
-            ExternalSubject::github("owner", repo).unwrap(),
+            dekopon_core::AttestedSubject::github_repository("owner", repo, 1).unwrap(),
             agent("chat-agent"),
             ChatScopeClaim {
                 participant: None,
@@ -1270,7 +1279,7 @@ async fn mismatched_smoke_delivery_reaches_broker_denial_not_duplicate_socket_ca
     let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client");
     let attestation = Attestation::for_chat(
-        subject(),
+        dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
         agent("chat-agent"),
         ChatScopeClaim {
             participant: None,
@@ -1921,7 +1930,7 @@ async fn real_broker_probe_child_and_probe_started_job_refuse_write_on_same_leg(
     for script in ["probe", "probe & wait $!"] {
         let broker = SpawnBroker::start_for(4, script).await;
         let claim = Attestation::for_chat(
-            subject(),
+            dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
             agent("chat-agent"),
             ChatScopeClaim {
                 participant: None,
@@ -2010,7 +2019,7 @@ async fn real_broker_refuses_probe_and_job_child_writes_during_spawn_upcalls() {
     for trigger in [Trigger::Probe, Trigger::Job] {
         let broker = SpawnBroker::start(4).await;
         let claim = Attestation::for_chat(
-            subject(),
+            dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
             agent("chat-agent"),
             ChatScopeClaim {
                 participant: None,
@@ -2626,7 +2635,7 @@ async fn a_console_scope_refusal_answers_before_the_guest_parses() {
     use dekopon_broker_protocol::{Arg, RunOutcome, RunRequest};
     let harness = RunHarness::start("dekopon-console").await;
     let claim = Attestation::for_chat(
-        subject(),
+        dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
         agent("chat-agent"),
         ChatScopeClaim {
             participant: None,

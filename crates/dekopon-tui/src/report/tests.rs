@@ -47,13 +47,13 @@ fn a_refusal_is_found_through_the_transparent_leg_error() {
 #[test]
 fn the_report_is_self_contained() {
     let report = ErrorReport::from_error("open broker session", &refused())
-        .with("subject", "discord.1")
+        .with("subject", "drn:discord:user::1")
         .with("agent", "ville-github")
         .with_note("look in the broker log");
     let text = report.to_string();
     for expected in [
         "dekopon-console: open broker session failed",
-        "subject: discord.1",
+        "subject: drn:discord:user::1",
         "agent: ville-github",
         "error: could not open a broker session for this subject and agent: broker returned \
          unauthenticated: attestation refused: no attestor authority for this subject",

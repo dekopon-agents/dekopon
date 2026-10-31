@@ -17,8 +17,8 @@ use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
 };
 use dekopon_core::{
-    Actor, AgentId, ExternalSubject, FileHygieneError, FileTier, GroupId,
-    PROVIDER_COMPONENT_EXTENSION, PrincipalId, ProviderId,
+    Actor, AgentId, FileHygieneError, FileTier, GroupId, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
+    ProviderId, Subject,
     fragments::{self, FragmentError, MergeRules},
     read_trusted_file,
 };
@@ -183,7 +183,7 @@ pub struct AgentBindingConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct PrincipalConfig {
-    pub subjects: Vec<ExternalSubject>,
+    pub subjects: Vec<Subject>,
     pub groups: BTreeSet<GroupId>,
 }
 
@@ -1155,7 +1155,7 @@ async fn resolve(
         let kinds = entry
             .subjects
             .iter()
-            .map(ExternalSubject::kind)
+            .map(Subject::principal_kind)
             .collect::<BTreeSet<_>>();
         if kinds.len() > 1 {
             mixed_principals.push(principal.clone());

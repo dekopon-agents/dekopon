@@ -1501,11 +1501,13 @@ fn the_digest_moves_when_membership_changes() {
 fn principal_kind_is_required_and_subjectless_peers_are_services() {
     let kinds = world().with_subjects([
         (
-            "slack.team.channel".parse().expect("space subject"),
+            "drn:slack:channel:team:channel"
+                .parse()
+                .expect("space subject"),
             "cpetersen".parse().expect("principal"),
         ),
         (
-            "slack.team.user".parse().expect("person subject"),
+            "drn:slack:user:team:user".parse().expect("person subject"),
             "direct-caller".parse().expect("principal"),
         ),
     ]);
@@ -1551,20 +1553,20 @@ fn principal_kind_is_required_and_subjectless_peers_are_services() {
 #[test]
 fn moving_a_subject_between_same_kind_principals_changes_only_the_identity_digest() {
     let first = world().with_subjects([(
-        "slack.team.user".parse().expect("subject"),
+        "drn:slack:user:team:user".parse().expect("subject"),
         "cpetersen".parse().expect("principal"),
     )]);
     let second = world().with_subjects([(
-        "slack.team.user".parse().expect("subject"),
+        "drn:slack:user:team:user".parse().expect("subject"),
         "direct-caller".parse().expect("principal"),
     )]);
     let extra = [
         (
-            "slack.team.u1".parse().expect("subject"),
+            "drn:slack:user:team:u1".parse().expect("subject"),
             "cpetersen".parse().expect("principal"),
         ),
         (
-            "slack.team.u2".parse().expect("subject"),
+            "drn:slack:user:team:u2".parse().expect("subject"),
             "direct-caller".parse().expect("principal"),
         ),
     ];
@@ -1898,5 +1900,92 @@ fn a_policy_id_annotation_that_is_empty_or_overlong_is_refused() {
             "{} bytes",
             id.len()
         );
+    }
+}
+
+fn subject_policy(condition: &str) -> String {
+    format!(
+        "@id(\"subject-fence\")\nforbid(principal, action, resource) when {{ context has subject && {condition} }};"
+    )
+}
+
+#[test]
+fn a_mixed_case_subject_forbid_is_refused_at_load() {
+    let error = PolicyEngine::new(
+        &subject_policy(r#"context.subject == "drn:slack:user:T045P84S5:U07A1MJHNUX""#),
+        &world(),
+    )
+    .expect_err("a mixed-case DRN never matches the lowercase subject");
+    assert!(matches!(
+        error,
+        PolicyBuildError::NonCanonicalDrn { ref policy, ref value }
+            if policy == "subject-fence" && value == "drn:slack:user:T045P84S5:U07A1MJHNUX"
+    ));
+}
+
+#[test]
+fn a_mixed_case_drn_like_pattern_is_refused_at_load() {
+    for condition in [
+        r#"context.subject like "drn:slack:*:T045P84S5:*""#,
+        r#"context.agent like "DRN:slack:*""#,
+    ] {
+        assert!(
+            matches!(
+                PolicyEngine::new(&subject_policy(condition), &world()),
+                Err(PolicyBuildError::NonCanonicalPattern { ref policy }) if policy == "subject-fence"
+            ),
+            "{condition}"
+        );
+    }
+}
+
+#[test]
+fn a_subject_literal_that_is_not_a_canonical_drn_is_refused_at_load() {
+    for (condition, literal) in [
+        (
+            r#"context.subject == "slack.t045p84s5.u1""#,
+            "slack.t045p84s5.u1",
+        ),
+        (
+            r#""slack.t045p84s5.u1" == context.subject"#,
+            "slack.t045p84s5.u1",
+        ),
+        (
+            r#"context.subject != "DRN:slack:user:t045p84s5:u1""#,
+            "DRN:slack:user:t045p84s5:u1",
+        ),
+        (
+            r#"["drn:slack:user:t045p84s5:u1", "github.owner.repo"].contains(context.subject)"#,
+            "github.owner.repo",
+        ),
+        (
+            r#"[context.subject].containsAny(["drn:slack:user:t045p84s5:u1", "slack.t045p84s5.u2"])"#,
+            "slack.t045p84s5.u2",
+        ),
+        (
+            r#"[context.subject].containsAll(["drn:github:repo:owner:Repo"])"#,
+            "drn:github:repo:owner:Repo",
+        ),
+    ] {
+        assert!(
+            matches!(
+                PolicyEngine::new(&subject_policy(condition), &world()),
+                Err(PolicyBuildError::NonCanonicalDrn { ref value, .. }) if value == literal
+            ),
+            "{condition}"
+        );
+    }
+}
+
+#[test]
+fn canonical_subject_literals_and_patterns_load() {
+    for condition in [
+        r#"context.subject == "drn:slack:user:t045p84s5:u07a1mjhnux""#,
+        r#""drn:github:repo:dekopon-agents:dekopon-agents.github.io" == context.subject"#,
+        r#"context.subject like "drn:slack:*:t045p84s5:*""#,
+        r#"[context.subject].containsAny(["drn:github:repo-id::42", "drn:tel:number::16034700182"])"#,
+    ] {
+        PolicyEngine::new(&subject_policy(condition), &world())
+            .unwrap_or_else(|error| panic!("{condition}: {error}"));
     }
 }

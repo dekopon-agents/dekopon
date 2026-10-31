@@ -293,7 +293,7 @@ async fn input_during_terminal_delivery_queues_a_fresh_turn_without_busy() {
     reason = "reshaped by the unit that next rewrites this"
 )]
 async fn another_sender_runs_under_its_own_leg_after_the_holders_receipts_finish() {
-    const OTHER: &str = "tel.16035550100";
+    const OTHER: &str = "drn:tel:number::16035550100";
     let (capture, _subscriber) = capture_spans();
     let directory = temporary();
     let (broker, mut observed) =
@@ -352,7 +352,7 @@ async fn another_sender_runs_under_its_own_leg_after_the_holders_receipts_finish
         else {
             panic!("a fresh attested listing per sender");
         };
-        subjects.push(claim.subject);
+        subjects.push(claim.subjects.name().clone());
     }
     assert_eq!(subjects, [subject(), OTHER.parse().expect("other subject")]);
     assert_eq!(driver.replies(), ["a1", "a2"]);

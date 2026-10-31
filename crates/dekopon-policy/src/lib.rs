@@ -58,8 +58,8 @@ use cedar_policy::{
 };
 use dekopon_capability::EffectKind;
 use dekopon_core::{
-    AgentId, CapabilityId, ExternalSubject, GroupId, IdentifierError, PrincipalId, PrincipalKind,
-    ProviderId, RiskLevel, SecretDrn, SecretSinkKind,
+    AgentId, CapabilityId, GroupId, IdentifierError, PrincipalId, PrincipalKind, ProviderId,
+    RiskLevel, SecretDrn, SecretSinkKind, Subject,
 };
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -90,7 +90,7 @@ const DIGEST_DOMAIN: &[u8] = b"dekopon-policy-v1\0";
 pub struct PolicyWorld {
     principals: BTreeSet<PrincipalId>,
     memberships: BTreeMap<PrincipalId, BTreeSet<GroupId>>,
-    subjects: BTreeMap<ExternalSubject, PrincipalId>,
+    subjects: BTreeMap<Subject, PrincipalId>,
     providers: BTreeSet<ProviderId>,
     capabilities: BTreeMap<CapabilityId, ProviderId>,
     read_only: BTreeSet<CapabilityId>,
@@ -224,7 +224,7 @@ impl PolicyWorld {
     #[must_use]
     pub fn with_subjects(
         mut self,
-        subjects: impl IntoIterator<Item = (ExternalSubject, PrincipalId)>,
+        subjects: impl IntoIterator<Item = (Subject, PrincipalId)>,
     ) -> Self {
         self.subjects.extend(subjects);
         self
@@ -234,7 +234,7 @@ impl PolicyWorld {
     pub fn principal_kind(&self, principal: &PrincipalId) -> PrincipalKind {
         self.subjects
             .iter()
-            .find_map(|(subject, mapped)| (mapped == principal).then(|| subject.kind()))
+            .find_map(|(subject, mapped)| (mapped == principal).then(|| subject.principal_kind()))
             .unwrap_or(PrincipalKind::Service)
     }
 
@@ -595,6 +595,7 @@ impl PolicyEngine {
             });
         }
         let policies = apply_annotated_ids(&policies)?;
+        refuse_non_canonical_literals(&policies)?;
         let (ordinary_policies, invalid_request_shapes) = inspect_request_shapes(&policies)?;
         if !invalid_request_shapes.is_empty() {
             return Err(PolicyBuildError::InvalidRequestShapes {
@@ -911,6 +912,136 @@ fn references_request(value: &serde_json::Value) -> bool {
         | serde_json::Value::Bool(_)
         | serde_json::Value::Number(_)
         | serde_json::Value::String(_) => false,
+    }
+}
+
+fn refuse_non_canonical_literals(policies: &PolicySet) -> Result<(), PolicyBuildError> {
+    for policy in policies.policies() {
+        let est = policy.to_json().map_err(|source| PolicyBuildError::Parse {
+            messages: vec![source.to_string()],
+        })?;
+        let id = policy.id().to_string();
+        literal_walk(&est, &id)?;
+    }
+    Ok(())
+}
+
+fn literal_walk(value: &serde_json::Value, policy: &str) -> Result<(), PolicyBuildError> {
+    let serde_json::Value::Object(fields) = value else {
+        if let serde_json::Value::Array(values) = value {
+            for value in values {
+                literal_walk(value, policy)?;
+            }
+        }
+        return Ok(());
+    };
+    if let Some(serde_json::Value::String(literal)) = fields.get("Value")
+        && is_drn_text(literal)
+        && literal.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(non_canonical_drn(policy, literal));
+    }
+    if let Some(like) = fields.get("like") {
+        // The EST may hold a literal run as one piece per character, so runs are rejoined.
+        let mut pieces = vec![String::new()];
+        for piece in like
+            .get("pattern")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match (
+                piece.get("Literal").and_then(serde_json::Value::as_str),
+                pieces.last_mut(),
+            ) {
+                (Some(literal), Some(run)) => run.push_str(literal),
+                (Some(_), None) | (None, _) => pieces.push(String::new()),
+            }
+        }
+        let checked = is_context_subject(like.get("left"))
+            || pieces.iter().any(|piece| is_drn_text_anywhere(piece));
+        if checked
+            && pieces
+                .iter()
+                .any(|piece| piece.bytes().any(|byte| byte.is_ascii_uppercase()))
+        {
+            return Err(PolicyBuildError::NonCanonicalPattern {
+                policy: policy.to_owned(),
+            });
+        }
+    }
+    for operator in ["==", "!=", "contains", "containsAny", "containsAll"] {
+        let Some(operands) = fields.get(operator) else {
+            continue;
+        };
+        let (left, right) = (operands.get("left"), operands.get("right"));
+        for (subject, other) in [(left, right), (right, left)] {
+            if mentions_context_subject(subject) {
+                subject_literals(other, policy)?;
+            }
+        }
+    }
+    for value in fields.values() {
+        literal_walk(value, policy)?;
+    }
+    Ok(())
+}
+
+fn is_drn_text(value: &str) -> bool {
+    value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("drn:"))
+}
+
+fn is_drn_text_anywhere(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("drn:")
+}
+
+fn is_context_subject(value: Option<&serde_json::Value>) -> bool {
+    value.is_some_and(|value| {
+        value.get(".") == Some(&json!({"left": {"Var": "context"}, "attr": "subject"}))
+    })
+}
+
+fn mentions_context_subject(value: Option<&serde_json::Value>) -> bool {
+    is_context_subject(value)
+        || value
+            .and_then(|value| value.get("Set"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|elements| {
+                elements
+                    .iter()
+                    .any(|element| is_context_subject(Some(element)))
+            })
+}
+
+fn subject_literals(
+    value: Option<&serde_json::Value>,
+    policy: &str,
+) -> Result<(), PolicyBuildError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let elements = value
+        .get("Set")
+        .and_then(serde_json::Value::as_array)
+        .map_or_else(|| std::slice::from_ref(value), Vec::as_slice);
+    for element in elements {
+        if let Some(literal) = element.get("Value").and_then(serde_json::Value::as_str)
+            && !literal
+                .parse::<Subject>()
+                .is_ok_and(|subject| subject.canonical() == literal)
+        {
+            return Err(non_canonical_drn(policy, literal));
+        }
+    }
+    Ok(())
+}
+
+fn non_canonical_drn(policy: &str, value: &str) -> PolicyBuildError {
+    PolicyBuildError::NonCanonicalDrn {
+        policy: policy.to_owned(),
+        value: value.to_owned(),
     }
 }
 
@@ -1290,6 +1421,10 @@ pub enum PolicyBuildError {
     UnknownProvider { policy: String, provider: String },
     #[error("policy {policy} names undeclared action {action:?}")]
     UnknownAction { policy: String, action: String },
+    #[error("policy {policy} compares a DRN that is not canonical lowercase: {value:?}")]
+    NonCanonicalDrn { policy: String, value: String },
+    #[error("policy {policy} has a DRN `like` pattern that is not canonical lowercase")]
+    NonCanonicalPattern { policy: String },
     #[error("policy {policy} names unknown entity type {entity_type}")]
     UnknownEntityType { policy: String, entity_type: String },
     #[error("policy {policy} has an @id annotation that is not a bounded portable identifier")]

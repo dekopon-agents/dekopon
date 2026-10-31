@@ -12,7 +12,7 @@ use axum::{
     routing::post,
 };
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
-use dekopon_core::{ExternalSubject, Redacted, SubjectSegment, SubjectService};
+use dekopon_core::{AttestedSubject, Redacted};
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -304,7 +304,9 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     let Some((owner, repo)) = entry.repository.full_name.as_str().split_once('/') else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
     };
-    let Ok(subject) = ExternalSubject::github(owner, repo) else {
+    let Ok(subject) =
+        AttestedSubject::github_repository(owner, repo, u64::from(entry.repository.id))
+    else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
     };
     let conversation = Conversation {
@@ -315,7 +317,7 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     };
     if !state
         .generation
-        .admits_github(&state.name, &conversation, &subject, event_kind)
+        .admits_github(&state.name, &conversation, subject.name(), event_kind)
     {
         ignored(state, &delivery, "not-listed");
         return webhook::content_free(StatusCode::OK);
@@ -381,16 +383,7 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
 }
 
 fn repository_ignore_reason(root: &Value) -> Option<&'static str> {
-    if !root.get("repository").is_some_and(Value::is_object) {
-        return Some("no-repository");
-    }
-    root.pointer("/repository/name")
-        .and_then(Value::as_str)
-        .filter(|name| {
-            !SubjectService::Github
-                .admits_segment(SubjectSegment::Subject, &name.to_ascii_lowercase())
-        })
-        .map(|_| "not-listed")
+    (!root.get("repository").is_some_and(Value::is_object)).then_some("no-repository")
 }
 
 fn ignored(state: &StateData, delivery: &str, reason: &str) {
@@ -1118,8 +1111,15 @@ pub(crate) mod tests {
         assert!(!eligible(
             &parse(&ignored, GithubEvent::PullRequest, "guid").unwrap()
         ));
-        ignored["repository"]["name"] = json!("dotted.repo");
-        assert!(parse(&ignored, GithubEvent::PullRequest, "guid").is_none());
+        ignored["repository"]["name"] = json!("Dotted.github.io");
+        assert_eq!(
+            parse(&ignored, GithubEvent::PullRequest, "guid")
+                .expect("a dotted repository is admitted")
+                .repository
+                .full_name
+                .as_str(),
+            "owner/dotted.github.io"
+        );
     }
 
     #[tokio::test]
@@ -1360,7 +1360,7 @@ mod typed_fact_tests {
         use dekopon_core::github::GithubBatch;
 
         let claim = Attestation::for_chat(
-            ExternalSubject::github("owner", "repo").unwrap(),
+            dekopon_core::AttestedSubject::github_repository("owner", "repo", 1).unwrap(),
             "reviewer".parse().unwrap(),
             ChatScopeClaim {
                 participant: None,

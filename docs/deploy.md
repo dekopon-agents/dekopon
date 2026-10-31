@@ -100,7 +100,8 @@ Keep the Mac awake, and bound the logs yourself; launchd doesn't.
    `--env-file` on a Mac, `gateway.env` Secret references on Kubernetes.
 4. A member's ID (`U…`) is under **Copy member ID** in their profile; the web client's URL,
    `app.slack.com/client/T…/C…`, shows the team ID, then the channel's. The broker's `principals`
-   and the gateway identity's `attestor.namespaces` take them lowercased.
+   take them as `drn:slack:user:T…:U…` and the gateway's `attestor.namespaces` as
+   `drn:slack:*:T…:*`, pasted in any case.
 
 ## Upgrades
 

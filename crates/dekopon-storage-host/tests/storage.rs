@@ -72,7 +72,7 @@ fn vfs_request(invocation: &str, access: StorageAccess) -> StorageGrantRequest {
         access,
         StorageScope::PrivateConversation,
         "reviewer".parse().expect("agent"),
-        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
         "slack",
         "scientist-slack",
         "c0123abc",
@@ -118,7 +118,7 @@ fn request(
         continuity,
         invocation,
         access,
-        "slack.t0123abc.u9xyz",
+        "drn:slack:user:t0123abc:u9xyz",
     )
 }
 
@@ -137,7 +137,7 @@ fn agent_request(
         access,
         StorageScope::Agent,
         agent.parse().expect("agent"),
-        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
         "slack",
         "scientist-slack",
         "c0123abc",
@@ -454,7 +454,7 @@ fn namespace_tokens_are_stable_across_processes() {
     for sentinel in [
         "memory-chat",
         "reviewer",
-        "slack.t0123abc.u9xyz",
+        "drn:slack:user:t0123abc:u9xyz",
         "scientist-slack",
         "c0123abc",
         "turns.jsonl",
@@ -527,7 +527,7 @@ fn every_trusted_scope_dimension_isolated_from_the_others() {
     let cases: &[&[(usize, &str)]] = &[
         &[(0, "other-provider")],
         &[(1, "other-agent")],
-        &[(2, "slack.t0123abc.uother")],
+        &[(2, "drn:slack:user:t0123abc:uother")],
         &[(3, "local")],
         &[(4, "other-transport")],
         &[(5, "c999999"), (6, "c999999:1712345678.000100")],
@@ -537,7 +537,7 @@ fn every_trusted_scope_dimension_isolated_from_the_others() {
         let mut scope = [
             "memory-chat",
             "reviewer",
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "slack",
             "scientist-slack",
             "c0123abc",
@@ -1183,7 +1183,7 @@ fn same_namespace_serializes_while_a_distinct_namespace_can_overlap() {
             ContinuityPolicy::Stable,
             "lease-held",
             StorageAccess::ReadOnly,
-            "slack.t0123abc.uone",
+            "drn:slack:user:t0123abc:uone",
         ))
         .expect("held grant");
     let held = host.begin(held).expect("held transaction");
@@ -1197,7 +1197,7 @@ fn same_namespace_serializes_while_a_distinct_namespace_can_overlap() {
                 ContinuityPolicy::Stable,
                 "lease-same",
                 StorageAccess::ReadOnly,
-                "slack.t0123abc.uone",
+                "drn:slack:user:t0123abc:uone",
             ))
             .and_then(|grant| same_host.begin(grant))
             .and_then(|transaction| transaction.finish_read());
@@ -1219,7 +1219,7 @@ fn same_namespace_serializes_while_a_distinct_namespace_can_overlap() {
                 ContinuityPolicy::Stable,
                 "lease-distinct",
                 StorageAccess::ReadOnly,
-                "slack.t0123abc.utwo",
+                "drn:slack:user:t0123abc:utwo",
             ))
             .and_then(|grant| other_host.begin(grant))
             .and_then(|transaction| transaction.finish_read());
@@ -1252,7 +1252,7 @@ fn slot_refusal_reports_present_plus_pending_and_byte_refusals_do_not() {
         ContinuityPolicy::Stable,
         "seed",
         StorageAccess::ReadOnly,
-        "slack.t0123abc.uone",
+        "drn:slack:user:t0123abc:uone",
     ))
     .expect("one namespace fits");
     drop(seed);
@@ -1267,7 +1267,7 @@ fn slot_refusal_reports_present_plus_pending_and_byte_refusals_do_not() {
             ContinuityPolicy::Stable,
             "second",
             StorageAccess::ReadOnly,
-            "slack.t0123abc.utwo",
+            "drn:slack:user:t0123abc:utwo",
         ))
     });
     assert!(matches!(result, Err(StorageHostError::QuotaExceeded)));
@@ -1277,7 +1277,7 @@ fn slot_refusal_reports_present_plus_pending_and_byte_refusals_do_not() {
         "{logged}"
     );
     assert!(logged.contains("storage.namespace.count=1"), "{logged}");
-    assert!(!logged.contains("slack.t0123abc"), "{logged}");
+    assert!(!logged.contains("drn:slack:*:t0123abc:*"), "{logged}");
 }
 
 #[test]
@@ -1296,7 +1296,7 @@ fn concurrent_namespace_and_root_caps_are_atomic_and_denials_are_byte_identical(
             ContinuityPolicy::Stable,
             "root-cap-seed",
             StorageAccess::ReadOnly,
-            "slack.t0123abc.uone",
+            "drn:slack:user:t0123abc:uone",
         ))
         .expect("one namespace fits");
     drop(seed_grant);
@@ -1318,9 +1318,12 @@ fn concurrent_namespace_and_root_caps_are_atomic_and_denials_are_byte_identical(
         let host = Arc::new(StorageHost::open(&root, limits).expect("exact-cap host"));
         let barrier = Arc::new(Barrier::new(3));
         let mut workers = Vec::new();
-        for (index, subject) in ["slack.t0123abc.uone", "slack.t0123abc.utwo"]
-            .into_iter()
-            .enumerate()
+        for (index, subject) in [
+            "drn:slack:user:t0123abc:uone",
+            "drn:slack:user:t0123abc:utwo",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let host = Arc::clone(&host);
             let barrier = Arc::clone(&barrier);
@@ -1366,7 +1369,7 @@ fn concurrent_namespace_and_root_caps_are_atomic_and_denials_are_byte_identical(
                 ContinuityPolicy::Stable,
                 "root-cap-plus-one",
                 StorageAccess::ReadOnly,
-                "slack.t0123abc.uthree",
+                "drn:slack:user:t0123abc:uthree",
             )),
             Err(StorageHostError::QuotaExceeded)
         ));
@@ -1457,7 +1460,7 @@ fn corrupt_namespaces_reset_once_without_losing_the_previous_generation_or_neigh
                 continuity,
                 invocation,
                 access,
-                "slack.t0123abc.uone",
+                "drn:slack:user:t0123abc:uone",
             )
         };
         let second_scope = |invocation: &str, access| {
@@ -1466,7 +1469,7 @@ fn corrupt_namespaces_reset_once_without_losing_the_previous_generation_or_neigh
                 continuity,
                 invocation,
                 access,
-                "slack.t0123abc.utwo",
+                "drn:slack:user:t0123abc:utwo",
             )
         };
         let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
@@ -1987,7 +1990,7 @@ fn every_contender_for_a_held_namespace_times_out_within_one_lock_timeout() {
             ContinuityPolicy::Stable,
             "lease-held",
             StorageAccess::ReadOnly,
-            "slack.t0123abc.uone",
+            "drn:slack:user:t0123abc:uone",
         ))
         .expect("held grant");
     let held = host.begin(held).expect("held transaction");
@@ -2006,7 +2009,7 @@ fn every_contender_for_a_held_namespace_times_out_within_one_lock_timeout() {
                     ContinuityPolicy::Stable,
                     &format!("lease-contender-{index}"),
                     StorageAccess::ReadOnly,
-                    "slack.t0123abc.uone",
+                    "drn:slack:user:t0123abc:uone",
                 ));
                 (result.map(|_| ()), started.elapsed())
             })
@@ -2058,9 +2061,12 @@ fn space_storage_separates_channels_and_shares_threads_across_speakers() {
                 }))
             };
             let subjects = if transport == "slack" {
-                ["slack.t0123abc.u9xyz", "slack.t0123abc.u8xyz"]
+                [
+                    "drn:slack:user:t0123abc:u9xyz",
+                    "drn:slack:user:t0123abc:u8xyz",
+                ]
             } else {
-                ["discord.123", "discord.124"]
+                ["drn:discord:user::123", "drn:discord:user::124"]
             };
             let first = host
                 .prepare_grant(scoped("channel-a", "thread-1", subjects[0]))

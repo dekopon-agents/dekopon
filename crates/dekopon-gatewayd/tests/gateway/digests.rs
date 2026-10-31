@@ -8,7 +8,8 @@ const WAIT: Duration = Duration::from_secs(30);
 const DAY: u64 = 86_400;
 
 pub(super) fn configure_broker(config: &mut Value, policies: &mut String, api: Option<&str>) {
-    config["principals"]["random-space"] = json!({"subjects":["fauxlack.acme.crandom"]});
+    config["principals"]["random-space"] =
+        json!({"subjects":["drn:fauxlack:channel:acme:crandom"]});
     policies.push_str(&format!(r#"
 @id("digest-space-write")
 permit(principal == Dekopon::Principal::"team", action == Dekopon::Action::"http-probe.purge", resource == Dekopon::Provider::"http-probe") when {{ context.via == "{GATEWAY_PRINCIPAL}" && context.agent == "{AGENT}" }};
@@ -103,7 +104,8 @@ fn assert_space_read(audit: &Audit, capability: &str, trigger: &str, root: &str)
     let decisions = decisions
         .into_iter()
         .filter(|decision| {
-            trigger != "probe" || decision.field("subject") == Some("fauxlack.acme.cteam")
+            trigger != "probe"
+                || decision.field("subject") == Some("drn:fauxlack:channel:acme:cteam")
         })
         .collect::<Vec<_>>();
     assert!(!decisions.is_empty(), "space {trigger} read observed");
@@ -190,7 +192,7 @@ async fn a_channel_digest_stores_space_ownership_and_fires_in_its_thread_with_no
     let mut rows = stored(&fixture);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["run_as"], "space");
-    assert_eq!(rows[0]["subject"], "fauxlack.acme.cteam");
+    assert_eq!(rows[0]["subject"], "drn:fauxlack:channel:acme:cteam");
     assert_eq!(rows[0]["conversation"]["thread"], root.id());
     assert_eq!(rows[0]["watch"]["everyMs"], DAY * 1000);
     assert_eq!(
@@ -280,10 +282,10 @@ async fn channel_schedule_and_watch_wakes_run_as_space_while_dm_wakes_remain_per
         let mut rows = stored(&fixture);
         if container == "cteam" {
             assert_eq!(rows[0]["run_as"], "space");
-            assert_eq!(rows[0]["subject"], "fauxlack.acme.cteam");
+            assert_eq!(rows[0]["subject"], "drn:fauxlack:channel:acme:cteam");
         } else {
             assert!(rows[0].get("run_as").is_none());
-            assert_eq!(rows[0]["subject"], "fauxlack.acme.ualice");
+            assert_eq!(rows[0]["subject"], "drn:fauxlack:user:acme:ualice");
             assert!(fixture.tool_result("personal-list").contains("wake 1:"));
         }
         let directory = fixture.shutdown().await;
@@ -841,7 +843,7 @@ async fn a_fired_digest_cannot_write_and_can_decline_after_reads() {
     let trigger: Trigger =
         serde_json::from_value(json!(fired_read.field("turn.started_by").unwrap())).unwrap();
     let claim = Attestation::for_chat(
-        serde_json::from_value(row["subject"].clone()).unwrap(),
+        serde_json::from_value(json!([row["subject"]])).unwrap(),
         serde_json::from_value(row["agent"].clone()).unwrap(),
         ChatScopeClaim {
             transport: serde_json::from_value(row["transport"].clone()).unwrap(),

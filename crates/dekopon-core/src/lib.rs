@@ -52,7 +52,10 @@ pub use skill::{
     SkillIdError,
 };
 pub use space::{SpaceBinding, SpaceChannel, SpaceKey, SpaceTransport, SpaceWorkspace};
-pub use subject::{ExternalSubject, PrincipalKind, SubjectError, SubjectSegment, SubjectService};
+pub use subject::{
+    AttestedSubject, Namespace, PrincipalKind, Subject, SubjectError, SubjectField, SubjectKind,
+    SubjectScope,
+};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
 pub use trusted_file::{
