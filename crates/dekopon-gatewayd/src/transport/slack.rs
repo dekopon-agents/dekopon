@@ -865,29 +865,19 @@ impl ChatDriver for SlackReplier {
         let ReplyTarget::Slack { channel, thread_ts } = target else {
             return Err(TransportError::Response);
         };
-        let attachments = !images.is_empty();
-        if attachments {
-            if footer.is_none() {
-                return self
-                    .upload_attachments(channel.clone(), thread_ts.clone(), text, images)
-                    .await;
-            }
-            self.upload_attachments(channel.clone(), thread_ts.clone(), String::new(), images)
-                .await?;
+        if !images.is_empty() {
+            return self
+                .upload_attachments(
+                    channel.clone(),
+                    thread_ts.clone(),
+                    text,
+                    images,
+                    footer.as_ref(),
+                )
+                .await;
         }
-        let result = self
-            .post_answer(channel, thread_ts.as_deref(), &text, footer.as_ref())
-            .await;
-        match result {
-            Err(error) if attachments => {
-                tracing::error!(
-                    category = error.category(),
-                    "gateway.reply.failed.after_attachments"
-                );
-                Err(TransportError::PartialDelivery)
-            }
-            result => result,
-        }
+        self.post_answer(channel, thread_ts.as_deref(), &text, footer.as_ref())
+            .await
     }
 
     fn status(&self) -> Option<&dyn NativeStatus> {
@@ -1344,6 +1334,7 @@ impl SlackReplier {
         thread_ts: Option<String>,
         text: String,
         mut images: super::hydration::ImageQueue,
+        footer: Option<&crate::progress::Footer>,
     ) -> Result<(), TransportError> {
         let mut accepted = false;
         while let Some(read) = images.next().await {
@@ -1356,7 +1347,13 @@ impl SlackReplier {
                 .then_some(text.as_str())
                 .filter(|text| !text.is_empty());
             match self
-                .upload_attachment(&channel, thread_ts.as_deref(), comment, image)
+                .upload_attachment(
+                    &channel,
+                    thread_ts.as_deref(),
+                    comment,
+                    image,
+                    (index == 0).then_some(footer).flatten(),
+                )
                 .await
             {
                 Ok(()) => accepted = true,
@@ -1373,6 +1370,7 @@ impl SlackReplier {
         thread_ts: Option<&str>,
         initial_comment: Option<&str>,
         image: super::hydration::HydratedImage,
+        footer: Option<&crate::progress::Footer>,
     ) -> Result<(), TransportError> {
         let filename = image.filename;
         let length = image.bytes.len().to_string();
@@ -1418,7 +1416,11 @@ impl SlackReplier {
             "files": [{"id": file_id, "title": filename}],
             "channel_id": channel,
         });
-        if let Some(initial_comment) = initial_comment {
+        if footer.is_some() {
+            body["blocks"] = Value::String(
+                answer_blocks(initial_comment.unwrap_or_default(), footer).to_string(),
+            );
+        } else if let Some(initial_comment) = initial_comment {
             body["initial_comment"] = Value::String(initial_comment.to_owned());
         }
         if let Some(thread_ts) = thread_ts {
@@ -3010,7 +3012,7 @@ mod driver_tests {
         assert_eq!(body["text"], "All good.");
         assert_eq!(
             body["blocks"],
-            json!([{"type":"markdown", "text":"All good."}, {"type":"context", "elements":[{"type":"plain_text", "text":"model-a · 1 step · 7 s"}]}])
+            json!([{"type":"markdown", "text":"All good."}, {"type":"context", "elements":[{"type":"plain_text", "text":"model-a · 1 step · 8 s"}]}])
         );
     }
 

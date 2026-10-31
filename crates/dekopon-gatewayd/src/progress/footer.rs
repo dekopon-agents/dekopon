@@ -11,7 +11,9 @@ impl Footer {
         Self(format!(
             "{} · {turns} {steps} · {} s",
             models.join(" + "),
-            elapsed.as_secs()
+            elapsed
+                .as_secs()
+                .saturating_add(u64::from(elapsed.subsec_nanos() >= 500_000_000))
         ))
     }
 
@@ -31,20 +33,25 @@ impl Footer {
             split_message(text, max, unit)
         };
         if let Some(suffix) = suffix {
-            let count = |value: &str| match unit {
-                TextUnit::Utf16 => value.encode_utf16().count(),
-                TextUnit::Scalar => value.chars().count(),
-            };
             if let Some(last) = chunks.last_mut()
-                && count(last) + 2 + count(suffix) <= max
+                && let Some(caption) = Self::caption(last, suffix, max, unit)
             {
-                last.push_str("\n\n");
-                last.push_str(suffix);
+                *last = caption;
             } else {
                 chunks.push(suffix.to_owned());
             }
         }
         chunks
+    }
+
+    pub(crate) fn caption(text: &str, suffix: &str, max: usize, unit: TextUnit) -> Option<String> {
+        let count = |value: &str| match unit {
+            TextUnit::Utf16 => value.encode_utf16().count(),
+            TextUnit::Scalar => value.chars().count(),
+        };
+        let separator = if text.is_empty() { "" } else { "\n\n" };
+        (count(text) + separator.len() + count(suffix) <= max)
+            .then(|| format!("{text}{separator}{suffix}"))
     }
 
     pub(crate) fn without_discord_footer(text: &str) -> &str {
@@ -90,7 +97,7 @@ mod tests {
     fn a_footer_names_models_and_uses_singular_steps_and_whole_seconds() {
         assert_eq!(
             Footer::new(&["model-a".into()], 1, Duration::from_millis(7999)).line(),
-            "model-a · 1 step · 7 s"
+            "model-a · 1 step · 8 s"
         );
         assert_eq!(
             Footer::new(

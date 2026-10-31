@@ -2734,7 +2734,7 @@ fn a_finished_footer_survives_a_full_progress_queue() {
     assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
     assert_eq!(
         adapter.take_footer().unwrap().line(),
-        "model-a · 1 step · 0 s"
+        "model-a · 1 step · 1 s"
     );
     assert!(adapter.take_footer().is_none());
 }

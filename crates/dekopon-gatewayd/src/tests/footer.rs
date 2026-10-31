@@ -370,3 +370,153 @@ async fn a_cancelled_chat_answer_carries_no_footer() {
     );
     assert_eq!(posts[0]["text"], crate::session::STOPPED_REPLY);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_slack_image_answer_is_one_file_share_ending_with_its_footer() {
+    let base = Arc::new(Mutex::new(String::new()));
+    let response_base = Arc::clone(&base);
+    let http = spawn_http_mock(move |path, _| match path {
+        "/api/files.getUploadURLExternal" => json!({
+            "ok":true,"upload_url":format!("{}/upload", response_base.lock()),"file_id":"f-generated"
+        }),
+        "/upload" => json!({"uploaded":true}),
+        "/api/files.completeUploadExternal" => json!({"ok":true,"files":[{"id":"f-generated"}]}),
+        _ => json!({"ok":true,"channel":"d0123abc","ts":"1712345678.000101"}),
+    });
+    *base.lock() = http.base.clone();
+    slack(&http.base)
+        .driver()
+        .reply(
+            &ReplyTarget::Slack {
+                channel: "d0123abc".into(),
+                thread_ts: Some("1712345678.000100".into()),
+            },
+            OutboundReply::with_images("Here is your kitty.", generated_images(1)).with_footer(
+                Some(crate::progress::Footer::new(
+                    &["model-a".into()],
+                    1,
+                    Duration::from_secs(7),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    let calls = http.calls();
+    assert_eq!(
+        calls.len(),
+        3,
+        "one upload and file share, with no separate answer post"
+    );
+    assert_eq!(calls[2].0, "/api/files.completeUploadExternal");
+    let posted: Value = serde_json::from_str(&calls[2].1).unwrap();
+    assert_eq!(posted["channel_id"], "d0123abc");
+    assert_eq!(posted["thread_ts"], "1712345678.000100");
+    assert!(posted.get("initial_comment").is_none());
+    let blocks: Value = serde_json::from_str(posted["blocks"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        blocks,
+        json!([
+            {"type":"markdown","text":"Here is your kitty."},
+            {"type":"context","elements":[{"type":"plain_text","text":"model-a · 1 step · 7 s"}]}
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_telegram_image_answer_is_one_captioned_message_ending_with_its_footer() {
+    let http = spawn_http_mock(|_, _| {
+        json!({"ok":true,"result":{
+            "message_id":12,"chat":{"id":-1001},"message_thread_id":77,"photo":[{"file_id":"photo"}]
+        }})
+    });
+    telegram(&http.base)
+        .driver()
+        .reply(
+            &ReplyTarget::Telegram {
+                chat_id: -1001,
+                reply_to: Some(3),
+                message_thread_id: Some(77),
+            },
+            OutboundReply::with_images("Here is your kitty. 🐈", generated_images(1)).with_footer(
+                Some(crate::progress::Footer::new(
+                    &["model-a".into()],
+                    1,
+                    Duration::from_secs(7),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    let calls = http.calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the photo, answer and footer arrive together"
+    );
+    assert!(calls[0].0.ends_with("/sendPhoto"));
+    let multipart = &calls[0].1;
+    assert!(
+        multipart.contains(
+            "name=\"caption\"\r\n\r\nHere is your kitty. 🐈\n\nmodel-a · 1 step · 7 s\r\n"
+        )
+    );
+    assert!(multipart.contains(&format!("name=\"caption_entities\"\r\n\r\n{}\r\n", json!([
+        {"type":"italic","offset":"Here is your kitty. 🐈\n\n".encode_utf16().count(),"length":"model-a · 1 step · 7 s".encode_utf16().count()}
+    ]))));
+    assert!(multipart.contains("name=\"reply_parameters\"\r\n\r\n{\"message_id\":3}\r\n"));
+    assert!(multipart.contains("name=\"message_thread_id\"\r\n\r\n77\r\n"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_whatsapp_image_answer_is_one_captioned_message_ending_with_its_footer() {
+    let http = spawn_http_mock(|path, _| match path {
+        "/v23.0/456/media" => json!({"id":"987"}),
+        "/v23.0/456/messages" => {
+            json!({"messaging_product":"whatsapp","messages":[{"id":"wamid.reply"}]})
+        }
+        other => panic!("unexpected WhatsApp image call: {other}"),
+    });
+    let transport = crate::transport::whatsapp::WhatsappTransport::new(
+        "wa".into(),
+        "127.0.0.1:0".parse().unwrap(),
+        "/wa".into(),
+        "123".into(),
+        "456".into(),
+        "v23.0".into(),
+        http.base.clone(),
+        "app-fixture".into(),
+        "verify-fixture".into(),
+        "access-fixture".into(),
+        LivenessSettings::default(),
+    )
+    .unwrap();
+    transport
+        .driver()
+        .reply(
+            &ReplyTarget::WhatsApp {
+                recipient: "16034700182".into(),
+            },
+            OutboundReply::with_images("Here is your kitty.", generated_images(1)).with_footer(
+                Some(crate::progress::Footer::new(
+                    &["model-a".into()],
+                    1,
+                    Duration::from_secs(7),
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+    let calls = http.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "one media upload and one captioned image send"
+    );
+    assert_eq!(calls[1].0, "/v23.0/456/messages");
+    let posted: Value = serde_json::from_str(&calls[1].1).unwrap();
+    assert_eq!(posted["type"], "image");
+    assert_eq!(
+        posted["image"],
+        json!({"id":"987","caption":"Here is your kitty.\n\n_model-a · 1 step · 7 s_"})
+    );
+}

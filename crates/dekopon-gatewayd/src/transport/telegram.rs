@@ -786,12 +786,20 @@ impl TelegramDriver {
 }
 
 fn add_footer_entity(body: &mut Value, footer: Option<&crate::progress::Footer>) {
-    if let Some(footer) = footer
-        && let Some(text) = body["text"].as_str()
-        && let Some(answer) = text.strip_suffix(footer.line())
+    if let Some(entities) = body["text"]
+        .as_str()
+        .and_then(|text| footer_entities(text, footer))
     {
-        body["entities"] = json!([{"type": "italic", "offset": answer.encode_utf16().count(), "length": footer.line().encode_utf16().count()}]);
+        body["entities"] = entities;
     }
+}
+
+fn footer_entities(text: &str, footer: Option<&crate::progress::Footer>) -> Option<Value> {
+    let footer = footer?;
+    let answer = text.strip_suffix(footer.line())?;
+    Some(
+        json!([{"type": "italic", "offset": answer.encode_utf16().count(), "length": footer.line().encode_utf16().count()}]),
+    )
 }
 
 fn addressed(message: &MessageRef) -> Result<(i64, Option<i64>, i64), TransportError> {
@@ -856,8 +864,16 @@ impl ChatDriver for TelegramDriver {
         };
         let (chat_id, reply_to, message_thread_id) = (*chat_id, *reply_to, *message_thread_id);
         if !images.is_empty() {
-            let caption_fits =
-                footer.is_none() && text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
+            let caption_fits = text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
+            let caption = footer.and_then(|footer| {
+                crate::progress::Footer::caption(
+                    text,
+                    footer.line(),
+                    MAX_PHOTO_CAPTION_CHARS,
+                    TextUnit::Utf16,
+                )
+            });
+            let caption_footer = caption.as_ref().and(footer);
             let mut accepted = false;
             while let Some(read) = images.next().await {
                 let (index, image) = match read {
@@ -865,7 +881,8 @@ impl ChatDriver for TelegramDriver {
                     Err(_) if accepted => return Err(TransportError::PartialDelivery),
                     Err(error) => return Err(error),
                 };
-                let caption = (index == 0 && caption_fits).then_some(text.as_str());
+                let caption = (index == 0 && caption_fits)
+                    .then_some((caption.as_deref().unwrap_or(text), caption_footer));
                 match self
                     .send_photo(chat_id, reply_to, message_thread_id, caption, image)
                     .await
@@ -875,8 +892,11 @@ impl ChatDriver for TelegramDriver {
                     Err(error) => return Err(error),
                 }
             }
-            if caption_fits {
+            if caption_fits && (footer.is_none() || caption.is_some()) {
                 return accepted.then_some(()).ok_or(TransportError::Response);
+            }
+            if caption_fits {
+                reply.text.clear();
             }
             return self
                 .send_text_chunks(chat_id, reply_to, message_thread_id, &reply, true)
@@ -1010,7 +1030,7 @@ impl TelegramDriver {
         chat_id: i64,
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
-        caption: Option<&str>,
+        caption: Option<(&str, Option<&crate::progress::Footer>)>,
         image: super::hydration::HydratedImage,
     ) -> Result<(), TransportError> {
         let filename = image.filename;
@@ -1026,8 +1046,11 @@ impl TelegramDriver {
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
             .part("photo", part);
-        if let Some(caption) = caption {
+        if let Some((caption, footer)) = caption {
             form = form.text("caption", caption.to_owned());
+            if let Some(entities) = footer_entities(caption, footer) {
+                form = form.text("caption_entities", entities.to_string());
+            }
         }
         if let Some(reply_to) = reply_to {
             form = form.text(
@@ -1958,7 +1981,7 @@ mod tests {
             .await
             .unwrap();
         let posted = api.body("editMessageText");
-        assert_eq!(posted["text"], "😀 done\n\nmodel-a · 1 step · 7 s");
+        assert_eq!(posted["text"], "😀 done\n\nmodel-a · 1 step · 8 s");
         assert_eq!(
             posted["entities"],
             json!([{"type":"italic", "offset":9,"length":22}])

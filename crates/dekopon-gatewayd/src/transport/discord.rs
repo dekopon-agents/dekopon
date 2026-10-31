@@ -3446,7 +3446,7 @@ mod unit_tests {
         let posted = server.await.unwrap();
         assert_eq!(
             posted[0].body["content"],
-            "done\n\n-# model-a · 1 step · 7 s"
+            "done\n\n-# model-a · 1 step · 8 s"
         );
     }
 }

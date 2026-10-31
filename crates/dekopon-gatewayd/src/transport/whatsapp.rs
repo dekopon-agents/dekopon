@@ -740,26 +740,34 @@ impl ChatDriver for WhatsappDriver {
         {
             return Err(media::failure("image-too-large"));
         }
-        let caption_fits = footer.is_none()
-            && !images.is_empty()
-            && text.chars().count() <= media::MAX_CAPTION_CHARS;
+        let caption_fits = !images.is_empty() && text.chars().count() <= media::MAX_CAPTION_CHARS;
+        let caption = suffix.as_deref().and_then(|suffix| {
+            crate::progress::Footer::caption(
+                &text,
+                suffix,
+                media::MAX_CAPTION_CHARS,
+                TextUnit::Scalar,
+            )
+        });
+        let caption_text = caption.as_deref().unwrap_or(&text);
         let mut accepted = 0_usize;
         while let Some(read) = images.next().await {
             let (index, image) = match read {
                 Ok(read) => read,
                 Err(error) => return Err(self.reply_failure(error, accepted)),
             };
-            let caption = (caption_fits && index == 0 && !text.is_empty()).then_some(text.as_str());
+            let caption =
+                (caption_fits && index == 0 && !caption_text.is_empty()).then_some(caption_text);
             if let Err(error) = self.send_image(recipient, caption, image).await {
                 return Err(self.reply_failure(error, accepted));
             }
             accepted += 1;
         }
-        if caption_fits {
+        if caption_fits && (footer.is_none() || caption.is_some()) {
             return Ok(());
         }
         for chunk in crate::progress::Footer::chunks(
-            &text,
+            if caption_fits { "" } else { &text },
             suffix.as_deref(),
             MAX_WHATSAPP_TEXT_CHARS,
             TextUnit::Scalar,
