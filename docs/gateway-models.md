@@ -57,7 +57,7 @@ timed-out, or failed call is charged its input estimate and the text it already 
 settle above its estimate; that is real spend, and it shows as debt that delays the next allow.
 
 Without `metering`, or for an agent with no budget, spend is unbounded and still recorded: every
-model call writes one [`meter` record](observability.md#the-meter-charge-record). Summary calls are
+model call writes one `meter` record. Summary calls are
 recorded with `via = "summary"` but never admitted or refused, so they never use room a reply step
 needs, and a ledger rebuilt from records skips them. A budget added
 later restores real history. A refusal mid-turn ends the turn with the sentence; capability calls
@@ -123,7 +123,7 @@ proxy:
   URI SAN, or the TLS handshake fails. The jail names the VM in `x-dekopon-vm-subject`; an
   unlisted subject gets a 403. See [the security model](security-model.md#the-guest-model-proxy-trusts-the-jail-to-name-its-vm).
   The jail also sets `x-dekopon-vm-session`; the proxy records it on the call's
-  [`model.proxy.call` span](observability.md#the-meter-charge-record) and nothing else.
+  `model.proxy.call` span and nothing else.
 - **Models.** A guest names a configured model (`astra`, `claude-opus`), never an upstream id.
   A model outside the guest's list, or one the path's dialect cannot reach, gets a 403. The proxy
   rewrites `model` to the configured upstream id and injects the upstream credential. It drops
@@ -203,4 +203,4 @@ coding.
 
 `dekopon-gatewayd auth chatgpt {login,status,logout,export}` runs before gateway configuration,
 telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
-ordinary serving requires `--config PATH`. See [`cli.md`](cli.md) for auth-only flags, output, exit codes and both export guards.
+ordinary serving requires `--config PATH`. See `cli.md` for auth-only flags, output, exit codes and both export guards.

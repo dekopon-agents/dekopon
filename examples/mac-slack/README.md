@@ -17,8 +17,7 @@ Apply it in this order:
    directories and `credentials.env` in
    [Prepare the broker and gateway](../../docs/run-on-mac.md#prepare-the-broker-and-gateway).
    Create the Slack app from the
-   [0.74.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml)
-   with [Slack setup](../slack/README.md#create-the-app-and-credentials).
+   [0.74.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml).
 2. Here, create five files, each mode `0600`, then [check them](#validate-and-accept):
    - in `/usr/local/etc/dekopon/broker/`, owned by `_dekopon_broker`:
      `jsonplaceholder-provider.wasm`, `broker.yaml` and `policies.cedar`;
@@ -55,8 +54,8 @@ runbook's [install commands](../../docs/run-on-mac.md#prepare-the-broker-and-gat
 | Placeholder | Value |
 |---|---|
 | `BROKER_UID`, `GATEWAY_UID` | Output of `id -u _dekopon_broker` and `id -u _dekopon_gateway` |
-| `t0123abc`, `u0123abc` | Slack workspace and member IDs, lowercased ([Allow a sender](../slack/README.md#allow-a-sender)); names and email addresses are not IDs |
-| `replace-with-exact-openrouter-model-id` | One exact OpenRouter model ID that supports tool calls ([model settings](../../docs/gatewayd.md#openrouter-model-settings)) |
+| `t0123abc`, `u0123abc` | Slack workspace and member IDs, lowercased (Allow a sender); names and email addresses are not IDs |
+| `replace-with-exact-openrouter-model-id` | One exact OpenRouter model ID that supports tool calls (model settings) |
 
 `check` accepts the sample Slack IDs and the model placeholder, so confirm none remain.
 

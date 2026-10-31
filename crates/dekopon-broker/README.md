@@ -56,7 +56,7 @@ paths, queries, headers, bodies, cookies, authorization values, or credentials.
 The record is a structured `tracing` event on target `dekopon_broker::audit`, emitted inside the span
 that made the decision: `broker.decision` for an allow or deny, `broker.execution` for a terminal
 outcome, including an authorized failure before the provider ran
-([fields](../../docs/observability.md#the-broker-audit-record)). It is emitted before the `AuditLog`
+(fields). It is emitted before the `AuditLog`
 sink is offered the event, so a sink cannot suppress it. `TraceOnlyAuditLog` keeps nothing and is
 the sink [`dekopon-brokerd`](../dekopon-brokerd/README.md#audit) runs. `InMemoryAuditLog` is a
 bounded sink for tests and embedding: `records()` returns the events in append order, and a full log

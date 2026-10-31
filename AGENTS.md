@@ -11,11 +11,10 @@ The model proposes; a separate broker authorizes and executes provider effects.
   then the applicable [change map](docs/development.md#change-maps).
 - Read relevant [security model](docs/security-model.md) sections before changing identity,
   capabilities, credentials, providers, audit, or external effects.
-- Select other contracts from the [area index](docs/README.md#change-a-specific-area);
-  do not read every document by default or copy its inventory here.
+- The code is the reference for keys, fields, defaults, events and errors: read the types,
+  `dekopon-gatewayd check`, `dekopon-brokerd check` and `--help`, not a doc.
 - Follow [CONTRIBUTING.md](CONTRIBUTING.md#change-guidelines) for implementation and review conventions.
-- Write or change documentation with the [`succinct-docs` skill](.claude/skills/succinct-docs/SKILL.md)
-  under the [Documentation](#documentation) rules.
+- Write documentation only under the [Documentation](#documentation) rules.
 - This file and the documents it links are the whole contract. A cloud agent in a bare checkout has
   no owner memories, machine instructions or sibling repositories, and needs none: fetch what a
   gate needs (`ci/fetch-external-provider-components.sh`), and name every gate you could not run.
@@ -72,7 +71,9 @@ Audits and plans default to over-building, and the owner reels them back. Before
   redundant primitive instead of adding coordination.
 - **Enforcement is compiler-native only:** `clippy.toml` `disallowed-*` with a `reason`, a site
   `#[expect(..., reason)]`, workspace lints. No CI checker scripts, grep gates, exception
-  registries, negative-fixture suites or per-boundary inventory docs.
+  registries, negative-fixture suites or per-boundary inventory docs. The exceptions are the
+  dependency-boundary gates and the documentation word budget ([Documentation](#documentation)),
+  which no compiler can enforce.
 - **Fail fast, one rich trace record, a reset path.** No quarantine, integrity MACs or detection
   that cannot fix anything ([non-goals](docs/design.md#non-goals)).
 - **Calibrate severity to the one deployment,** a Raspberry Pi serving family chats. Owner-only
@@ -98,12 +99,12 @@ Audits and plans default to over-building, and the owner reels them back. Before
   regenerate Cargo locks with Cargo, never hand-edit them.
 - Start with `git diff --check`, then the applicable [validation](docs/development.md#validation).
   Use `--locked`; root Cargo commands do not cover separate provider workspaces.
-  Markdown-only work uses [documentation gates](docs/development.md#documentation-gates), not Rust builds.
+  Markdown-only work runs the word-budget step of the `docs` job in `.github/workflows/ci.yml`, not Rust builds.
 - Check disk before expensive builds; follow the documented artifact lifecycle.
   Never delete active builds or another owner's artifacts.
 - Before a push, run CI's own steps for what you touched: rebuild and byte-compare the checked
   components when the SDK or WIT changes ([provider change map](docs/development.md#provider-contract-or-host)),
-  the audit-event documentation gate when you add a trace event, rustdoc with `-D warnings`, `cargo deny`.
+  rustdoc with `-D warnings`, `cargo deny`.
 - A fleet re-pin moves every exact pin a provider carries, not only `dekopon-provider-*`: providers
   also pin `dekopon-core`, `-capability`, `-broker`, `-broker-protocol` and `-broker-host` at the
   workspace version.
@@ -129,26 +130,52 @@ Audits and plans default to over-building, and the owner reels them back. Before
 
 ## Documentation
 
-Docs serve skilled engineers and coding agents: the fewest words that get them running correctly.
-Write and review every doc change with the [`succinct-docs` skill](.claude/skills/succinct-docs/SKILL.md),
-which holds the rubric. These rules are hard; a doc change that breaks one is not merged.
+Docs are for humans: what a principal engineer cannot derive from the code. Agents read the code,
+`check`, `--help` and this file. These rules are hard; a change that breaks one is not merged.
 
-- **Current tree only.** Describe what the code does now; future work keeps its Committed direction
-  or Exploration label. No history, "previously", migration steps, Dekopon version minimums,
-  deprecation or compatibility guidance. `CHANGELOG.md` is the only history, and `docs/upgrading.md`
-  holds only the current release's upgrade and rollback steps. Name the current key, never the old
-  one, except in those steps.
-- **No receipts.** No CI run IDs, OS or Homebrew patch versions, observed call counts or "we
-  tested". What a CI lane proves is stated once, in its section of `docs/development.md`.
-- **One fact, one owner.** State a fact in the doc the [area
-  index](docs/README.md#change-a-specific-area) gives it; elsewhere link to the precise heading.
-- **Verified blocks.** Every command and config block is checked against the code or a released
-  binary; a prose edit leaves blocks byte-identical.
-- **No backsliding.** A doc change never lowers the file's rubric score, and a new doc scores at
-  least 40 of 50. A fresh reviewer scores it before merge.
+**When to document.** Write a doc, a README section or a comment only for:
+
+- one of Dekopon's four ideas:
+  - **credentials the agent never holds:** the model proposes through one bash-like script, and the
+    broker, its own process and UID, runs Wasm providers and injects a destination-bound credential
+    after the provider builds the request;
+  - **two-layer authority:** the broker alone maps an authenticated subject to a principal and Cedar
+    decides whether it may act; operator constraint sets decide how far, and policy cannot widen
+    them; Cedar also checks each outbound request;
+  - **the memory ladder:** journaled turns replay through summaries written ahead of time, and a
+    record keeps its rung until a repack, until it leaves the hot window or until its pin changes,
+    so the prompt cache stays warm; memory never grants authority;
+  - **keyless model access for outside VMs:** coding agents reach models through the gateway's proxy,
+    which injects the key and charges the agent's token budget;
+- a design reason the code cannot show;
+- a security limit: what Dekopon deliberately does not protect;
+- a step a human performs outside the repository.
+
+Everything else is the code, `check` and `--help`. Errors are loud and name the key.
+
+1. **Budget.** Tracked Markdown, except the files the `docs` CI job excludes (`CHANGELOG.md`, this
+   file and fixtures), stays within the word budget that job enforces. A change over budget cuts as
+   much as it adds, or cites the owner's raise.
+2. **Whole file first.** A pull request that touches a doc gives it a KEEP, MERGE or DELETE verdict
+   in its body before any line is edited.
+3. **Derivation test.** No doc states a key, field, default, event, error, limit or command that a
+   type, serde attribute, constant, `values.yaml`, `--help` or test name states; link the path.
+4. **Novelty test.** A section survives only if a principal engineer who knows agent gateways,
+   Kubernetes, OpenTelemetry, Cedar and Slack could not predict it from its heading.
+5. **Why, limit or manual step.** Every paragraph is one of the three; delete the rest.
+6. **No indexes, history, proposals or receipts.** `README.md` is the only index, `CHANGELOG.md`
+   the only history, and issues hold proposals. No "previously", migration steps, version minimums,
+   CI run IDs, patch versions or "we tested".
+7. **Code names no docs.** Errors, comments and config name keys, not doc paths. Only packaging
+   (`release.yml`, the Homebrew formula, the chart) names doc files, and anything may cite AGENTS.md.
+8. **Delete, don't reword.** When a change makes a sentence wrong, delete it unless it passes rules
+   3–5. A doc diff that adds more words than it removes says why.
+
+- **No documentation in Rust.** See [Comments](#comments).
 - **Deployment positioning.** Kubernetes is the preferred deployment; the Mac path serves people
-  moving from OpenClaw or Hermes. The root README, `docs/README.md` and the website's `/deploy/`
-  link both before their first section, Kubernetes first.
+  moving from OpenClaw or Hermes. The root README and the website's `/deploy/` link both before
+  their first section, Kubernetes first.
+- **Review.** A fresh reviewer who did not write the change checks every kept claim against the code.
 
 ## Rust guidelines
 
@@ -300,10 +327,10 @@ The owner reads the code; every comment is text he has to read past. Write none 
 comment earns its line only by stating a constraint the code cannot show: an ordering requirement,
 an invariant other code relies on that the types do not enforce, the security reason behind a
 restriction that looks arbitrary, an upstream workaround with its link, or why the obvious simpler
-alternative is wrong here. One sentence, at the site. `///` and `//!` follow the same rule; the
-exceptions are one-or-two-sentence docs on the public items of `dekopon-provider-sdk` and its
-testkit, clap `///` (it is the `--help` text), `///` on `JsonSchema` input fields (it is the
-model-facing schema description), `compile_fail` doctests, and `// SAFETY:`.
+alternative is wrong here. One sentence, at the site. No `///` or `//!`: prose docs drift from the
+code beside them. The exceptions are text a binary or model reads, and tests: clap `///` (it is the
+`--help` text), `///` on `JsonSchema` input fields (it is the model-facing schema description),
+doctests, and `// SAFETY:`.
 
 - Yes: `// The descriptor closes before accounting is released; unlink alone is not disk reclamation.`
 - No: a `///` that restates the item's name or signature; a module overview; `// step 1: open the file`; `// handle error`; `// TODO: clean this up`; history (`// previously…`, `// now uses…`, `// replaces the old…`); plan, finding or PR IDs (`// D18`, `// W2-E`, `// see #187`); a comment narrating what a test asserts; three lines where one sentence carries the constraint.

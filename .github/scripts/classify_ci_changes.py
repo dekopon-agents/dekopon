@@ -35,7 +35,6 @@ FULL_CI_INPUTS = {
     ".github/scripts/classify_ci_changes.py",
     ".github/scripts/test_classify_ci_changes.py",
     ".github/scripts/test_daemon_dependency_gates.py",
-    ".github/scripts/check_docs_duplicates.py",
     ".github/scripts/render-homebrew-formula.py",
     ".github/scripts/test_render_homebrew_formula.py",
 }
@@ -160,9 +159,6 @@ def classify_path(path: str) -> dict[str, bool]:
     # gating would silently lose coverage.
     if flags["run_rust"]:
         flags["run_otel"] = True
-        # The documentation lane also reads crates/**/*.rs: it fails a PR that emits
-        # an audit event name docs/observability.md does not carry.
-        flags["run_docs"] = True
 
     return flags
 

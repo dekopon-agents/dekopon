@@ -6,7 +6,7 @@ Kubernetes is the preferred deployment. People moving from OpenClaw or Hermes to
 The operator reference for the [Helm chart](../charts/dekopon/), for readers who know Kubernetes and
 Helm. The chart places files and sets their owners and modes; their contents are defined by the
 [broker configuration reference](../crates/dekopon-brokerd/README.md) and the
-[gateway configuration reference](gatewayd.md). The [container image guide](container-image.md)
+gateway configuration reference. The [container image guide](container-image.md)
 covers the image.
 
 The chart runs `dekopon-brokerd` and `dekopon-gatewayd` as one pod under separate UIDs. It is
@@ -231,7 +231,7 @@ does not rewrite configuration.
 budget plus `brokerAssets.maxInFlightBytes` (64 MiB), because unlinked broker outputs stay on it until
 the gateway closes them. Raise each with its budgets. The chart refuses `gateway.journal.enabled`
 without `gateway.assets.enabled`, and the reverse; with a journal, attachments survive restarts on
-the claim, and without one they stay in gateway `/tmp` ([Chat assets](gateway-assets.md#chat-assets)).
+the claim, and without one they stay in gateway `/tmp` (Chat assets).
 Kubelet enforces `emptyDir.sizeLimit` by evicting the pod; it reserves nothing.
 
 ## Probes
@@ -478,7 +478,7 @@ claim binds to the hook's pod.
 `dekopon-gatewayd check --probe` on the configuration a release is about to apply, with the
 Deployment's image. A problem fails the hook: the release stops before anything changes, and the old
 pod keeps serving. Each check is the function its daemon runs at boot
-([gateway](gatewayd.md#check-a-configuration), [broker](../crates/dekopon-brokerd/README.md#check-a-configuration)).
+(gateway, [broker](../crates/dekopon-brokerd/README.md#check-a-configuration)).
 
 ```yaml
 configCheck:

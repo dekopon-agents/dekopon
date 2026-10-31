@@ -163,7 +163,7 @@ memory growth is charged against the shared ceiling by the store's high-water, a
 drop, without refunds for failed allocation. A refused growth emits `memory.refused`; the guest
 sees -1, and an invocation that fails after refusal reports `host-memory-budget`. Invocation
 stores also report fuel where available. Describe and command-run stores emit `memory.store` too.
-See [operator sizing and limitations](../../docs/observability.md#provider-linear-memory-sizing).
+See operator sizing and limitations.
 
 ## Offline skill reader
 

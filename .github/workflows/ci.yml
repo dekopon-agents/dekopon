@@ -276,10 +276,8 @@ jobs:
     with:
       runners: '["ubuntu-24.04-arm"]'
 
-  # Both gates are toolchain-free, so they stay out of quality_checks: a documentation-only
-  # pull request selects no Rust lane and must still fail on a stale duplicate entry or an
-  # undocumented audit event. The audit gate reads crates/**/*.rs, which is why every
-  # Rust-affecting change also selects run_docs.
+  # Toolchain-free, so it stays out of quality_checks: a documentation-only pull request selects
+  # no Rust lane and must still fail when the docs outgrow their budget (AGENTS.md#documentation).
   docs:
     name: documentation checks
     needs: changes
@@ -288,39 +286,19 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Verify documentation has no stale duplicate entries
-        run: |
-          python3 .github/scripts/check_docs_duplicates.py \
-            docs README.md AGENTS.md crates/*/README.md
-      - name: Verify emitted audit events are documented
+      - name: Keep documentation within its word budget
         shell: bash
         run: |
           set -euo pipefail
-          doc=docs/observability.md
-          emitted=()
-          while IFS= read -r event; do
-            emitted+=("$event")
-          done < <(
-            grep -rhoE 'audit\.event[[:space:]]*=[[:space:]]*"[a-z0-9_.]+"' --include='*.rs' crates \
-              | grep -oE '"[a-z0-9_.]+"' \
-              | tr -d '"' \
-              | sort -u
-          )
-          # An empty set means the emission shape changed and this gate stopped reading anything,
-          # which is the silent failure worth failing on.
-          if [ ${#emitted[@]} -eq 0 ]; then
-            echo 'no audit.event names found in crates/; the extraction pattern is stale' >&2
+          budget=110000
+          words=$(git ls-files -z -- '*.md' ':(exclude)CHANGELOG.md' ':(exclude)AGENTS.md' \
+            ':(exclude)crates/*/examples/eval/*' ':(exclude)examples/catalog/skills/*' \
+            ':(exclude)crates/*/tests/fixtures/*' | xargs -0 cat | wc -w)
+          printf 'documentation: %d of %d words\n' "$words" "$budget"
+          if [ "$words" -gt "$budget" ]; then
+            echo "documentation is over its ${budget}-word budget; cut as much as you add (AGENTS.md#documentation)" >&2
             exit 1
           fi
-          status=0
-          for event in "${emitted[@]}"; do
-            if ! grep -Fq -- "\`$event\`" "$doc"; then
-              echo "undocumented audit event: $event (add \`$event\` to $doc)" >&2
-              status=1
-            fi
-          done
-          printf 'checked %d audit event names against %s\n' "${#emitted[@]}" "$doc"
-          exit "$status"
 
   # Preserve the required branch-protection context while its expensive halves run in parallel. A
   # lane this pull request did not select is skipped, so require each one only under its own gate.

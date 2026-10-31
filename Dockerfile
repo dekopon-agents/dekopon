@@ -16,7 +16,7 @@
 # The chart runs broker UID 65532 and gateway UID 65533 in a shared pod, with IPC group 65534.
 # Its broker-owned IPC parent is 0710 and the group-reachable socket is 0660; peer UID mapping
 # authenticates callers, not group membership. Owner-only local chat sockets remain 0600.
-# See docs/security-model.md#current-local-process-boundary; private stores stay owner-only.
+# Private stores stay owner-only.
 # One image whose `command` selects the binary supports both processes without changing identity.
 #
 # This file expects a staged context and is not buildable from the repository root. The context is

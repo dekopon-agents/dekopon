@@ -4,13 +4,13 @@ How a chat message reaches an agent session, what the gateway keeps between turn
 turn is authorized. Read [Routing](#routing) and [Sessions](#sessions) to run a route, and
 [Conversations](#conversations) before changing a route's `memory:` block.
 
-- [`gatewayd.md`](gatewayd.md#configuration) owns every key named here and its default;
-  [memory settings](gatewayd.md#memory-settings) owns the journal, summary and retention keys.
+- `gatewayd.md` owns every key named here and its default;
+  memory settings owns the journal, summary and retention keys.
 - [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) owns the threats
   conversation memory accepts; [`inference.md`](inference.md#how-scoped-conversation-memory-works)
   owns what reaches the model request.
-- [`gateway-liveness.md`](gateway-liveness.md#liveness-progress-and-stopping-a-run) owns progress,
-  stops, seals and the fixed stop lines; [`gateway-transports.md`](gateway-transports.md) owns each
+- `gateway-liveness.md` owns progress,
+  stops, seals and the fixed stop lines; `gateway-transports.md` owns each
   chat service's behaviour.
 
 ## Routing
@@ -35,9 +35,9 @@ A route picks the agent that answers a message. It grants no authority.
 - **Addressing.** Every kind except `directMessage` needs the bot addressed to start a turn:
   `<@BOT_USER_ID>` on Slack, the bot user (`mentions`) or its managed role (`mention_roles`) on
   Discord, `@botname` on Telegram. A route never changes that. Transports admit some unaddressed
-  messages: Slack Agent [owned-thread continuation](gateway-transports.md#slack-socket-mode),
-  [thread follow](gateway-transports.md#slack-thread-follow),
-  [pull-request links](gateway-transports.md#slack-pull-request-links), and the rest of a Telegram
+  messages: Slack Agent owned-thread continuation,
+  thread follow,
+  pull-request links, and the rest of a Telegram
   album whose first message was addressed. Others are ignored with `reason = not-addressed`.
 - **fauxlack.** Test-only subjects are `fauxlack.<server>.u<id>` people and
   `fauxlack.<server>.c<id>` spaces. A fauxlack conversation's container is the subject's server;
@@ -69,13 +69,13 @@ Each admitted turn runs one session through five steps. On a `oneShot` route
      always may), a refusal-reply permit is free and the transport accepts it.
    - Follow-ups run inline under the same permit, each with its own route, subject, cancellation,
      broker leg and trace. A conversation keeps its permit until its mailbox is empty.
-2. **Authorization.** A [sealed](gateway-liveness.md#liveness-progress-and-stopping-a-run) thread is
+2. **Authorization.** A sealed thread is
    refused first. Every other session opens an attested broker leg with
    `capabilities(subject, agent, scope)`; a refusal replies as in [Refusals](#refusals) and starts
    no model call and no progress. An admission acknowledgement on queued input does not mean it was
    authorized.
 3. **Liveness.** Where the transport opted in, one session-owned task shows progress from the fresh
-   grant onward ([liveness](gateway-liveness.md#liveness-progress-and-stopping-a-run)).
+   grant onward (liveness).
 4. **Execution.**
    - On a `persistent` route the session looks up its [conversation](#conversations) after step 2,
      because the grant comparison needs the fresh grant, and seeds what survives ahead of the new
@@ -89,18 +89,18 @@ Each admitted turn runs one session through five steps. On a `oneShot` route
      The duration renders in seconds when `maxDurationMs` is not whole minutes and is absent when
      it is unset. Instructions are read fresh each session and never stored in history.
    - The agent's catalog skills follow in a second system message, by name and description;
-     `read_skill` loads one on demand ([skills](catalog.md#skills-are-directories-the-model-reads-on-demand)).
+     `read_skill` loads one on demand (skills).
    - Every session offers `bash`, `suggest_improvement` and the no-argument `wake_reason`, which
      reports whether chat, a GitHub webhook, a wake or a job started the turn and grants nothing.
      `inspect_agent_config` is offered only where the route sets `inspectAgentConfig: true`.
      `suggest_improvement` writes `agent.improvement.suggested` to telemetry and never to chat
-     ([improvement](improvement.md)).
+     (improvement).
    - Shell bounds are the shell's defaults, except `maxCapabilityCalls` and `scriptTimeoutMs`,
      which come from the route. Every model request carries a [prompt cache key](#the-prompt-cache-key).
 5. **Answer.**
    - The bounded final text and accepted provider attachments go to chat.
    - A failed required turn posts the fixed line from
-     [liveness](gateway-liveness.md#liveness-progress-and-stopping-a-run), or the `failed` template:
+     liveness, or the `failed` template:
      appended to a streamed partial answer, otherwise as a fresh reply after removing any progress
      message. Failure detail goes to `gateway_session_failed` (`category`), never to chat.
    - A stop finalizes the progress message in place, except that a steer staged after the post gets
@@ -111,7 +111,7 @@ Each admitted turn runs one session through five steps. On a `oneShot` route
      every turn posts `The agent attempted capability work but could not report the result. Check the audit before retrying.`
    - A follow batch or an inherited Slack Agent continuation may call `decline_chat_reply` before
      capability work; the turn then posts nothing
-     ([continuation boundary](architecture.md#slack-agent-continuation-boundary)).
+     (continuation boundary).
    - A `persistent` route stores the textual exchange as one turn, trims the window and restarts
      the idle clock. A declined or failed session stores its question with no answer; a session
      refused at step 2 stores nothing. Stop and failure lines, stop notices and attachment bytes
@@ -124,7 +124,7 @@ Each admitted turn runs one session through five steps. On a `oneShot` route
 
 | Case | Reply | Record |
 |---|---|---|
-| Unmapped sender | `I only talk to the Lange family. I've let my owner know you stopped by.`, at most one per second gateway-wide | owner notice `gateway.session.rejected` on every refusal ([unmapped sender notices](observability.md#unmapped-sender-notices)) |
+| Unmapped sender | `I only talk to the Lange family. I've let my owner know you stopped by.`, at most one per second gateway-wide | owner notice `gateway.session.rejected` on every refusal (unmapped sender notices) |
 | Mapped principal denied this agent, or an empty grant naming a principal | `Sorry <principal>, you don't have permission for this agent.` | `gateway_session_rejected`, `reason` `agent-denied` or `unauthorized` |
 | Attestation refused, or an empty grant naming no principal | `You're not authorized to use this agent.` | `gateway_session_rejected`, `reason` `attestation-refused` or `unauthorized` |
 
@@ -143,17 +143,17 @@ Each admitted turn runs one session through five steps. On a `oneShot` route
   the next model call and replace a draft answer when another step remains. An interrupted call
   does not spend `maxSteps`. A run requests at most eight interrupts, then steers wait for the
   boundary; each follow-up starts a fresh budget. Only the asker's steers interrupt.
-  [Harness gotchas](harness-gotchas.md) owns staging, leftovers and folding.
+  Harness gotchas owns staging, leftovers and folding.
 - **Text.** Inbound text is bounded to 16 KiB keeping the head; answers to 8 KiB keeping head and
   tail. Both truncations say so in the text.
 - **Shutdown.** Transport readers stop and in-flight sessions, with their queued follow-ups, get
   `shutdownGraceMs` to finish. When the grace expires the gateway logs `gateway_sessions_abandoned`
   and aborts them: no later model or capability call starts, queued receipts become `abandoned`
   and queued wakes are lost; admitted ticks still deliver their completed fires. A model request or provider effect already in progress may still
-  finish. Native work then drains on the blocking pool ([runtime threads](gatewayd.md#runtime-threads));
+  finish. Native work then drains on the blocking pool (runtime threads);
   the chart's termination grace covers both daemon drains plus `drainBudget.bufferSeconds`
   ([Kubernetes](kubernetes.md#draining-takes-both-graces-in-sequence)). A transport that exhausts
-  [connection recovery](gatewayd.md#connection-recovery), or whose reader task panics, stops the
+  connection recovery, or whose reader task panics, stops the
   gateway through the same drain.
 
 ## Conversations
@@ -206,7 +206,7 @@ or not.
   `maxAgeMs` and the journal routes' `forgetAfterMs` are deleted.
 - A file the binary cannot load is deleted, never migrated: another format, a corrupt line, or the
   file `loading.marker` names after a start crashed while loading it.
-- A wall-clock [seal](gateway-liveness.md#liveness-progress-and-stopping-a-run) writes
+- A wall-clock seal writes
   `<stem>.sealed` in the journal root, holding `{"atMs":<u64>}` with mode `0600`, and no transcript
   line. No turn clears it; its mtime expires it after the route's `forgetAfterMs`, the longest
   configured `forgetAfterMs` bounds its sweep, and a marker that does not parse is removed. A
@@ -334,7 +334,7 @@ by part, through its plan's model, with the record's non-opaque text cut to `max
 - No reply, steer or next turn waits on it. `sessions.memory.summaries` bounds concurrency and
   queue; a part that does not fit the queue fails as `overflow`, with every later part.
 - A part ends generated or failed with its cause, never synthesized
-  ([history records](observability.md#what-conversation-history-changes)).
+  (history records).
 - The model's `timeoutMs` bounds each call. Shutdown cancels running calls without lengthening the
   drain; a part left running resumes at the next start.
 - The plan is frozen into the record, so a reload changes only new records, and a plan whose
@@ -346,7 +346,7 @@ summaries are kept and removed together. The broker audit log stores no conversa
 
 ### The bounds
 
-[`gatewayd.md`](gatewayd.md#configuration) owns `idleTimeoutMs`, `maxTurns`, `maxBytes`, `recall`,
+`gatewayd.md` owns `idleTimeoutMs`, `maxTurns`, `maxBytes`, `recall`,
 `forgetAfterMs` and `sessions.maxConversations`, with their defaults.
 
 - `maxTurns` and `maxBytes` both apply, oldest turns dropping first until both hold. When the newest
@@ -453,7 +453,7 @@ never reaches a prompt.
   [journal retention](#the-history-lives-in-the-gateway) removes them.
 - With shared scope, retained text and attachments belong to the whole conversation audience.
 - Another process under the gateway UID is inside its trust domain
-  ([current process boundary](gatewayd.md#current-process-boundary)); paging and core dumps are
+  (current process boundary); paging and core dumps are
   outside the daemon's control.
 
 ## Durable memory after transport acceptance
@@ -486,8 +486,8 @@ memory search --query TEXT
   outcome; failures log `gateway_memory_record_failed`.
 - Acceptance means the service accepted every part of the answer, never that a person read it.
   Slack and Telegram need an HTTP success status before `ok: true`, and Telegram also checks the
-  topic ([Slack](gateway-transports.md#slack-socket-mode),
-  [Telegram](gateway-transports.md#telegram-long-polling)); the local transport accepts after
+  topic (Slack,
+  Telegram); the local transport accepts after
   `write_all` and `flush`.
 - The request carries a service-specific inbound delivery identity, which the broker checks against
   the attested scope before creating the namespace, so one transport cannot alias another. Local
