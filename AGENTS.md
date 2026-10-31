@@ -165,6 +165,8 @@ Everything else is the code, `check` and `--help`. Errors are loud and name the 
    3–5. A doc diff that adds more words than it removes says why.
 
 - **No documentation in Rust.** See [Comments](#comments).
+- **WIT doc comments stay.** When hunting for text to cut, never remove `///` in a `.wit` file:
+  it is part of the published interface contract.
 - **Deployment positioning.** Kubernetes is the preferred deployment; the Mac path serves people
   moving from OpenClaw or Hermes. The root README and the website's `/deploy/` link both before
   their first section, Kubernetes first.
