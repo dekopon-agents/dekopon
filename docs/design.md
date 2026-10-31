@@ -51,8 +51,8 @@ An argument to keep or add code on any of these grounds is rejected.
 4. For each proposal the broker re-checks the attestation, requires an owner-authored constraint
    set, asks Cedar, authorizes any secret use, emits the decision record, and runs the provider in a
    fresh Wasm store bounded by that constraint set.
-5. Each HTTP request the provider makes passes the constraint set's limits and a second Cedar
-   decision over the request itself. Then the broker injects the credential and sends it.
+5. Each HTTP request is [checked again](authorization.md#each-outbound-request-is-checked-again);
+   the broker then injects the credential.
 6. The provider's output streams back into the script.
 
 Nothing caches a decision: each turn and invocation is authorized afresh, and replayed conversation
@@ -71,8 +71,7 @@ in a shared process would cross it. CI keeps the halves apart: the gateway's dep
 contain the broker, policy or HTTP-host crates, and the broker's may not contain the agent, shell or
 config crates (the two "excludes" steps in `.github/workflows/ci.yml`).
 
-The broker authenticates local peers by kernel UID rather than a token. A request carries no
-identity fields, and there's no shared secret to leak or rotate. The [current local process
+The broker authenticates local peers by kernel UID, not a token. The [current local process
 boundary](security-model.md#current-local-process-boundary) describes the chart's layout.
 
 ## Trace as audit
@@ -89,6 +88,12 @@ waits on them. A full console queue drops lines and later logs how many it dropp
 (`crates/dekopon-telemetry/src/exporter.rs`). Lose the exporter, or overflow it, and those audit
 lines are gone; nothing reconstructs them. The telemetry store holds every prompt and output; it
 sits inside the operator's trust boundary.
+
+A `telemetry` block in each daemon's configuration turns the export on
+([broker](../crates/dekopon-brokerd/src/config.rs), [gateway](../crates/dekopon-gatewayd/src/config.rs);
+[example](../examples/conditional-write/broker.yaml)).
+The model's prompt lands in `agent.model.prompt` records and its reply in
+`agent.model.answer` ([`prompt.rs`](../crates/dekopon-agent/src/prompt.rs)).
 
 ## Keyless model access for outside VMs
 
