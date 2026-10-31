@@ -1742,6 +1742,7 @@ impl PermanentReactionError {
             },
             TransportError::AssetType { .. }
             | TransportError::AssetTooLarge { .. }
+            | TransportError::AssetRefused { .. }
             | TransportError::Attachment(_)
             | TransportError::AttachmentTask { .. }
             | TransportError::MissingCredential { .. }

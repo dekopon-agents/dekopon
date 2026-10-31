@@ -17558,45 +17558,77 @@ async fn a_whatsapp_pdf_reaches_the_model_as_a_file_part_with_its_bytes_name_and
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_oversized_whatsapp_pdf_tells_the_model_the_limit_and_sends_no_file() {
+async fn a_whatsapp_pdf_fetch_refusal_tells_the_model_its_cause_and_sends_no_file() {
     use crate::transport::whatsapp::tests_media::{
-        MediaPeer, admitted, document_webhook, json_reply,
+        MediaPeer, PDF, admitted, bytes_reply, document_webhook, json_reply, metadata,
     };
-    let peer = MediaPeer::new(|origin, index| match index {
-        0 => json_reply(json!({"id":"789", "mime_type":"application/pdf",
-            "file_size": 8 * 1024 * 1024 + 1,
-            "url": format!("{origin}/whatsapp_business/attachments/?signed=URL_SENTINEL")})),
-        _ => panic!("an oversized PDF is never downloaded"),
-    })
-    .await;
-    let document = json!({"id":"789", "mime_type":"application/pdf", "caption":"Total?"});
-    let (transport, upload) = admitted(&peer.origin, &document_webhook(document)).await;
-    let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
-    let models = ModelScript::new([fetch_asset_call(1), answer("That PDF is too large.")]);
-    let mut runner = runner(broker, Arc::clone(&models), 4);
-    Arc::get_mut(&mut runner)
-        .expect("unique runner")
-        .asset_fetchers
-        .insert("wa".to_owned(), transport.asset_fetcher().expect("fetcher"));
-    let mut route = route(model_config());
-    route.transport = "wa".to_owned();
-    run_session(runner, route, upload, Arc::new(RecordingDriver::default())).await;
-    assert_eq!(
-        tool_message(&models, 1),
-        "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read."
-    );
-    assert!(model_files(&models, 1).is_empty());
-    assert_eq!(peer.requests.lock().len(), 1);
-    peer.finish().await;
+    use axum::{http::StatusCode, response::IntoResponse as _};
+    const LIMIT: usize = 8 * 1024 * 1024;
+    for (case, requests, expected) in [
+        (
+            "advertised",
+            1,
+            "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read.",
+        ),
+        (
+            "streamed",
+            2,
+            "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read.",
+        ),
+        (
+            "signature",
+            2,
+            "chat-asset:1 cannot be opened: the downloaded file is not the type it was sent as.",
+        ),
+        (
+            "not-found",
+            1,
+            "chat-asset:1 is unavailable: platform-gone: the platform no longer allows this attachment to be downloaded.",
+        ),
+        (
+            "download-refused",
+            2,
+            "chat-asset:1 could not be downloaded: WhatsApp answered HTTP 403.",
+        ),
+    ] {
+        let peer = MediaPeer::new(move |origin, index| match (case, index) {
+            ("advertised", 0) => json_reply(json!({"id":"789", "mime_type":"application/pdf",
+                "file_size": LIMIT + 1,
+                "url": format!("{origin}/whatsapp_business/attachments/?signed=URL_SENTINEL")})),
+            ("not-found", 0) => (StatusCode::NOT_FOUND, "raw body").into_response(),
+            (_, 0) => metadata(origin, "application/pdf", PDF),
+            ("streamed", 1) => bytes_reply(&vec![b'%'; LIMIT + 1]),
+            ("signature", 1) => bytes_reply(&vec![b'X'; PDF.len()]),
+            ("download-refused", 1) => (StatusCode::FORBIDDEN, "raw body").into_response(),
+            _ => panic!("no request after a refusal"),
+        })
+        .await;
+        let document = json!({"id":"789", "mime_type":"application/pdf", "caption":"Total?"});
+        let (transport, upload) = admitted(&peer.origin, &document_webhook(document)).await;
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            )],
+        )
+        .await;
+        let models = ModelScript::new([fetch_asset_call(1), answer("I could not read it.")]);
+        let mut runner = runner(broker, Arc::clone(&models), 4);
+        Arc::get_mut(&mut runner)
+            .expect("unique runner")
+            .asset_fetchers
+            .insert("wa".to_owned(), transport.asset_fetcher().expect("fetcher"));
+        let mut route = route(model_config());
+        route.transport = "wa".to_owned();
+        run_session(runner, route, upload, Arc::new(RecordingDriver::default())).await;
+        assert_eq!(tool_message(&models, 1), expected, "{case}");
+        assert!(model_files(&models, 1).is_empty(), "{case}");
+        assert_eq!(peer.requests.lock().len(), requests, "{case}");
+        peer.finish().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

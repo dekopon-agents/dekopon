@@ -32,7 +32,10 @@ use tokio::{
 
 pub(crate) const MAX_SENDS_PER_TURN: u8 = 4;
 
-use crate::{conversation::ConversationKey, transport::AssetFetcher};
+use crate::{
+    conversation::ConversationKey,
+    transport::{AssetFetcher, MediaRefusal},
+};
 
 pub(crate) const MAX_ASSETS_PER_MESSAGE: usize = 32;
 
@@ -1303,6 +1306,9 @@ impl Attempt {
                     if let crate::transport::TransportError::AssetTooLarge { size } = error {
                         return AssetFailure::TooLarge { size };
                     }
+                    if let crate::transport::TransportError::AssetRefused { cause } = error {
+                        return AssetFailure::Media(cause);
+                    }
                     if let Retry::Refetch = self.ticket.retry
                         && let crate::transport::TransportError::Service { code } = &error
                         && matches!(
@@ -1587,6 +1593,7 @@ enum AssetFailure {
     Unknown,
     Unreadable { reason: &'static str },
     TooLarge { size: u64 },
+    Media(crate::transport::MediaRefusal),
     Unavailable,
     TimedOut,
     Transport { category: &'static str },
@@ -1614,6 +1621,15 @@ impl AssetFailure {
                 kibibytes(size),
                 kibibytes(MAX_ASSET_BYTES)
             ),
+            Self::Media(MediaRefusal::Gone) => {
+                Self::Refused(ChatAssetRefusal::PlatformGone).for_model(id)
+            }
+            Self::Media(MediaRefusal::Signature) => format!(
+                "chat-asset:{id} cannot be opened: the downloaded file is not the type it was sent as."
+            ),
+            Self::Media(MediaRefusal::Download { status }) => {
+                format!("chat-asset:{id} could not be downloaded: WhatsApp answered HTTP {status}.")
+            }
             Self::Unavailable => format!("chat-asset:{id} cannot be opened."),
             Self::TimedOut => format!("chat-asset:{id} could not be read (fetch-timeout)."),
             Self::Transport { category } => {
@@ -1626,11 +1642,15 @@ impl AssetFailure {
         match self {
             Self::Refused(reason) => reason,
             Self::Unknown | Self::Storage(BlobError::Unknown) => ChatAssetRefusal::UnknownAsset,
-            Self::Unreadable { .. } => ChatAssetRefusal::UnsupportedMedia,
+            Self::Unreadable { .. } | Self::Media(MediaRefusal::Signature) => {
+                ChatAssetRefusal::UnsupportedMedia
+            }
+            Self::Media(MediaRefusal::Gone) => ChatAssetRefusal::PlatformGone,
             Self::Storage(BlobError::Reclaimed) => ChatAssetRefusal::Evicted,
             Self::Storage(BlobError::Unauthorized) => ChatAssetRefusal::Revoked,
             Self::Storage(_)
             | Self::TooLarge { .. }
+            | Self::Media(MediaRefusal::Download { .. })
             | Self::Transport { .. }
             | Self::TimedOut
             | Self::Unavailable => ChatAssetRefusal::Unavailable,

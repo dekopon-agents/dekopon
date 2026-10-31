@@ -129,10 +129,31 @@ impl Media {
         }
     }
 
-    const fn signature_reason(self) -> &'static str {
+    fn body_failure(self, failure: BodyFailure) -> TransportError {
+        match (self, failure) {
+            (Self::Pdf, BodyFailure::TooLarge { observed }) => self.oversized(observed),
+            (Self::Pdf, BodyFailure::Status(status)) => {
+                refused(&format!("http-{status}"));
+                TransportError::AssetRefused {
+                    cause: match status {
+                        404 | 410 => MediaRefusal::Gone,
+                        _ => MediaRefusal::Download { status },
+                    },
+                }
+            }
+            (Self::Png | Self::Jpeg | Self::Pdf, failure) => failure.into_service(),
+        }
+    }
+
+    fn signature_failure(self) -> TransportError {
         match self {
-            Self::Png | Self::Jpeg => "image-signature",
-            Self::Pdf => "document-signature",
+            Self::Png | Self::Jpeg => failure("image-signature"),
+            Self::Pdf => {
+                refused("document-signature");
+                TransportError::AssetRefused {
+                    cause: MediaRefusal::Signature,
+                }
+            }
         }
     }
 }
@@ -170,28 +191,57 @@ fn request_failed(error: reqwest::Error) -> TransportError {
     TransportError::Request(Box::new(error.without_url()))
 }
 
-async fn read_body(
+enum BodyFailure {
+    Status(u16),
+    TooLarge { observed: u64 },
+    Transport(TransportError),
+}
+
+impl BodyFailure {
+    fn into_service(self) -> TransportError {
+        match self {
+            Self::Status(status) => failure(&format!("http-{status}")),
+            Self::TooLarge { .. } => failure("response-too-large"),
+            Self::Transport(error) => error,
+        }
+    }
+}
+
+async fn bounded_body(
     mut response: reqwest::Response,
     limit: usize,
-) -> Result<Vec<u8>, TransportError> {
+) -> Result<Vec<u8>, BodyFailure> {
     if !response.status().is_success() {
-        return Err(failure(&format!("http-{}", response.status().as_u16())));
+        return Err(BodyFailure::Status(response.status().as_u16()));
     }
-    if response
+    if let Some(length) = response
         .content_length()
-        .is_some_and(|length| length > limit as u64)
+        .filter(|length| *length > limit as u64)
     {
-        return Err(failure("response-too-large"));
+        return Err(BodyFailure::TooLarge { observed: length });
     }
     let mut bytes = asset_buffer(response.content_length(), limit);
-    while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
-        if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err(failure("response-too-large"));
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| BodyFailure::Transport(request_failed(error)))?
+    {
+        let observed = bytes.len().saturating_add(chunk.len());
+        if observed > limit {
+            return Err(BodyFailure::TooLarge {
+                observed: observed as u64,
+            });
         }
         reserve_for_chunk(&mut bytes, chunk.len(), limit);
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+async fn read_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, TransportError> {
+    bounded_body(response, limit)
+        .await
+        .map_err(BodyFailure::into_service)
 }
 
 async fn json_response(response: reqwest::Response) -> Result<Value, TransportError> {
@@ -376,6 +426,10 @@ impl AssetFetcher for WhatsappDriver {
                 .send()
                 .await
                 .map_err(request_failed)?;
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                return Err(kind.body_failure(BodyFailure::Status(status)));
+            }
             let metadata = json_response(response).await?;
             if metadata.get("id").and_then(Value::as_str) != Some(&id)
                 || metadata.get("mime_type").and_then(Value::as_str) != Some(&mime)
@@ -402,12 +456,14 @@ impl AssetFetcher for WhatsappDriver {
                 .send()
                 .await
                 .map_err(request_failed)?;
-            let bytes = read_body(response, limit).await?;
+            let bytes = bounded_body(response, limit)
+                .await
+                .map_err(|failure| kind.body_failure(failure))?;
             if bytes.len() as u64 != size {
                 return Err(failure("media-size-mismatch"));
             }
             if crate::asset::signature_mime(&bytes) != Some(mime.as_str()) {
-                return Err(failure(kind.signature_reason()));
+                return Err(kind.signature_failure());
             }
             Ok(bytes)
         })

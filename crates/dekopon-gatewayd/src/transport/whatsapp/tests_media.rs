@@ -763,9 +763,15 @@ async fn a_pdf_is_fetched_through_graph_metadata_then_the_trusted_download_once_
 }
 
 #[tokio::test]
-async fn pdf_fetch_refusals_name_their_reason_without_the_token_url_or_body() {
+async fn pdf_fetch_refusals_carry_their_typed_cause_without_the_token_url_or_body() {
     const LIMIT: u64 = 8 * 1024 * 1024;
-    for case in ["signature", "advertised", "streamed", "not-found"] {
+    for case in [
+        "signature",
+        "advertised",
+        "streamed",
+        "not-found",
+        "download-refused",
+    ] {
         let peer = MediaPeer::new(move |origin, index| match (case, index) {
             ("not-found", 0) => (
                 StatusCode::NOT_FOUND,
@@ -778,6 +784,9 @@ async fn pdf_fetch_refusals_name_their_reason_without_the_token_url_or_body() {
             (_, 0) => metadata(origin, "application/pdf", PDF),
             ("signature", 1) => bytes_reply(&vec![b'X'; PDF.len()]),
             ("streamed", 1) => bytes_reply(&vec![b'%'; usize::try_from(LIMIT).unwrap() + 1]),
+            ("download-refused", 1) => {
+                (StatusCode::FORBIDDEN, "TOKEN_SENTINEL raw body").into_response()
+            }
             _ => panic!("no request after a refusal"),
         })
         .await;
@@ -785,23 +794,19 @@ async fn pdf_fetch_refusals_name_their_reason_without_the_token_url_or_body() {
             .fetch(&source("application/pdf"), LIMIT)
             .await
             .expect_err(case);
-        match case {
-            "advertised" => assert!(
-                matches!(error, TransportError::AssetTooLarge { size } if size == LIMIT + 1),
-                "{error:?}"
-            ),
-            _ => {
-                let expected = match case {
-                    "signature" => "document-signature",
-                    "streamed" => "response-too-large",
-                    _ => "http-404",
-                };
-                assert!(
-                    matches!(&error, TransportError::Service { code } if code == expected),
-                    "{case}: {error:?}"
-                );
-            }
-        }
+        let expected = match case {
+            "advertised" | "streamed" => TransportError::AssetTooLarge { size: LIMIT + 1 },
+            "signature" => TransportError::AssetRefused {
+                cause: MediaRefusal::Signature,
+            },
+            "not-found" => TransportError::AssetRefused {
+                cause: MediaRefusal::Gone,
+            },
+            _ => TransportError::AssetRefused {
+                cause: MediaRefusal::Download { status: 403 },
+            },
+        };
+        assert_eq!(format!("{error:?}"), format!("{expected:?}"), "{case}");
         let debug = format!("{error:?} {error}");
         assert!(
             !debug.contains("TOKEN_SENTINEL")

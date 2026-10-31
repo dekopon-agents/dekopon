@@ -66,6 +66,13 @@ pub(crate) struct InboundMessage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaRefusal {
+    Gone,
+    Signature,
+    Download { status: u16 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputRefusal {
     UnsupportedDocument,
 }
@@ -667,6 +674,8 @@ pub enum TransportError {
     Service { code: String },
     #[error("chat service media is {size} bytes, over the limit the gateway will read")]
     AssetTooLarge { size: u64 },
+    #[error("chat service media was refused: {cause:?}")]
+    AssetRefused { cause: MediaRefusal },
     #[error(
         "Discord refused the requested gateway intents (close 4014): messageContent: true needs \
          Developer Portal > Bot > Privileged Gateway Intents > Message Content Intent turned on"
@@ -710,6 +719,7 @@ impl TransportError {
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
             Self::AssetTooLarge { .. } => "asset-too-large",
+            Self::AssetRefused { .. } => "asset-refused",
             Self::DisallowedIntents => "disallowed-intents",
             Self::Response => "response",
             Self::MalformedResponse(_) => "malformed-response",

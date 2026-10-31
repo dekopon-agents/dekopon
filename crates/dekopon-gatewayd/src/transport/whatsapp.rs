@@ -32,9 +32,9 @@ use crate::{
     config::{LivenessMode, LivenessSettings},
     transport::{
         AssetFetcher, ChatDriver, ChatTransport, InboundMessage, InputRefusal, LivenessTarget,
-        MessageId, OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError, TransportEvent,
-        TransportIdentity, TypingLease, bound_inbound, credential_client, receive_span,
-        record_conversation, split_message,
+        MediaRefusal, MessageId, OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError,
+        TransportEvent, TransportIdentity, TypingLease, bound_inbound, credential_client,
+        receive_span, record_conversation, split_message,
         webhook::{
             self, MAX_WEBHOOK_CONCURRENCY, VerifyFailure, WEBHOOK_REQUEST_TIMEOUT, content_free,
             text_response,
