@@ -132,7 +132,7 @@ chart guarantees by never running two pods at once.
 - **No native runtime plugins.** Broker host services are statically linked, so nothing a provider
   imports can load native code into the process that holds the credentials.
 
-### Legacy credential bindings
+### Credential bindings
 
 Besides [public DRNs](authorization.md#secretuse-and-public-drns), a constraint set may name one
 symbolic credential from the broker's owner-only credentials file, and a per-agent binding may swap
@@ -143,5 +143,5 @@ on the agent reuses the partition routes already make, so two organizations reac
 with two tokens. An entry is a fixed bearer token or a credential the broker renews itself: a
 ChatGPT subscription or a GitHub App installation token.
 
-*Committed direction:* public DRNs replace these bindings. The replacement keeps renewal and
-injection in the broker, never in the gateway or a Wasm component.
+Bindings and DRNs end in the same broker-side injection: a proposed or default DRN wins, otherwise
+the binding applies. Only bindings carry a ChatGPT subscription or a GitHub App token today.
