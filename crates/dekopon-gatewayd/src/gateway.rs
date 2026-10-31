@@ -721,8 +721,7 @@ impl Gateway {
                     reason = "unrouted",
                     conversation.kind = message.conversation.kind.as_str(),
                     conversation.container = message.conversation.container.as_deref().unwrap_or_default(),
-                    mention = addressed,
-                    direct_message,
+                    addressing_cause = if direct_message { "direct_message" } else { "mention" },
                     "gateway.message.ignored"
                 );
             } else {

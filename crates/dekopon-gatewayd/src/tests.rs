@@ -10100,7 +10100,13 @@ fn unrouted_info(capture: &dekopon_test_support::CaptureLayer) -> dekopon_test_s
     ] {
         assert_eq!(record.field(name), Some(value), "{name}");
     }
-    for name in ["text", "sender.display_name", "subject"] {
+    for name in [
+        "text",
+        "sender.display_name",
+        "subject",
+        "mention",
+        "direct_message",
+    ] {
         assert_eq!(record.field(name), None, "{name}");
     }
     record
@@ -10119,20 +10125,22 @@ async fn an_unrouted_mention_emits_one_info_record_without_text() {
         let record = unrouted_info(&capture);
         assert_eq!(record.field("conversation.kind"), Some("channel"));
         assert_eq!(record.field("conversation.container"), Some("T0123ABC"));
-        assert_eq!(record.field("mention"), Some("true"));
-        assert_eq!(record.field("direct_message"), Some("false"));
+        assert_eq!(record.field("addressing_cause"), Some("mention"));
     }
 }
 
 #[tokio::test]
 async fn an_unrouted_direct_message_emits_one_info_record_without_text() {
-    let (capture, sessions) = dispatch_notice(message("private message text")).await;
-    assert_eq!(sessions, 0);
-    let record = unrouted_info(&capture);
-    assert_eq!(record.field("conversation.kind"), Some("directMessage"));
-    assert_eq!(record.field("conversation.container"), Some(""));
-    assert_eq!(record.field("mention"), Some("false"));
-    assert_eq!(record.field("direct_message"), Some("true"));
+    for addressed in [None, Some(true)] {
+        let mut inbound = message("private message text");
+        inbound.addressed = addressed;
+        let (capture, sessions) = dispatch_notice(inbound).await;
+        assert_eq!(sessions, 0);
+        let record = unrouted_info(&capture);
+        assert_eq!(record.field("conversation.kind"), Some("directMessage"));
+        assert_eq!(record.field("conversation.container"), Some(""));
+        assert_eq!(record.field("addressing_cause"), Some("direct_message"));
+    }
 }
 
 #[tokio::test]
