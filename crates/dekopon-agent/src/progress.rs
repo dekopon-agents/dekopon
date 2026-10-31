@@ -236,6 +236,7 @@ pub enum CancelSource {
     Budget { limit: BudgetLimit },
 }
 
+// Synchronous so a sink never slows the session: an implementation never blocks, awaits or fails.
 pub trait ProgressSink: Send + Sync {
     fn emit(&self, event: ProgressEvent);
 }

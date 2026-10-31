@@ -138,6 +138,7 @@ impl Projection {
         self.owner
     }
 
+    // Call after the last read: an unchanged `..data` link means every read saw one generation.
     pub fn confirm(&self) -> Result<(), ProjectionError> {
         let data = self.root.join(DATA_LINK);
         let current = fs::read_link(&data).map_err(|source| ProjectionError::Io {

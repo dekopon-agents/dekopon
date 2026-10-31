@@ -185,6 +185,7 @@ impl Drop for Reservation {
     }
 }
 
+// Fields drop in declaration order: the file closes and unlinks before its reservation releases.
 #[derive(Debug)]
 pub struct Spool {
     sink: Sink,
