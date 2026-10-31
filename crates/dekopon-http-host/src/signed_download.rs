@@ -43,7 +43,7 @@ pub enum DownloadError {
     #[error("signed download timed out")]
     Timeout,
     #[error("signed download exceeds the response limit")]
-    ResponseTooLarge,
+    ResponseTooLarge(Option<super::ByteLimitExceeded>),
     #[error("signed download is incomplete")]
     Incomplete,
     #[error("signed download storage request failed")]
@@ -59,7 +59,7 @@ impl DownloadError {
             Self::RedirectRefused => "redirect-refused",
             Self::RequestLimit => "host-call-limit",
             Self::Timeout => "timeout",
-            Self::ResponseTooLarge => "response-too-large",
+            Self::ResponseTooLarge(_) => "response-too-large",
             Self::Incomplete => "incomplete",
             Self::Storage => "storage",
             Self::Internal => "internal",
@@ -72,7 +72,7 @@ impl From<HttpError> for DownloadError {
         match error.code {
             ErrorCode::HostCallLimit => Self::RequestLimit,
             ErrorCode::Timeout => Self::Timeout,
-            ErrorCode::ResponseTooLarge => Self::ResponseTooLarge,
+            ErrorCode::ResponseTooLarge => Self::ResponseTooLarge(error.byte_limit),
             ErrorCode::Denied
             | ErrorCode::InvalidMethod
             | ErrorCode::InvalidUri
@@ -198,7 +198,9 @@ impl BufferedHttpClient {
                 DownloadError::Denied => Some(super::PolicyViolation::Denied),
                 DownloadError::RedirectRefused => Some(super::PolicyViolation::RedirectRefused),
                 DownloadError::RequestLimit => Some(super::PolicyViolation::HostCallLimit),
-                DownloadError::ResponseTooLarge => Some(super::PolicyViolation::ByteLimit(None)),
+                DownloadError::ResponseTooLarge(exceeded) => {
+                    Some(super::PolicyViolation::ByteLimit(*exceeded))
+                }
                 DownloadError::Timeout
                 | DownloadError::Incomplete
                 | DownloadError::Storage
@@ -673,14 +675,14 @@ impl BufferedHttpClient {
         let expected = coverage.end_exclusive - coverage.start;
         if let Some(length) = response.content_length() {
             if length > expected {
-                return Err(DownloadError::ResponseTooLarge);
+                return Err(DownloadError::ResponseTooLarge(None));
             }
             if length != expected {
                 return Err(DownloadError::Incomplete);
             }
         }
         if expected > u64::from(WINDOW_BYTES) {
-            return Err(DownloadError::ResponseTooLarge);
+            return Err(DownloadError::ResponseTooLarge(None));
         }
         let mut spool = directory
             .allocate()
@@ -709,14 +711,23 @@ impl BufferedHttpClient {
         {
             read = read
                 .checked_add(chunk.len() as u64)
-                .ok_or(DownloadError::ResponseTooLarge)?;
+                .ok_or(DownloadError::ResponseTooLarge(None))?;
             let evidence = self.evidence.last_mut().ok_or(DownloadError::Internal)?;
             evidence.response_bytes = evidence
                 .response_bytes
                 .checked_add(chunk.len() as u64)
-                .ok_or(DownloadError::ResponseTooLarge)?;
-            if read > expected || evidence.response_bytes > maximum {
-                return Err(DownloadError::ResponseTooLarge);
+                .ok_or(DownloadError::ResponseTooLarge(None))?;
+            if evidence.response_bytes > maximum {
+                return Err(DownloadError::ResponseTooLarge(Some(
+                    super::ByteLimitExceeded {
+                        key: super::ByteLimitKey::MaxResponseBytes,
+                        limit: maximum,
+                        observed: evidence.response_bytes,
+                    },
+                )));
+            }
+            if read > expected {
+                return Err(DownloadError::ResponseTooLarge(None));
             }
             for bytes in chunk.chunks(super::CHUNK_BYTES) {
                 scan.location.extend_from_slice(bytes);
@@ -1187,7 +1198,7 @@ mod tests {
         for (response, expected) in [
             (b"HTTP/1.1 302 Found\r\nLocation: https://evil.test/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(), DownloadError::RedirectRefused),
             (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/3\r\nContent-Length: 3\r\nConnection: close\r\n\r\nx".to_vec(), DownloadError::Incomplete),
-            (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/3\r\nContent-Length: 4\r\nConnection: close\r\n\r\nxxxx".to_vec(), DownloadError::ResponseTooLarge),
+            (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/3\r\nContent-Length: 4\r\nConnection: close\r\n\r\nxxxx".to_vec(), DownloadError::ResponseTooLarge(None)),
             (b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-23/24\r\nContent-Length: 24\r\nConnection: close\r\n\r\nsig=private-signed-query!".to_vec(), DownloadError::Denied),
         ] {
             let server = LoopbackServer::once(&response);
@@ -1207,6 +1218,41 @@ mod tests {
             assert!(!server.request_text().contains("authorization"));
             server.join();
         }
+    }
+
+    #[tokio::test]
+    async fn a_storage_body_over_max_response_bytes_names_the_key() {
+        let body = "x".repeat(200);
+        let wire = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-199/200\r\nContent-Length: 200\r\nConnection: close\r\n\r\n{body}"
+        );
+        let server = LoopbackServer::once(wire.as_bytes());
+        let mut limited = grant(server.authority());
+        limited.max_response_bytes = 200;
+        let mut parent = BufferedHttpClient::authorized(
+            limited,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut target = destination(&server, &parent).await;
+        let root = tempfile::tempdir().unwrap();
+        let directory = AssetDirectory::new(root.path().to_owned(), 65536);
+        let response = parent.storage_get(&mut target, 0, 199).await.unwrap();
+        let coverage = content_range(&response).unwrap();
+        let result = parent
+            .read_storage(response, &target, coverage, &directory)
+            .await
+            .map(|_| ());
+        assert!(matches!(
+            result,
+            Err(DownloadError::ResponseTooLarge(Some(super::super::ByteLimitExceeded {
+                key: super::super::ByteLimitKey::MaxResponseBytes,
+                limit: 200,
+                observed,
+            }))) if observed > 200
+        ));
+        server.join();
     }
 
     #[test]

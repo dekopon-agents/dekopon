@@ -151,7 +151,7 @@ impl fmt::Display for ByteLimitExceeded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "the grant allows {} bytes and the {} reached {} bytes when it was refused",
+            "the grant allows {} bytes and the {} is at least {} bytes",
             self.limit,
             self.key.direction(),
             self.observed
@@ -3765,6 +3765,76 @@ mod tests {
             serialized.contains("\"credentialInjected\":true"),
             "{serialized}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_request_names_max_request_bytes_and_its_least_size() {
+        let mut limited = grant("127.0.0.1:9".to_owned(), "POST");
+        limited.max_request_bytes = 64;
+        let mut client = BufferedHttpClient::authorized(
+            limited,
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(Request {
+                method: "POST".to_owned(),
+                uri: "http://127.0.0.1:9/upload".to_owned(),
+                headers: Vec::new(),
+                body: vec![b'x'; 128],
+            })
+            .await
+            .expect_err("the request bound refuses before sending");
+        assert!(matches!(
+            error.byte_limit,
+            Some(super::ByteLimitExceeded {
+                key: super::ByteLimitKey::MaxRequestBytes,
+                limit: 64,
+                observed,
+            }) if observed > 128
+        ));
+        assert_eq!(
+            client.policy_violation(),
+            Some(PolicyViolation::ByteLimit(error.byte_limit))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn response_headers_over_max_response_bytes_name_the_key() {
+        let wire = format!(
+            "HTTP/1.1 200 OK\r\nx-pad: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "p".repeat(256)
+        );
+        let server = LoopbackServer::once(wire.as_bytes());
+        let authority = server.authority().to_owned();
+        let mut limited = grant(authority.clone(), "GET");
+        limited.max_response_bytes = 128;
+        let mut client = BufferedHttpClient::authorized(
+            limited,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: format!("http://{authority}/headers"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("the head alone exceeds the response bound");
+        assert_eq!(error.code, ErrorCode::ResponseTooLarge);
+        assert!(matches!(
+            error.byte_limit,
+            Some(super::ByteLimitExceeded {
+                key: super::ByteLimitKey::MaxResponseBytes,
+                limit: 128,
+                observed,
+            }) if observed > 128
+        ));
+        server.join();
     }
 
     #[tokio::test(flavor = "multi_thread")]
