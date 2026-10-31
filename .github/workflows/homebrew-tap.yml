@@ -75,7 +75,7 @@ jobs:
           elif [ -z "$TAP_APP_ID" ] || [ "$TAP_APP_KEY_SET" != "true" ]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "::warning::TAP_APP_ID or TAP_APP_PRIVATE_KEY is unset; skipping the Homebrew tap update." \
-              "See README.md#homebrew-tap-automation to install the tap GitHub App."
+              "See docs/development.md#homebrew-tap-github-app to install the tap GitHub App."
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
@@ -112,7 +112,7 @@ jobs:
           echo "present=false" >> "$GITHUB_OUTPUT"
           echo "::warning::Could not mint an installation token for $TAP_REPOSITORY; skipping the Homebrew tap update." \
             "Both secrets are set, so the App exists but is probably not installed on $TAP_REPOSITORY." \
-            "See README.md#the-cross-repository-credential, step 6."
+            "See docs/development.md#homebrew-tap-github-app, step 3."
           {
             echo "### Homebrew tap skipped"
             echo

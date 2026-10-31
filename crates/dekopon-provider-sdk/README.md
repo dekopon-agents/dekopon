@@ -1,57 +1,61 @@
 # dekopon-provider-sdk
 
-Rust guest SDK for Dekopon component providers. Declare a `Provider` with an
-identity, command words, clap `Args`, and a tuple of typed `Capability` types.
-Each capability declares a closed, serializable input, a `Needs` tuple of
-broker-granted handles, a serializable output, and a typed failure code. The
-SDK derives the manifest and command dispatch; `export!(P)` exports the current
-`dekopon:provider/provider-cli@0.4.0` WIT world. `propose` and `describe` must
-not use host imports: only an authorized `invoke` receives handles.
+Write a Dekopon provider: a Wasm component that gives agents new shell commands. The broker runs it
+once per authorized invocation, in a fresh memory-bounded store. Its stdout is the result; a failure
+exits with the capability's code and writes its message to stderr.
 
-```rust,ignore
-// In a provider component with a declared Provider type:
-dekopon_provider_sdk::export!(MyProvider);
+## The model
+
+A `Provider` declares its command words, a clap grammar and a tuple of `Capability` types. When a
+model's script runs one of those words, `propose` turns the arguments into one capability proposal.
+It runs before authorization, so it reaches no host import. Only a call the broker authorizes reaches
+`Capability::run`.
+
+Each capability declares its `Needs`: handles the SDK constructs only inside an authorized call.
+They are `Http`, `Clock`, `Monotonic`, `Random`, `Settings<T>`, `Storage<Jsonl>`,
+`Storage<DurableFiles>`, `Assets`, and `Spawn`, which runs a child script through the gateway under
+the same person, agent and budget. The host links no WASI, so a provider has no filesystem,
+sockets or environment beyond these.
+
+Never set an `Authorization` header. The broker's HTTP engine refuses one from the guest, holds each
+request to the operator's grant and a Cedar check, then adds the operator's credential for that
+destination. Trust the endpoint: it receives the credential.
+
+[`cli-probe`](../../examples/providers/cli-probe/src/lib.rs) is a complete provider.
+
+## Build
+
+A provider is a `cdylib` crate that ends with `dekopon_provider_sdk::export!(MyProvider);`.
+
+```console
+cargo build --release --target wasm32-unknown-unknown
+wasm-tools component new target/wasm32-unknown-unknown/release/my_provider.wasm -o my-provider.wasm
 ```
 
-The SDK owns guest bindings for buffered HTTP, asset-backed request bodies,
-wall and monotonic clocks, OS entropy, settings, storage, and child scripts. `provider::Http`, `Clock`,
-`Monotonic`, `Random`, `Settings<T>`, `Storage<K>`, `Assets`, and `Spawn` are private-construction handles; the broker alone
-grants their imports. `Settings<T>` parses the owner's `providerSettings.<id>`, or `{}` when
-there is none. `provider::endpoint::Base` is the origin a provider sends to: a vendor default from
-`Base::from_static`, overridden by the owner key `providerSettings.<id>.baseUrl`; `join` appends a
-path beginning with `/`. The rule: a provider talks to one origin; a second vendor is a second provider or a `vendor` setting. `Clock` remains wall-only; `Random::fill` splits a buffer into 4096-byte host reads. `Bounded<N>` validates input by UTF-8 byte length, and
-`Truncated<N>` cuts output on a character boundary. `manifest::<P>()`,
-`call::<P>()` and `command::<P>()` use the same typed dispatch as the component
-export. `Spawn::run(script, ChildStdin)` exposes a child stdout reader and a status
-resource; `Child::wait(self)` consumes and drops that reader before waiting.
-`ChildStdin` is `None`, `Inherit`, or `Reader(Stdin)`; running twice before a wait
-is refused as `SpawnError::Busy`. `Inherit` shares the remaining bytes of the
-caller's stdin with the child: the component host duplicates the descriptor,
-while the native test port moves the caller's stdin into the child. The gateway
-pump can read ahead, so the parent must not read its stdin after `run(Inherit)`. Child stdout is bounded script
-text yielded at exit, with a trailing newline when nonempty; ordinary
-`exit.stderr` is empty (the shell has no separate script stderr), and a child
-panic yields status 70. Native `Spawn::run` calls the installed `Port::spawn`,
-which receives `NativeChildStdin` and returns `NativeChild` (stdout and exit).
-The default `Port::spawn` panics for ports that do not script children; the SDK
-enforces the one-live-child `Busy` rule and releases the slot on wait or drop.
-The monotonic clock includes elapsed child wait time; the separate work clock
-parks during a child wait.
-The wire response and published provider WIT remain unchanged.
+`dekopon_provider_sdk::skills!("my-provider/SKILL.md")` embeds Agent Skills from the crate's
+`skills/` directory. They are model text and grant nothing.
 
-See the repository-owned probes under `examples/providers/` for working typed
-components, and `dekopon-provider-sdk-testkit` for native/component parity and
-conformance checks. Previously published guest binding crates continue to serve
-external providers until those providers migrate separately; they are not part
-of this workspace.
+## Test
 
-## Embedded skills
+Add `dekopon-provider-sdk-testkit` as a dev-dependency at exactly the SDK's version. `Native::<P>`
+runs a capability in-process against scripted HTTP, clocks and children. `Harness::<P>::get(path)`
+runs the built component on the real broker host against a loopback HTTPS script.
+`conformance::<P>(path)` checks that the component's manifest, help, imports and input schemas match
+the Rust declaration.
 
-Call `dekopon_provider_sdk::skills!("gh/SKILL.md", "gh/references/review.md");` at crate scope.
-Paths are relative to `skills/` beside the calling crate's `Cargo.toml`. Each file's raw bytes
-become a `dekopon:skill/<path>` custom section on Wasm targets; native builds emit nothing.
-The macro uses no build script and performs no validation. The offline
-`dekopon-brokerd provider skills --out DIR` reader validates the `SkillId` grammar, provider ID
-or `<provider-id>-` naming, safe paths, required `SKILL.md`, UTF-8 and catalog bounds before
-export. The gateway checks front matter when it loads the exported directory. Skills are
-untrusted model text and grant no capability. See the [export contract](../dekopon-brokerd/README.md#managed-provider-sets).
+```rust
+conformance::<MyProvider>("my-provider.wasm").expect("component matches its declaration");
+let out = Harness::<MyProvider>::get("my-provider.wasm")
+    .call("my-provider.upper", serde_json::json!({ "text": "hi" }))
+    .expect("component runs");
+assert_eq!(out.status, 0);
+```
+
+## Install
+
+A provider does nothing until the operator grants it. In the broker configuration, list the
+component, or pin it in a provider set that `dekopon-brokerd provider sync` resolves; give each
+capability you want reachable a constraint set; and permit it in Cedar. The broker denies a
+capability without a constraint set before Cedar is asked, and no policy widens a constraint set.
+[`conditional-write`](../../examples/conditional-write/broker.yaml) grants two of the `http-probe`
+provider's three capabilities. Run `dekopon-brokerd check` before restarting the broker.

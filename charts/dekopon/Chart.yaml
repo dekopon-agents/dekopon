@@ -15,8 +15,7 @@ version: 0.62.0
 # The application release this chart deploys. It is also what app.kubernetes.io/version reports on
 # every rendered object, so it has to track the image or the cluster answers `kubectl get pods -l
 # app.kubernetes.io/version` with a version nothing is running. Move it with the application, in
-# the release-prep commit; see README.md ("Two version numbers"). v0.3.0 and earlier predate the
-# container-image workflow and have no image. The image tag is the Git tag, so the rendered
+# the release-prep commit. The image tag is the Git tag, so the rendered
 # reference is v<appVersion>, not <appVersion>.
 appVersion: "0.75.0"
 

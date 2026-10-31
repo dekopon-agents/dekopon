@@ -1,575 +1,131 @@
 # Security model
 
-This document expands the security constraints introduced in [`design.md`](design.md). Read it before changing capabilities, identity, policy, credentials, providers, evidence, audit behavior, or external effects.
-
-## Foundational invariant
-
-A proposal is not authority: anything may create a `ProposedInvocation`, and only the broker may create an `AuthorizedInvocation`. [`design.md`](design.md#constitution) states the invariant; this document states how each boundary holds it.
-
-A capability name in an agent spec permits the agent to propose that operation. It does not grant process authority, credentials, or permission to call a provider directly.
-
-## Security-relevant stages
-
-1. **Model proposal** — untrusted model output names a capability and supplies untrusted arguments in a `ProposedInvocation`.
-2. **Authorization decision** — the privileged broker authenticates the transport, derives the actor/workload from trusted mapping, evaluates policy and current context, then either denies the proposal or creates a constrained `AuthorizedInvocation` inside its execution boundary.
-3. **External effect** — the broker consumes that authorization state while a narrow provider executes only the authorized capability using broker-held credentials and enforced constraints.
-4. **Evidence** — policy decisions and provider execution produce digests or bounded records that support later verification. *Committed direction:* removed; the trace is the record ([design.md](design.md#core-concepts)).
-5. **Audit record** — the broker links proposal, trusted identity, policy digest, authorization receipt, effect outcome, and evidence under an invocation ID and the W3C trace id the request carried, which is also the trace the decision's spans are recorded in ([goal 2](design.md#constitution)).
-
-The local daemon-to-broker request carries only a proposal over an authenticated Unix connection, not identity claims or an `AuthorizedInvocation` for the broker to trust. The broker does not return transferable authorization to `dekopon-gatewayd`; a serialized authorization representation is inert audit/evidence data rather than a bearer grant.
-
-Generation coordination frames are accepted only from the peer mapped as `dekopon-gatewayd` with an attestor grant; other mapped peers are refused before any coordination state changes.
-
-Rust's private, non-cloneable `AuthorizedInvocation` fields and absent deserialization make accidental in-process fabrication or reuse harder. `AuthorizationGate::new` is public so a broker adapter can own the transition; constructing that handle authenticates no caller and evaluates no policy. This is defense in depth only. The real authority boundary depends on separate processes, authenticated requests, policy enforcement, authorization bound to execution, isolated credentials, provider sandboxing, and credential-safe audit linkage.
+What each boundary protects, and what Dekopon deliberately doesn't. Decisions are in
+[authorization](authorization.md).
 
 ## Trust boundaries
 
-Trusted inputs are expected to include:
+Trusted: the owner's broker configuration, Cedar policy, constraint sets, private secret map and
+peer-UID mapping; the provider bytes the lock pins; the telemetry store. Untrusted: everything the
+model writes, everything it reads (chat messages, pull-request text, web pages, provider output),
+and the catalog's instructions and skills. Those are operator text the model reads in full, so
+they're no place for a secret, and they grant nothing.
 
-- principal and workload identity derived from authenticated transport plus owner-controlled mapping;
-- broker configuration installed by an authorized operator;
-- the owner-only Cedar policy file, read under the configuration's own hygiene rules (server-owned, single-link, not group/world writable, no symlink following, byte-capped) — it is authorization input in exactly the sense the configuration is;
-- owner-authored execution constraint sets, validated at startup against loaded provider manifests, component-host ceilings, and the credential store;
-- provider directories held to the same standard as every other trusted input the broker reads: owned by the expected UID and not group- or world-writable, because anyone who can write such a directory can add a component the broker compiles and runs. Every file a scan yields is validated individually exactly as a directly-named one is, and there is no implicit search path — a directory the broker loads code from is named in its owner-only configuration or nowhere;
-- when managed providers are enabled, the strict byte-capped generated provider lock and the protected content-addressed store it names. The lock records an immutable OCI manifest digest plus component digest/length and provider ID; startup derives the blob path rather than accepting one from the lock and compares those expectations with the exact one-read buffer and bounded description passed into the privileged host. The operator-authored desired set and manager registry traffic are not consulted at daemon startup;
-- a `strict` startup posture choosing whether configuration that *cannot apply* refuses startup or is reported and ignored. It governs complaint, never enforcement: a capability no loaded provider routes is denied `unconstrained-capability` before Cedar is consulted in either mode, and a policy naming one is registered as a schema-only phantom that no constraint set can bind and no route can reach. A constraint block naming a capability its loaded provider does not declare and an undeclared *principal* stay fatal in both modes, because principals come from owner-authored configuration rather than from a loaded component;
-- broker-generated authorization receipts and audit records;
-- secrets obtained by the broker from an approved secret store;
-- the telemetry store the operator selected.
-
-That last one carries goal 2 ([design.md](design.md#constitution)): access to the telemetry store is access to every conversation, prompt, and argument the system has handled. What rides the trace, and the short list of what never does, is in observability.md.
-
-Explicitly untrusted inputs include:
-
-- model output, reasoning, tool names, and tool arguments;
-- repository files, pull-request text, issues, comments, diffs, and fetched web content;
-- provider responses until validated and bounded;
-- identity claims embedded inside model text or repository content;
-- an agent's catalog `instructions` and every skill it mounts. Instructions are operator-authored text; skills are operator-authored text, or shipped by a pinned provider under the same bounds, handed to the model, and the model can read all of it — a skill's `SKILL.md` body and each of its resource files arrive in full through `read_skill` — so neither is a place for a secret. Both grant nothing: nothing in either can widen a capability or name a principal, and authority is only what the broker attests. The loader reads a skill whole into memory at catalog load under bounds fixed before a byte is read (64 KiB `SKILL.md`, 256 KiB per resource file, 64 resource files and 1 MiB of them per skill, four directory levels), accepts only UTF-8 regular files and directories, skips `.`-prefixed entries, and refuses a symbolic link rather than following it, so a catalog cannot pull an arbitrary file into a prompt and a session opens no file. The one link it follows is a skill directory that is itself a Kubernetes projection entry, under the gateway source-trust rule below;
-- local config supplied from an untrusted checkout.
-
-A model or repository document cannot self-assert a trusted `Actor`. For the local broker, the connected peer UID and strict owner-controlled mapping own identity attribution; invocation payloads have no identity fields.
-
-Attested proposals are the one sanctioned indirection, and they are narrow. A peer whose owner-configured identity carries an `attestor` grant may attach a typed `Attestation` naming a canonical external subject (`slack.t0123abc.u9xyz`, `slack.<team>.<channel>`, `discord.123456789012345678`, `discord.<guild>.<channel>`, `whatsapp.16034700182`, `tel.16034700182`, `github.owner.repo`) alongside its proposal. A channel subject maps a space, which the broker derives from the attested conversation and which narrows each person's decision in its channel and threads by requiring both principals to allow. Every wake newly created in a mapped space, including ordinary schedules, watches, digests and PR subscriptions, instead fires as that mapped space alone. Chat subjects carry names verified by their chat service; a GitHub repo subject is derived only after the gateway verifies the webhook's raw-body HMAC, not from a purported sender, header or repository text before verification. The gateway mounts GitHub only with a nonblank HMAC secret; configuration alone authenticates nobody. For a GitHub delivery, the signed repository owner/name is authenticated ingress identity, but its run status, PR association and head are still unverified claims for the agent to check through its own broker-granted read. The subject is transport routing metadata, not a principal and not authority: the broker — never the peer — resolves it through owner-controlled `principals`, and an unmapped subject resolves to nothing rather than minting a principal on demand. The grant's optional `namespaces` bound which subjects a peer may speak for, matched on segment boundaries so `slack.t0123abc` cannot reach workspace `t0123abcx`; without them it speaks for exactly the mapped subjects and permits disclosure of the unmapped cause for every subject. A refused attestation is an audited denial under the peer's own principal with a stable reason (`attestation-denied`, `unmapped-subject`), never a silent error, so a compromised or misconfigured gateway leaves a decision trail. The resulting context is bound to a `via` naming the attestor and an `agent`, and policy sees both as required `context.via` and `context.agent`. A direct peer carries neither, so no policy can grant it a capability; every capability runs inside an attested agent session. Driving an agent at all is a separate `agent.prompt` statement, so a mapped subject with no such grant is refused (`agent-denied`) before any capability is considered. Each routed GitHub owner/repo needs an explicit owner-mapped principal, an `agent.prompt` grant and separately scoped read/write grants; optional agent-owned notes require their own `turso.exec` grant.
-
-Session-surface refusals disclose the broker's typed `unmapped-subject` or `agent-denied` cause for friendly gateway replies only for subjects permitted by the peer's attestor namespaces, with an omitted `namespaces` list permitting the unmapped cause for every subject; outside them, mapped and unmapped subjects receive the same opaque refusal. The latter includes only the mapped principal ID as display data, never a credential, policy ID or policy evaluation detail. Policy evaluation errors and other authentication failures remain generic. This display distinction grants no authority and changes no authorization decision. Invocation refusals retain their existing opacity.
-
-The published vocabulary also accepts `fauxlack.<tenant>.u<id>` person subjects and
-`fauxlack.<tenant>.c<id>` space subjects for disposable multi-participant tests. A fauxlack
-chat scope binds its container to the sender's tenant. These names grant no authority: owner
-mappings and attestor grants apply unchanged, including to claims from trusted Local clients.
-No deployed transport produces them.
-
-A chat scope also states what started the turn: `trigger` is `message` for a person's message or a verified repository delivery, `wake` for a wake session other than a daily digest, `job` for a detached job or its notice turn, and `probe` for a watch's unattended check or a daily digest session. Policy sees it as `context.trigger`. A personal wake reuses the subject and conversation of the authenticated message that scheduled it. Every wake created in a mapped space uses the existing canonical channel subject with `trigger: wake` or, for a daily digest, `trigger: probe`; a space watch also probes under `trigger: probe`: the broker requires that subject to resolve to the exact space derived from the attested channel/thread, with no participant, native delivery or GitHub claim. Its prompt and every effect are authorized as that space alone, with no scheduling person's grants. Legacy personal once/watch rows without `run_as` and new wakes created outside mapped spaces remain personal; channel participants manage new space schedules by their anchored conversation container under fresh asker ∩ space authorization, while a DM sees only its own personal wakes. Every wake session is authorized afresh. A job under trigger `job` may write only when the broker explicitly authorizes its narrow write capability. A job started by a probe retains trigger `probe`: its leg is refused every capability whose effect is not read-only (`probe-write`) before policy is consulted. A probe's job may look, never act.
-
-## Typed GitHub facts
-
-A verified GitHub message carries bounded facts on `ChatScopeClaim.github`; the broker binds every event to the attested repository, conversation thread and first delivery ID. Only GitHub message claims carry this field. The gateway and broker ship and roll back together because the claim rejects unknown fields; other clients omit `github` on non-GitHub claims.
-
-Cedar sees one delivery at a time as optional `context.github`. Repository-set facts may support permits. Author-set facts live only in `context.github.authorSet` and can only deny: every event must allow both with `authorSet` omitted and with it present. The same checks cover capability, prompt, secret and HTTP decisions, including both principals in a mapped space. An error denies. A coalesced turn can do only what every delivery could do alone.
-
-The six classifications cover actor login versus stable numeric ID; PR draft and issue/PR state; run/check status, conclusion and path; deployment details; discussion category/answered; and review state. Author-only detail that is not a policy fact is dropped. Trust an actor by `actor.id`, never by its chosen login. Policies must not permit on a label an issue template can apply: an outsider selecting a template can receive its labels and assignees.
-
-Facts keep GitHub's case, except repository names, which are lowercase. Cedar `==` is case-sensitive, so a forbid on `"none"` never matches `NONE`. Actions and other words admit `[A-Za-z0-9_.:-]{1,64}`. Out-of-bound discussion categories and repository-dispatch actions are absent, including CJK category slugs and dispatch names with spaces. Optional malformed facts disappear, invalid set elements are dropped, and unknown payload fields are ignored; only missing or malformed required facts refuse the delivery.
-
-Titles, bodies, comment/review text, commit messages and lists, dispatch inputs, URLs, secret values and location text, and run/job/check names never reach Cedar, the GitHub note or `wake_reason`. Facts do not change policy digests. The agent must still read current checks, reviews and head through broker-granted capabilities before acting.
-
-Every gateway session offers `wake_reason`, a no-argument view of the turn's
-trigger. Its GitHub events are the same bounded typed facts carried on the
-claim, in arrival order, and remain unverified claims of current repository
-state. Chat and wake views expose no identity beyond the broker-mapped principal
-name (or null): no canonical subject, conversation, channel, container or thread
-ID. Wake and job IDs identify the scheduled work only. The tool grants nothing
-and calls no broker; embedders that supply no view do not offer it.
+Identity comes from the kernel (the peer UID) and, through an attestor grant, from the chat service;
+never from text.
 
 ## Current local process boundary
 
-The chart runs the broker as UID/GID **65532:65532** and the gateway as
-**65533:65533**, with supplementary IPC group **65534**. The broker owns a **0660**
-socket in a **0710**, broker-owned IPC directory with that group: the gateway can
-connect but cannot replace the socket or write its parent. Group membership grants
-reachability, not identity or authorization. The broker maps the actual OS peer UID;
-the gateway explicitly pins `broker.serverUid: 65532`, checking both filesystem owner
-and live server credentials. Unmapped peers are refused.
+The chart runs the broker and the gateway under different UIDs that share only an IPC group
+(`charts/dekopon/values.yaml`). The broker's socket is group-writable inside a directory only the
+broker can write, so the gateway can connect but not replace the socket. The broker maps the
+kernel's peer UID; the gateway checks the socket's owner and the server's live UID against the UID
+it's configured to expect. Group membership grants reachability, not identity.
 
-Broker configuration, provider credentials and private storage are broker-owned and
-unreachable through gateway mounts; gateway configuration and model credentials are
-absent from broker mounts. Private broker files remain **0600** and private directories
-**0700**; `fsGroup` is not used to widen them. The gateway mounts only its own
-read-only root-owned configuration, catalog and skill projections; the init container
-alone sees broker copy sources. Separate claim subdirectories and temporary volumes
-keep one daemon from replacing the other's private files. See the
-[chart layout](kubernetes.md#paths-the-chart-owns).
+Each UID is one trust domain. Anything running as the broker UID holds every provider credential.
+Anything running as the gateway UID reads conversation history and journals, holds the chat and
+model keys, and attests for every subject its attestor grant covers, so narrow that grant to the
+workspaces it serves. Run both daemons under one UID and the attestor grant gives attribution and
+deny-by-default scoping, not separation.
 
-Attestor namespaces and `via` policy constrain a distinct gateway peer rather than a
-broker-UID process. A compromised gateway can speak for subjects inside its configured
-attestor grant; this is not independent per-process attestation or general tenant
-isolation. Each UID is its own trust domain. Broker-UID compromise and host/root
-compromise are outside this boundary ([`design.md`](design.md#non-goals)). Owner-only
-local broker clients are supported with a private parent and **0600** socket; the
-gateway's local chat socket is **0600**, owner-only and development-only.
+## What each process holds
 
-## Capability and effect rules
+| Process | Holds | Never holds |
+|---|---|---|
+| `dekopon-gatewayd` | chat tokens, model keys, conversation history and journals, the model proxy's TLS key | provider credentials, policy, constraint sets |
+| `dekopon-brokerd` | policy, constraint sets, peer and principal maps, provider credentials and the secret map, provider storage | the gateway's model keys, a model loop, chat tokens unless the owner also binds one as a provider credential |
+| A Wasm provider | its input, in a fresh store per invocation | a credential: the host injects it after the request passes its checks |
+| The model | prompts and command output | a credential or any authority |
+| A VM behind the model proxy | its own work | a model key |
 
-- Capabilities are narrow and name one effect class.
-- External writes require an explicit capability; read access never implies write access.
-- Provider permissions should be least privilege and independently enforced by provider credentials.
-- Authorization constraints bind timeout, output size, exact HTTP destinations/methods, call counts, and byte ceilings.
-- Credential values do not appear in agent prompts, authored catalogs, invocation evidence, or normal logs. A legacy credential's symbolic *name* is owner-authored configuration; its `credential`/`agents.<id>.credentials` binding [will be replaced by public DRNs](design.md#legacy-credential-bindings). A public DRN is inert typed proposal metadata: it is separately Cedar-authorized, matched to an owner-only use binding, and resolved only inside the broker. The broker records the symbolic name/DRN so an effect can be attributed to the authority that carried it, never the value or physical locator.
-- A component import declares a required host interface; it never grants that interface or any transitive authority. The `spawn/run@0.1.0` import asks the gateway to execute a child script, not the broker to execute it: each child provider proposal must still pass broker policy under the same attested identity, leg and tree budget. A probe's read-only restriction follows its child, including a job started inside a probe: the same attestation and leg carry every nested proposal, and the broker authorizes each one afresh. The broker's upcall carries only a child stdout descriptor and, when requested, a child stdin descriptor; it carries no credentials or authorization. A malformed upcall or non-socket descriptor is refused before the gateway starts a child; cancellation closes the parent connection and stops descendants.
-- Broker HTTP authorization binds exact destinations, methods, host-call counts, byte limits, and deadlines to one invocation. Secret-backed calls additionally bind the exact DRN, native sink, private binding ID, canonical path/query scope, and injection count.
+## Endpoint trust
 
-The example reviewer has `github.pull-request.read` and the explicit external-write `github.pull-request.comment`. It does not have, and the example does not declare, `github.pull-request.approve`.
+The endpoint you authorize receives the credential; that's the point of sending it. The native HTTP
+engine injects a credential only for a destination inside that credential's binding, rejects a
+provider-supplied `authorization` header instead of overwriting it, and refuses a response that
+contains the raw credential (`crates/dekopon-http-host/src/lib.rs`). Plaintext HTTP reaches only
+loopback and hosts the owner lists as plaintext (`crates/dekopon-brokerd/src/config.rs`).
 
-Every provider may import and call `spawn.run`; there is no caller grant list.
-This is an intentional trade: providers can request child scripts, but the
-import is not authority to perform their effects. Each child's provider invoke
-is independently authorized by the broker under the same person, agent,
-attestation and tree budget. The gateway runs the script, not the broker;
-secrets remain broker-side. A probe and a probe-started job retain their
-read-only capability surface, so nesting cannot turn a read into a write.
+Allowlist a host that reflects headers back in another encoding (base64, JSON escapes) and the token
+walks out through the provider's output to the model. Basic authentication hands the endpoint the
+password. An endpoint that logs requests keeps your token. Pick your hosts, and give each credential
+the narrowest upstream scope.
 
-## Signed downloads
+## Prompt injection
 
-The separate `dekopon:http/signed-download@0.1.0` interface requires an invocation's
-`signedDownload: github-actions-logs-v1` constraint. Its API GET retains ordinary exact-host,
-method, policy and credential-binding checks; missing credentials refuse before API dispatch. Only the fixed Actions job-log route can produce
-one native storage hop. Storage hostname families are compiled, anchored and bounded; unknown
-families, plaintext, literals, userinfo, fragments, oversized Location headers and additional
-redirects refuse. DNS addresses are validated and pinned, with no production private-address
-exception. Storage transport has no credential binding, inherited headers or trace propagation.
-On the granted 302 path, the signed URL remains native and redacted; traces retain every effect without secret URL bytes. Other API statuses, including 301, 303 and 307, return status and body without following the redirect; any Location header retains its prefix but replaces its query and fragment with `[redacted]`. Ordinary HTTP send and stream apply the same Location redaction and never follow the redirect.
-A byte-zero probe establishes the total before explicit bounded range requests. Before exposing a window, the host scans bounded source context on both sides, retaining scanner overlap across responses so separate offset reads cannot reconstruct a signed query. Context ranges share the existing limits; insufficient budget, refused ranges or incomplete context expose no window. All requests
-consume the invocation's request count and the download sequence retains its deadline. Status,
-headers and body share the response-byte grant; the storage body separately caps at 64 KiB.
-A refused download redirect remains terminal through broker-host and broker, with the safe `redirect-refused` label and exit status 3. The host returns non-302 API responses with that Location redaction and storage status/coverage separately; the
-provider owns GitHub outcome semantics, untrusted-text rendering and continuation cursors.
-No deployment gains this constraint or a logs capability merely by upgrading core.
+Dekopon doesn't detect prompt injection or make a model trustworthy. It shrinks what a successful
+injection can reach: the broker authorizes each proposal for the person and agent the turn runs as,
+under constraint sets no text can touch. Inside that envelope an injection can do anything the grant
+allows.
 
-## Public DRNs and private resolution
-
-**Status: current.** A model may propose one canonical logical DRN only through the typed top-level
-`SecretUseProposal`; a DRN placed in provider input, a WIT value, URL, header or body is inert text.
-The proposal comes from a provider command: the model passes the DRN on the word's argv, and the
-guest's `run-command` answer returns it as `secretUse` beside the capability and input it built, so
-the invoke input never carries it. The shell forwards it to the broker leg; immediate invokers refuse
-it. A broker-backed proposal then passes four independent ceilings:
-
-1. ordinary capability Cedar policy;
-2. separate `secret.use` Cedar policy over the exact `Dekopon::Secret` resource and authenticated
-   routing context;
-3. an owner-authored private binding fixing capability, sink, username where applicable,
-   authority, method, canonical path/query rule and injection count;
-4. the capability's broader HTTP constraints and native host ceilings.
-
-The authorized proposal and effective constraints commit to the DRN, sink and binding ID.
-`dekopon-broker-host` compares the resolved credential with that commitment before creating a
-store. Resolution occurs once after the decision audit record is emitted and is pinned to that
-invocation; there is no stale fallback or cross-invocation cache. Unknown, unbound, wrong-sink and
-policy-denied names all produce `secret-denied`, avoiding a source-inventory oracle.
-
-The native host checks exact path and query scope before injection and discards a response carrying
-the raw secret or complete Authorization value. This is defense in depth, not proof against a
-malicious authorized endpoint: it may transform or semantically encode what it legitimately
-received, which [`design.md`](design.md#non-goals) rules out defending. Basic authentication
-necessarily gives the password to that endpoint. Narrow providers, upstream credential scope and
-destination trust remain necessary. [`secrets.md`](secrets.md) is the complete source and
-configuration contract.
-
-## Current operator and model posture
-
-The isolated `dekopon-gatewayd auth` namespace manages model-account login against fixed authentication hosts, on the CLI runtime before gateway configuration or transports. Within that namespace, `dekopon-gatewayd auth chatgpt export` is the single command in Dekopon that writes credential material in the clear; it is gated behind a required `--expose-credential`, refused when standard output is a terminal unless `--allow-terminal` is passed, and warns on standard error that the exported copy is invalidated by the next refresh. It fails rather than emitting a partial document, and it makes no network request. See [`chatgpt-credential.md`](chatgpt-credential.md). Auth performs no model inference, provider credential resolution, authorization decisions, or external effects. Provider readiness in local config is descriptive data, not a verified connection.
-
-The shared model client can contact an operator-selected OpenAI-compatible endpoint or
-OpenAI's fixed ChatGPT/Codex subscription endpoints, or OpenRouter at the fixed `openrouter.ai`
-host using its API key. Model bearer tokens are read from named
-environment variables and terminate inside that client, never inside provider components.
-ChatGPT authentication and inference hosts are fixed to `auth.openai.com` and
-`chatgpt.com`; no credentials are imported from pi, OpenClaw, or Codex. The isolated credential
-file is `0600` on Unix. Refresh rotates the token, so its directory must be writable and a
-secret-store export is a seed for one deployment, not a backup. Opaque encrypted reasoning
-items are stored only in `0600` journal files, replayed only to a model with an equal identity
-(backend, upstream model and reported model), and never sent to telemetry, a summarizer, a
-decider or another model. Replayed journal text reaches a model only as slices of those files, which the Codex,
-OpenRouter and OpenAI-compatible encoders stream into the request body through the gateway's
-own read-only descriptors; no descriptor crosses to the broker.
-
-Provider schemas are model-facing metadata, not general host input validation; each provider
-must validate capability-specific input. The shared agent loop accepts only typed tool
-arguments, and catalog skills are loaded under bounds before a session starts, never by the
-script. Skills are untrusted model text and grant no authority.
-
-OTLP trace and log fields carry prompts, model responses, command arguments and output, and component input; there is no payload gate and no metadata-only mode ([goal 2](design.md#constitution)). Bearer tokens are omitted, and so is raw internal error text. A provider's own typed failure is the one untrusted failure string that is carried: `error.code` and `error.message` on the `broker.execution` record and the `broker.execute` span, bounded at 128 and 1024 bytes, because without them the reason an invocation failed exists nowhere in the trace ([goal 2](design.md#constitution)). They are read as provider-authored text, never as a broker statement. OTLP lifecycle logs are operational data rather than authorized invocation evidence. Final text and machine-readable outputs remain untrusted data. Terminal table cells in auth status remove control characters. `observability.md` is the complete telemetry contract.
-
-## Current gateway posture
-
-`dekopon-gatewayd` is the unprivileged process on the other side of the attestation boundary described above. It holds credentials to hear requests and ask a model, but its chat credentials can also make gateway-originated calls. The owner-approved exception shares the DekoponVille Slack bot token with the broker for the Slack provider; the gateway's copy of that token also gains canvas read and write reach as `canvases:read` and `canvases:write` are granted. Broker Cedar authorization does not govern gateway-originated Slack calls.
-
-- **What terminates in the daemon.** Chat bot credentials (Slack app-level and bot tokens, Discord and Telegram bot tokens, plus the WhatsApp app secret, webhook verification token, and sending access token; a configured GitHub webhook secret is reserved exclusively for raw-body HMAC verification and has no outbound API role) and model credentials (an OpenAI-compatible or OpenRouter API key, or Dekopon's own ChatGPT device-flow credential file). All of them are named in configuration as *environment variable names*, never values, and load into `Redacted` wrappers; a missing or blank chat or bound-route model credential is a startup failure naming the variable and never its value. An OpenAI-compatible model's `apiKeyEnv` is optional (OpenRouter requires it), because a loopback endpoint needs no key; naming a variable and exporting nothing into it is not. Blank counts as missing on purpose: an empty HMAC key verifies signatures anybody can compute, and an empty bearer token is sent as a header anyway, so an exported-but-empty variable is the absence of a credential presented as presence. A name that is not a valid variable name is rejected at startup, so a token pasted into that field is a refusal rather than a plaintext secret in a config file. WhatsApp uses its app secret only for exact-raw-body webhook HMAC and its access token only at pinned Graph endpoints and the exact HTTPS `lookaside.fbsbx.com:443/whatsapp_business/attachments/` download sink, with public DNS results bound to connections; neither enters prompts, broker requests, provider configuration, or normal logs.
-- **Gateway source trust.** Gateway configuration and catalog resources are not broker authorization sources. Ordinary gateway configuration, catalog, instruction and skill files must be owned by the daemon UID and not group/world writable; on a read-only mount, regular root-owned files are also accepted if not group/world writable. Projected keys accept a root- or daemon-owned `..data` symlink chain on a read-only mount, with a regular target owned by root or the daemon UID and not group/world writable. A skill directory may be such a projected key: `<mount>/<skill>` linked to `..data/<skill>`, read from the one generation `..data` names, with every directory and file below it owned by root or the daemon UID and not group/world writable, any further symbolic link refused, and a generation switch during the read refusing the load. A skill directory outside a projection still refuses every symbolic link. A pinned provider may ship a skill exported offline from its verified locked component; the operator mounts its directory through the same gateway source-trust rules, and its text grants no authority. `dekopon_config::Projection` holds this rule once for gateway sources and skills. The broker's stricter policy/secret owner and no-follow rules are unchanged. A writable imitation of a Kubernetes projection is refused.
-- **What never enters it.** Provider credentials other than that shared token, policy, and authorization state. Broker-mediated provider effects are attested proposals to `dekopon-brokerd`; the daemon supplies the attested chat scope and nothing else, and the broker maps, decides, resolves, and executes. Gateway-originated chat calls instead use its chat credentials directly.
-- **What is untrusted.** Message text end to end, bounded to 16 KiB before it reaches a model and 8 KiB on the way back out. The names and media types of files attached to a chat message are the same untrusted text, and the 16 KiB bound covers the message and the reference note naming them together.
-
-  File *contents* are untrusted in the same way. Each attachment is named in the prompt as
-  `chat-asset:N`, and the gateway downloads its bytes only for a model's use: a `fetch_chat_asset`
-  call, or a provider command that names it. They reach the replying model only through that call,
-  or through a pin, which passes the same checks and requires `summaries.attachments` to enable
-  images or documents. Where a journal-recall route turns on `summaries.attachments`, the gateway
-  also sends bytes it already holds for a conversation to the route's `summaries.model` and no other
-  endpoint, after the reply, without the replying model asking for it:
-  - PNG, JPEG, WebP and GIF images, and PDF, Word, Excel, PowerPoint and RTF documents, whole,
-    up to 8 MiB;
-  - at most the first 256 KiB of the textual documents `fetch_chat_asset` shows.
-
-  It downloads nothing for this. The description it returns is untrusted text, replays to everyone
-  the conversation's history replays to, dies with the history entry that carried the file, and
-  never carries the file's name or platform locator.
-
-  Refilling evicted inbound bytes uses the session’s live access generation and current grant through the same transport download path. An attachment is part of the message that carried it, and chat services deliver it by reference rather than by value. Resolving a Slack, Telegram, or WhatsApp reference uses the bot token the daemon already holds to hear a request; a Discord CDN download carries no token and returns to pinned Discord REST only to refresh an expired signed URL. Neither path grants policy, a provider credential, or a way to write anything. What bounds it is arithmetic rather than authority: an allowlist of media types a model can be shown, 8 MiB per attachment enforced while the response streams rather than after it, 256 KiB of a textual file on the way into the prompt with a trailer saying it was cut, 40 MiB decoded assets per model request, 60 s per fetch, and generation-scoped attachment numbering and a fitted inventory note. Fetched payloads use private gateway-owned files; with a journal, content-addressed files and their index live under the required `sessions.assets.path`, and without one they use temporary disk. Uploaded files persist only while retained journal records name them; generated files remain session-only. Session messages retain weak scoped references, not disk leases or bulk bytes. Only request encoding, descriptor-backed consumers and outbound upload materialize consumption buffers. Temporary leases clean up on final drop; durable bytes leave through budget eviction or journal retention. Generation checks still reject a stale fetch before publication. Persistent conversation history retains text and one `[gateway: attached chat-asset:N — name]` line per file that arrived with a turn and, on those routes, each file's descriptions; the inventory note reaches the current prompt only. The gateway owns one configurable `sessions.assetRetentionBytes` disk budget (1 GiB default, zero disables retention/delivery), evicting re-downloadable inbound files before generated files and using LRU within each class, and accepts no model/provider paths; see chat assets. The agent's `instructions` from the catalog are untrusted model text by the same definition: they shape how an agent answers and can never assert identity, name a principal, or widen a capability. Broker policy never reads that field. A skill the agent's catalog entry mounts is the same text by the same definition: every session on the route lists it by name and description and may read its body and resource files in full through `read_skill`, so a skill is no more a place for a secret than the instructions are.
-- **Authorization is a gate, not a filter.** A session calls `capabilities` under a chat attestation of `(subject, agent, scope)` before any model call or liveness write, and the broker answers it only if policy permits `agent.prompt` for that principal and agent. An empty answer or refusal costs no model call: an ordinary addressed turn ends with a fixed sentence, while an unmentioned followed turn ends silently without a capability call or post. A follow turn opens its own leg as the newest authenticated speaker; it never inherits the inviter's grants, including after revocation. Ordinary failures answer a fixed cause line or the failure template — a `PromptError` can carry model, provider, or transport text, and none of it reaches chat.
-- **Assets are scoped file handles, not authority.** Every proposal's exact references resolve
-  automatically in its authenticated conversation generation; at most five read-only close-on-exec
-  descriptors and assets totaling 40 MiB decoded cross per invocation. Paths never come from the model.
-  Path-backed files are freshly opened read-only, pathless broker outputs are duplicated read-only,
-  and all readers use positional IO. On macOS, received descriptors get `FD_CLOEXEC` immediately
-  via `fcntl`; the accepted non-atomic window relies on neither daemon spawning child processes
-  during descriptor receipt (Linux uses atomic `MSG_CMSG_CLOEXEC`). Broker policy and HTTP grants still decide effects; descriptor
-  access covers only references in this invocation, not the whole metadata table. No byte expansion
-  or old route capability-name allowlist remains. Old route opt-ins are refused at configuration
-  load rather than silently ignored.
-- **Attachment does not authorize delivery.** Successful typed outputs join the gateway's bounded
-  LRU without a copy; their declared labels are authoritative and decoded-prefix mismatches log only
-  metadata. Only broker-approved sends enter a request-local reply queue, bounded to four new sends
-  per turn. Sent state lasts for the generation; failed delivery neither retries nor clears it.
-  Failed/cancelled turns send nothing. Chat/model credentials remain gateway-side and provider
-  credentials broker-side. Broker output files are unlinked read-only handles, not a shared path
-  mount; closing the final descriptor reclaims disk. Bytes never enter proposal/result JSON or asset
-  audit fields. See adapter format support and lifecycle.
-- **Indicators are presentation, not authority.** They are opt-in and resolve leaf by leaf from sessions to transport to conversation kind to route, with an off mode suppressing all indicators and working and seen reactions defaulting off. They use the same chat bot credential already terminating in this process, target only service-native channel/thread/message coordinates derived from the authenticated envelope, and never change what a transport can render. The model supplies no coordinate, emoji, cadence, or fallback: every progress line is assembled from operator templates and the session's own counters. besides the streamed answer, the one model-authored text a surface may carry is a progress note on a route that sets `progressNotes: true`: written with the shell's `progress` builtin, at most 100 characters, stripped of control and format characters and of `<`, `>`, `@`, `[`, `]` and backticks, at most 8 per script and 24 per session, rendered inside the operator's `note` template, or, on a Slack Agent transport with `indicators.statusText: true`, as the thread's status line, and recorded on `gateway.progress`. A note is the same class of text as the answer and carries no authority. Discord typing and Telegram chat actions expire; Slack Agent status is explicitly returned to active; an opted-in working reaction is the fixed `:tangerine:` and cleanup removes only this turn's attempted working reaction. The independent opt-in steer acknowledgement 👀 persists and is not removed by working cleanup. WhatsApp working reactions are refused at load until a verified clear exists. Liveness failures carry only low-cardinality categories and never affect the answer. An authenticated stop — a native Stop, a cancel button, a configured stop word, an operator shutdown, or a route's wall-clock bound — is transport control rather than model text, and only the subject who started a session may stop it: it cooperatively prevents later model/tool/broker work and suppresses history, answer delivery, attachment delivery, and durable recording, but cannot roll back a model request or provider effect already in progress. Only the route's
-wall-clock stop seals that conversation: later thread turns are refused before connecting to the
-broker, while DM, group DM and channel turns discard the old window and filter recall at the seal.
-With a journal, the private `.sealed` sibling survives restart until journal retention expires it;
-without one it is resident only. One stop-cause notice reaches the next permitted prompt, never
-history or the journal, and is lost on restart.
-- **Slack Agent continuation is authorization-fed routing state.** The Agent installation's channel-history scopes cause Slack to deliver ambient public/private channel events, but the transport drops them before routing, authorization, telemetry, or inference unless the bot was explicitly addressed or the exact authenticated workspace/channel/root-thread/sender tuple is already owned. A claim enters the 1,024-entry process-local LRU only after a fresh non-empty broker surface, refreshes only after fresh authorization, is removed on a definitive refusal, and disappears on restart. Another sender in the same thread owns nothing until separately addressed and authorized. An inherited message gets one request-scoped no-reply tool; selecting it before capability work emits no chat post or durable receipt. A decline selected alongside work runs nothing, while any earlier capability invocation makes a visible report mandatory so the model cannot conceal an effect by choosing silence; with no reporting turn left, a fixed warning directs the sender to audit before retrying. After capability work, a PR subscription re-review may decline its Slack reply only when every capability invocation in the turn successfully refreshed the head-pinned GitHub review of the subscribed PR and the model judges blocking findings unchanged. Those reviews are that wake's visible report. Any other invocation, including a failed review or a review of another PR, keeps the reporting rule and the fixed warning when no reporting turn remains, even if the subscribed review was refreshed. A daily digest wake runs under `trigger: probe`: its leg is read-only, so declining after its reads conceals no effect.
-  On explicitly follow-enabled Slack channel/thread routes, the shared follow ticket instead controls unmentioned admission ahead of owned-thread continuation; every batch opens a fresh leg as its newest speaker, and leaving prevents ownership from admitting more replies until an addressed turn successfully invokes `follow stay`.
-- **Self-inspection is narrower than configuration access.** Every authorized gateway session on a route that has set `inspectAgentConfig: true` may call `inspect_agent_config`; any other route does not offer the tool at all, which removes the structured dump and nothing else — the instructions are still the system prompt, so this is the model's obedience rather than a gate. Its typed result contains the catalog agent's identifier, description, model class and exact standing instructions; route limits and the route's memory mode; mounted skills by name, description, and resource path, never their text; and only the capability metadata from that sender's fresh chat-scoped `capabilities` result. It includes no raw Cedar source, policy IDs or digest, principal, subject, transport/channel identifier, execution constraint, model or broker endpoint/path, legacy credential name, private secret-map source/selector/binding inventory, or credential value. Exact standing instructions remain visible and may intentionally contain a public inert DRN. The gateway never receives provider credentials or raw policy in the first place, and the view constructor has no field for the chat/model credentials it does hold. The bounded view is repeatable under the prompt loop's shared per-turn tool-call and model-step bounds, with no inspection-specific call limit. Inspection consumes no capability budget, makes no broker invocation, grants nothing, and produces no durable broker audit record. Standing instructions are therefore authorized-user-visible rather than confidential; putting a credential in a prompt would already disclose it to the model and is invalid configuration hygiene.
-- **Improvement suggestions are advisory telemetry, not a channel.** Every session offers `suggest_improvement`, and an accepted call writes `agent.improvement.suggested` carrying model-authored text like any other model-authored record (goal 2). The record holds the six fields the model wrote — enum tokens for category and confidence, and `target`, `summary`, `evidence`, and `proposal` bounded to 128, 512, 2048, and 2048 bytes, trimmed and stripped of control characters other than newline and tab — and no subject and no chat text of the daemon's own; a message execution records at most ten, and a bound violation is `agent.improvement.refused` plus a tool result the model reads rather than a session failure. The daemon relays nothing to chat and applies nothing: a suggestion is a record a person reads, never a change to an instruction, skill, limit, or grant.
-- **The development transport is the one exception** to "identity comes from authenticated transport": it trusts its local caller to declare a subject. It grants nothing by doing so, because the claim has to pass the broker's attestor grant and identity mapping, and its `0600` socket under an owner-only parent keeps it inside the gateway UID trust domain. It is a development tool, not a production transport.
-
-The WhatsApp transport adds one public wakeup surface to the unprivileged daemon. An unmatched routed GitHub delivery starts a new repo-subject session through the normal admission, connect, capabilities and `agent.prompt` gate before inference. A routed `pull_request.synchronize` delivery may instead resume a subscribed space thread only after its repository subject resolves through owner-controlled `principals`, passes the GitHub route's `ids` and receives fresh broker admission. The repository admission leg closes before the resumed wake opens a fresh leg as the mapped channel space alone; neither repository nor person grants enter that wake. Routed, admitted PR close deliveries remove matching subscriptions. GitHub's configured `/webhooks/github` path shares its bounded listener and verifies the exact raw-body HMAC-SHA256 before parsing the repository subject. GitHub replies are silent and refusals are reason-only and rate-limited; an acknowledged bounded in-process enqueue is not durable, restart permits another freshly authorized turn, and an unsigned delivery GUID and lack of signed timestamp cannot prevent replay. Traces of accepted turns can contain prompts and output payloads, never webhook or provider secret bytes. It terminates no TLS and exposes no admin method. WhatsApp GET proves only knowledge of the separate verification token. WhatsApp POST identity is accepted only after one exact HMAC-SHA256 over the untouched bounded bytes; the signed `messages[].from`, never profile/display text, becomes `whatsapp.<wa_id>`, while the exact configured WABA and receiving-phone tuple stays transport-derived scope. The HTTP 200 returns before the turn starts, so Meta redelivers only when that 200 is lost in the network, and a post-200 crash can still lose queued work before it drains. A redelivered message joins the original turn as a steer while it is still running, or starts a fresh turn and answers again once it has completed; no durable exactly-once claim is made ([`design.md`](design.md#non-goals)). WhatsApp ignores webhook URLs, resolves media IDs under its configured phone, and bounds PNG/JPEG downloads and PNG/JPEG uploads to 5,000,000 bytes; metadata and byte signatures are validated without full image decoding. Captionless images use the same scoped attachment inventory. Other media hosts, redirects, proxies, userinfo, fragments, and unexpected ports are refused; this conservative host pin may reject future Meta CDN changes. Outbound Graph sends are never blindly retried because a timeout after transmission has unknown outcome.
-
-Being public also makes the daemon's own telemetry an attacker-reachable resource, which no other transport's is. Refused requests are reported per reason once a minute with the count they stand for rather than once each, so a stranger cannot turn a wrong signature into unbounded volume in a shared log sink, and a genuinely wrong app secret is one obvious line. A refusal never records the body, the headers, the sender, or the message ID it refused.
-
-The [current local process boundary](#current-local-process-boundary) applies to every transport. See `gatewayd.md` for the complete gateway contract.
+The sharp case is an agent that can read something private and write somewhere public: injected text
+can move one to the other. Give those capabilities to different agents, or fence the write with a
+request `forbid`. In a mapped channel a script may act under any current participant's handle, so
+text from one participant can steer the model into acting under another's grant. An unattended watch
+probe can only read.
 
 ## Conversation memory as a trust surface
 
-**Status: current.** A route set to `mode: persistent` implements the [Conversations](gateway-conversations.md#conversations) contract: a history bounded by a sliding window, an idle timeout, and a process-wide ceiling, held in the gateway process's memory and replayed into the next prompt. `scope: privateConversation` is the persistent default and isolates it by authenticated subject. `scope: sharedConversation` is an explicit audience expansion inside one exact agent/transport/conversation key. In a mapped channel, shared replay belongs to its space and remains across speakers, using the space principal’s grants; everyone in the channel sees it, while threads retain separate replay windows and private routes remain per subject. `persistent` is the route default; `memory: { mode: oneShot }` opts out of replay between sessions, while authorized steers can still join the current session under the admission rule below.
+Memory never grants authority ([memory](memory.md)): replayed and recalled text is prompt text, and
+each turn is authorized afresh. What memory widens is time and audience.
 
-On mapped shared or one-shot channels, every newly authorized participant receives one gateway join line after their authenticated first line. It summarizes read versus write by provider from their fresh capability answer, including the channel downscope. Display names and message text follow outside the authenticated line and remain untrusted. Participant legs and join tracking die with the session.
+- **Time.** On a one-shot route an injected instruction dies with its session. With history it stays
+  in every later prompt until the window, the idle timeout or retention drops it. Anything an agent
+  writes to agent-scoped storage and reads back lasts until deleted, across sessions and people: the
+  longest-lived injection surface.
+- **Audience.** Shared scope replays each participant's text and the agent's answers into prompts
+  others start. The chat service decides how wide a conversation is: a Discord message outside a
+  thread shares the whole channel.
+- **Revocation.** A changed grant drops history before the next turn, but the check compares
+  capability names only, so tightening a constraint set keeps what was read under the looser one.
+  Dropping history removes it from future prompts, not from the chat transcript or the telemetry
+  store.
+- **Residence.** History lives under the gateway UID, in memory and, with a journal, in 0600 files.
+  The UID boundary separates it from the broker, not from other processes running as the gateway.
 
-### Containment
+## Signed downloads
 
-The broker authorizes every invocation. A persistent conversation opens a fresh attested leg per new turn exactly as a one-shot session does — the same chat-scoped `capabilities` call, the same policy evaluation against the same `via`-scoped rules, the same audit record. No grant is cached, no decision is carried forward, and replayed history reaches the model as prompt text and never reaches the broker as authorization input. On a mapped channel with shared or one-shot scope, every authorized participant's admitted native chat message joins the running turn, attributed using that participant's fresh broker leg; once consumed there it never runs again as its own turn. Messages left queued at the final model step start later turns, each freshly authorized under its own subject; messages from different subjects are never folded together. A refused or empty leg exposes no text or assets to the model. The gateway retains at most eight legs, the asker's included; later participants are still freshly authorized, then their temporary leg closes and their attributed text joins without an executable leg. Only the asker's steers interrupt the model, and only the asker stops the session. DMs, private scope, and unmapped channels, including unmapped shared routes, keep same-sender steering and other-sender follow-up turns; wakes and GitHub deliveries remain separate turns. A debounced unmentioned Slack or Discord follow message is also a new turn under its newest speaker's fresh leg, never a steer or an inherited grant. The broker's named capability answer alone defines that speaker's work surface; a memory forbid or missing listing cannot be bypassed by an invitation, and a refused leg cannot reach the model.
+GitHub serves Actions job logs through a 302 to a signed storage URL, itself a bearer credential. A
+capability whose constraint set enables signed downloads may follow that one hop. The API request
+gets the usual checks. The storage request goes only to GitHub's compiled storage host families,
+carries no credential, inherited header or `traceparent`, and its URL stays inside the native host
+and out of traces. Any other redirect is returned unfollowed, with its query redacted.
 
-The owner’s mapped-channel rule is one shared stream, with capabilities “done under the most accurately identified conversants identity”. Each join lookup is recorded under the asker’s turn, never as that participant’s effect decision. Each call runs under one participant’s gateway-minted handle, the asker by default. The bash tool’s optional `as` selects one current handle for every command word in its script. Unknown handles cause a tool error before any broker call. The broker authorizes that frame’s own subject ∩ space; a handle is only a recorded label, never an identifier or policy key. Persistence itself grants no authority: remembered text remains a proposal.
-
-### What persistence widens is duration
-
-Prompt injection is not defended against, and this is the change that matters to it.
-
-On a `oneShot` route an instruction embedded in a pull-request body, an issue comment, or a fetched page reaches the model and dies with the session that read it. Authorized participant steers join that session; the next session starts from an empty prompt, so its blast radius is one session's proposals.
-
-On a mapped channel a participant’s authority is spendable during any turn they speak in, bounded by that participant ∩ space. Scripts default to the asker’s handle and can select another current participant’s handle with `as`. Text may still persuade the model to spend within that envelope for someone else; attribution records the pairing rather than proving the model’s purpose.
-
-With history it stays. The injected text — or the model's own answer restating it — sits in the prompt for the rest of that conversation, up to `maxTurns`, up to `maxBytes`, up to the idle timeout, and every subsequent turn in that conversation is evaluated with it present. A person who asks three follow-ups after the poisoned message is asking all three with the injection in scope.
-
-The mitigations below shorten the dwell time. None of them detects the injection, because nothing in this project does. A route that selects `oneShot` keeps the one-session dwell time.
-
-The longest dwell is an agent-written skill: a row in agent-scoped storage that every later session of that agent reads, indefinitely and across users.
-
-### Shared scope widens audience as well as duration
-
-`sharedConversation` lets a participant's prompt and the agent's answer survive into prompts initiated by other authenticated participants. Attachments follow the same complete key and live generation, so their numbered references and fetchability are shared too. This is disclosure within an owner-selected route, not a policy bypass, and disclosure is a security effect. A participant can seed prompt injection that persists for everyone using that conversation, ask the model to repeat prior text, or cause another participant's canonical identifier to be sent again on replay.
-
-The transport identity determines how wide "conversation" is. Slack sharing is normally rooted at the opening message and its thread replies. Discord guild messages use the channel identity, so a shared route can cover the **whole guild channel**; only a native Discord thread channel creates a different identity. Operators must evaluate the service-native audience, not assume every UI reply gesture creates a private thread.
-
-Each mapped-channel user message is prefixed by the gateway with `[gateway: authenticated participant: <principal>, handle pN]` for a retained leg (`p1` for the asker, then `p2`…`p8` by first authorized appearance). Authorized overflow text has no handle; on other shared routes the line remains `[gateway: authenticated participant: <principal>]`. The line names the broker principal the broker maps the attested subject to in its `capabilities` answer, or `[gateway: unmapped participant]` when it names none. The subject comes from the transport envelope accepted for the fresh broker leg, not message text, and the principal name is display-only: the gateway holds no policy and decides nothing from it, and a user-authored lookalike cannot replace that first line. This gives the model provenance; it does not make the following text trustworthy, defend against prompt injection, or prove that a later participant was allowed to see the earlier content outside this configuration choice. On the local development transport, only the owner UID is authenticated and the subject is that trusted caller's declaration; the uniform wording does not claim independent service authentication of the person. Principal names are model-provider input; canonical subjects, which can be phone numbers or service user IDs, are not.
-
-The scope stops at `(agent, configured transport, transport-derived conversation identity)`. It is not global agent memory, team memory, a durable shared namespace, or automatic replay across channels, threads, transports, routes, or agents. `recall: journal` does bring the same key's window back across restarts and idle or capacity eviction, but never across a grant change. Every participant starts a fresh attested leg and must independently be authorized for the agent on each new turn; a same-sender steer does not re-check the running leg's grant. On unmapped shared routes, differing participants’ capability identifier sets drop the shared window. Mapped shared routes compare the space’s grants instead, keeping the window across speakers.
-
-### The second-order case: history outliving its grant
-
-Tool output a session fetched under a broad grant is in the history. If the owner then narrows what that subject may reach, the text remains in the prompt even though the capability that produced it is gone — a quiet way for a revocation to be less complete than the owner believes.
-
-The mechanism that closes it: the granted capability set is stored with the conversation and compared against the fresh leg's grant on each new turn, or the space’s grant on a mapped shared route. Any difference drops the history and its attachment generation and starts a new conversation. On a mapped shared route, an empty asker grant refuses the asker and preserves the space’s shared slot. On other routes, an empty grant removes the entry outright and closes the same asset fence, applying the refusal to remembered content as well as future calls. It costs a cache miss on the first new turn after a policy change. That is the correct price: a narrowed grant is precisely the moment replaying old output is wrong.
-
-Two honest limits on that mechanism. It compares capability *identifiers*, so a policy edit that keeps the same capability list while tightening its owner-authored constraint set — a narrower allowed host, a smaller output ceiling, a different injected credential — produces an identical grant set and does not drop the history; text fetched under the older constraints may remain on disk until retention expiry, although the in-process window can evict earlier. And invalidation removes text from a future prompt, never from anywhere it was already shown: the answer that quoted it is in a chat transcript the daemon does not own, and in the operator's telemetry store.
-
-Invalidation also has to survive concurrency. Each seeded session receives a monotonically generated lease and attachment-access fence for the exact store generation it read. Grant replacement, empty-grant removal, idle replacement, and capacity eviction invalidate older leases and close their fences; a late model completion becomes a no-op, and stale work can neither publish attachment metadata nor resolve a source for byte fetching. A transport read that started while the generation was live may finish concurrently, but the fence is checked again and those bytes are discarded instead of entering the model after retirement. Sessions from the same live generation append in completion order, reuse one inventory, and preserve the first committed cache lane. Asset numbering is monotonic for that live generation even if the independently bounded asset map drops and later rebuilds its inventory, so a removed number cannot silently name a newer file.
-
-### The mitigations, as a set
-
-None of these is sufficient alone, and the design depends on all of them:
-
-- **Scope- and generation-aware complete keying.** Every key includes agent, configured transport, and transport-derived conversation identity. Private scope additionally includes the canonical authenticated subject, so one person's exchange cannot enter another person's prompt. Explicit shared scope omits only that subject and accepts that participants in the exact conversation can receive one another's earlier text, answers, and attachment references. Transcript removal closes the matching asset-generation fence; old metadata may remain inert in the bounded map until its next lazy prune, but stale sessions cannot inventory it or fetch its bytes.
-- **Idle timeout.** An untouched conversation is evicted, 15 minutes by default. It bounds how long an injection or a stale tool result can persist without anyone continuing the conversation that produced it. The check is lazy — the eviction happens on the next lookup rather than on a timer — so an idle entry can outlive its timeout in memory until something asks for it or the ceiling displaces it. What it can never do is reach a prompt.
-- **The window.** `maxTurns` and `maxBytes` bound what is replayed regardless of how long the conversation lives; eviction from the prompt does not delete an eligible journal record. `forgetAfterMs` and memory `maxAgeMs` independently bound chat recall and record eligibility.
-- **Compaction.** The journal stores one record per turn, with its original items and summary slots, on every journal-backed persistent route. On a route whose `recall` is not `journal` the record keeps only tool exchanges: no user, steer, assistant or reasoning item, and no summaries. A record and its summaries are kept and removed together; a summary is either generated or recorded as failed, never synthesized. Rewriting a file discards records past memory age, not eligible records merely evicted from a prompt window. Journal-backed persistent memory tools check the full conversation key, current grant, age and seal before returning text or queueing a pin, and they persist nothing; a pin selects the rung of an older record, not authority or inclusion.
-- **In the gateway.** History lives in the gateway process and is never sent to the broker. Without `sessions.journal` it is never written to disk and dies with the process. With it, journal routes store eligible records under per-agent directories in operator-owned `0600` files on the gateway's volume, until memory `maxAgeMs` expires; a longer route `forgetAfterMs` may extend file sweep time but not record eligibility. The summary engine sends a journal-recall record's non-opaque text to its plan's model after the reply. The operator is inside the trust boundary ([design.md](design.md#non-goals)). `recall: platform` rereads chat text from the chat service, but a journal-backed platform route also persists captured tool exchanges under the same retention bounds, without a second journal user/answer projection. History also reaches the operator's telemetry store, for as long as that store retains it.
-- **Grant-set invalidation.** Described above: the granted capability set travels with the conversation, and a change drops it.
-
-### Where the text goes
-
-Not into the broker. `dekopon-brokerd` holds provider credentials and emits one metadata-only audit record per decision, in which a provider's output survives only as a digest, and its records exclude inputs, outputs, paths, queries, headers, and bodies except the bounded `X-GitHub-Request-Id` response value in HTTP evidence. Putting conversation text in that process would place the most sensitive content in the system inside the most privileged one, next to a record built specifically not to contain it, and it would turn a log of what was *authorized* into a store of what was *said*.
-
-Telemetry is the other direction. `conversation.turns` and `conversation.bytes` are a count and a byte total because a span attribute is the wrong container for unbounded text, and the history itself rides `agent.model.prompt` in the message trace, split into records of at most 16 KiB, inside the operator's trust boundary described under [Trust boundaries](#trust-boundaries). There is no mode in which it does not. Replayed journal turns enter that trace from the same file slices the request body streams, and opaque reasoning enters it only as `[opaque N B]`.
-
-Not into the [prompt cache key](gateway-conversations.md#the-prompt-cache-key) either. The key is an HMAC-SHA256 of the agent, transport and conversation key, including the private subject, under a secret only the gateway holds, so a model provider can neither reverse it nor confirm a guessed subject, phone numbers included. It is stable across restarts when a journal holds the secret, which links one conversation's turns over time for the provider; that is the price of cache hits. It is a routing hint, never an access-control boundary: a request carrying a key is authorized exactly as one without it, by the broker, for each new session.
-
-### What this does not fix
-
-Keeping history in memory does not protect it from another process running as the gateway UID.
-The [current local process boundary](#current-local-process-boundary) separates that UID
-from the broker, not from itself. Paging and core dumps are outside the daemon's control.
-The development transport authenticates the local gateway UID, not the declared person;
-configured transport and agent keys prevent aliasing another route's history.
-
-## Provider storage and durable on-demand chat memory
-
-**Status: current.** The broker may hold a separate provider-storage PVC.
-Components receive no WASI, host path, environment, socket, or
-ambient I/O: an exact JSONL or durable-files import is linked to a single-use grant bound to host
-instance, invocation, capability, provider, interface, access, configured storage scope, scope
-commitment, and limits. Private conversation scope retains the authenticated subject;
-shared-conversation scope retains transport and conversation without subject; space scope retains the
-agent, configured transport, optional workspace and channel, without subject, principal or thread;
-agent scope retains provider and agent. Agent scope is refused inside a mapped channel, and space
-scope is unavailable outside one. An agent-scope storage constraint may name `namespace: <provider id>` in owner
-configuration, which then stands in for the provider, so providers naming one namespace share one
-resource per agent; no provider or input can name it, the grant still binds the invoking provider,
-and broker startup refuses the key under any other scope and refuses agent-scope sets that share a
-namespace with a different interface. Scope never bypasses per-caller Cedar authorization. Shared, space and agent scope
-use stable storage continuity so different callers' effective permissions cannot rotate a shared
-resource; private storage keeps its existing authority-bound default. HTTP and storage authority cannot coexist in one v1 capability. Description and command
-resolution receive a disabled sticky context.
-
-Chat storage needs more than the existing subject attestation. New operations carry an
-invocation-bound transport and conversation claim that must be canonical for the sender's service.
-The canonical conversation enters Cedar context, as the
-record `context.conversation.{kind, container, id, thread}`; `container` and `thread` are optional
-there, so an ordinary policy reading either without a `has` guard fails strict validation at load, while a
-0.13 statement still guarding the retired `context.channel` loads and quietly stops matching
-([`CHANGELOG.md`](../CHANGELOG.md#0140---2026-09-13)). What is reserved is what the owner declared: a
-constraint set carries a `route:` of `chatMemoryRecord`, `chatMemoryRecent`, or `chatMemorySearch`,
-and legacy capability, run, resolve, and invoke operations omit and refuse exactly those capabilities and
-every command word of the provider they name. Naming a capability `memory.chat.export` or a
-provider `memory-chat` reserves nothing, and renaming the shipped provider drops nothing. Generic
-chat invocation may reach the two retrieval routes but never the record route.
-
-Command words are the only way a script reaches a provider: a capability identifier used as a word
-is `command not found`, and `cap` lists and describes grants without invoking anything. A provider
-command word is ungated. Dispatch sends one typed `Run` frame and receives `Ran`. This grants
-no authority, so the
-broker runs the declaring component's argv handling — a
-pure, import-free guest call under the ordinary fuel and wall-clock bounds — before any
-authorization, and authorizes only the proposal that comes back, on exactly the path a direct
-`invoke` takes. Text the guest renders itself (a help page, a usage error) is provider-authored,
-pre-authorization, model-visible output: it authorizes nothing, charges no capability call, and is
-bounded by the host output ceiling and the shell's value and output ceilings, but it is the
-provider speaking to the model, with the trust its manifest and schemas already carry. The order
-of checks is what keeps the reservation above meaningful: a refused attestation and a reserved
-word are both answered as an unknown word before the guest is instantiated, so a reserved provider
-renders not even its help page, and a proposal that lands on a chat-memory route is refused after
-the run whatever word produced it. Argv is bounded by the client's frame ceiling before it leaves
-the process and by the host's `maxInputBytes` before a store exists. Host failures retain their
-cause in `command.resolve.failed`. `Run` parser refusals return `Ran` with `RunOutcome::Refused`,
-before invocation authorization begins. Unknown words return `NotFound`. [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#command-execution-refusals)
-carries the wire detail. The same provider-authored `--help` text is also rendered once per
-provider at broker load — one render maps to every command word that provider declares, since
-the guest command parser takes no word — and baked into the bash tool description once per page with every word it serves named, so a reachable word's help
-reads as part of the tool surface without a per-session round trip. That baked text is exactly as
-untrusted as any other guest-rendered output and grants no authority: it lives inside the tool
-description a model reads as instructions because that is where the words are listed, not because
-the provider earned more trust than an ordinary `--help` call carries. A page that fails to render
-is omitted rather than blocking startup.
-
-Recording is **model-hidden, gateway-attested transport acceptance**, not broker-proven delivery or
-human receipt. Slack/Telegram/Discord receipts prove complete service acceptance; local `flush`
-proves kernel acceptance. Discord partial delivery produces no receipt. The gateway submits one
-fresh dedicated request after acceptance, waits once, and never retries after timeout, EOF, denial,
-or outcome-unknown. Its already delivered answer remains answered.
-
-One conversation is the broker's own. A chat claim on transport `console-smoke` is accepted only as
-the exact literal `{transport: console-smoke, kind: local, conversation: {kind: directMessage, id:
-console-smoke}, trigger: message}`; any other claim naming that transport is refused
-(`console-smoke-claim-denied`) before policy. Any peer whose attestor grant covers the claimed
-subject may send it, and the attestor namespace, identity mapping and `agent.prompt` checks run as
-for every claim. The broker then replaces the conversation id with `smoke-` and the hex SHA-256 of
-a random nonce drawn once per broker start, the peer's `via`, the subject and the agent. No peer
-chooses the id; two peers, subjects or agents never share one; a broker restart moves every caller
-to a fresh, empty conversation. It cannot address a real conversation: `console-smoke` is the
-transport in every storage namespace the derived scope reaches, no real claim may carry that
-transport, and the id fits no Slack, Discord, Telegram or WhatsApp id grammar. A
-`recordDeliveredTurn` under the literal claim carries a placeholder local `DeliveryIdentity`; the
-broker keeps its boot nonce, connection and sequence, substitutes the derived transport and
-conversation, and checks canonicality against the derived scope, so the operator console seeds and
-reads one chat-memory conversation through the ordinary record and recent routes and its turn is
-console-attested, not transport acceptance. Under the derived scope the caller also reaches
-storage-constrained generic capabilities, agent-scoped ones included, whose namespace omits the
-conversation; a statement that must not reach them from a smoke session adds
-`unless { context.transport == "console-smoke" }`.
-
-The broker refuses a real conversation scope from the authenticated `dekopon-console` peer
-before subject mapping, canonicalization, Cedar evaluation, or storage preparation. The same
-`dekopon sandbox:` remedy is returned whether or not the claimed subject is mapped, so it cannot
-be used to enumerate subjects. Unmapped peers remain opaque. Subject mapping and the
-attestor namespace still apply to unscoped and exact
-`console-smoke` claims; a gateway-authenticated real conversation remains eligible for its own
-policy and storage checks. Memory permits retain both
-the `context.transport == "console-smoke"` restriction and the gateway's `via`
-(`context.via == "dekopon-gatewayd"`), rather than trusting a console-authored transport.
-
-Storage audit records carry every field a non-storage record does — principal, actor/agent,
-via/subject, provider, broker principal, policy IDs and digest, and credential —
-plus the audit-scope commitment and storage evidence. Physical paths, audit scope, record IDs,
-content commitment, evidence, authority, and generations are separate unkeyed SHA-256 domains, so
-no two are equal. Nothing in them is secret: isolation is the broker granting only the caller's
-own scope, in the namespace the owner configured for that capability, and the host binding each
-handle to that scope's directory, and a name the operator can recompute is
-a name the operator could already list.
-Storage spans likewise carry identity, capability, provider, input, and the namespace token, and
-storage evidence carries exact read and write byte counts. The telemetry store is inside the
-operator's boundary, which already holds the conversation
-(`observability.md`).
-
-The filesystem boundary retains directory descriptors and uses descriptor-relative no-follow
-opens, scans, creates, renames, and unlinks. It detects/refuses ordinary symlinks, hard links, wrong
-identities, unsafe modes, malformed namespace layouts, and a second conforming writer. Base then
-generation lease ordering serializes authority pointers, grants, and invocation access. Startup
-validates only the root. A grant that finds its namespace's authority pointer or generation corrupt
-rotates that namespace to a fresh, empty generation and fails that one invocation; corruption in the
-base's own shape fails the grant naming the entry. The host never chmods a directory it has
-classified as untrusted. An actively malicious same-UID process
-racing filesystem mutation is out of scope. Native filesystem operations can remain blocked after
-a timeout signal; the finalization budget prevents starting the next bounded finalization step after
-its deadline, while leases/reservations stay held until an already-started blocking operation
-drains, so this is not a hard wall-clock guarantee. Durable-files has no lock operation, no SHM
-operation and no multiprocess-database claim. A single-instance WAL engine needs none of them and
-runs on these primitives unchanged; the out-of-tree `turso-sql` provider ships one and opens
-exactly two files. Providers configured into one shared namespace take turns under the base lease,
-so each engine still runs alone over those files, and they must agree on the file format.
-Writes apply per host call. A trap can leave partial database/log changes; neither sync nor
-invocation success promises cross-file atomicity or crash recovery ([`design.md`](design.md#non-goals)).
-
-Memory text is not encrypted by Dekopon at rest, has no deletion/export UX, and is never
-automatically replayed. Recording never deduplicates: a redelivered message becomes a second stored
-turn.
-
-## Mapped compiled-provider trust
-
-Managed providers default to broker-owned immutable cwasm. Startup still verifies source Wasm
-against the activation lock; a trusted local index binds source digest and engine fingerprint to
-a compiled digest and length. Selected compiled objects are SHA-256-verified once per registry
-startup before Wasmtime maps them. The hash detects corruption; it does not establish provenance
-or defend against an adversary replacing both index and compiled bytes. The operator keeps mapped
-inodes unchanged for their entire lifetime. Same-UID/root filesystem attacks are out of scope.
-
-The production unsafe-code exception is the private `dekopon-broker-host::cwasm::deserialize` call to
-`Component::deserialize_file`. It is reached only for compiler-produced, locally indexed artifacts
-that were just published or verified. Wasmtime checks compatibility. Publication never overwrites
-an existing inode. Failures stop startup; `compileOnLoad: true` explicitly bypasses the feature.
-An explicit test-only opt-in also permits in-memory deserialization of immutable bytes serialized
-by the same process, keyed by engine compatibility and source SHA-256. Daemon paths never enable it.
-No hash, file read, or cache authority decision runs on invocations. Provider authority and source
-identity are unchanged. See [configuration and limits](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
-
-## Current privileged broker foundation
-
-`dekopon-broker-host` is the privileged component library; in deployment only the separately deployed `dekopon-brokerd` process runs it (directly and through `dekopon-broker`), while `dekopon-provider-sdk-testkit` embeds it in-process as a fake broker for provider tests. It links only the versioned Dekopon imports listed under [Component boundaries](design.md#component-boundaries), consumes one non-cloneable `AuthorizedInvocation` plus an exact single-use storage grant when applicable, and runs each description or invocation in a fresh memory-, fuel-, input-, output-, and wall-clock-bounded asynchronous Wasmtime store. Provider description and command resolution receive disabled HTTP/storage contexts and refused clock and entropy reads; any attempted host call rejects the component. Wall time and invocation-relative monotonic time need no grant during invoke, and a successful read is not recorded. OS entropy also needs no grant during invoke, is capped at 4096 bytes per call before allocation, and has no fallback source. A successful entropy read is not recorded; a refusal or failure logs only its requested length and status as `provider_random_read`, never its bytes. Policy/storage denials remain terminal even if guest code catches the typed WIT error.
-
-The statically linked native client enforces exact authority/port and method grants, request count and byte bounds, HTTPS by default, explicitly authorized plaintext to loopback destinations and to the exact hostnames the broker owner listed in `http.plaintextHosts`, DNS address validation and pinning, sensitive-header ownership, no redirects, no ambient proxy, and bounded response collection. The host advertises `Accept-Encoding: gzip, deflate` unless the provider set its own, and decodes gzip and deflate bodies itself before the byte limits and the credential echo scan see them, so both count and scan decoded bytes; a response in any other or stacked content encoding is refused before its body is read, unless it has no body (HEAD, 204, 304 or zero length). The independent `http.nonPublicHttps` list permits only exact DNS authorities and ports whose every resolved address is private unicast; `http.extraCABundles` adds broker-owned PEM roots alongside public roots for all HTTPS destinations without granting egress. Gateway/model inference clients separately accept an empty-by-default top-level `extraCABundles` list with the same file limits and additive public-root trust; neither setting applies to OTLP or the OCI provider manager. The broker's evidence contains method, authorized authority, status, byte counts and the bounded `X-GitHub-Request-Id` response value (1–64 visible ASCII bytes); no paths, queries, other headers or bodies. Only an owner-authored HTTP constraint set with `propagateTrace: true` permits the broker to send its egress span's `traceparent`; operators opt in only first-party destinations inside their trust boundary. Provider-supplied `traceparent` and `tracestate` headers are refused on every grant.
-
-An owner-authored HTTP constraint set may carry `requestTemplates`: method, path and query rules whose slots name attested chat-scope values (`conversation.id`, `conversation.thread`, `conversation.apiChannel`, `transport`). The broker renders the slots from the gateway's attested `ChatScopeClaim` per invocation and denies a templated capability with no chat scope or a missing slot before any request. The native host compares the once-decoded path against the rule, rebuilds the outgoing path from the rule with the rendered values, denies a provider-supplied pinned query key rather than overwriting it, and denies a key outside `allowed`; its denials name the rule, never the ids. Rules are `GET` or `HEAD` only, refused at startup otherwise, and the host denies a body on them, so a form body cannot name a second channel; send templates arrive with the send capability's body grammar. The provider writes slot names and never learns the values. The rules are part of the committed authority surface; the rendered values are not, and stay out of evidence and audit. Cedar still decides who may invoke the capability; the template constrains which conversation the request names.
-
-The standalone JSONPlaceholder demonstration keeps post reads and creates in separate capability IDs, one read-only and one external-write. Its guest accepts only the exact production HTTPS origin or explicit literal loopback HTTP endpoints, but guest validation is not authority: broker policy independently pins the exact authority and GET/POST method. Provider tests inject responses and broker tests use ephemeral loopback servers; CI does not contact the public service. Transport error details, post inputs, outputs, paths, and bodies remain absent from audit.
-
-`dekopon-broker` wraps that host with a transport-independent trusted context, deny-by-default Cedar authorization, owner-authored execution constraint sets validated at startup against provider metadata and host ceilings, single-use authorization construction, stable public outcomes, digest evidence, and metadata-only audit: every decision is a `broker.decision` or `broker.execution` log record inside the trace, emitted before any `AuditLog` sink sees it. Human/service actor principals must match transport principals; an agent actor's identity reaches policy as `context.agent`.
-
-Authorization and execution are different files with different failure modes. `dekopon-policy` decides who may act, over a schema generated from the deployment's own declared world and validated in Cedar's strict mode for ordinary policies; guarded request-referencing forbids bypass that schema validation and evaluate schemaless at the HTTP request point. Request-policy shape is checked before validation. Undeclared principals remain fatal, while lenient loading can register anticipated capabilities and providers as schema-only phantoms. Constraint sets decide how narrowly the broker then executes, and Cedar cannot reach them: no policy edit can widen a timeout, an output ceiling, an allowed host or method, or a credential binding. Evaluation errors deny. Invocation policy excludes arbitrary provider input and message content; the bounded exception is `context.request` at the HTTP request point, containing the outgoing method, host and path, optional query and guest headers, and `body` whenever the request carries one. A buffered `application/json` object of at most 16 KiB enters as a record: a `null` member is omitted, a number written with a fraction or exponent enters as a Cedar `decimal` when it has at most four fractional digits, and an array enters as a set. Any other body — streamed, another media type, larger, malformed, or holding a value Cedar cannot hold (a finer fraction, an integer outside 64 bits, a `null` array element, a duplicate or reserved key) — enters as the string `"opaque"`, so a guarded forbid that tests one of its attributes errors and denies instead of reading the body as absent, and a denial with policy errors records which of those it was (`policy.request.body_opaque`), never the body. Because a `null` member reads as absent and `==` across types is false rather than an error, write a body fence as an allowlist, `unless { context.request has body && context.request.body has model && context.request.body.model == "pinned" }`, never as a blocklist: `when { context.request has body && context.request.body has model && context.request.body.model != "pinned" }` is slipped by a `null` or omitted member, and `when { … context.request.body.max_tokens == 4096 }` by `4096.0`. A canonical public DRN is separately evaluated through `secret.use`, whose private binding remains the execution ceiling.
-
-Decisions are explainable without being leaky. `broker.decision` marks invocation versus HTTP request decisions with `decision.point`; request denials also carry `policy.error_ids` and `policy.errors_present` for evaluation errors. Every audit record carries `policy.ids`, the identifiers of the policies that determined the outcome (an `@id("…")` annotation names them stably), and `policy.digest`, a fingerprint of the policy set and world evaluated. Policy source itself reaches an operator only through startup errors — never through a per-request decision, an audit field, or a `Debug` rendering. Inputs, provider outputs, URL paths/queries, headers, bodies, and credentials are absent from audit records except the bounded `X-GitHub-Request-Id` response value in `http.calls`; a failed record's bounded `error.code`/`error.message` are the provider's own account of its refusal, not its output, which stays a digest. Authorization decisions are recorded before execution. When provider work may already have completed with no terminal record — terminal evidence failed to hash, or an embedding's bounded `InMemoryAuditLog` refused the outcome — the error says so. `BrokerError::unaudited_outcome` makes that distinction structural rather than a matter of error text, and `dekopon-brokerd` preserves it across the wire as the `outcome-unaudited` failure code so a client can tell "nothing executed" from "the effect may have happened".
-
-Reload lifecycle records are operational logs, not broker decision/execution audit: activation records carry a digest of non-secret configuration/reference identity and changed categories, while refusals carry bounded safe reasons rather than source values, vendor diagnostics or credential bytes. A `gateway.session` span captures the activated gateway digest, not a conversation identifier or a durable journal link. Without that retained span, historical activation is unknown; the digest cannot reconstruct old source content or prove unchanged secret values.
-
-`dekopon-brokerd` runs `TraceOnlyAuditLog`, which keeps nothing: the log record is the audit, offered to best-effort stdout and as an OTLP log record when `telemetry` is configured, so losing the exporter loses audit. There is no tamper-detection, rollback protection, or crash-recovery guarantee, and [`design.md`](design.md#non-goals) rules out building one. The bounded `InMemoryAuditLog` is for tests and embedding.
-
-`dekopon-broker-protocol` defines strict versioned frames and an unprivileged Unix client. Invocation wire values omit principal, actor, policy, constraints, credential values, and authorization. An optional public DRN/sink proposal is inert and requires the broker's separate decision. Frame lengths have a hard ceiling before allocation, complete reads/writes time out, and the client checks protected socket metadata plus server peer UID.
-
-`dekopon-brokerd` performs server-side Unix socket acceptance and derives `AuthenticatedContext` from the connected peer UID plus exact trusted configuration. It requires a broker-owned non-symlink parent, creates the socket under the [current local process boundary](#current-local-process-boundary), refuses unsafe/live replacement, limits concurrent one-request connections, drains under a configured grace period, and removes only its own socket inode. Its strict configuration and provider files must be single-link, server-owned, and not group/world writable; provider parents must also be protected, and writable non-sticky ancestors are rejected. Every process under a mapped UID can use its configured actor; group access alone supplies no actor.
-
-The same executable has a separate provider-manager operator mode. Exact-reference `sync` is the only path that resolves a mutable tag; an unchanged desired reference preserves its existing manifest digest, while `sync --locked` can fetch a missing component directly by the locked layer digest without requesting the tag manifest. Registry manifests, token/error bodies, and component streams are independently bounded and timed. Components are staged and synchronized under their digest before complete provider-set validation; only the generated lock is activated atomically, so an orphan blob is possible and a partially validated active set is not. Installed, orphan, and stale-temporary files share a hard 4 GiB/1,024-file lifetime ceiling checked under the store lock; the absence of automatic prune can require explicit operator cleanup at the ceiling. `list`, `verify`, and daemon startup make no network request. Public anonymous OCI Bearer flow is supported; registry credentials, SemVer ranges, update/remove/prune, and vulnerability/revocation response are not. An operator-set `DEKOPON_REGISTRY_CA_BUNDLE` adds PEM roots beside WebPKI for registry fetches only.
-
-The service performs no process attestation or non-Unix network transport. It injects legacy destination-bound credentials from an owner-only `0600` credentials file. The `credential`/`agents.<id>.credentials` selection [will be replaced by public DRNs](design.md#legacy-credential-bindings), preserving broker-owned refresh and injection. It also supports an owner-only private secret map: public DRNs remain untrusted proposal names until an ordinary capability decision, a separate exact `secret.use` decision, and a private binding all allow; only then does the broker resolve one source snapshot and construct native Basic/Bearer material. Both paths enter a request only inside the native HTTP engine after guest headers were validated — a guest-supplied `authorization` header is rejected, never overwritten. A constraint set may name one default credential and per-agent overrides of it; every credential the set can select is proved against the store and against that set's allowed hosts at startup, so an override is exactly as validated as the default. Evidence, audit, spans, accounting logs, and public results record only that injection happened (`credentialInjected`) and, in the terminal audit record and the execution span, the credential's owner-authored symbolic name — never the value, and redaction plus destination binding are independently tested. The gateway uses the lightweight protocol client, validates socket metadata and server peer credentials, and submits proposals without policy, constraints, credential values, or authorization state; an optional DRN/sink is inert proposal data. CI excludes privileged broker machinery from its normal dependencies.
-
-## Per-agent credentials, and where their boundary stops
-
-**Status: current.** A constraint set may present a different broker-held secret depending on which
-agent is acting. Combined with the mechanisms above — a route binding a transport and a channel
-match to an agent, a canonical subject mapping to its own principal, and a policy conditioned on
-`context.via` and `context.agent` — this is what makes two organizations reachable from one broker
-with two tokens, no capability duplicated and no token reachable from the wrong workspace.
-*Committed direction:* `credential`/`agents.<id>.credentials` bindings will be replaced by public DRNs,
-preserving per-agent isolation ([migration requirements](design.md#legacy-credential-bindings)).
-The following describes the current implementation.
-
-The selection input is trusted for the same reason `via` is. The agent name lives in the
-`AuthenticatedContext` the broker derived from an owner-configured attestor grant and identity
-mapping; it is never a payload field, and the map from agent to credential is owner-authored
-configuration in the same file as the timeouts and allowed hosts. A caller with no agent — a direct
-peer carrying `Actor::Service` — matches no override and takes the default. Policy cannot reach any
-of it: a policy edit can broaden who may drive an agent and can never bind a credential.
-
-Two limits are worth stating plainly. **Legacy capability/per-agent credential selection cannot
-bind a provider-input path**: it selects a token by trusted agent, not by arbitrary provider JSON.
-An HTTP request forbid can narrow outgoing method, host, path, query presence and buffered JSON
-body fields at the request point, but cannot change which credential is bound. A
-credential per agent narrows *who may use a token*, not *what that token can touch*. A DRN binding
-can additionally constrain the native HTTP path on which that one secret is injected, but it does
-not interpret repository/object identity in bodies or upstream API semantics. The token's own scope
-at the provider remains the final boundary. The [current local process boundary](#current-local-process-boundary)
-separates gateway and broker UIDs; per-agent credential selection does not establish a separate OS identity for each organization.
+Redaction replaces the signature and every long query value
+(`crates/dekopon-http-host/src/signed_download.rs`). A shorter parameter that an unfollowed redirect
+echoes into its body passes through.
 
 ## The guest model proxy trusts the jail to name its VM
 
-`dekopon-gatewayd`'s optional guest model proxy lets `claude`, `pi` or `codex` inside a Firecracker guest
-call a configured model with no model credential of its own. The guest never holds an identity:
-the jail's egress gateway (`vm-runnerd jail`) connects to the proxy over mTLS and asserts which VM
-it serves in `x-dekopon-vm-subject`, stripping any copy the guest sent. The proxy accepts only a
-client certificate that chains to the configured CA and carries the configured URI SAN
-(`jailIdentity`); anything else fails the TLS handshake.
+The proxy accepts only a client certificate that chains to the configured CA and carries the
+configured jail identity as a URI SAN. It then believes the VM subject the jail sends in a header.
+The certificate identifies the jail, not a VM, so a guest that escapes into the jail process can
+name any configured subject and spend that agent's token budget on that agent's models. That's
+accepted: an escape already owns the jail.
 
-It trusts the asserted subject only because an authenticated jail asserted it. Every jail pod
-shares one ServiceAccount and one client certificate, so the certificate proves "a jail pod", not
-which VM: a guest that escaped into the jail process could assert any configured subject and spend
-that subject's agent's budget on the models that subject is granted. That rates low, because an
-escape already owns the jail, and it is the same trust the jail already has with the controller.
-The subject grants only model calls, never broker authority: a proxied call reaches no provider,
-capability or broker, and the guest still holds no credential. Model credentials stay in
-`dekopon-gatewayd` and are injected per request. The guest's own `authorization` and `x-api-key` are
-dropped, and the upstream credential never appears in a response, record or log.
+The escape doesn't get the model key: the gateway injects it per request and forwards from the guest
+only the body and three named headers. It gets no broker authority and reaches no provider. The
+guest's body otherwise passes through as sent, so a VM can use your key for anything the upstream
+API offers on a granted model. The budget bounds the spend.
 
-## Threat-model limitations
+## Threat-model limits
 
-[`design.md`](design.md#non-goals) lists what this project has decided not to defend: a malicious process in the broker's trust domain, a compromised host or root, crash durability and audit tamper-detection, transformed reflection at an authorized endpoint, duplicate-effect defense, end-user privacy from the operator, and production-sandbox claims for Wasmtime. This section adds the limits that are specific to what is built.
-
-The project does not defend against a local user who can replace the binary, component, provider lock/store, or owner-controlled config; dependency or compiler compromise; denial of service during component compilation or from adversarial model endpoints; or side channels. The Wasmtime limits reduce invocation risk. Prompt injection is not defended against: a chat message reaching `dekopon-gatewayd` can say anything to a model, and the containment is that the model can only propose, never authorize. On a `oneShot` route an injected instruction dies with the session that read it, including authorized participant steers. A participant’s authority is spendable during any mapped-channel turn they speak in, under their own handle; it is bounded by that participant ∩ space. The model may still act on someone else’s injected text within that envelope: the frame directs it to act on the owner’s request or endorsement, or a participant’s own request under their handle, and report whose idea and handle it used. The table is per turn; replayed handles are inert. On a `persistent` route it stays in the prompt for the rest of that conversation, which lengthens its dwell time without changing that containment.
-
-The project has no provider provenance verification in its manager, provider registry credential support, provider vulnerability/revocation automation, general leased/dynamic secret lifecycle (the broker-private `oauth2Refresh` map source alone performs an OAuth refresh-token grant, including scheduled idle rotation without provider use; seed and record bytes stay broker-private and out of traces), per-process/client attestation, external evidence store, key management, tenancy isolation, operator-CLI integration with the broker or the daemon, or incident-response automation. A digest proves byte identity rather than publisher identity; container staging therefore retains its independent GitHub attestation checks and is not replaced by manager output.
-
-Conversation replay and optional durable on-demand chat memory are both live trust surfaces. Immediate in-memory grant invalidation compares capability *identifiers*. Durable `authority-bound` continuity instead commits effective capability metadata, constraints, selected legacy symbolic credentials, effective DRN use bindings/private-map revision, provider artifact bytes, host/storage ceilings, backend, and memory limits, and rotates a non-reusing random generation when that semantic surface changes. `stable` explicitly keeps prior text reachable across those changes after fresh authorization. Neither mechanism detects prompt injection or makes recalled text trusted authorization input.
-
-Provider execution boundaries are in the [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries), which preserves the separate broker boundary and treats HTTP imports as structural requirements rather than authority.
-
-Before any production-readiness claim, threat-model confused-deputy attacks, prompt injection, credential exfiltration, provider escalation, SSRF and DNS rebinding, redirect escapes, TOCTOU between authorization and execution, malicious Wasm components, resource exhaustion, forged identity envelopes, and cross-tenant data leaks.
+- Dekopon isn't production-hardened and has no multi-tenant transport. Per-agent credentials don't
+  give each organization its own OS identity.
+- A compromised gateway speaks for every subject inside its attestor namespaces.
+- The provider lock pins bytes by digest. A digest proves identity, not publisher, and there's no
+  provenance check or revocation.
+- Wasmtime bounds memory, fuel and time per invocation; it isn't claimed as a production sandbox.
+- Dependency or compiler compromise, side channels, and denial of service from model endpoints or
+  component compilation are out of scope.
+- Audit lives in the trace and dies with the exporter ([trace as audit](design.md#trace-as-audit)).
+- Whoever reads the telemetry store reads every conversation.
+- If something hostile already runs as root or as the broker's user, you've lost.
+- Gateway history in memory can reach swap and core dumps; the daemon controls neither.
+- Chat memory with `continuityPolicy: stable`, and shared, agent and space storage always, stay
+  readable after the capability, constraints or credential that wrote them change.
+- A GitHub issue template can apply labels for an outsider, so never permit on a label. Logins are
+  chosen by their owners; trust the numeric actor ID.
+- A GitHub webhook delivery carries no signed timestamp, so a captured delivery can be replayed.
+- The gateway's own chat calls (replies, reactions, downloads) are not Cedar-governed; Cedar governs
+  provider effects.

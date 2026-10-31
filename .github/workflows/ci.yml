@@ -290,7 +290,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          budget=110000
+          budget=10500
+          docs=$(git ls-files 'docs/*.md' | wc -l)
+          if [ "$docs" -gt 7 ]; then
+            echo "docs/ holds $docs files; the limit is 7 (AGENTS.md#documentation)" >&2
+            exit 1
+          fi
           words=$(git ls-files -z -- '*.md' ':(exclude)CHANGELOG.md' ':(exclude)AGENTS.md' \
             ':(exclude)crates/*/examples/eval/*' ':(exclude)examples/catalog/skills/*' \
             ':(exclude)crates/*/tests/fixtures/*' | xargs -0 cat | wc -w)
