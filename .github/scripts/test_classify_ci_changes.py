@@ -12,8 +12,8 @@ class ClassifyCiChangesTests(unittest.TestCase):
         self.assertEqual(result, expected)
 
     def test_catalog_fixture_family_selects_its_real_readers(self) -> None:
+        self.assert_selected(["examples/catalog/dekopon.yaml"], "run_rust", "run_otel")
         for path in (
-            "examples/catalog/dekopon.yaml",
             "examples/catalog/skills/pull-request-review/SKILL.md",
             "examples/catalog/skills/pull-request-review/references/risk-checklist.md",
         ):
@@ -38,7 +38,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
             ["crates/dekopon-policy/src/lib.rs"],
             "run_rust",
             "run_otel",
-            "run_docs",
         )
 
     def test_lockfile_change_runs_every_rust_metadata_lane(self) -> None:
@@ -48,7 +47,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_otel",
             "run_package",
             "run_dependencies",
-            "run_docs",
         )
 
     def test_optimized_wasmtime_lock_selects_rust_and_its_companion_lanes(self) -> None:
@@ -58,7 +56,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_otel",
             "run_package",
             "run_dependencies",
-            "run_docs",
         )
 
     def test_crate_manifest_runs_package_and_dependency_checks(self) -> None:
@@ -68,7 +65,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_otel",
             "run_package",
             "run_dependencies",
-            "run_docs",
         )
 
     def test_changelog_runs_release_chart_and_documentation_checks(self) -> None:
@@ -102,15 +98,13 @@ class ClassifyCiChangesTests(unittest.TestCase):
                     [path],
                     "run_rust",
                     "run_otel",
-                    "run_docs",
-                )
+                        )
 
     def test_otel_fixture_preserves_rust_and_smoke_coverage(self) -> None:
         self.assert_selected(
             ["examples/otel-traces/smoke-test.sh"],
             "run_rust",
             "run_otel",
-            "run_docs",
         )
 
     def test_ci_control_changes_fail_open_to_every_lane(self) -> None:
@@ -119,7 +113,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
     def test_gate_scripts_fail_open_to_every_lane(self) -> None:
         # Gate scripts have no lane of their own; edits must not run nothing at all.
         for path in (
-            ".github/scripts/check_docs_duplicates.py",
             ".github/scripts/test_daemon_dependency_gates.py",
             ".github/scripts/render-homebrew-formula.py",
             ".github/scripts/test_render_homebrew_formula.py",
@@ -132,7 +125,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
             ["crates/dekopon-policy/src/lib.rs", "charts/dekopon/values.yaml"],
             "run_rust",
             "run_otel",
-            "run_docs",
             "run_chart",
         )
 

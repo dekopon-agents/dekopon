@@ -7,7 +7,7 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 Runtime sizing uses `--worker-threads`, `--blocking-threads`, `--blocking-keep-alive` and
 `--shell-threads`, with `DEKOPON_*` environment fallbacks; worker and blocking counts are each
 limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
-[runtime threads](../../docs/gatewayd.md#runtime-threads) for defaults and thread ceilings.
+runtime threads for defaults and thread ceilings.
 
 - **Transports** — Slack Socket Mode and Discord Gateway over outbound WebSockets, Telegram long
   polling, a raw-body-HMAC-authenticated text/image WhatsApp Cloud API webhook with pinned Graph
@@ -19,7 +19,7 @@ limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
   ten failures per episode, reset only after five continuously connected minutes. Healthy peers
   serve during recovery. Any terminal reader failure drains sessions and exits nonzero so the
   supervisor can restart the gateway container. No outbound effects are replayed. See
-  [policy and lifecycle](../../docs/gatewayd.md#connection-recovery).
+  policy and lifecycle.
 - **Routing** — first match wins on (transport, direct message or channel), and a channel
   route names one channel or, with the name left out, any channel the bot is invited to.
   Declaration order is the precedence rule: a named channel written above a catch-all keeps
@@ -29,7 +29,7 @@ limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
   with existing follow and journal configuration: a PR link starts a threaded review turn using
   only the poster’s broker leg, downscoped by a mapped channel. Other speakers wait for separate
   turns. Unmapped or denied posters' ambient links are silently refused, with a trace record
-  and no thread reply or reaction. See [Slack pull-request links](../../docs/gateway-transports.md#slack-pull-request-links).
+  and no thread reply or reaction. See Slack pull-request links.
 - **Chat assets** — Slack, Discord, and Telegram photos/files plus WhatsApp PNG/JPEG photos become bounded references
   that a model opens on demand. Feature-only fauxlack also reads manifest files from its world. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
@@ -44,7 +44,7 @@ limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
   Successful typed outputs join the scoped disk LRU; attaching does not send. Broker-authorized
   `asset.send` queues at most four files per turn, with persistent sent flags and bounded failure
   notices. Slack/Discord/local and feature-only fauxlack accept concrete valid media types; Telegram/WhatsApp send PNG/JPEG.
-  WhatsApp retains its 5,000,000-byte ceiling. See the [asset contract](../../docs/gateway-assets.md#asset-handles-and-delivery).
+  WhatsApp retains its 5,000,000-byte ceiling. See the asset contract.
 - **Indicators** — layered `sessions`/transport/conversation-kind/route settings default off;
   after fresh authorization, `progress: auto` prefers native status, then typing. Working
   and steer reactions default off. `working: on` adds to status or typing;
@@ -54,7 +54,7 @@ limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
   that surface for an explicit Stop button or when no indicator works. `progressDetail` controls
   prose only: explicitly requested `stream` remains independent of progress/detail Off.
   Best-effort steer/queue 👀 is separate and requires `reaction.seen: on`; it defaults off.
-  See [presentation limits](../../docs/gateway-liveness.md#liveness-progress-and-stopping-a-run).
+  See presentation limits.
   A stop word, a cancel button, or
   `limits.maxDurationMs` ends a run early. Cosmetic failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
@@ -80,7 +80,7 @@ limited to 4096, including the legacy `TOKIO_WORKER_THREADS` fallback. See
   shares WhatsApp's listener when both use the same bind; GitHub alone binds that port. It
   verifies raw-body HMAC-SHA256 before parsing repository identity, acknowledges accepted,
   ignored and recent-duplicate deliveries, and retries queue saturation with HTTP 503. Replies
-  are silent; a route still requires a fresh broker-authorized `agent.prompt` session before inference. A signed run report alone authorizes no fix or post, and the transport never posts even on failure. See [gateway configuration](../../docs/gatewayd.md).
+  are silent; a route still requires a fresh broker-authorized `agent.prompt` session before inference. A signed run report alone authorizes no fix or post, and the transport never posts even on failure. See gateway configuration.
   Every person-originated turn, in every scope, carries a gateway-authored participant label naming the sender's broker principal,
   and those names reach the model provider. History is compacted and bounded;
   transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share
@@ -141,12 +141,12 @@ is a development tool, not a production transport.
 
 Configuration, transport semantics, session bounds, telemetry, the conversation contract,
 and the distinct-UID deployment boundary are documented in
-[`docs/gatewayd.md`](../../docs/gatewayd.md).
+`docs/gatewayd.md`.
 
 WhatsApp media-first collection uses `debounceMs` (5000ms quiet by default) and
 `debounceMaxWaitMs` (15000ms maximum from the first receipt). Zero quiet time bypasses collection;
 an enabled maximum must be at least the quiet interval. See the
-[multi-message contract](../../docs/gateway-assets.md#multi-message-media-inputs) for bounds and isolation.
+multi-message contract for bounds and isolation.
 
 ## Run
 
@@ -171,7 +171,7 @@ record failure cannot change an already delivered answer. Receipts do not prove 
 
 `dekopon-gatewayd auth chatgpt {login,status,logout,export}` runs before gateway configuration,
 telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
-ordinary serving requires `--config PATH`. See [`docs/cli.md`](../../docs/cli.md) for auth-only flags, output, exit codes and both export guards.
+ordinary serving requires `--config PATH`. See `docs/cli.md` for auth-only flags, output, exit codes and both export guards.
 
 Asset retention shares one `sessions.assetRetentionBytes` budget, defaulting to 1073741824 bytes
 (1 GiB). With `sessions.journal`, the required `sessions.assets.path` holds content-addressed files
@@ -180,5 +180,5 @@ journal, files use private temporary disk and die with the process. Generated fi
 session-only in both modes. Zero disables asset retention and attachment delivery, not the bound;
 text-only sessions remain usable. Weak model references cannot prevent LRU reclamation. Generated
 PNG results publish gateway-owned `chat-asset:<N>` markers for successive edits; availability is
-not delivery confirmation. See [chat assets](../../docs/gateway-assets.md#chat-assets) for lifecycle,
+not delivery confirmation. See chat assets for lifecycle,
 limits, explicit release notices and no-refetch/no-blind-retry behavior.

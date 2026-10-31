@@ -27,8 +27,8 @@ Then work in order:
 7. Pass [acceptance](#acceptance-before-switching) before replacing another agent.
 
 Out of scope: Docker Desktop ([container guide](container-image.md)),
-[subscription authentication](cli.md) and the same-user
-[local transport](gateway-transports.md#local-development-transport), which trusts the caller's declared subject.
+subscription authentication and the same-user
+local transport, which trusts the caller's declared subject.
 
 ## Install
 
@@ -140,7 +140,7 @@ Create the Slack app and a dedicated OpenRouter key, choose one model, and colle
 1. Create the app from the
    [released Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.75.0/examples/slack/manifest-agent.yaml)
    and get its `xapp-…` and `xoxb-…` tokens with the
-   [Slack setup guide](../examples/slack/README.md#create-the-app-and-credentials). The workspace
+   Slack setup guide. The workspace
    plan and admin policy must allow Slack's Agent features; otherwise choose the
    [classic manifest](../examples/slack/manifest.yaml) and `experience: classic` deliberately.
 2. For the review channel, invite the bot to one private channel whose members may see the
@@ -152,7 +152,7 @@ Create the Slack app and a dedicated OpenRouter key, choose one model, and colle
 4. Choose one exact, tool-capable OpenRouter model ID, never an auto-router; check its price and
    availability, and set it as `model:` in the example's `gateway.yaml`. Add `routing.only` only
    after checking that provider's slug and support
-   ([routing controls](gatewayd.md#openrouter-model-settings)).
+   (routing controls).
 
 Spending limits:
 
@@ -265,7 +265,7 @@ sudo -u _dekopon_broker -e /usr/local/etc/dekopon/broker/broker-credentials.yaml
 secret on a command line. The PAT file's contents are in the
 [recipe](../examples/slack-github/README.md#keep-the-github-pat-in-the-broker).
 
-The gateway loads `credentials.env` itself with [`--env-file`](gatewayd.md#environment-file). The
+The gateway loads `credentials.env` itself with `--env-file`. The
 file's contract:
 
 - It holds the three `export` lines from [Prepare Slack and the model](#prepare-slack-and-the-model),
@@ -341,7 +341,7 @@ sudo -u _dekopon_gateway /usr/local/lib/dekopon/current/dekopon-gatewayd \
   or model reachability. It accepts the examples' sample Slack IDs and any nonblank model ID.
 
 `check --probe` sends one billable model request that proves the model ID exists and returns a tool
-call ([probe contract](gatewayd.md#check-a-configuration)). `check` refuses `--env-file`, so the
+call (probe contract). `check` refuses `--env-file`, so the
 shell sources the credentials:
 
 ```console

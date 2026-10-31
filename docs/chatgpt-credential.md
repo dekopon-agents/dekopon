@@ -8,8 +8,8 @@ credential on its own — the flow is interactive by design. The same is true of
 everything below.
 
 This document is the whole lifecycle for getting a credential from a local login into a cluster and
-keeping it correct afterwards. Read [`cli.md`](cli.md) for the command's contract,
-[`inference.md`](inference.md) for the inference boundary, [`gatewayd.md`](gatewayd.md) for the
+keeping it correct afterwards. Read `cli.md` for the command's contract,
+[`inference.md`](inference.md) for the inference boundary, `gatewayd.md` for the
 `models[].authFile` setting that names the file in a pod, and
 [`secrets.md`](secrets.md#legacy-credentials-the-broker-renews) for the broker credential kind.
 
@@ -79,7 +79,7 @@ dekopon-gatewayd auth chatgpt status
 `DEKOPON_CHATGPT_AUTH_FILE`, then `$XDG_CONFIG_HOME/dekopon/chatgpt-auth.json`, then
 `$HOME/.config/dekopon/chatgpt-auth.json` — and prints it. It is the only Dekopon command whose
 output is credential material in the clear, so it is gated twice and warns every time. The full
-flag contract is in [`cli.md`](cli.md#exporting-a-credential-for-a-secret-store).
+flag contract is in `cli.md`.
 
 ### The 1Password route
 

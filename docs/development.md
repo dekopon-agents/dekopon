@@ -8,7 +8,7 @@ From the repository root (`Cargo.toml`, `AGENTS.md`, and `docs/` should be prese
 
 1. Run `git status --short --branch` and preserve unrelated work.
 2. Classify the change as **Current**, **Committed direction**, or **Exploration** ([`design.md`](design.md#constitution)).
-3. Select the relevant contracts from the [area index](README.md#change-a-specific-area); identify which process owns the data and which owns the authority.
+3. Select the relevant contracts from the area index; identify which process owns the data and which owns the authority.
 4. Find the implementation and its nearest tests before editing.
 5. Check whether the change crosses the root workspace, a separate provider workspace, a generated artifact, or a mirrored contract.
 
@@ -79,9 +79,9 @@ proposal and its result; repeated references share a row and descriptor. Quoted 
 text stays text. Gateway-built proposals retain `Invoke`; no proposal JSON walk discovers files.
 `attachment.rs` owns the gateway-facing registration/send traits; `dekopon-gatewayd::asset` owns scoped
 numbering, retention and output sniffing. Update the descriptor, lifetime, queue, transport and
-failure-note tests together. See [asset handles](gateway-assets.md#asset-handles-and-delivery).
+failure-note tests together. See asset handles.
 
-Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered on every session, and its record carries model-authored text same as every other model-authored record (goal 2). The contract is in [`improvement.md`](improvement.md).
+Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered on every session, and its record carries model-authored text same as every other model-authored record (goal 2). The contract is in `improvement.md`.
 
 Provider JSON Schemas are exposed to the model, but there is no general JSON Schema validator in the host. The host requires an object-shaped schema and object invocation input; each provider must validate its own capability-specific fields and constraints.
 
@@ -209,7 +209,7 @@ Declare shared versions and path dependencies in the root `Cargo.toml`; commit `
 
 GitHub Actions are pinned by full commit SHA. Required check names such as `test (Rust)` are branch-protection contexts: renaming a job without coordinating the repository setting leaves a permanently pending required check. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>` when those tools are available. Do not change branch protection, publish crates, create a release, or add credentials without explicit maintainer authorization; an execution contract the owner approved gives it for what it lists.
 
-Expensive validation runs on pull requests (`pull_request`) and merge queue groups (`merge_group`), with both ARM64 and x86-64 lanes of the [memory-optimized Wasmtime](#memory-optimized-wasmtime) check also running after merge on matching main pushes; the x86-64 lane is excluded from PR runs. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them, a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`, and a native `macos-15` lane runs only `cargo test -p dekopon-broker-protocol`, the one crate that receives `SCM_RIGHTS` descriptors; the required `quality (stable)` context aggregates all five lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. The package-archive lane runs one `cargo package --locked --no-verify` invocation with `-p` for every public crate in `.github/release-crates.txt` when manifests, build scripts, explicit package inputs, WIT, or publication machinery change; it checks packaging and pins, not an archive rebuild, which first happens at `cargo publish` in the Release workflow. Release metadata validation runs for ordinary Rust and changelog changes.
+Expensive validation runs on pull requests (`pull_request`) and merge queue groups (`merge_group`), with both ARM64 and x86-64 lanes of the [memory-optimized Wasmtime](#memory-optimized-wasmtime) check also running after merge on matching main pushes; the x86-64 lane is excluded from PR runs. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the word-budget gate beside them, a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`, and a native `macos-15` lane runs only `cargo test -p dekopon-broker-protocol`, the one crate that receives `SCM_RIGHTS` descriptors; the required `quality (stable)` context aggregates all five lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. The package-archive lane runs one `cargo package --locked --no-verify` invocation with `-p` for every public crate in `.github/release-crates.txt` when manifests, build scripts, explicit package inputs, WIT, or publication machinery change; it checks packaging and pins, not an archive rebuild, which first happens at `cargo publish` in the Release workflow. Release metadata validation runs for ordinary Rust and changelog changes.
 
 The optional `memory-lab` workflow runs the pinned memory harness's deterministic fake-profile
 scenarios against the exact pull-request head SHA on `pull_request`, filtered to
@@ -316,9 +316,9 @@ Privileged broker path:
 - `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, maps distinct configured peer UIDs, bounds concurrent connections, and serves with `TraceOnlyAuditLog`, so its audit is the log record alone.
 - `dekopon-brokerd provider` is a separate operator mode. Exact-reference `sync` and `sync --locked` are the only network-capable lifecycle commands; `list`, `verify`, `skills --out DIR`, and daemon startup construct no registry request. A managed lock passes expected component length, SHA-256, and provider ID into the host so its one artifact read is both verified and compiled. The daemon embeds a narrow strict OCI-reference parser and bounded distribution path over `http-auth` and the rustls `reqwest` client.
 - The service enforces the [current local process boundary](security-model.md#current-local-process-boundary). Auth does not invoke it. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, `dekopon-policy`, `dekopon-console`, or `dekopon-tui` in the normal dependency tree of `dekopon-gatewayd`. In the reverse direction, CI rejects `dekopon-agent`, `dekopon-shell`, `dekopon-process`, `dekopon-config`, `dekopon-console`, or `dekopon-tui` in the normal dependency tree of `dekopon-brokerd`; `dekopon-model` is allowed for the shared `chatgpt::CredentialFile` refresh implementation. Both gates allow the shared `dekopon-broker-protocol` client.
-- `dekopon-gatewayd` is the unprivileged agent daemon on the other side of that boundary: strict owner-controlled configuration naming environment variables rather than secrets, chat transports, first-match routing to catalog agents, admission-bounded sessions, optional bounded conversation history in process memory (private per authenticated subject by default, explicitly shareable only within one agent/transport/conversation), and attested on-behalf-of proposals. Its attested `capabilities` gate refuses an unauthorized subject before any model call; the broker answers it only when policy permits `agent.prompt` for that principal and agent. See [`gatewayd.md`](gatewayd.md).
+- `dekopon-gatewayd` is the unprivileged agent daemon on the other side of that boundary: strict owner-controlled configuration naming environment variables rather than secrets, chat transports, first-match routing to catalog agents, admission-bounded sessions, optional bounded conversation history in process memory (private per authenticated subject by default, explicitly shareable only within one agent/transport/conversation), and attested on-behalf-of proposals. Its attested `capabilities` gate refuses an unauthorized subject before any model call; the broker answers it only when policy permits `agent.prompt` for that principal and agent. See `gatewayd.md`.
 
-See [`gatewayd.md`](gatewayd.md) for the user-facing contract, [`observability.md`](observability.md) for OTLP signal and redaction behavior, and [`security-model.md`](security-model.md) for the trust boundary.
+See `gatewayd.md` for the user-facing contract, `observability.md` for OTLP signal and redaction behavior, and [`security-model.md`](security-model.md) for the trust boundary.
 
 ### In-process multi-participant gateway tests
 
@@ -328,7 +328,7 @@ fixtures under `crates/dekopon-gatewayd/tests/gateway/` cover sequential asker â
 refused participants, bot suppression, membership, server isolation, files and config refusal.
 The shared fixture owns model shutdown and joins its worker even when scripted replies remain.
 The feature adds no dependencies and is not enabled for release builds. See the
-[fauxlack transport contract](gateway-transports.md#fauxlack-tests-only).
+fauxlack transport contract.
 
 ## Validation
 
@@ -344,7 +344,7 @@ Two permission tests assume a non-root user: `dekopon-brokerd`'s `a_secret_file_
 
 Record the exact tested head or artifact, the commands and outcomes actually observed, and remaining verification gaps. Verify required remote checks on the exact submitted head; local success does not prove remote CI passed. Never describe future behavior as tested or an unobserved remote operation as successful.
 
-For deployment diagnosis, inspect the deployed runtime version/ref and provider component digest, not checkout HEAD or an old report. Browser, fixture, native-host, provider-loading, and live-provider-request acceptance exercise different boundaries; none proves the others. State precisely which boundary and bytes were exercised. Use the [area index](README.md#change-a-specific-area) for deployment and operational contracts.
+For deployment diagnosis, inspect the deployed runtime version/ref and provider component digest, not checkout HEAD or an old report. Browser, fixture, native-host, provider-loading, and live-provider-request acceptance exercise different boundaries; none proves the others. State precisely which boundary and bytes were exercised. Use the area index for deployment and operational contracts.
 
 ### Root workspace
 
@@ -419,21 +419,10 @@ Only `dekopon-gatewayd` packages `tests/**`; every other published crate's `incl
 
 ### Documentation gates
 
-Both gates run without a Rust toolchain in the `documentation checks` job that the required
-`quality (stable)` context aggregates, so a Markdown-only pull request is gated even though it
-selects no Rust lane. The duplicate-entry check covers `docs/`, the root `README.md`, `AGENTS.md`,
-and every `crates/*/README.md`:
-
-```console
-python3 .github/scripts/check_docs_duplicates.py docs README.md AGENTS.md crates/*/README.md
-```
-
-The other gate is inline in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml): every
-`audit.event` name emitted under `crates/` must appear in [`observability.md`](observability.md),
-and an extraction that reads nothing fails rather than passing silently. Emitting a new name
-therefore means adding it, backticked, to that document in the same change. Grep `docs/` and `crates/*/README.md` for every event identifier renamed or removed. This is why
-`agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and
-`agent.improvement.refused` appear there.
+The `documentation checks` job runs without a Rust toolchain and the required `quality (stable)`
+context aggregates it, so a Markdown-only pull request is gated even though it selects no Rust
+lane. Its one step fails when tracked Markdown, excluding `CHANGELOG.md`, `AGENTS.md` and test
+fixtures, exceeds the word budget set in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml).
 
 ### macOS Homebrew compatibility
 
@@ -445,7 +434,7 @@ fixtures. It is not a required PR check; dispatch it as
 | Input | Values |
 |---|---|
 | `daemons` | `tap` (default): the tap's `dekopon` and `cassette`, as installed. `checkout`: both daemons built in release mode from the dispatched commit, with the tap's `cassette`; candidate evidence, not a released installation. |
-| `mode` | `env-file` (default): both daemons start directly with [`--env-file`](gatewayd.md#environment-file), as the Mac runbook installs. `legacy-wrapper`: the gateway starts through a shell wrapper that sources a private `credentials.env`; the only mode before 0.74.0. |
+| `mode` | `env-file` (default): both daemons start directly with `--env-file`, as the Mac runbook installs. `legacy-wrapper`: the gateway starts through a shell wrapper that sources a private `credentials.env`; the only mode before 0.74.0. |
 
 **Pins.** Every run requires ARM64 Mach-O daemons and `cassette` 0.1.0. A `tap` run also requires
 the tap at `DEKOPON_TAP_COMMIT` and daemons at `DEKOPON_EXPECTED_VERSION`. The helper refuses any
@@ -458,7 +447,7 @@ HTTP responses from
 no upstream request; replay ignores `Authorization`, so an HTTP fixture in front of it checks the
 broker's bearer credential. The real Slack Agent adapter speaks Socket Mode to the loopback
 [`slack_socket_fixture.py`](../ci/slack_socket_fixture.py), not
-[Fauxlack](gateway-transports.md#fauxlack-tests-only) or a real workspace.
+Fauxlack or a real workspace.
 
 **A green run proves:**
 

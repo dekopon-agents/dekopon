@@ -33,7 +33,7 @@ components or credentials, invokes nothing, and initializes no telemetry.
 ## Environment file
 
 Serving accepts `--env-file PATH` with the grammar, file policy and precedence of
-the [gateway's environment file](../../docs/gatewayd.md#environment-file); `probe`, `provider` and
+the gateway's environment file; `probe`, `provider` and
 `check` refuse it with exit 2 before opening anything. The broker reads tuning and `OTEL_*`
 variables from it. It reads no credential from its environment: a `GITHUB_TOKEN` line is an unread
 variable, and provider credentials stay in the private `credentialsPath` YAML.
@@ -738,7 +738,7 @@ The section has no credential field. Ingest authentication is read from the stan
 `OTEL_EXPORTER_OTLP_HEADERS` environment variable by the OpenTelemetry SDK, so a token never enters
 this configuration file, the process command line, or a span attribute. Export goes over OTLP/HTTP
 (protobuf) to the endpoint's `/v1/traces` and `/v1/logs`; OpenObserve takes the organization from
-the endpoint path and the stream from a `stream-name` header ([receivers](../../docs/observability.md#enable-otlp-export)). Export
+the endpoint path and the stream from a `stream-name` header (receivers). Export
 failures disable telemetry and log the reason rather than preventing startup. Broker logs are
 structured JSON on stdout, filtered by `RUST_LOG`.
 
@@ -785,7 +785,7 @@ are capped at 512 MiB each; before publishing, the cache refuses growth beyond 1
 2 GiB of compiled-object bytes (separate from the source-Wasm store limit). Keep the cache on
 persistent disk, not memory-backed `/tmp`, for reclaimable pages. Artifact hashes detect corruption, not publisher provenance.
 
-See [startup tracing](../../docs/observability.md#broker-execution-spans) for cache status, sizes,
+See startup tracing for cache status, sizes,
 source verification, compile/hash/publish/map stage timings, and total registry load time. These
 measure cost, not RAM saved: compare process PSS and cgroup anonymous/file memory separately.
 
@@ -1014,7 +1014,7 @@ verifying provenance for each downloaded component.
 Audit is the `broker.decision` and `broker.execution` log events the broker emits inside the span
 that made each decision: structured JSON on best-effort stdout, and OTLP log records when `telemetry`
 names a receiver, over the same endpoint and headers as the spans. Their fields and correlation are
-documented in [observability](../../docs/observability.md#the-broker-audit-record).
+documented in observability.
 
 Nothing else keeps a copy. `run` serves with `TraceOnlyAuditLog`, which accepts every record and
 stores none, so no audit failure can refuse an invocation. Without `telemetry`, audit lasts as long
@@ -1254,4 +1254,4 @@ validation. Every storage request counts against `maxRequests`; no redirects fol
 For a full 64-KiB body, **recommend** `maxResponseBytes: 131072` to leave room for the existing
 64-KiB response-head ceiling. The combined total remains enforced. This is guidance, not a grant:
 the operator must separately authorize the capability and choose its limits. No example or
-homelab grant is enabled by this change. See the [security model](../../docs/security-model.md#signed-download).
+homelab grant is enabled by this change. See the [security model](../../docs/security-model.md#signed-downloads).

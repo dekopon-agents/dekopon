@@ -17,7 +17,7 @@ cross-release compatibility or negotiation
 Run the new release's `dekopon-brokerd check` and `dekopon-gatewayd check` on the configuration each
 daemon will serve, before starting either daemon on it
 ([broker](../crates/dekopon-brokerd/README.md#check-a-configuration),
-[gateway](gatewayd.md#check-a-configuration)). Where the new binaries can sit beside the running
+gateway). Where the new binaries can sit beside the running
 ones, check before stopping anything, as [on a Mac](run-on-mac.md#upgrade-and-rollback).
 
 A check that exits 1 lists every problem the new release refuses. Fix the configuration as the

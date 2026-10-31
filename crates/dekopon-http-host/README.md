@@ -44,4 +44,4 @@ favor of public DRNs ([decisions](../../docs/design.md#accepted-implementation-d
 The optional signed-download operation uses a byte-zero probe and explicit ranges, with a
 64-KiB body cap, shared request accounting and a retained deadline. It follows only a validated
 API Location under `signedDownload: github-actions-logs-v1`; the storage transport never has a
-credential binding. See [signed downloads](../../docs/security-model.md#signed-download).
+credential binding. See [signed downloads](../../docs/security-model.md#signed-downloads).

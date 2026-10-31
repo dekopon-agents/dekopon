@@ -1145,7 +1145,6 @@ async fn chat_memory_without_routes_names_every_missing_role() {
         "chatMemoryRecent",
         "chatMemorySearch",
         "exactly one constraint set",
-        "docs/upgrading.md",
     ] {
         assert!(
             rendered.contains(fragment),

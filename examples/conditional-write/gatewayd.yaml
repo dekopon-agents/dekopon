@@ -22,8 +22,7 @@ transports:
   - name: workspace-slack
     kind: slackSocketMode
     # Environment variable NAMES, never values. Pasting a token here is a startup failure, and a
-    # missing variable is reported by name. See ../slack/README.md for creating the app and both
-    # tokens.
+    # missing variable is reported by name. ../slack/ holds the app manifests.
     appTokenEnv: DEKOPON_GATEWAYD_SLACK_APP_TOKEN
     botTokenEnv: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
     # This example uses examples/slack/manifest-agent.yaml. Agent DMs are thread-scoped; if the

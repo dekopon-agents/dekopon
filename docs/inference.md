@@ -53,7 +53,7 @@ Slack event
 The broker authorization leg is new for every Slack message. Neither remembered text nor a prompt cache key enters Cedar policy or grants a capability.
 
 Gateway operators can add explicit PEM roots beside public WebPKI roots with the
-optional top-level [`extraCABundles`](gatewayd.md#extra-model-ca-bundles) list. Its empty
+optional top-level `extraCABundles` list. Its empty
 default leaves trust unchanged; the same list covers OpenRouter, OpenAI-compatible
 and Codex inference. Files are read at boot and reload, including same-path replacements;
 plain `check` validates paths without reading them. This does not change model credentials.
@@ -148,7 +148,7 @@ Within one session, the second request is the first request plus more items. Bet
 
 `generation`, `reasoning`, `routing` and `cache` are immutable client settings, not arbitrary JSON
 or request-scoped overrides. The strict configuration and every accepted spelling/bound are in
-[`gatewayd.md`](gatewayd.md#openrouter-model-settings). Omitted members remain absent on the wire:
+`gatewayd.md`. Omitted members remain absent on the wire:
 `maxOutputTokens` maps to `max_tokens`, `topP` to `top_p`, reasoning effort to `reasoning.effort`,
 and routing to snake-case members of `provider`. Forwarding a control does not prove that a remote
 provider honored it; telemetry labels these as requested settings.
@@ -342,7 +342,7 @@ storage is decoded by the native codec on consumption. Model wire serialization 
 streaming model request bodies is a separate change, not claimed by descriptor integration.
 
 For adapter types, storage ceilings and transport paths, see
-[asset handles and delivery](gateway-assets.md#asset-handles-and-delivery). Memory retains text and scoped
+asset handles and delivery. Memory retains text and scoped
 reference notes, never provider payload bytes. A partial native delivery suppresses durable recording.
 
 
@@ -531,11 +531,11 @@ Compute it only over calls where both fields were reported. A key proves Dekopon
 
 ## Related documents
 
-- [`gatewayd.md`](gatewayd.md) — routing, persistent-conversation bounds, cache-key scope and derivation, generated images, durable recording, and telemetry.
+- `gatewayd.md` — routing, persistent-conversation bounds, cache-key scope and derivation, generated images, durable recording, and telemetry.
 - [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) — retained text and prompt-injection dwell time.
-- [`cli.md`](cli.md) — isolated model-account login.
+- `cli.md` — isolated model-account login.
 - [`chatgpt-credential.md`](chatgpt-credential.md) — rotating subscription credential lifecycle.
-- [`observability.md`](observability.md) — model usage fields and payload gating.
+- `observability.md` — model usage fields and payload gating.
 - [`design.md`](design.md#non-goals) — the project's non-goals, which reject a memory feature argued on durability grounds.
 - [OpenAI Prompt Caching](https://developers.openai.com/api/docs/guides/prompt-caching) — public API behavior, not a subscription-endpoint guarantee.
 - [OpenAI conversation state](https://developers.openai.com/api/docs/guides/conversation-state) — public Responses state patterns Dekopon does not use.

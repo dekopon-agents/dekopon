@@ -22,7 +22,7 @@ Apply it in this order:
    [Prepare the broker and gateway](../../docs/run-on-mac.md#prepare-the-broker-and-gateway).
    Create the Slack app from the
    [0.74.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml)
-   with [Slack setup](../slack/README.md#create-the-app-and-credentials).
+   with Slack setup.
 2. Here, create six files, each mode `0600`, then [check them](#validate-and-accept):
    - in `/usr/local/etc/dekopon/broker/`, owned by `_dekopon_broker`: `gh-provider.wasm`,
      `broker-credentials.yaml`, `broker.yaml` and `policies.cedar`;
@@ -106,7 +106,7 @@ runbook's [install commands](../../docs/run-on-mac.md#prepare-the-broker-and-gat
 | `uownerid`, `ucolleagueid` | Slack member IDs, lowercased; names and email addresses are not IDs |
 | `replace-with-exact-openrouter-model-id` | One exact OpenRouter model ID that supports tools |
 
-[Allow a sender](../slack/README.md#allow-a-sender) shows where Slack displays the IDs. `check`
+Allow a sender shows where Slack displays the IDs. `check`
 accepts the sample Slack IDs and the model placeholder, so confirm none remain; only the gateway's
 [`check --probe`](../../docs/run-on-mac.md#check-before-installing-a-service) proves the model ID.
 
@@ -354,7 +354,7 @@ authorization. Then accept:
    policy.
 4. Requests to publish, approve or merge produce no successful write. With the overlay, the
    colleague still has no comment grant. Never test approval or merging against a real PR.
-5. Confirm native Working/Stop or its [reaction fallback](../slack/README.md#configure-in-flight-indicators),
+5. Confirm native Working/Stop or its reaction fallback,
    restart recovery and the OpenRouter spending limit; `check` proves none of them.
 
 Keep the daemon pair, provider Wasm and checksum, policy and configuration together for

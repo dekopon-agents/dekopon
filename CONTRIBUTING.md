@@ -2,7 +2,7 @@
 
 A change is judged by the three goals in the [constitution](docs/design.md#constitution); a subsystem that serves none of them is a deletion candidate. Small, reviewable changes with explicit trust assumptions beat speculative framework code.
 
-For behavior or architecture changes, read the relevant sections of [`docs/design.md`](docs/design.md). Select the applicable [change map](docs/development.md#change-maps) and [validation group](docs/development.md#validation), using the [repository map](docs/development.md#repository-map) to locate source and tests. Other contracts are routed by the [area index](docs/README.md#change-a-specific-area); reading every manual is not a prerequisite.
+For behavior or architecture changes, read the relevant sections of [`docs/design.md`](docs/design.md). Select the applicable [change map](docs/development.md#change-maps) and [validation group](docs/development.md#validation), using the [repository map](docs/development.md#repository-map) to locate source and tests. Other contracts are routed by the area index; reading every manual is not a prerequisite.
 
 ## Development setup
 
@@ -30,11 +30,7 @@ cargo deny --all-features check
 
 The pinned compiler is the MSRV, so the required `test (Rust)` check is the compile/run/doctest sequence in [Root workspace](docs/development.md#root-workspace) and there is no second MSRV run. Run `cargo package --workspace --locked` from a clean tree when changing package metadata, crate dependencies, or include lists. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>`; the exact file list CI shellchecks is the `shellcheck` line in [Root workspace](docs/development.md#root-workspace).
 
-Documentation edits are gated too: run the duplicate-entry check below, and add every new `audit.event` name, backticked, to [`docs/observability.md`](docs/observability.md) in the same change ([details](docs/development.md#documentation-gates)).
-
-```console
-python3 .github/scripts/check_docs_duplicates.py docs README.md AGENTS.md crates/*/README.md
-```
+Documentation follows [AGENTS.md#documentation](AGENTS.md#documentation); the `docs` CI job fails when tracked Markdown exceeds its word budget.
 
 ## Exercise changed behavior
 

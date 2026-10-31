@@ -68,4 +68,4 @@ Construct `CodexClient`, `OpenRouterClient` or `OpenAiClient`, select it with `M
 into the synchronous agent loop with a per-session `BlockingModel` on `spawn_blocking`.
 `with_loopback_endpoint` accepts only literal loopback over plain HTTP and never refreshes credentials.
 See [`docs/inference.md`](../../docs/inference.md) and
-[`docs/observability.md`](../../docs/observability.md#model-exchange-fields).
+`docs/observability.md`.

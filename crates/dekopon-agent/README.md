@@ -101,7 +101,7 @@ The reusable agent session layer consumed by `dekopon-gatewayd` and external emb
 - `IdSequence` — one session's W3C trace and the collision-free invocation identifiers that
   extend it, adopted from the exporting span or minted when the process exports nothing, as
   described in
-  [`docs/observability.md`](../../docs/observability.md#trace-context-across-the-socket).
+  `docs/observability.md`.
 
 `meta::AgentConfigView` is the narrow introspection shape: exact standing
 instructions, session limits, and effective capability classifications. Its type has no

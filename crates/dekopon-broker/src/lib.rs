@@ -1675,8 +1675,7 @@ pub enum BrokerBuildError {
     #[error(
         "chatMemory is configured but no constraint set declares route: {}; the surface is all \
          three roles — chatMemoryRecord, chatMemoryRecent, chatMemorySearch — with exactly one \
-         constraint set declaring each and all of them naming one provider; see \
-         docs/upgrading.md",
+         constraint set declaring each and all of them naming one provider",
         roles.iter().map(|role| role.as_str()).collect::<Vec<_>>().join(", ")
     )]
     UnroutedChatMemory { roles: Vec<CapabilityRoute> },
