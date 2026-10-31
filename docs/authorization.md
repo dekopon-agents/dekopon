@@ -52,13 +52,20 @@ session no capabilities.
 
 Policy sees where a message arrived as `context.conversation`
 ([schema](../crates/dekopon-policy/src/lib.rs)): `kind`, `container`, `id` and `thread`. `container`
-and `thread` are optional, so a policy that reads either guards with `has` or fails to load.
-`id` is the channel; `container` is the Slack team, Discord guild or GitHub owner; `thread` is
-the Slack thread root's timestamp (a top-level message is its own root), the Discord thread's channel
-id or the GitHub issue or pull request. Direct messages carry no `thread`, except in Slack's agent
-experience.
+and `thread` are optional, so a policy that reads either guards with `has` or fails to load. Each
+transport fills them differently:
 
-To keep an agent's comments in one Slack thread, forbid every other conversation:
+| Transport | `container` | `id` | `thread` |
+|---|---|---|---|
+| [Slack](../crates/dekopon-gatewayd/src/transport/slack.rs) | team | channel | thread root timestamp (a top-level message is its own root); none in a classic-experience DM |
+| [Discord](../crates/dekopon-gatewayd/src/transport/discord.rs) | guild; none in a DM | channel, or a thread's parent | the thread's channel id |
+| [Telegram](../crates/dekopon-gatewayd/src/transport/telegram.rs) | none | chat | topic |
+| [WhatsApp](../crates/dekopon-gatewayd/src/transport/whatsapp.rs) | `waba_id:phone_number_id` | sender | none |
+| [GitHub](../crates/dekopon-gatewayd/src/transport/github.rs) | owner | `owner.repo` | issue, pull request or discussion number, else [`repository`](../crates/dekopon-core/src/github.rs) |
+| [Fauxlack](../crates/dekopon-gatewayd/src/transport/fauxlack.rs) | server | channel | thread |
+| [local](../crates/dekopon-gatewayd/src/transport/local.rs) | none | `dev` | none |
+
+This `forbid` allows pull-request comments only from the Slack thread under one message:
 
 ```cedar
 @id("comments-stay-in-one-thread")
@@ -66,6 +73,8 @@ forbid(principal, action == Dekopon::Action::"gh.pull-request.comment", resource
 unless { context has conversation && context.conversation has thread
       && context.conversation.thread == "1761900000.000100" };
 ```
+
+It fences that capability only; the agent's Slack replies are not fenced.
 
 ## `secret.use` and public DRNs
 

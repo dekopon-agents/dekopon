@@ -12,8 +12,7 @@ helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
   -n dekopon --create-namespace -f my-values.yaml
 ```
 
-This installs the newest chart; `--version <chart-version>` pins one. The chart has its own version,
-and its `appVersion` names the release it deploys. [`values.yaml`](../charts/dekopon/values.yaml) is
+This installs the newest chart; `--version <chart-version>` pins one. [`values.yaml`](../charts/dekopon/values.yaml) is
 the reference. The defaults start a broker with nothing to run; a chat deployment sets
 `gateway.enabled` and supplies policy, configuration, a catalog and credentials, as
 [`examples/conditional-write`](../examples/conditional-write/) does.
@@ -31,9 +30,7 @@ What the values don't make obvious:
   `prepare-files` init container, root with only `CHOWN` and `FOWNER`, copies each into a memory
   volume as a fresh `0600` file. The namespace must admit it: Pod Security `baseline`, not
   `restricted`. A changed existing Secret reaches the broker only when you restart the pod.
-- **The UIDs are fixed.** Broker `65532`, gateway `65533`, console `65535`, sharing only group
-  `65534` for the socket. The image's providers belong to `65532`, and the broker loads only
-  components it owns.
+- **The image's providers belong to `65532`**, and the broker loads only components it owns.
 - **A hook Job syncs the provider set.** With `broker.providerSet` and `broker.providerSync`, a
   pre-install and pre-upgrade Job runs `dekopon-brokerd provider sync` onto the state claim, and a
   `precompile` init container compiles before the broker starts. The claim must already exist
