@@ -30,8 +30,6 @@ pub(crate) struct PostReply {
     pub recalled: Option<journal::records::Snapshot>,
 }
 
-/// A turn's journal writes; nothing here touches disk until the session drains it after the
-/// reply's terminal is delivered.
 #[derive(Default)]
 pub(crate) struct Deferred {
     pub corrupt: Option<CorruptStem>,

@@ -84,8 +84,6 @@ impl RoutingTable {
             .any(|route| route.memory.window().is_some())
     }
 
-    /// Every route is checked before any is refused, so a config with several broken routes gets
-    /// one error naming all of them instead of one restart per fix.
     pub fn bind(config: &ResolvedConfig, catalog: &LocalCatalog) -> Result<Self, RouteError> {
         let models = config
             .models
@@ -230,9 +228,6 @@ impl RoutingTable {
             .collect()
     }
 
-    /// Declaration order is the only precedence rule, with no specificity ranking, so an operator
-    /// reads top to bottom to see which route wins; a catch-all still needs dispatch's own
-    /// addressing check.
     pub(crate) fn github_route(
         &self,
         transport: &str,

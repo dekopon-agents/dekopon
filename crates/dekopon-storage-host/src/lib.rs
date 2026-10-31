@@ -1,7 +1,3 @@
-//! Broker-owned namespace-bound provider storage.
-//!
-//! `StorageGrant` is single-use process authority. Its fields are private:
-//!
 //! ```compile_fail
 //! use dekopon_storage_host::StorageGrant;
 //!
@@ -9,31 +5,23 @@
 //!     StorageGrant { host_id: [0; 32] }
 //! }
 //! ```
-//!
-//! It is neither cloneable nor serializable or deserializable:
-//!
 //! ```compile_fail
 //! use dekopon_storage_host::StorageGrant;
 //! fn require_clone<T: Clone>() {}
 //! fn main() { require_clone::<StorageGrant>(); }
 //! ```
-//!
 //! ```compile_fail
 //! use dekopon_storage_host::StorageGrant;
 //! use serde::Serialize;
 //! fn require_serialize<T: Serialize>() {}
 //! fn main() { require_serialize::<StorageGrant>(); }
 //! ```
-//!
 //! ```compile_fail
 //! use dekopon_storage_host::StorageGrant;
 //! use serde::de::DeserializeOwned;
 //! fn require_deserialize<T: DeserializeOwned>() {}
 //! fn main() { require_deserialize::<StorageGrant>(); }
 //! ```
-//!
-//! Rust visibility is defense in depth. Host ownership, trusted broker derivation, exact binding,
-//! and filesystem isolation are the authority boundary.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -115,8 +103,6 @@ pub struct StorageEvidence {
     pub operations: u64,
     pub syncs: u64,
     pub quota_denials: u64,
-    /// Exact bytes charged against this invocation's read budget: each read counts the length it
-    /// asked for, whatever it returned.
     pub read_bytes: u64,
     pub write_bytes: u64,
     pub evidence_commitment: String,
@@ -777,8 +763,6 @@ impl std::fmt::Display for StorageFailureClass {
     }
 }
 
-/// No variant carries guest content; paths and tokens here are for operator logs only. A guest sees
-/// just the WIT error enum, and a model only the broker's fixed public code.
 #[derive(Debug, Error)]
 pub enum StorageHostError {
     #[error(transparent)]

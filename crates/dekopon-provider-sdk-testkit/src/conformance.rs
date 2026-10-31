@@ -8,7 +8,6 @@ use dekopon_provider_sdk::{
 use serde_json::Value;
 use wasmparser::{Parser, Payload};
 
-/// A mismatch between a typed declaration and its checked component.
 #[derive(Debug, thiserror::Error)]
 pub enum ConformanceError {
     #[error("fixture I/O: {0}")]
@@ -162,10 +161,6 @@ fn rendered(outcome: &CommandRunOutcome, help: bool) -> bool {
     }
 }
 
-/// Checks the four declaration/real-component contract items for `P`.
-///
-/// # Errors
-/// Returns the first mismatch, decode, manifest or host failure.
 pub fn conformance<P: Provider>(component: impl AsRef<Path>) -> Result<(), ConformanceError> {
     let path = component.as_ref();
     let bytes = std::fs::read(path)?;

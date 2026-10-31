@@ -6,8 +6,6 @@ use tokio::time::Instant;
 
 use crate::config::TemplateOverrides;
 
-/// This is a rendering bound, not a trust boundary: the word comes from a provider manifest, not a
-/// model, and the limit just stops it blowing a transport's message ceiling.
 const MAX_WORD_CHARS: usize = 32;
 const WORD_MARKER: char = '…';
 

@@ -61,8 +61,6 @@ impl JournalError {
     }
 }
 
-/// Only an unlocked reader that met a malformed line constructs one, so a reset is always one a
-/// reader asked for.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct CorruptStem(String);
 
@@ -624,8 +622,6 @@ impl Journal {
         );
     }
 
-    /// Builds the record from the captured turn and writes it; ids, the turn id, slots and assets
-    /// exist only here, under the lock.
     pub fn append(
         &self,
         stem: &str,
@@ -721,8 +717,6 @@ impl Journal {
         Ok(Some(header))
     }
 
-    /// The directory sweep, this stem's horizon and its agent's byte cap: every rewrite here
-    /// writes a new file and renames it, so readers holding the old inode keep their bytes.
     pub(crate) fn maintain(&self, stem: &str, now: SystemTime, next_asset_id: u64) {
         let _lock = self.lock.lock();
         let _assets = AssetSync(self);

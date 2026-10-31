@@ -11,16 +11,12 @@ pub(super) struct HydratedImage {
     pub bytes: Vec<u8>,
 }
 
-/// Dropping the returned future does not abort the blocking task, which still disposes its leases
-/// when IO finishes; an unpolled future is not covered by this guarantee.
 pub(super) fn hydrate_images(
     images: Vec<GeneratedImage>,
 ) -> impl Future<Output = Result<Vec<HydratedImage>, TransportError>> + Send {
     hydrate_images_with(0, images, GeneratedImage::into_bytes)
 }
 
-/// Reading everything up front would hold all attachments resident at once, so single-attachment
-/// transports read one at a time; only Discord's multipart post reads all at once.
 #[derive(Default)]
 pub(super) struct ImageQueue {
     images: VecDeque<GeneratedImage>,

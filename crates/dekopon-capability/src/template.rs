@@ -47,8 +47,6 @@ impl fmt::Display for ChatSlot {
     }
 }
 
-/// Rendered per invocation from the attested chat scope; never serialized, so the values stay out
-/// of evidence and the authority commitment.
 #[derive(Clone, Default, Eq, PartialEq)]
 pub struct ChatSlotValues(BTreeMap<ChatSlot, String>);
 
@@ -97,8 +95,6 @@ impl PathTemplate {
         })
     }
 
-    /// A slot position matches only its own `{slot}` placeholder: the provider names the slot and
-    /// never supplies the value.
     #[must_use]
     pub fn matches(&self, decoded: &[&str]) -> bool {
         self.segments.len() == decoded.len()
@@ -189,8 +185,6 @@ impl From<PathTemplate> for String {
     }
 }
 
-/// Literals are restricted to bytes a path segment carries unencoded, so the host can rebuild the
-/// outgoing path from the template without an encoding choice.
 const fn is_literal_path_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(

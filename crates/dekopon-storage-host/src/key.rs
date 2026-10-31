@@ -1,6 +1,3 @@
-//! These hashes aren't secret and don't authenticate; isolation comes from the broker granting only
-//! the caller's own scope and the host binding each handle to that directory.
-
 use sha2::{Digest as _, Sha256};
 
 use crate::StorageHostError;
@@ -31,7 +28,6 @@ pub(crate) fn digest(domain: &str, fields: &[&[u8]]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Sixty-four lowercase hexadecimal digits: every physical name in the tree has this shape.
 pub(crate) fn token(domain: &str, fields: &[&[u8]]) -> String {
     hex(&digest(domain, fields))
 }

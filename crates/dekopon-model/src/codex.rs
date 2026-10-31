@@ -60,8 +60,6 @@ impl CodexClient {
         )
     }
 
-    /// Clients on one credential file must share a single CredentialFile instance, or a sibling
-    /// could spend a refresh token that an unwritten rotation already retired.
     pub fn with_credential(
         model: impl Into<String>,
         credential: Arc<CredentialFile>,

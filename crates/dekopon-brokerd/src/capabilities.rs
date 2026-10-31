@@ -9,9 +9,6 @@ use dekopon_core::{CapabilityId, ProviderId, RiskLevel};
 use serde::Deserialize;
 use thiserror::Error;
 
-/// One provider's execution bounds. Only the capabilities listed under `capabilities` run, each
-/// inheriting `constraints` and `credential`, so a capability a provider upgrade adds reaches
-/// nobody until the owner lists it.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderCapabilities {
@@ -30,8 +27,6 @@ pub struct CapabilityConfig {
     pub constraints: ConstraintsPatch,
 }
 
-/// A field-wise mirror of `ExecutionConstraints`: an override replaces a field whole, lists
-/// included, so a capability can never widen `allowedHosts` by appending to its provider's.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ConstraintsPatch {

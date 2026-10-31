@@ -154,16 +154,9 @@ enum ProviderCommand {
     Verify,
 }
 
-/// Transport crates are silenced explicitly: an HTTP stack logs every connection. The
-/// OTLP exporter's own diagnostics are silenced by `dekopon_telemetry`, which appends that
-/// directive to every OTLP layer it installs; category targets run at the standard level.
 #[cfg(unix)]
 const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,dekopon_http_host=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off";
 
-/// Log records ride the same crate set as spans, because the broker's audit record is one of them.
-///
-/// A trace that carries every decision span but not the `broker.decision` record it produced is
-/// exactly the split the constitution removed, so the two signals select the same targets.
 #[cfg(unix)]
 const OTEL_LOG_FILTER: &str = OTEL_TRACE_FILTER;
 
@@ -338,11 +331,6 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
     }
 }
 
-/// The one dispatch over the parsed command line.
-///
-/// Each arm brings the process state its mode needs, which is why the setup lives here rather than
-/// ahead of the match: a health check must discover no credentials and initialize no telemetry or
-/// provider machinery, and provider management must read no daemon configuration.
 #[cfg(unix)]
 async fn execute(cli: Cli) -> ExitCode {
     match cli.command {

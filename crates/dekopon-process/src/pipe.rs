@@ -102,8 +102,6 @@ impl<C: Default> Default for PipeReader<C> {
 }
 
 impl<C> PipeReader<C> {
-    /// Reads a provider's stdout; dropping the reader closes the socket, so the provider's next
-    /// write finds its reader gone.
     pub fn from_socket(
         socket: UnixStream,
         context: C,
@@ -133,8 +131,6 @@ impl<C> PipeReader<C> {
         self.read_unless(budget, &AtomicBool::new(false))
     }
 
-    /// Reads as [`Self::read`] until `stopped` is set, then reports the end without ending the
-    /// stream, so a later reader still finds whatever was not yet read.
     pub fn read_unless(
         &mut self,
         budget: &TreeContext,

@@ -22,8 +22,6 @@ use crate::{
     limits::Budget,
 };
 
-/// env reads the host process environment and now reads the host wall clock; neither is reachable
-/// any other way in this crate, so both are excluded from the filter set.
 const HOST_REACHING_FILTERS: &[&str] = &["env", "now"];
 
 pub(crate) const HELP: &str = "-r -c -n -s --arg NAME VALUE";
@@ -543,7 +541,6 @@ pub(crate) fn run_filter(
     Ok(())
 }
 
-/// jaq_core::unwrap_valr calls process::exit on halt; the worker must report the halt as a failure.
 fn describe_exception(exception: Exn<'_, Val>) -> String {
     match exception.get_err() {
         Ok(error) => format!("jq: {error}"),
@@ -554,13 +551,8 @@ fn describe_exception(exception: Exn<'_, Val>) -> String {
     }
 }
 
-/// Matches serde_json's own nesting ceiling; without it a filter like
-/// `reduce range(100000) as $i (.;[.])` recurses once per level in convert and can abort the
-/// worker before reporting a jq failure.
 const MAX_OUTPUT_DEPTH: usize = 128;
 
-/// jaq's value type is a JSON superset (byte strings, non-string keys, NaN) that its own writer
-/// says cannot round-trip through JSON text, so this refuses them rather than inventing a meaning.
 fn convert(value: &Val, depth: usize) -> Result<Value, String> {
     if depth > MAX_OUTPUT_DEPTH {
         return Err(format!(

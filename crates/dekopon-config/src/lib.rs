@@ -34,15 +34,11 @@ pub const MAX_INSTRUCTIONS_BYTES: usize = 256 * 1024;
 pub struct LocalCatalog {
     source: PathBuf,
     agents: BTreeMap<AgentId, Agent>,
-    /// Skills are read once at catalog load so a live session never touches the filesystem, and a
-    /// broken skill fails the catalog, not a running session.
     skills: BTreeMap<AgentId, Vec<Skill>>,
     files: Vec<(PathBuf, String)>,
 }
 
 impl LocalCatalog {
-    /// A directory is read as every `*.yaml` directly inside it, in filename order; an agent named in
-    /// two files is a duplicate like one named twice in a file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let read = |file: &Path| {

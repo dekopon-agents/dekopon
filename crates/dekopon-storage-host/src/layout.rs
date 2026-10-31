@@ -572,8 +572,6 @@ impl Directory {
     }
 }
 
-/// Only a WouldBlock error proves another writer holds the root; every other lock failure is
-/// filesystem trouble and must surface as I/O, not be misreported as a second writer.
 fn writer_lock_failure(root: &Directory, source: TryLockError) -> StorageHostError {
     match source {
         TryLockError::WouldBlock => StorageHostError::SecondWriter,

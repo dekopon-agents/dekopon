@@ -20,8 +20,6 @@ use crate::{FrameLimits, MAX_DESCRIPTORS_PER_FRAME, ProtocolError, read_frame, w
 
 const MAX_KERNEL_DESCRIPTORS_PER_MESSAGE: usize = 512;
 
-/// Every read receives ancillary data even off the frame prefix; typed callers must reject
-/// descriptors on any operation besides Invoke or Invocation.
 pub struct DescriptorStream {
     stream: UnixStream,
     received: Vec<OwnedFd>,
@@ -65,8 +63,6 @@ impl DescriptorStream {
         }
     }
 
-    /// Only the frame body is timed: a peer parked on a child script is bounded by its hangup and
-    /// the caller's cancellation, never by the io timer.
     pub async fn read_frame_when_ready<T: DeserializeOwned>(
         &mut self,
         limits: FrameLimits,

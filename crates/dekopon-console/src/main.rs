@@ -1,12 +1,3 @@
-//! `dekopon-console` — an interactive terminal view over a running Dekopon broker.
-//!
-//! This binary owns exactly one decision the library cannot make for it: what a command line means.
-//! Everything after that — connecting, authenticating, drawing, running turns — is `dekopon-tui`.
-//!
-//! It is an ordinary unprivileged client of `dekopon-brokerd`'s Unix socket. It holds a model
-//! credential and nothing else: no policy, no provider credential, no authorization. Every
-//! capability call it makes is a proposal the broker alone decides.
-
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
@@ -172,24 +163,18 @@ struct Cli {
     verbose: u8,
 }
 
-/// Failure opening or running the console.
 #[derive(Debug, Error)]
 enum ConsoleError {
-    /// The catalog would not load.
     #[error(transparent)]
     Config(Box<dekopon_config::ConfigError>),
-    /// Connecting, authenticating, or choosing a model failed.
     #[error(transparent)]
     Session(#[from] dekopon_tui::SessionError),
-    /// The console ran and the terminal failed under it.
     #[error(transparent)]
     Exit(#[from] dekopon_tui::ConsoleExit),
-    /// The async runtime could not be built.
     #[error("could not start the console runtime")]
     Runtime(#[source] io::Error),
     #[error(transparent)]
     Telemetry(#[from] telemetry::TelemetryError),
-    /// No subject was supplied.
     #[error(
         "no console identity: pass --subject <SUBJECT>, set DEKOPON_CONSOLE_SUBJECT, or select an authored --profile / defaultProfile; the broker must map the subject and authorize this console UID"
     )]
@@ -222,11 +207,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Opens the console.
-///
-/// Returns before drawing anything when the catalog will not load, no broker is listening, or the
-/// credential guard refuses. Once the console is drawing, only a terminal failure comes back here:
-/// a refused hop or a failed session is something the console shows and stays open after.
 #[expect(
     clippy::too_many_lines,
     reason = "the existing startup sequence validates CLI modes before creating any broker or model client"
@@ -615,7 +595,6 @@ fn idle(mut builder: tokio::runtime::Builder) -> Result<(), ConsoleError> {
     })
 }
 
-/// Exporters are created and drained while their runtime is alive, including startup refusals.
 fn run_console(cli: &Cli, mut builder: tokio::runtime::Builder) -> Result<(), ConsoleError> {
     let runtime = builder.build().map_err(ConsoleError::Runtime)?;
     let _entered = runtime.enter();

@@ -5,12 +5,9 @@ use reqwest::{Method, Url, header::HeaderMap};
 
 use crate::{ErrorCode, Header, HttpError, Request, Response, http_error};
 
-/// One request the scripted transport served.
 #[derive(Clone, Debug)]
 pub struct ObservedRequest {
-    /// The request as the guest built it, before the host injected any credential or range.
     pub guest: Request,
-    /// The request as the host transmitted it, including injected credentials and headers.
     pub sent: Request,
 }
 

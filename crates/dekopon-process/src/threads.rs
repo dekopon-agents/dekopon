@@ -36,7 +36,6 @@ impl ShellThreads {
             .map_err(|_unsplit: Vec<ThreadPermit>| self.exhausted())
     }
 
-    /// Takes every permit or none, so a group of cooperating threads never starts half admitted.
     pub fn reserve_many(&self, count: usize) -> Result<Vec<ThreadPermit>, LimitExceeded> {
         let mut permits = Vec::with_capacity(count);
         let Some(last) = count.checked_sub(1) else {
@@ -72,7 +71,6 @@ impl ShellThreads {
 pub struct ThreadName(&'static str);
 
 impl ThreadName {
-    /// Linux keeps only the first 15 bytes of a thread name, so a `const` longer name fails to build.
     #[must_use]
     pub const fn new(name: &'static str) -> Self {
         assert!(name.len() <= 15, "a thread name is at most 15 bytes");
@@ -132,7 +130,6 @@ impl ThreadPermit {
         })
     }
 
-    /// The permit lives as long as the thread, so it is released on return, unwind or a refused spawn.
     pub fn spawn<'scope, T: Send + 'scope>(
         self,
         scope: &'scope Scope<'scope, '_>,

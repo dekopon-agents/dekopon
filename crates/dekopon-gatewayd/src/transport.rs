@@ -1,6 +1,3 @@
-//! The subject is trusted only as service-authenticated routing metadata, never as content; message
-//! text is always untrusted and bounded before reaching a model.
-
 use std::{
     collections::{HashSet, VecDeque},
     fmt,
@@ -39,7 +36,6 @@ pub(crate) mod webhook;
 pub(crate) mod whatsapp;
 
 pub(crate) const MAX_INBOUND_TEXT_BYTES: usize = 16 * 1024;
-/// Outbound text is bounded because chat services reject or silently mangle oversized posts.
 pub(crate) const MAX_OUTBOUND_TEXT_BYTES: usize = 8 * 1024;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const BASE_RECONNECT_DELAY: Duration = Duration::from_millis(500);
@@ -51,25 +47,13 @@ pub(crate) struct InboundMessage {
     pub transport: String,
     pub transport_kind: ChatTransportKind,
     pub subject: ExternalSubject,
-    /// Slack omits thread_ts on the message that opens a thread but includes it on every reply, so
-    /// this is derived from the bot's own reply, not raw thread_ts.
     pub conversation: Conversation,
-    /// This is checked against the separately attested chat scope so a Slack timestamp cannot be
-    /// replayed as a Discord snowflake; it is not used for redelivery rejection.
     pub message_id: MessageId,
-    /// Reference lines naming attachments are appended by the session, not the transport, because
-    /// AssetStore assigns the numbers and a transport minting its own would collide.
     pub text: String,
     pub pull_request_links: Option<crate::pull_request_links::PullRequestLinkContext>,
     pub assets: Vec<PendingAsset>,
     pub asset_overflow: bool,
-    /// Discord sets addressed to Some(false) deliberately from its authenticated mentions array so
-    /// presentation text cannot override it; other transports use None and match identifier or
-    /// handle syntax instead.
     pub addressed: Option<bool>,
-    /// Claims are recorded only after fresh broker authorization, and inherited is true only when
-    /// the same authenticated sender continues that exact thread; no model text can create this
-    /// state.
     pub thread_continuation: Option<ThreadContinuation>,
     pub reply: ReplyTarget,
     pub liveness: Option<LivenessTarget>,
@@ -131,8 +115,6 @@ impl fmt::Display for MessageId {
     }
 }
 
-/// drop.reason is declared on this span rather than by the transport that records it, because
-/// recording a field a span never declared is a silent no-op.
 pub(crate) fn receive_span(kind: ChatTransportKind) -> tracing::Span {
     tracing::info_span!(
         "transport.receive",
@@ -532,8 +514,6 @@ pub(crate) trait SteerAck: Send + Sync {
     async fn seen(&self, target: &LivenessTarget) -> Result<(), TransportError>;
 }
 
-/// Implementations must acknowledge before the event reaches the bounded inbound channel, since
-/// that send can block past the interaction deadline.
 #[async_trait]
 pub(crate) trait CancelButton: Send + Sync {
     async fn ack(&self, press: &CancelPress) -> Result<(), TransportError>;
@@ -581,8 +561,6 @@ pub(crate) trait ChatDriver: Send + Sync {
     }
 }
 
-/// Messages the chat service shows in a conversation, oldest first, strictly between `after` and
-/// `before`; when more than `limit` fall in that range, the newest `limit` of them.
 #[async_trait]
 pub(crate) trait ChatHistory: Send + Sync {
     async fn recent(
@@ -799,8 +777,6 @@ pub(crate) fn bound_outbound(text: &str) -> String {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TextUnit {
-    /// Discord and Telegram count UTF-16 code units, not Unicode scalars; counting scalars would
-    /// let astral emoji through at double their counted size and reject the whole message.
     Utf16,
     Scalar,
 }
@@ -814,8 +790,6 @@ impl TextUnit {
     }
 }
 
-/// max_units is counted in the given unit because chat services disagree on what they count, and a
-/// chunk measured in the wrong unit is rejected whole rather than trimmed.
 pub(crate) fn split_message(text: &str, max_units: usize, unit: TextUnit) -> Vec<String> {
     if text.trim().is_empty() {
         return vec!["[empty response]".to_owned()];

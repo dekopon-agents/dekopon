@@ -339,8 +339,6 @@ fn observe_task(result: Result<Result<(), ConnectionError>, tokio::task::JoinErr
     }
 }
 
-/// Every framing failure gets the same generic wire code; this label is the only way to tell a slow
-/// client from an oversized frame from bad JSON.
 const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
     match error {
         ProtocolError::InvalidFrameLimit { .. } => "invalid-frame-limit",
@@ -378,8 +376,6 @@ fn report_command_run_failure(word: &str, error: &dekopon_broker_host::BrokerHos
     );
 }
 
-/// This checks only structural validity, not authorization: a well-formed claim can still be
-/// refused later, and failing here authorizes, accounts, or audits nothing.
 fn claim_is_valid(attestation: Option<&Attestation>, proposal: Option<&InvocationId>) -> bool {
     attestation.is_none_or(|claim| {
         claim.is_well_formed()
@@ -432,8 +428,6 @@ const fn command_run_outcome(outcome: &CommandRunOutcome) -> &'static str {
     }
 }
 
-/// The client picks this trace parent, so it's used only for correlation, never policy; a parent
-/// the SDK rejects just becomes its own root span.
 fn adopt_trace_parent(span: &tracing::Span, parent: TraceParent) {
     if let Err(error) = span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
         trace_id: parent.trace_id(),
@@ -1042,8 +1036,6 @@ impl UpcallError {
     }
 }
 
-/// Collapsing this into one wire code would invite retries that duplicate a non-idempotent external
-/// effect, so the completed-or-not distinction crosses the wire intact.
 async fn write_broker_failure(
     stream: &mut DescriptorStream,
     limits: FrameLimits,

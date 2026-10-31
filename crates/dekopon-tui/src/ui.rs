@@ -1,11 +1,3 @@
-//! Drawing. Every decision here is about pixels; the state being drawn is owned by
-//! [`crate::app`], which knows nothing about a terminal.
-//!
-//! One rule holds across every pane: **no borrowed text reaches a buffer unsanitised.** A pull
-//! request title, an issue body, and a provider error are all attacker-controlled text arriving
-//! through a read-only capability, and drawn raw they can move the cursor or repaint earlier
-//! lines. [`crate::redact::sanitize_line`] is the only way text gets in.
-
 pub mod agents;
 pub mod chrome;
 pub mod detail;
@@ -21,7 +13,6 @@ pub use theme::Theme;
 
 use crate::app::{App, Mode, Pane};
 
-/// Draws the whole console for one frame.
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let [header, tabs, body, status] = Layout::vertical([
         Constraint::Length(6),

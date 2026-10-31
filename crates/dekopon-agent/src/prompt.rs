@@ -60,8 +60,6 @@ pub const DECLINE_REPLY_TOOL_NAME: &str = "decline_chat_reply";
 const MAX_TOOL_CALLS_PER_TURN: usize = 10;
 
 const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_process::DEFAULT_MAX_OUTPUT_BYTES;
-/// Capped at the shell's own output limit so a larger asset would end the session with a provider
-/// context-length rejection instead of an answer.
 const OPTIONAL_REPLY_INSTRUCTION: &str = "This message was not addressed to you. Default to silence. Only if you can \
 help with a specific, useful contribution, reply. For thanks, side talk, or when you cannot help, call \
 `decline_chat_reply` before doing any capability work. After capability work, report what happened \
@@ -70,8 +68,6 @@ instead of declining, even if you requested to leave the conversation.";
 const DECLINE_AFTER_WORK_RESULT: &str = "Not declined: a capability already ran, so reply with what \
 happened. None of this turn's tool calls ran.";
 
-/// Returns no Result because a script failure is an outcome the model recovers from, like a nonzero
-/// exit code, not a reason to end the session.
 pub trait ScriptRuntime {
     fn run_script(&self, script: &str, participant: Option<&str>) -> ScriptOutcome;
 
@@ -125,7 +121,6 @@ pub trait AssetSource {
         AssetRequest::default()
     }
 
-    /// Asked once per session; the answer fixes whether the session offers the fetch tool.
     fn offers_fetch(&self) -> bool;
 }
 
@@ -143,9 +138,7 @@ pub trait CancellationProbe: Send + Sync {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Steer {
-    /// `recorded` is what history keeps; `prompt` may add gateway notes that only this turn needs.
     Person { prompt: String, recorded: String },
-    /// Reaches the model but never the recorded turn: it is not the person's words.
     Notice(String),
 }
 
@@ -163,14 +156,10 @@ pub enum Handoff {
 }
 
 pub trait SteerSource: Send + Sync {
-    /// Moves every queued steer out, oldest first, as finished user text. Empty when none.
     fn take(&self) -> Vec<Steer>;
 
-    /// Takes queued steers, or seals when none are queued; the check and the seal are one step, so
-    /// no steer can arrive between them unread.
     fn seal_or_take(&self) -> Handoff;
 
-    /// Idempotent: a mailbox already sealed or stopped reports that outcome again.
     fn seal(&self) -> Seal;
 }
 
@@ -1801,8 +1790,6 @@ fn asset_tool() -> ModelTool {
     }
 }
 
-/// A tool result cannot carry an attachment on either wire format, so the asset always arrives as a
-/// following message; this shape must not be simplified.
 #[derive(Default)]
 struct AssetBytes {
     total: usize,

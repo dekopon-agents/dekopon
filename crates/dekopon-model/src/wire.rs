@@ -44,7 +44,6 @@ impl From<ResponsesUsage> for ModelUsage {
     }
 }
 
-/// `CacheWrite` is `u64` only for OpenRouter: compatible endpoints put arbitrary values there.
 #[derive(Debug, Deserialize)]
 pub struct ChatUsage<CacheWrite = serde::de::IgnoredAny> {
     #[serde(default)]
@@ -102,8 +101,6 @@ impl ChatUsage<u64> {
     }
 }
 
-/// Anthropic Messages usage, from `message_start` or `message_delta`. Its `input_tokens` excludes
-/// cache reads and writes, so normalization adds them back.
 #[derive(Debug, Deserialize)]
 pub struct MessagesUsage {
     #[serde(default)]
@@ -148,7 +145,6 @@ pub enum PeekError {
     Duplicate(Field),
 }
 
-/// The top-level keys a proxy reads or edits. Every other key is skipped without being stored.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Field {
     Model,
@@ -202,9 +198,6 @@ impl TopKey {
     }
 }
 
-/// What a proxy reads from a request before forwarding it: the configured model it names, its
-/// stream flag, its image count, and where each recorded top-level field sits so a rewrite can
-/// leave every other byte as the client sent it.
 #[derive(Debug)]
 pub struct RequestPeek {
     pub model: String,
@@ -242,8 +235,6 @@ impl RequestPeek {
         self.fields.iter().any(|(field, _)| *field == wanted)
     }
 
-    /// Replaces each named top-level value with the given raw JSON, inserting a field the request
-    /// lacks at the front of the object, which always holds `model`.
     #[must_use]
     pub fn rewrite(&self, body: &[u8], replacements: &[(Field, &str)]) -> Vec<u8> {
         let mut edits = Vec::new();
@@ -279,8 +270,6 @@ impl RequestPeek {
     }
 }
 
-/// Validates the body and counts its image blocks in one pass; a `serde_json::Value` tree of the
-/// same body costs many times its size.
 #[derive(Default)]
 struct Scan {
     images: usize,
@@ -362,8 +351,6 @@ impl<'de> serde::de::Visitor<'de> for ScanVisitor {
     }
 }
 
-/// Walks a body serde_json already accepted, so every step is on valid JSON. Only the recorded
-/// keys are kept, once each, so the list never outgrows `Field`.
 fn top_level_fields(body: &[u8]) -> Result<Vec<(Field, std::ops::Range<usize>)>, PeekError> {
     let mut fields = Vec::new();
     let mut at = skip_space(body, 0);

@@ -435,8 +435,6 @@ impl RecordingDriver {
         self.log.lock().push(DriverCall::Reply { text, images });
     }
 
-    /// Named apart from the trait accessor with the same job, since inherent methods win
-    /// method-call lookup and the trait implementation would otherwise silently call itself.
     #[must_use]
     pub fn typing_object(&self) -> Option<&RecordingTyping> {
         self.typing.as_ref()

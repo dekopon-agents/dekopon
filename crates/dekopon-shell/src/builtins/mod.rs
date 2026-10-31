@@ -95,9 +95,6 @@ impl From<LimitExceeded> for FatalError {
 pub(crate) enum FatalError {
     Limit(LimitExceeded),
     Unsupported(String),
-    /// Terminal rather than recoverable, because that is the point of the construct: reporting a
-    /// status and continuing with an empty string would be exactly the silent wrongness this shell
-    /// exists to refuse.
     Assertion(String),
 }
 

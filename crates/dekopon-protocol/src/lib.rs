@@ -1,6 +1,3 @@
-//! Authored resources reject unknown fields so a misspelled security-relevant setting fails to load
-//! instead of being silently ignored.
-
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
@@ -30,8 +27,6 @@ impl fmt::Display for ApiVersion {
     }
 }
 
-/// Kind carries its own type rather than a shared enum so serde rejects a document naming another
-/// resource on decode, even for callers that skip the configuration loader.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum AgentKind {
@@ -68,17 +63,10 @@ pub struct AgentSpec {
     pub description: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Instructions are untrusted model-shaping text only; they can never assert identity, name a
-    /// principal, widen a capability, or influence authorization, since broker policy never reads
-    /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    /// Skill files are untrusted model-reference text exactly like instructions: read on demand,
-    /// and they grant no authority.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<PathBuf>,
-    /// Read at catalog load, relative to the catalog file, into `instructions`; a spec names one or
-    /// the other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

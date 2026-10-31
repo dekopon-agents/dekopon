@@ -1,7 +1,3 @@
-//! A credentials file rejects any group/world permission bit, not just writability, since
-//! readability alone is the threat; a failed rotation because of a read-only parent directory would
-//! leave the retired token on disk for reuse.
-
 use tracing::Instrument as _;
 
 use std::{
@@ -35,15 +31,11 @@ use crate::{
 pub const CREDENTIALS_API_VERSION: &str = "dekopon.dev/broker-credentials/v1alpha1";
 pub const HARD_MAX_CREDENTIALS_BYTES: usize = 1024 * 1024;
 pub const HARD_MAX_CREDENTIALS: usize = 64;
-/// 64 KiB is far larger than the five-field JWT document needs, but it still bounds what a
-/// misconfigured path could make the broker read at startup.
 pub const HARD_MAX_CHATGPT_AUTH_BYTES: usize = 64 * 1024;
 const MAX_CREDENTIAL_NAME_BYTES: usize = 128;
 
 pub(crate) const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Anything not explicitly listed here is treated as transient by default, since classifying an
-/// outage as permanent would take a capability out of service until an operator noticed.
 pub(crate) const REAUTHORIZATION_CODES: [&str; 4] = [
     "invalid_grant",
     "refresh_token_reused",
@@ -76,8 +68,6 @@ struct CredentialEntry {
     #[serde(default)]
     scheme: Option<String>,
     destinations: Vec<String>,
-    /// The secret value deserializes directly into Redacted, never through a plain String field, so
-    /// a derived Debug on this entry can't accidentally print it.
     #[serde(default)]
     secret: Option<Redacted<String>>,
     #[serde(default)]
@@ -576,8 +566,6 @@ fn parent_is_owner_writable(parent: &Path) -> bool {
         .is_ok_and(|metadata| metadata.permissions().mode() & 0o200 != 0)
 }
 
-/// Sharing one CredentialFile per entry across invocations is what keeps two concurrent invocations
-/// of the same capability from spending the same single-use refresh token twice.
 struct ChatGptSubscriptionCredential {
     name: String,
     credential: Arc<CredentialFile>,

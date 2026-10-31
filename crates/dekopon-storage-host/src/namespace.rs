@@ -653,8 +653,6 @@ pub(crate) fn deadline_after(timeout_ms: u64) -> Result<Instant, StorageHostErro
         .ok_or(StorageHostError::Arithmetic)
 }
 
-/// Timeout means another holder still has the lease and is worth retrying; Io means the filesystem
-/// itself refuses advisory locks and retrying won't help.
 pub(crate) fn lock_exclusive(file: &File, deadline: Instant) -> Result<(), StorageHostError> {
     loop {
         match file.try_lock() {
@@ -667,8 +665,6 @@ pub(crate) fn lock_exclusive(file: &File, deadline: Instant) -> Result<(), Stora
     }
 }
 
-/// `flock` refuses a pipe on some platforms and accepts it on others, so this is tested directly
-/// rather than reported as `Timeout`, which would suggest endless retrying.
 fn lease_lock_failure(error: TryLockError, expired: bool) -> Option<StorageHostError> {
     match error {
         TryLockError::WouldBlock if !expired => None,

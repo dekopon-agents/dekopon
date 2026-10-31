@@ -65,7 +65,6 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// One scripted HTTPS origin, with a single response and no credential or policy override.
 #[derive(Clone, Debug)]
 pub struct HttpScript {
     pub hostname: String,
@@ -97,25 +96,21 @@ const UNEXPECTED_CHILD: &str = "unexpected child script";
 const CHILD_INPUT_LIMIT: u64 = 1024 * 1024;
 pub(crate) const HTTP_BYTES: usize = 64 * 1024;
 
-/// One scripted child: the script the provider must run next, and how that child behaves.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChildScript {
     pub script: String,
     pub status: u8,
     pub stdout: Vec<u8>,
     pub stderr: String,
-    /// How long the child runs before it writes its output and exits.
     pub runs_for: Duration,
 }
 
-/// Evidence of one child the provider ran: its script and the stdin it received.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildRun {
     pub script: String,
     pub stdin: ChildInput,
 }
 
-/// A child's stdin, captured up to its first MiB.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChildInput {
     None,
@@ -123,7 +118,6 @@ pub enum ChildInput {
     Reader(Vec<u8>),
 }
 
-/// A test invocation builder for a real checked provider component.
 pub struct Run<P: Provider> {
     component: PathBuf,
     limits: BrokerHostLimits,
@@ -141,11 +135,9 @@ pub struct Run<P: Provider> {
     _provider: PhantomData<P>,
 }
 
-/// A typed provider's real-component test entry point.
 pub struct Harness<P: Provider>(PhantomData<P>);
 
 impl<P: Provider> Harness<P> {
-    /// Binds a caller-supplied artifact; the compiled component is shared per binary and provider type.
     #[must_use]
     pub fn get(component: impl AsRef<Path>) -> Run<P> {
         Run {
@@ -166,7 +158,6 @@ impl<P: Provider> Harness<P> {
         }
     }
 
-    /// Number of compiled registry identities for this provider in the current test binary.
     #[must_use]
     pub fn compiled_identities() -> usize {
         COMPONENTS.get().map_or(0, |cache| {
@@ -198,14 +189,12 @@ pub enum HarnessError {
 }
 
 impl<P: Provider> Run<P> {
-    /// Applies an owner-authored request template through the component's real HTTP host.
     #[must_use]
     pub fn template(mut self, template: RequestTemplate) -> Self {
         self.templates.push(template);
         self
     }
 
-    /// Supplies an attested chat-scope value for this component invocation's request templates.
     #[must_use]
     pub fn chat_slot(mut self, slot: ChatSlot, value: impl Into<String>) -> Self {
         self.slots.insert(slot, value.into());
@@ -245,15 +234,12 @@ impl<P: Provider> Run<P> {
         self
     }
 
-    /// Supplies this call's provider settings in place of `providerSettings.<id>`.
     #[must_use]
     pub fn settings(mut self, settings: Value) -> Self {
         self.settings = Some(settings);
         self
     }
 
-    /// Scripts ordered API responses, exactly one a 302, and bounded storage ranges through the
-    /// real signed-download host; each API response answers one request, buffered or signed.
     #[must_use]
     pub fn signed_download(
         mut self,
@@ -277,28 +263,24 @@ impl<P: Provider> Run<P> {
         self
     }
 
-    /// Scripts the next child the component runs; any other script is a fixture refusal.
     #[must_use]
     pub fn child(mut self, script: ChildScript) -> Self {
         self.children.push_back(script);
         self
     }
 
-    /// Supplies piped bytes; an empty slice is distinct from no pipe.
     #[must_use]
     pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(bytes.into());
         self
     }
 
-    /// Closes the real stdout reader after at most `bytes` bytes; zero closes it before invocation.
     #[must_use]
     pub fn close_stdout_after(mut self, bytes: usize) -> Self {
         self.close_stdout_after = Some(bytes);
         self
     }
 
-    /// Returns a snapshot function that retains signed-request evidence even after a refused call.
     pub fn requests(&self) -> impl Fn() -> Vec<crate::ObservedRequest> + use<P> {
         let transport = self
             .signed
@@ -311,7 +293,6 @@ impl<P: Provider> Run<P> {
         }
     }
 
-    /// The exact scripted origin to pass to the provider input.
     #[must_use]
     pub fn origin(&self) -> Option<&str> {
         if let Some(signed) = &self.signed {
@@ -323,10 +304,6 @@ impl<P: Provider> Run<P> {
             .map(|server| server.origin.as_str())
     }
 
-    /// Calls a checked component and captures its exit status, stdout and stderr.
-    ///
-    /// # Errors
-    /// Fails on missing artifacts, host refusals, TLS fixture errors or capture failures.
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "only a guest exit is a captured result; every present and future host error remains a refusal"
@@ -563,7 +540,6 @@ fn async_stream(fd: OwnedFd) -> std::io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::from_std(stream)
 }
 
-/// Captured terminal result and HTTP evidence from one real component invocation.
 #[derive(Debug)]
 pub struct ComponentOutput {
     pub status: u8,
@@ -740,7 +716,6 @@ fn serve_https(script: HttpScript) -> Result<ScriptServer, HarnessError> {
     })
 }
 
-/// Native typed dispatch with fake clock and buffered HTTP imports, recording every request.
 pub struct Native<P: Provider> {
     clock: Option<SystemTime>,
     settings: Option<Value>,
@@ -783,14 +758,11 @@ impl<P: Provider> Native<P> {
         self.clock = Some(instant);
         self
     }
-    /// Supplies the provider settings every call reads.
     #[must_use]
     pub fn settings(mut self, settings: Value) -> Self {
         self.settings = Some(settings);
         self
     }
-    /// Scripts ordered API responses, exactly one a 302, and bounded storage ranges through the
-    /// real signed-download host; each API response answers one request, buffered or signed.
     #[must_use]
     pub fn signed_download(
         mut self,
@@ -823,13 +795,11 @@ impl<P: Provider> Native<P> {
         self.entropy = Some(bytes.into());
         self
     }
-    /// Supplies piped bytes to the native provider invocation.
     #[must_use]
     pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(bytes.into());
         self
     }
-    /// Scripts the next child each call runs; any other script panics as a fixture refusal.
     #[must_use]
     pub fn child(mut self, script: ChildScript) -> Self {
         self.scripts.push_back(script);
@@ -839,12 +809,10 @@ impl<P: Provider> Native<P> {
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().clone()
     }
-    /// The children every call so far ran, in order.
     #[must_use]
     pub fn children(&self) -> Vec<ChildRun> {
         self.children.lock().clone()
     }
-    /// Runs one call with nothing piped in, capturing its stdout, stderr and exit status.
     #[must_use]
     pub fn call(&self, capability: &str, input: &str) -> NativeOutput {
         let scripts = Arc::new(Mutex::new(self.scripts.clone()));
@@ -883,7 +851,6 @@ impl<P: Provider> Native<P> {
     }
 }
 
-/// What a native call wrote and how it exited.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeOutput {
     pub status: u8,

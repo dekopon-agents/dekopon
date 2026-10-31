@@ -1,6 +1,3 @@
-//! Describe and command runs must be pure, so a refused clock read traps rather than errors, and
-//! the store records the attempt instead of charging it.
-
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bindings::dekopon::clock::{monotonic, wall};

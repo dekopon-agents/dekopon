@@ -1,7 +1,3 @@
-//! Since a caller controls input size, the span renders input through the attribute cap directly
-//! rather than building the full value and cutting it, avoiding a copy of large attachments per
-//! layer.
-
 #![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use std::sync::Arc;

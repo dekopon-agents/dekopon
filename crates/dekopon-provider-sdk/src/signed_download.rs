@@ -16,7 +16,6 @@ pub use wit::{
     ApiResponse, Coverage, DownloadError, ErrorCode, Header, OffsetWindow, Request, Window,
 };
 
-/// An API response or a bounded storage window; signed URLs never cross this boundary.
 pub enum Response {
     Api(ApiResponse),
     Storage {
@@ -26,7 +25,6 @@ pub enum Response {
     },
 }
 
-/// Downloads a bounded window through the invocation's signed-download grant.
 #[cfg(target_arch = "wasm32")]
 pub fn download(request: &Request) -> Result<Response, DownloadError> {
     wit::download(request).map(|response| match response {
@@ -39,7 +37,6 @@ pub fn download(request: &Request) -> Result<Response, DownloadError> {
     })
 }
 
-/// Native callers have no broker invocation and therefore no signed-download authority.
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "native-test")))]
 pub fn download(_request: &Request) -> Result<Response, DownloadError> {
     Err(DownloadError {
@@ -47,7 +44,6 @@ pub fn download(_request: &Request) -> Result<Response, DownloadError> {
     })
 }
 
-/// Routes native tests through their scoped port when test support is enabled.
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-test"))]
 pub fn download(request: &Request) -> Result<Response, DownloadError> {
     crate::provider::native_signed_download(request)

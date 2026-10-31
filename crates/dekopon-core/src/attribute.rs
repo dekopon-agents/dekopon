@@ -30,8 +30,6 @@ impl BoundedDisplay {
     }
 }
 
-/// Renders straight into a bounded sink instead of formatting to a String first, so recording a
-/// multi-megabyte proposal costs the bound, not the proposal.
 #[must_use]
 pub fn bounded_display(value: &impl fmt::Display) -> BoundedDisplay {
     let mut sink = BoundedSink {

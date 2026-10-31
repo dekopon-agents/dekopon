@@ -15,8 +15,6 @@ use opentelemetry_sdk::{
 use serde::Deserialize;
 use thiserror::Error;
 
-/// `Grpc` is still a recognised token so a configuration that names it gets
-/// [`TelemetryError::GrpcTransport`] rather than an unknown-value parse error.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Transport {
@@ -226,8 +224,6 @@ struct OtlpHttpClient {
     runtime: tokio::runtime::Handle,
 }
 
-/// Redirects are disabled so the ingest credential header can't follow a redirect to an unnamed
-/// host, and environment proxies are disabled so it never routes through one either.
 fn otlp_client_from(
     builder: reqwest::ClientBuilder,
     timeout: Duration,

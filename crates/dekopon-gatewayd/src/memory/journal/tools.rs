@@ -19,8 +19,6 @@ pub(crate) struct Admission {
     pub sealed_at_ms: Option<u64>,
 }
 
-/// Reads walk the stem on their own descriptor without the journal lock; pins wait here until
-/// `persist` appends them after delivery.
 pub(crate) struct JournalMemoryTools<'a> {
     journal: &'a Journal,
     stem: String,

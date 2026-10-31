@@ -93,8 +93,6 @@ fn list_len(items: impl Iterator<Item = usize>) -> usize {
 }
 
 impl ReplayMessage {
-    /// The chat-completions encoding's exact size, every reasoning item admitted and no cache
-    /// marker, from slice lengths alone; no slice is read.
     pub fn encoded_len(&self) -> usize {
         let open = br#"{"role":"#.len() + json_len(self.role()) + br#","content":"#.len();
         let body = match self {

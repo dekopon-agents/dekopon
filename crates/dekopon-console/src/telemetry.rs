@@ -1,6 +1,3 @@
-//! Console serialization mirrors the daemon keys; validation/export remain shared core APIs.
-//! Error sources are deliberately not retained: parser/exporter errors can echo credential-bearing
-//! input, and verbose CLI diagnostics walk sources. Only safe, actionable categories cross here.
 use dekopon_telemetry::{
     Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, ExporterSettings, Install,
     TelemetryGuard, Transport,

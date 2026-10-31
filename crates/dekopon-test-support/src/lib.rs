@@ -200,8 +200,6 @@ impl LoopbackServer {
         .expect("bind loopback fixture")
     }
 
-    /// Writes each part of one response with `pause` between them, then holds the connection open
-    /// for `hold` without ending the body.
     #[must_use]
     pub fn paced(parts: Vec<Vec<u8>>, pause: Duration, hold: Duration) -> Self {
         Self::bind_with("127.0.0.1:0", move |listener, sender| {

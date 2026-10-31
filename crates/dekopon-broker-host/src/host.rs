@@ -22,24 +22,14 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 pub const RUN_COMMAND_EXPORT: &str = "run-command";
 
-/// The signature comes from the component's own type, which its author controls, and appears in a
-/// load error, so its length is bounded.
 const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 
-/// This is the subset of a host's limits that shapes a store; fuel, wall-clock, and serialized
-/// input/output bounds stay with the host enforcing them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreLimits {
-    /// Wasmtime applies this per memory, not per store, which is why the store also bounds
-    /// memories, tables, table elements, and instances.
     pub max_memory_bytes: usize,
-    /// Maximum elements in each Wasm table.
     pub max_table_elements: usize,
-    /// Maximum core instances in one store.
     pub max_instances: usize,
-    /// Maximum tables in one store.
     pub max_tables: usize,
-    /// Maximum linear memories in one store.
     pub max_memories: usize,
 }
 
@@ -56,7 +46,6 @@ impl Default for StoreLimits {
 }
 
 impl StoreLimits {
-    /// Builds the Wasmtime resource limiter a host installs on one fresh store.
     #[must_use]
     pub fn store_limits(&self) -> wasmtime::StoreLimits {
         StoreLimitsBuilder::new()
@@ -79,16 +68,12 @@ impl StoreLimits {
     }
 }
 
-/// A host limit configured as zero.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error("host limit {name} must be greater than zero")]
 pub struct ZeroLimit {
-    /// Name of the field that was zero.
     pub name: &'static str,
 }
 
-/// A zero store bound fails every instantiation, and zero fuel or a zero deadline traps before
-/// guest code runs, so this checks first and names the field.
 pub fn validate_limits(
     limits: &StoreLimits,
     additional: &[(&'static str, u128)],
@@ -101,16 +86,12 @@ pub fn validate_limits(
     Ok(())
 }
 
-/// The manifest broke a semantic rule; the message is the operator-facing detail.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("{message}")]
 pub struct ManifestRejection {
-    /// What was wrong with the manifest.
     pub message: String,
 }
 
-/// A declared effect is authorization's input at each invocation, not something this load-time
-/// check gates on.
 pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), ManifestRejection> {
     if manifest.description.trim().is_empty() {
         return Err(invalid("description must not be empty"));
@@ -156,22 +137,15 @@ fn invalid(message: impl Into<String>) -> ManifestRejection {
     }
 }
 
-/// Ambiguity is fatal because a host cannot silently pick among conflicting claims, so this reports
-/// every conflict in one run instead of one per mistake.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderConflicts {
-    /// Provider identities declared by more than one component.
     pub providers: Vec<ProviderId>,
-    /// Capability identifiers declared by more than one component.
     pub capabilities: Vec<CapabilityId>,
-    /// Providers that declare capabilities and no command word to reach them through.
     pub wordless: Vec<ProviderId>,
-    /// Command words that cannot be granted to the providers claiming them.
     pub command_words: Vec<CommandWordConflict>,
 }
 
 impl ProviderConflicts {
-    /// Reports how many distinct conflicts this covers.
     #[must_use]
     pub fn len(&self) -> usize {
         self.providers.len()
@@ -180,7 +154,6 @@ impl ProviderConflicts {
             + self.command_words.len()
     }
 
-    /// Reports whether there is nothing to complain about.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -241,8 +214,6 @@ impl fmt::Display for ProviderConflicts {
     }
 }
 
-/// Accumulates every ambiguity in one provider set; a host records each manifest in load order and
-/// finishes with the deterministic capability routes or the whole conflict report.
 #[derive(Clone, Debug, Default)]
 pub struct ConflictScan {
     provider_ids: BTreeSet<ProviderId>,
@@ -254,13 +225,11 @@ pub struct ConflictScan {
 }
 
 impl ConflictScan {
-    /// Starts an empty scan.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Records one loaded manifest and the index of its component in load order.
     pub fn record(&mut self, manifest: &ProviderManifest, provider_index: usize) {
         if !self.provider_ids.insert(manifest.id.clone()) {
             self.duplicate_providers.insert(manifest.id.clone());
@@ -281,7 +250,6 @@ impl ConflictScan {
         }
     }
 
-    /// Returns the deterministic capability routes, or every conflict the set contains.
     pub fn finish(self) -> Result<BTreeMap<CapabilityId, usize>, ProviderConflicts> {
         let command_words = dekopon_core::command_word_conflicts(&self.declared_words);
         if !self.duplicate_providers.is_empty()
@@ -300,23 +268,13 @@ impl ConflictScan {
     }
 }
 
-/// Absent and wrong-typed are different operator problems with different fixes, and neither is
-/// worth instantiating the component to discover.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandExport {
-    /// Exports `run-command: func(argv: list<string>, stdin-piped: bool) -> string`.
     Present,
-    /// Exports nothing under the name: the component was built against the base
-    /// `dekopon:provider` world.
     Absent,
-    /// Exports `run-command` as something the host cannot call.
-    Mismatched {
-        /// Bounded description of what the component actually exports under the name.
-        found: String,
-    },
+    Mismatched { found: String },
 }
 
-/// Reads whether `component` offers the `run-command` export from its type.
 #[must_use]
 pub fn command_export(engine: &Engine, component: &Component) -> CommandExport {
     let Some(item) = component
@@ -354,7 +312,6 @@ fn returns_one_string(function: &ComponentFunc) -> bool {
     results.len() == 1 && results.next() == Some(Type::String)
 }
 
-/// The broad kind of one item in a component type, as a stable word.
 #[must_use]
 pub const fn item_kind(item: &ComponentItem) -> &'static str {
     match item {
@@ -368,7 +325,6 @@ pub const fn item_kind(item: &ComponentItem) -> &'static str {
     }
 }
 
-/// Renders one component function's type as `fn(name: Type, …) -> (Type, …)`, bounded.
 #[must_use]
 pub fn function_signature(function: &ComponentFunc) -> String {
     let params = function
@@ -384,7 +340,6 @@ pub fn function_signature(function: &ComponentFunc) -> String {
     bounded_signature(format!("fn({params}) -> ({results})"))
 }
 
-/// Truncates a rendered component type to the signature bound, marking the cut.
 #[must_use]
 pub fn bounded_signature(mut value: String) -> String {
     if value.len() <= MAX_SIGNATURE_BYTES {
@@ -399,22 +354,14 @@ pub fn bounded_signature(mut value: String) -> String {
     value
 }
 
-/// Why a manifest's command words cannot be served by the component that declared them.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CommandExportProblem {
-    /// The component does not export `run-command`.
     #[error("exports no {RUN_COMMAND_EXPORT}")]
     Missing,
-    /// The component exports the name as something the host cannot call.
     #[error("exports {RUN_COMMAND_EXPORT} as {found}")]
-    Mismatched {
-        /// Bounded description of what the component actually exports under it.
-        found: String,
-    },
+    Mismatched { found: String },
 }
 
-/// Checking at load catches a manifest promising words its component cannot run, instead of failing
-/// hours into a session at the first call.
 pub fn check_command_export(
     manifest: &ProviderManifest,
     export: &CommandExport,
@@ -437,20 +384,15 @@ pub fn command_input_bytes(argv: &[String]) -> usize {
         .fold(0, |total: usize, word| total.saturating_add(word.len()))
 }
 
-/// Failure to build the shared Wasmtime engine.
 #[derive(Debug, Error)]
 pub enum EngineError {
-    /// Wasmtime engine initialization failed.
     #[error("could not initialize the Wasmtime engine")]
     Engine {
-        /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
     },
 }
 
-/// The broker host calls exports asynchronously and yields on a fuel interval so a Tokio deadline
-/// can cancel the call; external embeddings choose their own interruption policy.
 #[must_use]
 pub fn config() -> Config {
     let mut config = Config::new();
@@ -459,7 +401,6 @@ pub fn config() -> Config {
     config
 }
 
-/// Persistent compiled artifacts are owned by the broker host, not Wasmtime's own compressed cache.
 pub fn engine(config: Config) -> Result<Engine, EngineError> {
     Engine::new(&config).map_err(|source| EngineError::Engine { source })
 }

@@ -23,8 +23,6 @@ pub(crate) enum SpawnTrap {
     Streams { kind: std::io::ErrorKind },
 }
 
-/// A child script for the invocation's connection to send to the gateway; dropping it closes its
-/// descriptors and tells the waiting guest the conversation ended.
 #[derive(Debug)]
 pub struct UpcallRequest {
     pub script: String,

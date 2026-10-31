@@ -1,7 +1,3 @@
-//! A secret referenced in traced command arguments appears only as its public reference name,
-//! resolved solely by the broker, while literal secret text a script writes is recorded as written,
-//! and a command span is never dropped no matter how long the script runs.
-
 use std::{
     cell::RefCell,
     sync::{

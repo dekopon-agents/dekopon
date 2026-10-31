@@ -77,8 +77,6 @@ fn wait(from: i64, until: i64) -> Duration {
     Duration::from_millis(u64::try_from(until.saturating_sub(from)).unwrap_or(0))
 }
 
-/// A meter that refuses only because concurrent reservations hold its room asks for this wait;
-/// those calls settle within a turn.
 const RESERVATION_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -454,7 +452,6 @@ impl Meter {
     }
 }
 
-/// A rolling bucket counts until its end leaves the window, so spend never expires early.
 fn rolling_expiry(period: Duration) -> i64 {
     positive_millis(period).saturating_add(positive_millis(rolling_bucket(period)))
 }

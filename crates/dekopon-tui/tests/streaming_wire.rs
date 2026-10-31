@@ -1,4 +1,3 @@
-//! Always-run wire witness: console wrappers over the pinned broker client's real FD transport.
 #![cfg(unix)]
 #![allow(
     clippy::unwrap_used,

@@ -19,16 +19,11 @@ pub enum JobRefusal {
     Off,
 }
 
-/// Every call answers for the person and conversation the control was built for; an id another
-/// person started is `NotYours`, never a different answer that would confirm it exists.
 pub trait JobControl: Send + Sync {
     fn start(&self, seed: JobSeed) -> Result<JobId, JobRefusal>;
 
     fn list(&self) -> Vec<JobSummary>;
 
-    /// Every owned id is held before any is awaited, so none sends a notice or loses its row while
-    /// another is still awaited. `keep_waiting` is asked at least once a second; the call returns
-    /// once it answers false. One answer per id, in order.
     fn wait(
         &self,
         ids: &[JobId],

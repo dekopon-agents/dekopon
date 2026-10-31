@@ -35,7 +35,6 @@ use crate::provider_manager;
 
 pub const CONFIG_API_VERSION: &str = "dekopon.dev/brokerd/v1alpha1";
 pub const HARD_MAX_CONFIG_BYTES: usize = 1024 * 1024;
-/// Ceiling on the owner-only Cedar policy file, matching `dekopon-policy`'s own source bound.
 pub const HARD_MAX_POLICY_BYTES: usize = 1024 * 1024;
 pub const HARD_MAX_CONNECTIONS: usize = 1_024;
 pub const MINIMUM_RESPONSE_OVERHEAD_BYTES: usize = 64 * 1024;
@@ -55,8 +54,6 @@ pub struct BrokerdConfig {
     pub socket_path: PathBuf,
     #[serde(default)]
     pub credentials_path: Option<PathBuf>,
-    /// Loading validates descriptors without network access; an actual secret source is resolved
-    /// only after both capability and secret.use policy decisions permit the invocation.
     #[serde(default)]
     pub secret_map_path: Option<PathBuf>,
     #[serde(default)]
@@ -65,8 +62,6 @@ pub struct BrokerdConfig {
     pub provider_set: Option<ManagedProviderSetConfig>,
     #[serde(default)]
     pub compile_on_load: bool,
-    /// Tolerating a startup mismatch never grants anything at runtime: a capability nothing routes
-    /// is still denied unconstrained-capability at invocation regardless of this setting.
     #[serde(default)]
     pub strict: bool,
     #[serde(default)]
@@ -102,9 +97,6 @@ pub struct BrokerdConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct HttpConfig {
-    /// Listing a host here doesn't grant access by itself: it must still be named in a constraint
-    /// set's allowedHosts with allowPlaintextLoopback set; this only permits plaintext once already
-    /// authorized.
     pub plaintext_hosts: Vec<String>,
     #[serde(rename = "extraCABundles")]
     pub extra_ca_bundles: Vec<PathBuf>,
@@ -212,8 +204,6 @@ pub struct HostLimitsConfig {
     pub max_http_header_bytes: usize,
     pub fuel: u64,
     pub max_timeout_ms: u64,
-    /// This memory ceiling is deliberately left out of the authority commitment; including it would
-    /// rotate stored authority whenever the concurrency budget changes.
     pub max_total_memory_bytes: Option<usize>,
 }
 
@@ -264,7 +254,6 @@ impl HostLimitsConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServerLimitsConfig {
-    /// Defaults to the smallest frame every configured request and response fits in.
     pub max_frame_bytes: Option<usize>,
     pub io_timeout_ms: u64,
     pub max_connections: usize,
@@ -606,9 +595,6 @@ pub struct ResolvedConfig {
     pub telemetry: Option<ResolvedTelemetry>,
 }
 
-/// `Check` resolves the runtime-only paths (socket, credentials, secret map, storage and assets
-/// roots, the managed provider lock and store, extra CA bundles) without requiring them to exist and
-/// loads no managed provider lock; every other rule is the one boot applies.
 #[derive(Clone, Copy, Debug)]
 pub enum LoadMode<'a> {
     Boot,
@@ -834,9 +820,6 @@ fn resolve_future_path(path: PathBuf) -> Result<PathBuf, ConfigError> {
     Ok(parent.join(name))
 }
 
-/// Entries are scanned in filename order deliberately: the registry builds its capability route
-/// table in load order, so an unsorted scan would make identical directories disagree about which
-/// provider claims a duplicate capability.
 fn expand_provider_entry(path: &Path, expected_uid: u32) -> Result<Vec<PathBuf>, ConfigError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 

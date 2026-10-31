@@ -1,14 +1,9 @@
-//! The marker is always the same regardless of secret length, since a width-padded marker would
-//! leak the secret's length and narrow down its type.
-
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const REDACTION_MARKER: &str = "[REDACTED]";
 
-/// The length parameter is unused but kept because dekopon-console, pinned to this crate, still
-/// calls this signature; removing it would break that build.
 #[must_use]
 pub fn redaction_marker(_length: usize) -> String {
     REDACTION_MARKER.to_owned()
@@ -22,8 +17,6 @@ impl<T> Redacted<T> {
         Self(secret)
     }
 
-    /// Named to be conspicuous in code and in review, since every call site is a place a credential
-    /// leaves its wrapper.
     pub const fn expose(&self) -> &T {
         &self.0
     }
@@ -64,8 +57,6 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Redacted<T> {
     }
 }
 
-/// Opt-in per field, and only where the destination is owner-only storage; used elsewhere it
-/// defeats the whole redaction guarantee.
 pub fn serialize_exposed<S, T>(secret: &Redacted<T>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,

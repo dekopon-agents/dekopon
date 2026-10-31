@@ -16,8 +16,6 @@ use super::{
     CallOutcome, RecordingInvoker, RecordingProgress, RecordingRuntime, Sequence, SessionEvent,
 };
 
-/// A leg that answers from a fixed table, so a test asserts on what the decorator reported rather
-/// than on what a broker happened to be doing.
 struct FixedInvoker;
 
 impl CapabilityInvoker for FixedInvoker {
@@ -58,7 +56,6 @@ impl CapabilityInvoker for FixedInvoker {
     }
 }
 
-/// A runtime that reports a fixed outcome and drives the invoker exactly as the real one does.
 struct FixedRuntime<'invoker> {
     invoker: &'invoker dyn CapabilityInvoker,
 }

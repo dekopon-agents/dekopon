@@ -1,6 +1,3 @@
-//! What policy actually grants the attested subject through the open agent. The catalog declares
-//! no capabilities; the broker's answer is the whole surface.
-
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -12,7 +9,6 @@ use ratatui::{
 use super::Theme;
 use crate::{app::App, redact::sanitize_line};
 
-/// Draws the capability surfaces for the agent currently hopped into.
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(session) = app.session.as_ref() else {
         frame.render_widget(

@@ -1,7 +1,3 @@
-//! A span guard held across an await point stays entered on its worker thread while suspended, so
-//! whatever the runtime polls there next is misattributed as a child of this request, in production
-//! too.
-
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,

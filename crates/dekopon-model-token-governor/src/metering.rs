@@ -98,8 +98,6 @@ impl Estimate {
     }
 }
 
-/// The last settled input of one session, so the next call's estimate covers history the request
-/// bytes do not show (Codex's hidden items).
 #[derive(Debug, Default)]
 pub struct InputHint(AtomicU64);
 
@@ -139,7 +137,6 @@ struct Observed {
     text_bytes: usize,
 }
 
-/// Records one model call without reserving or charging a reply budget.
 #[must_use]
 pub struct Unadmitted {
     call: Call,
@@ -184,8 +181,6 @@ impl Drop for Unadmitted {
     }
 }
 
-/// Holds no lock guard, so it can live across an `.await`; dropping it unsettled settles it as
-/// cancelled, which is the proxy's client-disconnect path.
 #[must_use]
 pub struct Admission {
     call: Call,
@@ -263,7 +258,6 @@ impl Metering {
         })
     }
 
-    /// Every budget appends its live charges until `restore` or `abandon_restore` runs.
     pub fn begin_restore(&self) {
         for budget in self.budgets.values() {
             budget.lock().begin_restore();

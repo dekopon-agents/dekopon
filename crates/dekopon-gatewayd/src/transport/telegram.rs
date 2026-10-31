@@ -1,6 +1,3 @@
-//! The offset advance is the only acknowledgment Telegram has; polling blocks until something
-//! arrives, so there is no separate ack and no ack-before-work ordering problem.
-
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -28,16 +25,12 @@ use crate::{
 
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 const MAX_MESSAGE_CHARS: usize = 4_096;
-/// This counts Unicode scalars while MAX_MESSAGE_CHARS counts UTF-16 units; an astral scalar costs
-/// two units, so the headroom between them covers the worst-case gap.
 const MAX_STREAM_CHARS: usize = 4_000;
 const MAX_PHOTO_CAPTION_CHARS: usize = 1_024;
 
 const POLL_SECONDS: u64 = 50;
 const POLL_TIMEOUT: Duration = Duration::from_secs(POLL_SECONDS + 20);
 const LIVENESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-/// Telegram's typing indicator auto-expires after five seconds with no way to clear it early, so it
-/// must be renewed more often than that until the final answer.
 const TYPING_RENEW_INTERVAL: Duration = Duration::from_secs(4);
 const MAX_LIVENESS_COOLDOWN: Duration = Duration::from_secs(300);
 const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(3);
@@ -1042,8 +1035,6 @@ impl TelegramDriver {
     }
 }
 
-/// reqwest's error embeds the request URL, which carries the bot token, in both its Display and
-/// Debug; this is the only Bot API failure built with that URL removed.
 fn request_failed(source: reqwest::Error) -> TransportError {
     TransportError::Request(Box::new(source.without_url()))
 }

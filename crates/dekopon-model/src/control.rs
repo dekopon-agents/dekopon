@@ -18,8 +18,6 @@ impl TurnControl {
         Ok(Self { cancel, deadline })
     }
 
-    /// Call check() before scheduling any blocking credential or attachment operation, not after;
-    /// nothing else enforces this ordering.
     pub(crate) fn check(&self) -> Result<(), InferenceError> {
         if *self.cancel.borrow() {
             return Err(InferenceError::Cancelled);

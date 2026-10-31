@@ -1,6 +1,3 @@
-//! The policy is the sole terminal writer once a session starts, so a stopped reply can't land
-//! ahead of the partial answer it follows.
-
 use std::time::Duration;
 
 use dekopon_agent::{BudgetLimit, CancelSource, CancelVia};

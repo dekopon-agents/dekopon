@@ -8,7 +8,6 @@ use crate::export_bindings::dekopon::stdio::streams;
 
 const BROKEN_PIPE: NonZeroU8 = NonZeroU8::new(141).expect("141 is nonzero");
 
-/// The piped input of one invocation, read in bounded chunks; an empty read is end of input.
 pub struct Stdin(Source);
 
 enum Source {
@@ -18,8 +17,6 @@ enum Source {
     Native(Box<dyn io::Read>),
 }
 
-/// The piped input, `None` when nothing was piped into this invocation; piped input that is
-/// empty is `Some` and reads as end of input at once.
 #[must_use]
 pub fn stdin() -> Option<Stdin> {
     #[cfg(target_arch = "wasm32")]
@@ -55,7 +52,6 @@ impl Stdin {
         reader
     }
 
-    /// The input's lines, without their terminators.
     #[must_use]
     pub fn lines(self) -> io::Lines<io::BufReader<Self>> {
         io::BufRead::lines(io::BufReader::new(self))
@@ -81,8 +77,6 @@ impl io::Read for Stdin {
     }
 }
 
-/// The invocation's standard output; a write after the reader has gone fails with
-/// [`io::ErrorKind::BrokenPipe`] and the invocation exits 141.
 pub struct Stdout {
     sink: Sink,
     closed: bool,
@@ -104,7 +98,6 @@ impl Stdout {
         }
     }
 
-    /// Whether a write found the reader gone.
     #[must_use]
     pub const fn closed(&self) -> bool {
         self.closed
@@ -173,27 +166,19 @@ pub(super) fn take_native_stdin() -> Option<Box<dyn io::Read>> {
     native::take_stdin()
 }
 
-/// The streams of one native invocation.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct NativeStdio {
-    /// The piped input; `None` when nothing is piped.
     pub stdin: Option<Box<dyn io::Read>>,
-    /// Where the capability's output goes; a failed write is a closed reader.
     pub stdout: Box<dyn io::Write>,
 }
 
-/// How a native invocation exited.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeExit {
-    /// 0 on success, else the failure's status, or 141 when stdout's reader had gone.
     pub status: u8,
-    /// Everything written to standard error.
     pub stderr: String,
 }
 
-/// Runs one authorized call natively over `stdio`, with imports from the installed
-/// [`super::Port`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn invoke_native<P: super::Provider>(
     capability: &str,

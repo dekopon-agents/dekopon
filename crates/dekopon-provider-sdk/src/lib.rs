@@ -111,94 +111,61 @@ pub const PROVIDER_WIT: &str = include_str!("../wit/provider.wit");
 
 pub const ASSET_WIT: &str = include_str!("../wit/deps/asset.wit");
 
-/// Version of the component manifest returned by a provider.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProviderApiVersion {
-    /// Initial experimental provider contract.
     #[serde(rename = "dekopon.dev/provider/v1alpha1")]
     V1Alpha1,
 }
 
-/// Manifest returned by a provider component.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderManifest {
-    /// Provider manifest API version.
     pub api_version: ProviderApiVersion,
-    /// Stable provider identity.
     pub id: ProviderId,
-    /// Concise operator-facing description.
     pub description: String,
-    /// Capabilities implemented by this component.
     pub capabilities: Vec<ProviderCapability>,
-    /// The only way a model reaches this provider's capabilities; defaulted so an omitted list
-    /// still decodes and is named in the startup conflict report rather than failing to decode.
     #[serde(default)]
     pub command_words: Vec<String>,
 }
 
-/// One prompt-visible capability exported by a provider component.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderCapability {
-    /// Stable capability identity.
     pub id: CapabilityId,
-    /// Concise model- and operator-facing description.
     pub description: String,
-    /// Effect classification. Immediate mode accepts only [`EffectKind::ReadOnly`].
     pub effect: EffectKind,
-    /// Coarse risk classification available to callers.
     pub risk: RiskLevel,
-    /// Object-shaped JSON Schema supplied to a model as function parameters.
     pub input_schema: Value,
 }
 
-/// A provider's refusal of an argv, carried by [`CommandRunOutcome::Failed`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ComponentFailure {
-    /// Stable provider-specific code.
     pub code: String,
-    /// Bounded human-readable detail.
     pub message: String,
 }
 
-/// JSON result of a command-word run, returned across the `run-command` WIT boundary.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]
 pub enum CommandRunOutcome {
-    /// The argv maps to one capability proposal.
     Proposed {
-        /// Capability the command word named.
         capability: CapabilityId,
-        /// Input object assembled from the arguments.
         input: Value,
-        /// Secret use the proposal names, under the wire key `secretUse`; absent when it names
-        /// none, so a proposal without one keeps its earlier shape.
         #[serde(rename = "secretUse", default, skip_serializing_if = "Option::is_none")]
         secret_use: Option<SecretUseProposal>,
     },
-    /// The guest answered by itself, as a command-line program prints and exits.
     Rendered {
-        /// Text for the shell's standard output.
         stdout: String,
-        /// Text for the shell's standard error.
         stderr: String,
-        /// Exit status the shell reports for the word.
         status: u8,
     },
-    /// The provider declined this argv.
     Failed {
-        /// Stable failure detail, reported to the model as a usage error.
         error: ComponentFailure,
     },
 }
 
 const RUN_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"command run could not be serialized"}}"#;
 
-/// The description carries the serialization error instead of being empty, so the refusal is
-/// traceable rather than sending an operator hunting for a blank description nowhere in their
-/// source.
 fn describe_fallback(error: &serde_json::Error) -> String {
     serde_json::json!({
         "apiVersion": "dekopon.dev/provider/v1alpha1",
@@ -209,8 +176,6 @@ fn describe_fallback(error: &serde_json::Error) -> String {
     .to_string()
 }
 
-/// Embed files relative to the calling crate's `skills/` directory as Wasm custom sections.
-/// Validation happens when the locked provider's skills are read for export.
 #[macro_export]
 macro_rules! skills {
     ($($path:literal),* $(,)?) => {

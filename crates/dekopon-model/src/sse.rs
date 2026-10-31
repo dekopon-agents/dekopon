@@ -1,5 +1,3 @@
-/// Set to the larger of the two bounds these transports used separately, so there is one shared
-/// limit instead of a per-backend one, stopping an endless socket from growing the process.
 pub(crate) const MAX_STREAM_BYTES: u64 = 16 * 1024 * 1024;
 
 const DONE: &str = "[DONE]";

@@ -207,8 +207,6 @@ pub(crate) fn evidence(records: &[Head], now_ms: u64) -> Vec<Evidence> {
         .collect()
 }
 
-/// Asks the configured decider about one record and returns the choice line `persist` appends;
-/// a refusal or an answer outside the labels leaves the record on the ladder.
 pub(crate) fn choose<I: CapabilityInvoker>(
     runtime: &ShellRuntime<I>,
     decider: &config::Decider,

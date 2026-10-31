@@ -1,6 +1,3 @@
-//! Public DRNs never appear in provider input or WIT; the broker authorizes each secret use
-//! separately, and only the native HTTP sink gets resolved bytes.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -1890,8 +1887,6 @@ fn parse_token(bytes: Vec<u8>) -> Result<Redacted<String>, SourceError> {
     Ok(Redacted::new(text.to_owned()))
 }
 
-/// The refusal stays one opaque Insecure error on purpose so a caller can't learn which check
-/// failed; the real cause is only logged.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
@@ -2398,8 +2393,6 @@ pub enum SourceError {
     Internal,
 }
 
-/// Only the errno is extracted here, because every wrapper in the chain renders a path, which a
-/// secret-source event must never carry.
 fn io_cause<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a std::io::Error> {
     let mut source = error.source();
     while let Some(current) = source {

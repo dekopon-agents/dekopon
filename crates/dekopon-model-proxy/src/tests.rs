@@ -25,7 +25,6 @@ enum Step {
     Wait(Duration),
 }
 
-/// A loopback upstream that records each request and answers with scripted writes and pauses.
 struct FakeUpstream {
     url: String,
     requests: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -692,7 +691,6 @@ async fn a_refusal_is_each_dialects_throttling_error_with_retry_after() {
     assert_eq!(spans.outcomes(), ["refused"; 3]);
 }
 
-/// Asserts the dialect's error shape, the status and the sandbox prefix, and returns the message.
 async fn sandbox_refusal(
     response: reqwest::Response,
     path: &str,

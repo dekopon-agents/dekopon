@@ -179,8 +179,6 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Overrides the storage limits. Defaults to [`StorageLimits::default()`], which is what a
-    /// deployment runs — narrow these to test quota behavior, and prefer not to widen them.
     #[must_use]
     pub fn storage_limits(mut self, limits: StorageLimits) -> Self {
         self.storage_limits = limits;
@@ -205,18 +203,12 @@ impl FixtureHostBuilder {
         self
     }
 
-    /// Overrides the external subject the storage namespace is scoped from.
-    ///
-    /// Two brokers built with different subjects address different namespaces, which is how a
-    /// test proves isolation.
     #[must_use]
     pub fn subject(mut self, subject: impl Into<String>) -> Self {
         self.scope.subject = subject.into();
         self
     }
 
-    /// Narrows the per-invocation wall-clock ceiling below the host's own max_timeout; raising it
-    /// above that is refused, since an authorization may narrow a host ceiling but never widen it.
     #[must_use]
     pub const fn timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.timeout_ms = Some(timeout_ms);
@@ -274,13 +266,8 @@ impl FixtureHostBuilder {
     }
 }
 
-/// One FixtureHost is one durable namespace with a real storage host behind it; invocations see each
-/// other's completed per-call writes even after a failure, since there is no invocation-wide
-/// rollback.
 #[derive(Debug)]
 pub struct FixtureHost {
-    /// Kept only for its Drop impl, which deletes the temporary storage root; the field itself is
-    /// never read.
     _temporary: TempDir,
     root: PathBuf,
     registry: BrokerProviderRegistry,
@@ -373,7 +360,6 @@ impl FixtureHost {
         Ok((output, stdout.json()))
     }
 
-    /// A command proposal has no authority; pass it through invoke to execute it.
     pub async fn run_command(
         &self,
         word: &str,
@@ -383,7 +369,6 @@ impl FixtureHost {
         Ok(self.registry.run_command(word, argv, stdin_piped).await?)
     }
 
-    /// StorageEvidence counts bytes moved, not final file sizes; walk the opaque SHA-256 paths.
     #[must_use]
     pub fn storage_root(&self) -> &Path {
         &self.root

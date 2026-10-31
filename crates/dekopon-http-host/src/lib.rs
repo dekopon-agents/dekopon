@@ -1,6 +1,3 @@
-//! Every response from a credentialed context is checked for the raw or encoded secret and refused
-//! as Denied rather than returned to the component.
-
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
@@ -58,8 +55,6 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_HEADERS: usize = 128;
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_CREDENTIAL_BYTES: usize = 4096;
-/// The minimum is 16 bytes because the echo check substring-searches every response, and a shorter
-/// secret like token would falsely match unrelated text.
 pub const MIN_CREDENTIAL_BYTES: usize = 16;
 const _: () = assert!(MIN_CREDENTIAL_BYTES == 16);
 
@@ -267,7 +262,6 @@ impl NonPublicHttpsAuthority {
     }
 }
 
-/// Explicit HTTPS test destination pinned to loopback and a dedicated trust root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoopbackHttpsPin {
     authority: String,
@@ -349,8 +343,6 @@ pub enum ConfigurationError {
     InvalidCredential { reason: &'static str },
 }
 
-/// This lets an agent use a credential without ever seeing it: the value stays in a Redacted
-/// wrapper end to end, and a guest-supplied authorization header is rejected, never overwritten.
 #[derive(Clone)]
 pub struct BoundCredential {
     header_value: Redacted<String>,
@@ -565,9 +557,6 @@ impl BoundCredential {
         }
     }
 
-    /// Appends `bytes` behind the held tail and scans the window. `None` is an echo; otherwise the
-    /// count of leading window bytes that no later byte can complete into a secret, leaving
-    /// exactly `overlap` bytes held.
     fn scan_stream_chunk(
         &self,
         window: &mut Vec<u8>,
@@ -639,8 +628,6 @@ impl BoundCredential {
     }
 }
 
-/// This must agree exactly with BoundCredential's own coverage check, since a divergence would let
-/// the policy layer accept a host the runtime injector then refuses.
 #[must_use]
 pub fn destinations_cover(destinations: &[String], allowed_host: &str) -> bool {
     let allowed = allowed_host.trim().to_ascii_lowercase();
@@ -665,8 +652,6 @@ pub struct HttpCallEvidence {
     pub authority: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// request_bytes deliberately excludes any broker-injected credential header, since its length
-    /// must not leak into evidence or cost the guest's byte grant.
     pub request_bytes: u64,
     pub response_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1597,8 +1582,6 @@ impl BufferedHttpClient {
     }
 }
 
-/// The outgoing path is rebuilt from the template rather than edited in place, so how the provider
-/// percent-encoded its placeholders can never change what the upstream receives.
 fn apply_request_templates(
     grant: &HttpConstraints,
     slots: &ChatSlotValues,
@@ -1743,8 +1726,6 @@ async fn resolve_destination(host: &str, port: u16) -> Result<Vec<SocketAddr>, H
     bounded_addresses(addresses)
 }
 
-/// The bound truncates rather than refuses because refusing at the limit would make a large
-/// round-robin or dual-stack destination permanently or intermittently unreachable.
 fn bounded_addresses(
     addresses: impl IntoIterator<Item = SocketAddr>,
 ) -> Result<Vec<SocketAddr>, HttpError> {
@@ -1782,8 +1763,6 @@ fn canonical_authority(host: &str, port: u16) -> String {
     format!("{}:{port}", canonical_host(host))
 }
 
-/// The loopback branch requires every resolved address to be loopback; the list matches by
-/// hostname, not address, since address alone can't distinguish a LAN answer from a chosen one.
 fn plaintext_permitted(
     scheme: &str,
     host: &str,

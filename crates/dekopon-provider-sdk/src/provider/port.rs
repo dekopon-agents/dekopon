@@ -1,27 +1,19 @@
 use std::cell::RefCell;
 use std::io;
 
-/// Native import implementation installed for one scoped provider invocation.
 pub trait Port {
-    /// Reads the broker wall clock.
     fn now_unix_millis(&mut self) -> u64;
-    /// Reads elapsed nanoseconds on the native test port.
     fn now_nanos(&mut self) -> u64;
-    /// Fills a bounded buffer from the native test port's entropy source.
     fn fill_random(&mut self, out: &mut [u8]);
-    /// Reads provider settings under the invocation grant.
     fn settings(&mut self) -> Option<String>;
-    /// Sends a buffered HTTP request.
     fn send(
         &mut self,
         request: crate::http::Request,
     ) -> Result<crate::http::Response, crate::http::HttpError>;
-    /// Sends an asset-backed request.
     fn stream(
         &mut self,
         request: crate::http::StreamedRequest<'_>,
     ) -> Result<crate::http::StreamedResponse, crate::http::HttpError>;
-    /// Downloads through the installed test port; other native ports retain denial.
     #[cfg(feature = "native-test")]
     fn signed_download(
         &mut self,
@@ -31,28 +23,20 @@ pub trait Port {
             code: crate::signed_download::ErrorCode::Denied,
         })
     }
-    /// Runs a child script; a port that scripts no child refuses the call by panicking.
     fn spawn(&mut self, script: &str, stdin: NativeChildStdin) -> NativeChild {
         drop(stdin);
         panic!("this native Port runs no child script: {script}");
     }
 }
 
-/// What a native child script reads as its stdin.
 pub enum NativeChildStdin {
-    /// Nothing piped into the child.
     None,
-    /// The rest of the invocation's own stdin.
     Inherit(Box<dyn io::Read>),
-    /// A reader the capability passed.
     Reader(Box<dyn io::Read>),
 }
 
-/// A child script run by a native port: its output and how it exited.
 pub struct NativeChild {
-    /// The child's standard output.
     pub stdout: Box<dyn io::Read>,
-    /// The child's exit.
     pub exit: crate::spawn::Exit,
 }
 
@@ -70,7 +54,6 @@ impl Drop for Restore {
     }
 }
 
-/// Installs a native port for the duration of `f`, restoring the previous port even on panic.
 pub fn with_port<R>(port: impl Port + 'static, f: impl FnOnce() -> R) -> R {
     let previous = CURRENT.with(|current| current.replace(Some(Box::new(port))));
     let _restore = Restore(previous);

@@ -48,7 +48,6 @@ pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const SUBJECT_HEADER: &str = "x-dekopon-vm-subject";
 pub const SESSION_HEADER: &str = "x-dekopon-vm-session";
 const MAX_LABEL_BYTES: usize = 128;
-/// Under the jail's 90 s idle timer, so a reasoning model's silence never drops the stream.
 pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -176,7 +175,6 @@ impl ModelProxy {
         self
     }
 
-    /// Names only configured models, never anything from the request.
     fn model_rule(&self, grant: &Grant, dialect: Dialect) -> String {
         let granted = || grant.models.iter().filter_map(|name| self.models.get(name));
         let served = granted()
@@ -289,7 +287,6 @@ impl Drop for CallSpan {
     }
 }
 
-/// The guest controls these bytes, so only a short printable-ASCII label reaches telemetry.
 fn label<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
     headers
         .get(name)

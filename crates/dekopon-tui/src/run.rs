@@ -1,10 +1,3 @@
-//! Terminal lifecycle and the event loop that joins keys to sessions.
-//!
-//! Two things here are worth more care than they look. The terminal is restored on *every* exit
-//! path including a panic, because a panic inside a raw-mode alternate screen leaves the operator
-//! with a shell that no longer echoes. And `tracing` never reaches stdout while this runs, because
-//! this process owns the screen and one stray log line corrupts a frame.
-
 use std::{
     io::{self, Stdout},
     panic,
@@ -40,14 +33,9 @@ use crate::{
     ui,
 };
 
-/// Restores the terminal on drop, whatever the reason for the drop.
-///
-/// A guard rather than a call at the end of `run`: an error return, a `?`, and a panic all have to
-/// leave the terminal usable, and only a destructor covers all three.
 struct TerminalGuard;
 
 impl TerminalGuard {
-    /// Enters the alternate screen and installs a panic hook that leaves it.
     fn enter() -> io::Result<(Self, Terminal<CrosstermBackend<Stdout>>)> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -86,12 +74,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Puts the terminal back the way it was found.
-///
-/// Both failures are reported to standard error rather than through `tracing`: this runs while the
-/// screen is being given back, including from a panic hook, and a terminal left in raw mode is
-/// something the operator has to fix with `reset` — so the reason has to reach them somewhere that
-/// survives the subscriber.
 fn restore() {
     if let Err(error) = disable_raw_mode() {
         eprintln!("warning: could not leave raw mode ({error}); run `reset` to restore your shell");
@@ -101,20 +83,12 @@ fn restore() {
     }
 }
 
-/// One turn in flight, and what the console needs back when it finishes.
 pub(crate) struct RunningTurn {
     pub(crate) events: UnboundedReceiver<SessionEvent>,
     pub(crate) handle: tokio::task::JoinHandle<Result<History, SessionError>>,
     pub(crate) shell: bool,
 }
 
-/// Runs the console until the operator quits.
-///
-/// # Errors
-///
-/// Returns a terminal failure. Every other failure — an unreachable broker, a refused hop, a
-/// session that died — is drawn rather than returned, because the console is still usable after
-/// each of them.
 pub async fn run(
     mut app: App,
     client: BrokerClient,
@@ -215,7 +189,6 @@ async fn drive_event_loop(
     }
 }
 
-/// Join the blocking turn before releasing its broker leg and restoring the terminal.
 async fn stop_running(running: &mut Option<RunningTurn>, stop: &StopFlag) {
     if let Some(turn) = running.take() {
         stop.request();
@@ -225,10 +198,6 @@ async fn stop_running(running: &mut Option<RunningTurn>, stop: &StopFlag) {
     }
 }
 
-/// Waits for the next session event, or for there to be no session.
-///
-/// Pending forever when nothing is running, so `select!` simply never takes this branch rather than
-/// spinning on an immediately-ready `None`.
 async fn recv(running: &mut Option<RunningTurn>) -> Option<SessionEvent> {
     match running {
         Some(turn) => turn.events.recv().await,
@@ -236,7 +205,6 @@ async fn recv(running: &mut Option<RunningTurn>) -> Option<SessionEvent> {
     }
 }
 
-/// Collects a finished turn's history back and reports how it ended.
 async fn finish_turn(
     app: &mut App,
     running: &mut Option<RunningTurn>,
@@ -250,7 +218,6 @@ async fn finish_turn(
     settle_turn(app, turn.shell, joined, history, stop);
 }
 
-/// Reports how a joined turn ended and releases its stop binding.
 pub(crate) fn settle_turn(
     app: &mut App,
     shell: bool,
@@ -299,20 +266,13 @@ pub(crate) fn settle_turn(
     }
 }
 
-/// Something the loop must do that needs more than the state machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
-    /// Hop into the highlighted agent.
     Enter,
-    /// Run one prompt as a turn.
     Turn(String),
-    /// Run one line through the interpreter.
     Shell(String),
 }
 
-/// Maps one key press onto a state change, and possibly an action.
-///
-/// Split from the loop so the whole of the console's key handling is testable without a terminal.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "unhandled terminal key codes are ignored to preserve console input behavior"
@@ -482,7 +442,6 @@ pub(crate) async fn dispatch(
         .await;
 }
 
-/// Each submitted turn owns a root, never the preceding turn's context.
 pub fn console_turn_span(kind: &'static str) -> tracing::Span {
     tracing::info_span!(parent: None, "console.turn", console.origin = "dekopon-console", console.kind = kind)
 }
@@ -840,13 +799,11 @@ async fn dispatch_in_context(
     }
 }
 
-/// Closes the transcript when a fresh gate or model setup refuses before inference.
 fn refuse_turn(app: &mut App, report: ErrorReport) {
     app.on_session_event(SessionEvent::Finished(Box::new(Err(report.to_string()))));
     app.raise(report);
 }
 
-/// A failed `capabilitiesFor`, with the broker's refusal and where its reason is logged.
 fn session_refusal(app: &App, operation: &str, error: &SessionError) -> ErrorReport {
     let report = app.report(ErrorReport::from_error(operation, error));
     if !report
@@ -867,7 +824,6 @@ fn session_refusal(app: &App, operation: &str, error: &SessionError) -> ErrorRep
     report.with_note(note)
 }
 
-/// The broker answered, and policy grants this context nothing.
 fn empty_surface(app: &App, operation: &str) -> ErrorReport {
     let report = app.report(ErrorReport::from_message(
         operation,
@@ -884,7 +840,6 @@ fn empty_surface(app: &App, operation: &str) -> ErrorReport {
     report.with_note(note)
 }
 
-/// The agent's standing orders, handed to the model fresh on every turn.
 fn instructions(app: &App) -> Option<String> {
     let session = app.session.as_ref()?;
     app.agents
@@ -893,16 +848,12 @@ fn instructions(app: &App) -> Option<String> {
         .and_then(|agent| agent.spec.instructions.clone())
 }
 
-/// Why the console stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum ConsoleExit {
-    /// The terminal itself failed.
     #[error("the terminal could not be driven")]
     Terminal(#[source] io::Error),
-    /// Structured session could not safely continue.
     #[error("structured console: {0}")]
     Structured(String),
-    /// Setting up the session layer failed before the console could open.
     #[error(transparent)]
     Session(SessionError),
 }

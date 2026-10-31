@@ -1,6 +1,3 @@
-//! Skill text is untrusted, like model instructions; it can shape answers but never widen a
-//! capability or name a principal.
-
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -79,15 +76,11 @@ impl Skill {
         &self.metadata
     }
 
-    /// Recorded as metadata only; real tool authority always comes from broker policy, never from
-    /// what a skill file declares.
     #[must_use]
     pub fn allowed_tools(&self) -> Option<&str> {
         self.allowed_tools.as_deref()
     }
 
-    /// Sorted by relative path; resource() binary-searches this list and depends on that order
-    /// being maintained.
     #[must_use]
     pub fn resources(&self) -> &[SkillResource] {
         &self.resources
@@ -111,8 +104,6 @@ impl Skill {
         &self.file
     }
 
-    /// Every directory listed while loading, with all entry names in sorted order, hidden ones
-    /// included.
     #[must_use]
     pub fn directories(&self) -> &BTreeMap<PathBuf, Vec<OsString>> {
         &self.directories
@@ -344,8 +335,6 @@ fn split_front_matter<'a>(text: &'a str, path: &Path) -> Result<(&'a str, &'a st
     })
 }
 
-/// Symlinks are refused rather than followed, since a link is how content would escape the
-/// directory that was reviewed.
 fn collect_resources(
     (root, tree): (&Path, Tree<'_>),
     directory: &Path,

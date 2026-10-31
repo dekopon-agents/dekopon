@@ -1,6 +1,3 @@
-//! Constructs the sandbox drops are tokenized rather than skipped, so the parser can reject them by
-//! name instead of silently discarding them, as it would a trailing ampersand.
-
 use std::{collections::VecDeque, fmt, iter::Peekable, str::CharIndices};
 
 use crate::{
@@ -409,9 +406,6 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// Double-quoted strings and unquoted here-document bodies share this scanner since bash
-    /// interpolates both alike, except a backslash-quote is an escape in quotes but ordinary text
-    /// in a here-document, where collapsing it would corrupt embedded JSON.
     fn read_interpolated(
         &mut self,
         terminator: Option<char>,

@@ -257,8 +257,6 @@ impl Builtin {
     }
 }
 
-/// Each non-final stage thread reserves this much stack, charged against retained bytes until its
-/// join, so the default budget admits sixteen concurrent producers.
 const STAGE_STACK_BYTES: usize = ShellThreads::STACK_BYTES;
 
 const STAGE_THREAD: ThreadName = ThreadName::new("sh-stage");
@@ -278,8 +276,6 @@ enum Fed {
 }
 
 impl Fed {
-    /// A feeder that never started dropped the provider's stdin, so the provider read EOF instead
-    /// of the script's input; whatever it reported cannot stand as success.
     fn settle(
         self,
         capability: &str,
@@ -300,8 +296,6 @@ struct StageSetup {
     permit: ThreadPermit,
 }
 
-/// Ends when upstream ends, the provider stops reading or `finished` is set once the call has
-/// returned; either way the dropped socket is the provider's end of input.
 fn pump_stdin(
     reader: &mut PipeReader<StageObservation>,
     mut socket: UnixStream,
@@ -478,8 +472,6 @@ impl Diagnostic {
     }
 }
 
-/// A redirected stderr capture must stay bounded by the same output ceilings, since a function can
-/// run thousands of commands into it.
 #[derive(Debug)]
 struct StderrCapture {
     lines: Vec<Diagnostic>,
@@ -943,8 +935,6 @@ impl<'a> Evaluator<'a> {
         output.value(self, result)
     }
 
-    /// Whether a command produced no value has to be recognized before it reaches a capture, not
-    /// after, or it silently adds a blank element and an extra blank line to the captured result.
     fn absorb(&mut self, failure: CommandFailure) -> Result<ExitCode, FatalError> {
         match failure {
             CommandFailure::Status { message, status } => {
@@ -1660,8 +1650,6 @@ impl<'a> Evaluator<'a> {
         Ok((status, None))
     }
 
-    /// The enclosing compound's stream moves into the first stage for the stage's lifetime and
-    /// comes back at its join, so whatever it leaves unread is still there for the next command.
     fn spawn_stage<'scope, 'env>(
         &mut self,
         scope: &'scope Scope<'scope, 'env>,
@@ -2628,11 +2616,6 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// The call is charged and the deadline re-read on both sides, since capability calls are
-    /// wall-clock expensive but step-cheap. The provider's stdout is copied to this stage's sink
-    /// while the call runs, and dropping that copy closes the provider's stdout. An unpiped stage
-    /// outside any compound's input reads the script's own stdin when it has one, and whatever the
-    /// provider left unread stays there for the next command.
     fn run_provider(
         &mut self,
         call: crate::RunCall,
@@ -3070,9 +3053,6 @@ impl<'a> Evaluator<'a> {
         Ok(Executed::Result(CommandResult::status(status)))
     }
 
-    /// Assigning a variable from a whole command substitution or another whole variable keeps its
-    /// structured value instead of flattening it to text, a deliberate deviation from real shells
-    /// that lets a script later index into what it captured.
     fn assignment_value(&mut self, word: &Word) -> Result<CommandResult, CommandFailure> {
         if let [WordPart::CommandSubstitution(program)] = word.parts.as_slice() {
             let mut result = self.run_substitution(program)?;
@@ -4717,9 +4697,6 @@ fn reduce_captured(captured: Vec<CommandResult>) -> Value {
     }
 }
 
-/// The byte cost charged against the memory budget is an approximation, not a measurement, and
-/// includes a small fixed charge per node so a deeply nested structure built entirely of empty
-/// pieces still counts against the limit.
 fn value_bytes(value: &Value) -> u64 {
     const NODE_OVERHEAD: u64 = 16;
     NODE_OVERHEAD

@@ -11,9 +11,7 @@ use crate::{
     dialect::{Dialect, Observation},
 };
 
-/// A single SSE line longer than this is forwarded but not parsed for usage.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
-/// A non-streamed JSON answer longer than this is forwarded but its usage is estimated.
 const MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
 const PING: &[u8] = b": ping\n\n";
 

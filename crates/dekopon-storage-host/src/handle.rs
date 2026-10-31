@@ -15,7 +15,6 @@ use std::{
 };
 #[derive(Clone, Debug)]
 pub(crate) struct FileEntry {
-    /// Bounded working bytes, authoritative only while `loaded` is true.
     pub(crate) data: Option<Vec<u8>>,
     pub(crate) loaded: bool,
     exists: bool,
@@ -165,8 +164,6 @@ impl StorageHandle {
         })
     }
 
-    /// Corruption found here signals a race with a writer that skipped the leases this generation
-    /// was already validated under.
     fn open_generation(
         grant: &StorageGrant,
     ) -> Result<(File, Usage, BTreeSet<String>), StorageHostError> {

@@ -1,6 +1,3 @@
-//! Wire requests carry no trusted identity; the server derives authenticated context from OS peer
-//! credentials before dispatching them.
-
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
@@ -84,12 +81,8 @@ impl SessionRefusal {
 }
 
 pub const ERROR_INVALID_REQUEST: &str = "invalid-request";
-/// Nothing executed for this failure, so the same work may safely be resubmitted under a fresh
-/// invocation identifier.
 pub const ERROR_BROKER_UNAVAILABLE: &str = "broker-unavailable";
 
-/// The external effect may already have happened, so the request must never be resubmitted; the
-/// audit log is the only record of it.
 pub const ERROR_OUTCOME_UNAUDITED: &str = "outcome-unaudited";
 pub const ERROR_STORAGE_QUOTA: &str = "storage-quota";
 pub const ERROR_STORAGE_BUSY: &str = "storage-busy";
@@ -97,8 +90,6 @@ pub const ERROR_STORAGE_TIMEOUT: &str = "storage-timeout";
 pub const ERROR_STORAGE_CORRUPT: &str = "storage-corrupt";
 pub const ERROR_STORAGE_IO: &str = "storage-io";
 
-/// Nothing executed, but a full audit log cannot be fixed by a new identifier, so clients must not
-/// retry automatically.
 pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,8 +100,6 @@ pub enum ProtocolVersion {
     V1Alpha3,
 }
 
-/// This field is untrusted and reaches only telemetry and audit correlation; it is never an
-/// authorization or routing input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TraceParent {
     trace: TraceId,
@@ -246,18 +235,12 @@ pub enum TraceParentError {
     ZeroParentId,
 }
 
-/// Actor and principal are deliberately absent here; the server derives them from transport
-/// identity, not client input. The principal a `Capabilities` answer names is display-only.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InvocationRequest {
     pub id: InvocationId,
     pub capability: CapabilityId,
-    /// This field is untrusted and mandatory; a malformed value fails decoding rather than
-    /// defaulting, since an invalid trace is worse than refusing the frame.
     pub trace_parent: TraceParent,
-    /// This field is proposal data only, never a credential or bearer grant, and providers never
-    /// receive it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_use: Option<SecretUseProposal>,
     pub input: Value,
@@ -446,7 +429,6 @@ impl Attestation {
         }
     }
 
-    /// This checks structure only; it consults no grant and decides nothing about authority.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         self.scope.as_ref().is_none_or(ChatScopeClaim::is_bounded)
@@ -458,8 +440,6 @@ impl Attestation {
     }
 }
 
-/// The tagged shape stops one transport's identifier from being replayed as another's; scope is
-/// checked against the attested chat scope first.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
@@ -1060,7 +1040,6 @@ pub const MAX_ASSET_DESCRIPTORS: usize = 5;
 pub const MAX_STREAM_DESCRIPTORS: usize = 2;
 pub const MAX_DESCRIPTORS_PER_FRAME: usize = 8;
 
-/// Which stream ends follow an Invoke frame's asset descriptors: stdin when piped, then stdout.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StreamDescriptors {
@@ -1074,7 +1053,6 @@ impl StreamDescriptors {
     }
 }
 
-/// What an Upcall frame's child reads as stdin, and so which descriptors follow its stdout.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum UpcallStdin {
@@ -1101,8 +1079,6 @@ impl UpcallStdin {
     }
 }
 
-/// An Upcall frame's descriptors in wire order, owned from receipt: the child's stdout write end,
-/// then its stdin read end unless the child reads none.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct UpcallStreams {
@@ -1166,7 +1142,6 @@ fn stream_socket(descriptor: OwnedFd) -> Result<OwnedFd, ProtocolError> {
     }
 }
 
-/// An invocation's stream ends: stdin when something is piped in, and stdout.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct Streams {
@@ -1183,8 +1158,6 @@ impl Streams {
         }
     }
 
-    /// Splits stream ends off the tail of a received Invoke frame's descriptors, leaving the
-    /// asset descriptors in place.
     pub fn split_from(
         descriptors: &mut Vec<OwnedFd>,
         shape: StreamDescriptors,
@@ -1436,7 +1409,6 @@ pub enum GenerationOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameLimits {
     pub max_frame_bytes: usize,
-    /// Bounds a frame once its first byte is readable; an invocation parked on a child or on stdio is bounded by hangup and cancellation instead.
     pub io_timeout: Duration,
 }
 
@@ -1466,8 +1438,6 @@ impl FrameLimits {
 const FRAME_PREFIX_BYTES: usize = 4;
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Allocation follows bytes that actually arrive rather than the peer's claimed length, so a
-/// stalling peer holds one chunk, not a whole frame's memory.
 pub async fn read_frame<R, T>(reader: &mut R, limits: FrameLimits) -> Result<T, ProtocolError>
 where
     R: AsyncRead + Unpin,
@@ -1504,8 +1474,6 @@ where
     serde_json::from_slice(&bytes).map_err(|source| ProtocolError::Deserialize { source })
 }
 
-/// Growth reserves one chunk at a time and stops exactly at length, avoiding the overshoot a
-/// doubling strategy causes on large frames.
 async fn read_payload<R>(reader: &mut R, length: usize) -> Result<Vec<u8>, ReadFrameError>
 where
     R: AsyncRead + Unpin,
@@ -1766,8 +1734,6 @@ impl BrokerClient {
         })
     }
 
-    /// Keeps retrying a missing or refusing broker socket for up to `window` per request, which
-    /// is safe only because nothing was written: a failure after the request is never retried.
     #[must_use]
     pub const fn with_connect_window(mut self, window: Duration) -> Self {
         self.connect_window = window;
@@ -1819,8 +1785,6 @@ impl BrokerClient {
         Ok(self.session_surface(None).await?.capabilities)
     }
 
-    /// Strict alternation: the broker writes nothing while a child runs, so no read is outstanding
-    /// and a parked invocation is bounded by the caller's cancellation, not the io timer.
     pub async fn run(
         &self,
         attestation: Option<Attestation>,
@@ -2026,7 +1990,6 @@ impl BrokerClient {
         }
     }
 
-    /// The request digest is the observed active generation; the reply names the prepared candidate.
     pub async fn prepare_generation(
         &self,
         expected_active: String,
@@ -2295,8 +2258,6 @@ fn validate_response_descriptors(
     Ok(())
 }
 
-/// The parent directory is inspected regardless of the socket's own mode, so this client trusts
-/// exactly the sockets the broker would bind.
 #[cfg(unix)]
 async fn validate_socket_path(path: &Path, expected_uid: u32) -> Result<(), ClientError> {
     let metadata = tokio::fs::symlink_metadata(path)
@@ -2477,8 +2438,6 @@ impl ResolvedBrokerSocket {
     }
 }
 
-/// The socket directory must be server-owned and never group-writable or reachable by others; no
-/// credential path uses this rule.
 #[cfg(unix)]
 #[must_use]
 pub fn secure_socket_parent(parent: &std::fs::Metadata, expected_uid: u32) -> bool {
@@ -2489,8 +2448,6 @@ pub fn secure_socket_parent(parent: &std::fs::Metadata, expected_uid: u32) -> bo
         && matches!(mode & 0o070, 0 | 0o010 | 0o050)
 }
 
-/// A 0600 socket is owner-only; a 0660 socket is trustworthy only inside a group-traversable parent
-/// whose group it carries.
 #[cfg(unix)]
 #[must_use]
 pub fn secure_socket(
@@ -2508,8 +2465,6 @@ pub fn secure_socket(
                 && socket.gid() == parent.gid()))
 }
 
-/// A private parent keeps the socket owner-only, which is why a broker under one refuses any peer
-/// UID but its own.
 #[cfg(unix)]
 #[must_use]
 pub fn ipc_socket_mode(parent: &std::fs::Metadata) -> u32 {

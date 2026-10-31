@@ -70,8 +70,6 @@ struct Owner {
     len: usize,
 }
 
-/// Equality here means the same lease, not equal file contents, and reads always use the original
-/// descriptor rather than a path lookup.
 #[derive(Clone)]
 pub struct DiskBlob(Arc<Owner>);
 
@@ -135,8 +133,6 @@ impl DiskBlob {
         })
     }
 
-    /// Callers must separately enforce the decoded per-asset byte ceiling; this only checks the
-    /// stored representation length.
     pub fn from_descriptor(descriptor: OwnedFd, len: usize) -> Result<Self, BlobError> {
         if len > MAX_STORED_ATTACHMENT_BYTES {
             return Err(BlobError::TooLarge);
@@ -152,8 +148,6 @@ impl DiskBlob {
         })))
     }
 
-    /// The returned descriptor may be duplicated only because every consumer reads positionally; a
-    /// seek-based reader would race the shared file offset.
     pub fn descriptor(&self) -> Result<OwnedFd, BlobError> {
         let guard = self.0.file.lock();
         let file = guard.as_ref().ok_or(BlobError::Reclaimed)?;
@@ -220,8 +214,6 @@ impl DiskBlob {
     }
 }
 
-/// Implementors must authorize the resolution before pin() or touching retention; nothing in the
-/// trait itself enforces that order.
 pub trait BlobSource: Send + Sync {
     fn pin(&self) -> Result<DiskBlob, BlobError>;
     fn read(&self) -> Result<Vec<u8>, BlobError> {

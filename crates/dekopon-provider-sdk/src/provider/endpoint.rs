@@ -3,10 +3,6 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer};
 
-/// The origin, and an optional path prefix, a provider sends its requests to: the vendor's
-/// default, or the owner's `providerSettings.<id>.baseUrl`. The broker's grant, not this type,
-/// decides which destinations a call may reach.
-///
 /// ```compile_fail,E0080
 /// const BAD: dekopon_provider_sdk::provider::endpoint::Base =
 ///     dekopon_provider_sdk::provider::endpoint::Base::from_static("ftp://example.com");
@@ -14,22 +10,14 @@ use serde::{Deserialize, Deserializer};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Base(Cow<'static, str>);
 
-/// Why a base URL or a joined path was refused; the message never echoes the input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidBase {
-    /// The scheme is not `http://` or `https://`.
     Scheme,
-    /// The host is empty.
     Host,
-    /// The authority carries userinfo (`user@`).
     Userinfo,
-    /// The URL carries a query string.
     Query,
-    /// The URL carries a fragment.
     Fragment,
-    /// The URL contains whitespace.
     Whitespace,
-    /// A joined path does not start with `/`.
     RelativePath,
 }
 
@@ -105,16 +93,10 @@ const fn strip<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 }
 
 impl Base {
-    /// Parses an `http://` or `https://` URL without userinfo, query, fragment or whitespace,
-    /// trimming one trailing `/`.
-    ///
-    /// # Errors
-    /// Returns the first rule `url` breaks.
     pub fn parse(url: &str) -> Result<Self, InvalidBase> {
         checked(url).map(|url| Self(Cow::Owned(url.to_owned())))
     }
 
-    /// A provider's vendor default; an invalid `url` in a `const` is a compile error.
     #[must_use]
     pub const fn from_static(url: &'static str) -> Self {
         match checked(url) {
@@ -123,11 +105,6 @@ impl Base {
         }
     }
 
-    /// The base followed by `path`, which starts with `/`, so a path prefix in the base is kept
-    /// exactly once.
-    ///
-    /// # Errors
-    /// Refuses a `path` that does not start with `/`.
     pub fn join(&self, path: &str) -> Result<String, InvalidBase> {
         if path.starts_with('/') {
             Ok(format!("{}{path}", self.0))
@@ -136,7 +113,6 @@ impl Base {
         }
     }
 
-    /// The base URL, without a trailing `/`.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0

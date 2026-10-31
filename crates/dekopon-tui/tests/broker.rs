@@ -1,6 +1,3 @@
-//! Interoperability with a separately built/released broker process. No model or live provider.
-//! Run with DEKOPON_TEST_BROKERD and DEKOPON_TEST_PROBE_WASM pointing to verified artifacts.
-
 #![cfg(unix)]
 #![allow(
     clippy::unwrap_used,
@@ -225,8 +222,6 @@ capabilities:
     );
 }
 
-/// v0.33.0 core brokerd test fixture: its provider invokes spawn/run("printf child").
-/// Unlike the direct wire tests, this drives the console's own ShellRuntime and BrokerLeg.
 #[tokio::test]
 async fn console_shell_runs_provider_child_through_real_broker() {
     let Some(binary) = std::env::var_os("DEKOPON_TEST_BROKERD") else {

@@ -127,12 +127,8 @@ pub const DEFAULT_MAX_HTTP_REQUEST_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_MAX_HTTP_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_HTTP_HEADERS: usize = 128;
 pub const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
-/// Fuel is set high enough that durable-memory compaction's multi-megabyte rewrite completes
-/// without trapping before the wall-clock deadline does.
 pub const DEFAULT_FUEL: u64 = 8_000_000_000;
 pub const DEFAULT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bounds guest memory across all live stores, since max_memory_bytes only bounds one; set it to
-/// null for the old unbounded behavior.
 pub const DEFAULT_MAX_TOTAL_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,18 +191,13 @@ pub enum CompiledCacheMode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostOptions {
-    /// None compiles without a cache; the operator must not modify these mapped files while the
-    /// registry is alive, since hashes are checked once at startup.
     pub cwasm_dir: Option<PathBuf>,
     pub compiled_cache_mode: CompiledCacheMode,
     pub max_total_memory_bytes: Option<usize>,
     pub plaintext_hosts: PlaintextHosts,
     pub extra_ca_bundles: Arc<Vec<Vec<u8>>>,
-    /// Exact private HTTPS destinations; never populated from provider input.
     pub non_public_https: Arc<Vec<NonPublicHttpsAuthority>>,
-    /// JSON settings keyed by provider ID; readable only by that provider during invoke.
     pub provider_settings: Arc<BTreeMap<ProviderId, String>>,
-    /// Fixed guest clock for test invocations; host deadlines remain monotonic.
     pub test_clock: Option<std::time::SystemTime>,
     pub loopback_https_pin: Option<dekopon_http_host::LoopbackHttpsPin>,
 }
@@ -313,8 +304,6 @@ impl From<LockedProviderSource> for ProviderSource {
     }
 }
 
-/// Capped independently of the fuel ceiling so a store holding huge fuel still yields to the
-/// executor often enough for the wall-clock deadline to fire.
 const MAX_FUEL_YIELD_INTERVAL: u64 = 10_000;
 
 // Bounds one word's cached `--help` page: enough for a top-level usage/subcommand listing, not
@@ -506,8 +495,6 @@ struct StoreState {
     limits: memory::MemoryLimiter,
     http: HttpState,
     storage: storage::StorageState,
-    /// Granted only in an invocation's store, where it also gates entropy; descriptions and command
-    /// runs are pure.
     clock: ClockState,
     settings: SettingsState,
     stdio: stdio::StdioState,
@@ -949,8 +936,6 @@ impl BrokerWasmProvider {
         Ok(provider)
     }
 
-    /// Runs before authorization, so a host-import attempt here is refused rather than trusted; it
-    /// is import-free, timed out, and input/output-capped like describe.
     pub async fn run_command(
         &self,
         argv: &[String],
@@ -1058,9 +1043,6 @@ impl BrokerWasmProvider {
         Ok(output)
     }
 
-    /// Rendered once per provider at load and mapped to every word it declares, since
-    /// `run-command` takes no word and no host import, so the page is a pure function of the
-    /// component bytes; a failed render omits them all rather than failing the load.
     async fn render_command_word_help(&self) -> BTreeMap<String, String> {
         if self.manifest.command_words.is_empty() {
             return BTreeMap::new();
@@ -1785,8 +1767,6 @@ impl BrokerProviderRegistry {
         validate_authorized_constraints(constraints, &runtime.limits)
     }
 
-    /// The credential stays separate from the authorization, which must remain safely renderable as
-    /// evidence; a secret can't share that container, and the guest never observes it.
     pub async fn invoke(
         &self,
         authorized: AuthorizedInvocation,

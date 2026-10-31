@@ -1,6 +1,3 @@
-//! This file is checked as strictly as the broker's own config, since it names agent-reachable
-//! models and credential env vars, so a writable or symlinked copy could redirect the daemon.
-
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
@@ -716,8 +713,6 @@ const fn default_max_capability_calls() -> u32 {
     DEFAULT_MAX_CAPABILITY_CALLS
 }
 
-/// MemoryScope comes only from trusted route configuration; a transport kind, conversation kind,
-/// inbound message, or model response can never select it.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum MemoryScope {
@@ -815,9 +810,6 @@ pub struct RouteConfig {
     pub conversation: ConversationMatchConfig,
     #[serde(default, deserialize_with = "github_events_present")]
     pub github_events: Option<Vec<GithubEvent>>,
-    /// Subjects only routes which agent hears a message; authority stays with Cedar and the
-    /// broker's subject mapping, and it is restricted to direct-message routes since a channel
-    /// version would read as an access list.
     #[serde(default)]
     pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
@@ -835,9 +827,6 @@ pub struct RouteConfig {
         deserialize_with = "refuse_chat_asset_inputs"
     )]
     _retired_chat_asset_inputs: (),
-    /// Turning inspect_agent_config off only removes the structured config dump; the instructions
-    /// stay in the system prompt regardless, so this is never a real secrecy gate against a
-    /// determined user.
     #[serde(default)]
     pub inspect_agent_config: bool,
     #[serde(default)]
@@ -1073,7 +1062,6 @@ pub struct ResolvedBroker {
 }
 
 impl ResolvedBroker {
-    /// A leg's client waits out a restarting broker for one I/O timeout before failing.
     pub fn leg_client(&self) -> Result<BrokerClient, ClientError> {
         Ok(
             BrokerClient::new(&self.socket_path, self.server_uid, self.frame)?
@@ -1170,8 +1158,6 @@ impl ResolvedConfig {
     }
 }
 
-/// `Check` keeps going past a directory's fragment refusals so they are reported beside whatever
-/// the rest of startup finds; every rule is otherwise the one boot applies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoadMode {
     Boot,
@@ -1258,8 +1244,6 @@ const MERGE_RULES: MergeRules = MergeRules {
     concatenated: &["transports", "models", "routes"],
 };
 
-/// Routes match first-to-last within one transport, so a route must sit in the fragment that
-/// defines its transport; otherwise renaming a file could reorder them.
 async fn load_directory(
     directory: PathBuf,
     expected_uid: u32,
@@ -1407,8 +1391,6 @@ fn scan_gateway_directory(
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SourceSnapshot(pub(crate) BTreeMap<PathBuf, Vec<u8>>);
 
-/// In memory only, never logged or published: it covers source bytes and exists to tell one raw
-/// candidate from another.
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub(crate) struct RawCandidate([u8; 32]);
 
@@ -3079,9 +3061,6 @@ fn checked_endpoint(
     }
 }
 
-/// A rejected name may be a pasted secret, so the refusal never echoes it; the
-/// grammar is narrower than the OS's, rejecting a stray space that would otherwise fail cryptically
-/// at connect time.
 fn validate_env_name(name: &str) -> Result<(), ConfigProblem> {
     let mut bytes = name.bytes();
     let valid = match bytes.next() {
@@ -3097,9 +3076,6 @@ fn validate_env_name(name: &str) -> Result<(), ConfigProblem> {
     }
 }
 
-/// The loopback-only override lets tests point a transport at a mock without letting the same
-/// override send a bot token to an arbitrary host, and the host is checked after stripping
-/// userinfo.
 fn validate_endpoint(endpoint: Option<String>, production: &str) -> Result<String, ConfigProblem> {
     let Some(endpoint) = endpoint else {
         return Ok(production.to_owned());

@@ -1,6 +1,3 @@
-//! A session holds no authority of its own; it opens an attested broker leg naming the sender, and
-//! an empty grant ends it before any model token is spent, whatever the message text says.
-
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -150,8 +147,6 @@ fn blocking_model(
 pub(crate) struct ConfiguredModels {
     bound_clients: Mutex<BoundClients>,
     active_auth_files: Mutex<BTreeSet<std::path::PathBuf>>,
-    /// One credential instance per auth file path, shared across every model naming it, so a second
-    /// instance cannot spend a refresh token the first already rotated and retired.
     chatgpt_credentials:
         Mutex<HashMap<std::path::PathBuf, Arc<dekopon_model::chatgpt::CredentialFile>>>,
 }
@@ -1074,9 +1069,6 @@ impl SessionCancellation {
         }
     }
 
-    /// The cancel origin is written under the same lock that decides the race, so a caller that
-    /// observes the cancelled state and then reads the origin sees the winner's write, never the
-    /// prior absence.
     pub(crate) fn cancel(&self, source: CancelSource) -> bool {
         let cancelled = {
             let mut recorded = self.source.lock();
@@ -1570,9 +1562,6 @@ fn counted(count: u64, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// Only this first line is attribution the gateway vouches for, naming the broker principal the
-/// attested sender maps to; the rest is untrusted user text that can contain lookalike labels or
-/// prompt injection, even under the local-dev transport.
 fn attribution_header(principal: Option<&PrincipalId>) -> String {
     match principal {
         Some(principal) => format!("[gateway: authenticated participant: {principal}]\n"),
@@ -3772,9 +3761,6 @@ fn revoke_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
     }
 }
 
-/// Deliberately takes no model config, broker config, message, subject, or principal: a constructor
-/// that cannot receive credentials or identity is stronger than one expected to remember to redact
-/// them.
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is one catalog or route fact the view names; bundling them would hide which fact a caller forgot"
@@ -3840,9 +3826,6 @@ pub(crate) async fn connect(
         .map_err(SessionError::from)
 }
 
-/// No normalization step here: the transport already minted the conversation in the canonical form
-/// the grant, claim check, and policy engine all compare against, so re-normalizing would create a
-/// second definition of the same fact.
 fn chat_claim(route: &BoundRoute, message: &InboundMessage) -> Result<Attestation, SessionError> {
     chat_claim_for(route, message, message.subject.clone())
 }

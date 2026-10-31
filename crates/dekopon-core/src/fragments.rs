@@ -8,10 +8,6 @@ use std::{
 use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 
-/// How a configuration directory's fragments combine. Keys in `merged_by_name` are maps whose
-/// entries union by name, keys in `concatenated` are lists that append, and every other key is set
-/// by exactly one fragment, so no fragment overrides another and file order never changes the
-/// result.
 pub struct MergeRules {
     pub merged_by_name: &'static [&'static str],
     pub concatenated: &'static [&'static str],
@@ -98,7 +94,6 @@ pub fn merge(
     refusal.map_or(Ok(merged), Err)
 }
 
-/// Like [`merge`], but hands back the merged mapping beside the refusal.
 pub fn merge_reporting(
     fragments: Vec<(PathBuf, Mapping)>,
     rules: &MergeRules,

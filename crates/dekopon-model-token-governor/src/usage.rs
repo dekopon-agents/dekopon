@@ -1,6 +1,3 @@
-/// Every field is None when the provider reported nothing rather than zero, since defaulting to
-/// zero would misreport an unknown cost as a free one. A client normalizes before usage leaves it:
-/// `input_tokens` includes cache reads and cache writes, and `output_tokens` includes reasoning.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ModelUsage {
     pub input_tokens: Option<u64>,

@@ -1,7 +1,3 @@
-//! Addressing is decided by the authenticated `mentions` and `mention_roles` arrays, never by
-//! message text, so the privileged Message Content intent is requested only when `messageContent`
-//! opts in and a mention of the bot's managed role can then carry its text.
-
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, OnceLock},
@@ -702,8 +698,6 @@ impl DiscordTransport {
         }))
     }
 
-    /// This never takes the driver's rest_lock, because that lock serializes replies and a 429 here
-    /// must not stall the reader that also sends heartbeats.
     async fn lookup(&self, path: &str, event: &'static str) -> Option<Value> {
         if self.driver.rest_cooldown().is_some() {
             tracing::debug!(
@@ -1087,8 +1081,6 @@ pub(crate) struct DiscordDriver {
     token: Redacted<String>,
     http: reqwest::Client,
     production: bool,
-    /// This lock is held across one request only, because sleeping under it for a whole reply
-    /// blocked every other session's answer and any in-flight attachment fetch.
     rest_lock: Mutex<()>,
     rest_cooldown_until: parking_lot::Mutex<Option<Instant>>,
     liveness_cooldown_until: parking_lot::Mutex<Option<Instant>>,
@@ -2011,8 +2003,6 @@ fn is_conversation_key(value: &str) -> bool {
     )
 }
 
-/// A Discord thread is itself a channel for REST purposes; always address the thread, never its
-/// parent, or calls fail.
 fn key_channel(conversation_id: &str) -> &str {
     conversation_id
         .split_once(':')
@@ -2076,8 +2066,6 @@ fn encode(body: &Value) -> Result<Vec<u8>, TransportError> {
     serde_json::to_vec(body).map_err(|_| TransportError::Response)
 }
 
-/// This deliberately avoids form_urlencoded, which encodes a space as a plus sign, a literal plus
-/// rather than a space in a URL path segment.
 fn percent_encoded(value: &str) -> String {
     value
         .bytes()

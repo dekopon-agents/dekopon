@@ -21,8 +21,6 @@ pub struct FileResource {
 
 #[derive(Debug)]
 pub(crate) struct ActiveStorage {
-    /// Every storage effect holds this lock; finish acquiring it drains a cancelled job, which
-    /// either still holds the lock and makes finish wait, or never started.
     transaction: Arc<Mutex<Option<StorageHandle>>>,
     finalization_budget: Duration,
 }

@@ -523,7 +523,6 @@ enum RouterMessage<'a> {
     },
 }
 
-/// Bounded native subtrees are intentionally excluded from the turn's Debug/audit projections.
 #[derive(Clone, PartialEq)]
 pub(crate) struct Replay {
     calls: Vec<Value>,
@@ -555,7 +554,6 @@ struct RouterChunk {
     usage: Option<RouterUsage>,
 }
 
-/// Cost is telemetry only, so a value of any shape is kept as JSON and recorded only when numeric.
 #[derive(Deserialize)]
 struct RouterUsage {
     #[serde(flatten)]

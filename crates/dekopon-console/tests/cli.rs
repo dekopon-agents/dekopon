@@ -1,9 +1,3 @@
-//! Command-line tests over the real binary.
-//!
-//! Every one of these runs without a broker, because the flags they pin are resolved before the
-//! console connects to anything. They were untested for the whole time this lived inside `dekopon`,
-//! which is how `--api-key-env` could have stopped requiring `--endpoint` without anyone noticing.
-
 #![allow(
     clippy::unwrap_used,
     clippy::disallowed_methods,
@@ -15,7 +9,6 @@ use std::{path::Path, process::Command};
 
 use tempfile::TempDir;
 
-/// A catalog with one agent, so catalog loading is never the reason a test fails.
 const CATALOG: &str = r"apiVersion: dekopon.dev/v1alpha1
 kind: Agent
 metadata:
@@ -424,8 +417,6 @@ fn no_terminal_refuses_direct_selection_without_contacting_broker_or_model() {
     assert!(stderr(&output).contains("TTY"), "{}", stderr(&output));
 }
 
-/// The chart's catalog: a ConfigMap mount, so every file is a symlink into `..data/`, one agent per
-/// `*.yaml` with its instructions in a `.md` beside it.
 #[test]
 fn an_agents_directory_in_dekopon_config_loads_every_agent_and_its_instructions_file() {
     let dir = tempfile::tempdir().unwrap();

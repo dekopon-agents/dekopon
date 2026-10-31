@@ -1,6 +1,3 @@
-//! A subject is routing metadata, not authority; trust comes only from the transport that
-//! authenticated it and the broker's owner-controlled mapping to a principal.
-
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
@@ -238,8 +235,6 @@ impl ExternalSubject {
         }
     }
 
-    /// Matching is segment-boundary exact: a scope covers its own subtree but never a sibling with
-    /// a longer shared prefix, unlike a naive string check.
     #[must_use]
     pub fn in_namespace(&self, scope: &str) -> bool {
         let mut wanted = scope.split('.');

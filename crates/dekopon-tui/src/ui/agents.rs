@@ -1,5 +1,3 @@
-//! The catalog's agents.
-
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
@@ -10,7 +8,6 @@ use ratatui::{
 use super::Theme;
 use crate::{app::App, redact::sanitize_line};
 
-/// Draws the agent list.
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = app.agents.iter().enumerate().map(|(index, agent)| {
         let selected = index == app.selected_agent;

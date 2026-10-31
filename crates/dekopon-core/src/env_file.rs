@@ -174,8 +174,6 @@ impl EnvFile {
     }
 }
 
-/// Only sound once Clap has accepted `arguments` in serve mode: no positional argument and no
-/// option that takes a hyphen value can hold the option's text.
 #[must_use]
 pub fn strip_option(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     let mut arguments = arguments.into_iter();
@@ -197,7 +195,6 @@ pub fn strip_option(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsStri
     kept
 }
 
-/// Must run before any thread exists; it returns only when the file is refused or exec fails.
 #[must_use]
 pub fn reexec(path: &Path, euid: u32) -> EnvFileError {
     let file = match EnvFile::load(path, euid) {

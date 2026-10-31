@@ -334,8 +334,6 @@ where
     }
 }
 
-/// This renders every field including Debug ones, since a redaction test checking only expected
-/// fields would miss a new one leaking a secret.
 struct Visitor<'a>(&'a mut Fields);
 
 impl Visit for Visitor<'_> {
