@@ -1306,6 +1306,19 @@ impl Attempt {
                     if let crate::transport::TransportError::AssetTooLarge { size } = error {
                         return AssetFailure::TooLarge { size };
                     }
+                    if let crate::transport::TransportError::AssetRefused {
+                        cause: MediaRefusal::Gone,
+                    } = error
+                    {
+                        return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
+                    }
+                    if let Retry::Refetch = self.ticket.retry
+                        && let crate::transport::TransportError::AssetRefused {
+                            cause: MediaRefusal::Download { status: 401 | 403 },
+                        } = error
+                    {
+                        return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
+                    }
                     if let crate::transport::TransportError::AssetRefused { cause } = error {
                         return AssetFailure::Media(cause);
                     }
