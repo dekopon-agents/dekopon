@@ -86,7 +86,8 @@ pub(super) fn refusal<I: DeserializeOwned>(input: &str) -> InvalidInput {
             Kind::MissingField
         }
         DeserializerError::UnknownField(name, _) => {
-            if !matches!(error.path().iter().last(), Some(Segment::Map { key }) if key == name) {
+            if !matches!(error.path().iter().next_back(), Some(Segment::Map { key }) if key == name)
+            {
                 field(&mut path, name);
             }
             Kind::UnknownField
@@ -130,12 +131,30 @@ mod tests {
             }
         }
 
-        for failure in [
-            refusal::<Choice>(r#""SENTINEL-INPUT-VALUE""#),
-            refusal::<Custom>(r#""SENTINEL-INPUT-VALUE""#),
+        for (failure, kind, message) in [
+            (
+                refusal::<Choice>(r#""SENTINEL-INPUT-VALUE""#),
+                Kind::InvalidValue,
+                "invalid input: input: invalid value",
+            ),
+            (
+                refusal::<Choice>(r#"{"SENTINEL-INPUT-VALUE":null}"#),
+                Kind::InvalidValue,
+                "invalid input: input: invalid value",
+            ),
+            (
+                refusal::<Choice>(r#"{"Known":"SENTINEL-INPUT-VALUE"}"#),
+                Kind::WrongType,
+                "invalid input: input: wrong type",
+            ),
+            (
+                refusal::<Custom>(r#""SENTINEL-INPUT-VALUE""#),
+                Kind::InvalidValue,
+                "invalid input: input: invalid value",
+            ),
         ] {
-            assert_eq!(failure.kind, Kind::InvalidValue);
-            assert_eq!(failure.to_string(), "invalid input: input: invalid value");
+            assert_eq!(failure.kind, kind);
+            assert_eq!(failure.to_string(), message);
         }
     }
 }
