@@ -1869,7 +1869,7 @@ struct SlackProjection {
 }
 
 fn project_message(message: &Value) -> SlackProjection {
-    let mut text = message["text"].as_str().unwrap_or_default().to_owned();
+    let mut text = decode_slack_text(message["text"].as_str().unwrap_or_default());
     let top_files = message["files"].as_array();
     let mut assets = pending_assets(&message["files"]);
     let mut file_count = top_files.map_or(0, Vec::len);
@@ -1890,10 +1890,11 @@ fn project_message(message: &Value) -> SlackProjection {
         let time = label(forward["ts"].as_str().filter(|ts| canonical_timestamp(ts)));
         let quoted = forward["text"]
             .as_str()
-            .filter(|text| !text.trim().is_empty());
-        let block_text = quoted.is_none().then(|| forward_blocks(&forward["blocks"]));
-        let quoted =
-            quoted.or_else(|| block_text.as_deref().filter(|text| !text.trim().is_empty()));
+            .filter(|text| !text.trim().is_empty())
+            .map(decode_slack_text)
+            .or_else(|| {
+                Some(forward_blocks(&forward["blocks"])).filter(|text| !text.trim().is_empty())
+            });
         let nested_files = forward["files"].as_array();
         file_count += nested_files.map_or(0, Vec::len);
         let remaining = MAX_ATTACHMENTS.saturating_sub(assets.len());
@@ -1905,7 +1906,7 @@ fn project_message(message: &Value) -> SlackProjection {
         match quoted {
             Some(quoted) => {
                 text.push('\n');
-                text.push_str(quoted);
+                text.push_str(&quoted);
             }
             None if nested_files.is_none_or(Vec::is_empty) => {
                 text.push_str("\n[forwarded content unavailable]");
@@ -1957,6 +1958,55 @@ fn forward_blocks(blocks: &Value) -> String {
         }
     }
     text
+}
+
+// Slack escapes only these three in message and attachment text; rich_text block elements arrive
+// unescaped, so forward_blocks output is not decoded.
+const SLACK_ENTITIES: [(&str, char); 3] = [("&amp;", '&'), ("&lt;", '<'), ("&gt;", '>')];
+
+// Markup is located on the raw text so a decoded `<` or `>` can never open or close it.
+fn decode_slack_text(raw: &str) -> String {
+    let mut text = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(open) = rest.find('<') {
+        let Some(close) = rest[open..].find('>').map(|close| open + close) else {
+            break;
+        };
+        push_decoded(&mut text, &rest[..open]);
+        let inner = &rest[open + 1..close];
+        text.push('<');
+        let (target, label) = inner
+            .split_once('|')
+            .map_or((inner, None), |(target, label)| (target, Some(label)));
+        if target.starts_with(['@', '#', '!']) {
+            text.push_str(target);
+        } else {
+            push_decoded(&mut text, target);
+        }
+        if let Some(label) = label {
+            text.push('|');
+            push_decoded(&mut text, label);
+        }
+        text.push('>');
+        rest = &rest[close + 1..];
+    }
+    push_decoded(&mut text, rest);
+    text
+}
+
+fn push_decoded(text: &mut String, literal: &str) {
+    let mut rest = literal;
+    while let Some(at) = rest.find('&') {
+        text.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let (decoded, consumed) = SLACK_ENTITIES
+            .iter()
+            .find(|(entity, _)| tail.starts_with(entity))
+            .map_or(('&', 1), |(entity, decoded)| (*decoded, entity.len()));
+        text.push(decoded);
+        rest = &tail[consumed..];
+    }
+    text.push_str(rest);
 }
 
 fn has_request_content(message: &Value) -> bool {
@@ -2234,7 +2284,8 @@ mod driver_tests {
     use super::{
         CANCEL_ACTION_ID, Conversation, ConversationKind, HISTORY_PAGE_LIMIT,
         MAX_INBOUND_TEXT_BYTES, MAX_TRACKED_REACTIONS, OnceLock, PROGRESS_MAX_CHARS,
-        SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked, past_message,
+        SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked, decode_slack_text,
+        past_message,
     };
     use crate::{
         config::{SlackExperience, TemplateOverrides},
@@ -3547,6 +3598,92 @@ mod driver_tests {
         );
         assert!(past_message(&empty, TEAM, BOT_USER).is_none());
         assert!(transport.thread_ownership.owned.lock().order.is_empty());
+    }
+
+    fn direct_message(text: &str) -> Value {
+        json!({
+            "type": "message", "channel": DIRECT_CHANNEL, "channel_type": "im",
+            "user": USER, "ts": INBOUND_TS, "text": text,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_escaped_shell_redirect_reaches_the_turn_as_typed() {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        let inbound = transport
+            .routable(
+                TEAM,
+                &direct_message("printf old &gt; f &amp;&amp; cat f"),
+                &Span::none(),
+            )
+            .await
+            .expect("readable")
+            .expect("a direct message is routable");
+        assert_eq!(inbound.text, "printf old > f && cat f");
+    }
+
+    #[tokio::test]
+    async fn an_escaped_mention_stays_literal_and_attributes_nothing() {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        transport.identity.user_id = Some(BOT_USER.to_owned());
+        let escaped = format!("&lt;@{BOT_USER}&gt; answer me");
+        let mut channel = forwarded_event(&escaped, forward(json!("quoted"), json!([])));
+        channel["attachments"] = json!([]);
+        assert!(
+            transport
+                .routable(TEAM, &channel, &Span::none())
+                .await
+                .expect("readable")
+                .is_none()
+        );
+        assert!(transport.thread_ownership.owned.lock().order.is_empty());
+        let inbound = transport
+            .routable(TEAM, &direct_message(&escaped), &Span::none())
+            .await
+            .expect("readable")
+            .expect("a direct message is routable");
+        assert_eq!(inbound.text, format!("<@{BOT_USER}> answer me"));
+        assert!(inbound.addressed.is_none());
+        assert!(inbound.thread_continuation.is_none());
+    }
+
+    #[test]
+    fn an_escaped_entity_is_decoded_once() {
+        assert_eq!(
+            decode_slack_text("&amp;lt; &amp;gt; &amp;amp;"),
+            "&lt; &gt; &amp;"
+        );
+        assert_eq!(decode_slack_text("&quot; &#62; &amp"), "&quot; &#62; &amp");
+    }
+
+    #[tokio::test]
+    async fn a_real_mention_still_addresses_and_a_link_label_is_decoded() {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        transport.identity.user_id = Some(BOT_USER.to_owned());
+        let text = format!(
+            "<@{BOT_USER}> see <https://x?a=1&amp;b=2|a &amp; b> in <#C0123ABC|ops &gt; dev>"
+        );
+        let mut event = forwarded_event(&text, forward(json!("quoted"), json!([])));
+        event["attachments"] = json!([]);
+        let inbound = transport
+            .routable(TEAM, &event, &Span::none())
+            .await
+            .expect("readable")
+            .expect("a mention is routable");
+        assert_eq!(inbound.addressed, Some(true));
+        assert_eq!(
+            inbound.text,
+            format!("<@{BOT_USER}> see <https://x?a=1&b=2|a & b> in <#C0123ABC|ops > dev>")
+        );
+    }
+
+    #[test]
+    fn past_message_text_is_decoded_like_inbound_text() {
+        let mut quoted = said(USER, INBOUND_TS, "a &gt; b &amp;&amp; &lt;@U1&gt;");
+        quoted["attachments"] = json!([forward(json!("c &lt; d"), json!([]))]);
+        let past = past_message(&quoted, TEAM, BOT_USER).expect("a request message");
+        assert!(past.text.starts_with("a > b && <@U1>\n"), "{}", past.text);
+        assert!(past.text.contains("\nc < d\n"), "{}", past.text);
     }
 
     #[tokio::test]
