@@ -599,6 +599,21 @@ impl ModelConfig {
         }
     }
 
+    fn default_prompt_cache(&mut self) {
+        if let Self::Openrouter {
+            model,
+            cache: cache @ None,
+            ..
+        } = self
+            && model.starts_with("anthropic/")
+        {
+            *cache = Some(dekopon_model::openrouter::settings::Cache {
+                style: dekopon_model::openrouter::settings::CacheStyle::ExplicitPrefix,
+                ttl: None,
+            });
+        }
+    }
+
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
@@ -2086,6 +2101,7 @@ fn resolve_with_service(
     let (bundles, ca_sources) = model_ca_bundles(&config.extra_ca_bundles, mode, &mut problems);
     for model in &mut config.models {
         model.set_ca_bundles(&bundles);
+        model.default_prompt_cache();
     }
 
     if config.transports.is_empty() {
@@ -4580,6 +4596,63 @@ routes:
                 );
             }
         }
+    }
+
+    fn resolved_cache(
+        model: &str,
+        blocks: &str,
+    ) -> Option<dekopon_model::openrouter::settings::Cache> {
+        let document = router_document("openrouter", blocks)
+            .replace("model: any/model", &format!("model: {model}"));
+        let resolved = resolve(
+            super::decode(document.as_bytes()).unwrap(),
+            PathBuf::from("/tmp/gateway.yaml"),
+            &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
+            501,
+            LoadMode::Boot,
+        )
+        .unwrap();
+        match resolved.models.into_iter().next() {
+            Some(ModelConfig::Openrouter { cache, .. }) => cache,
+            Some(
+                ModelConfig::OpenaiCompatible { .. }
+                | ModelConfig::ChatgptSubscription { .. }
+                | ModelConfig::Anthropic { .. },
+            )
+            | None => panic!("the fixture resolves one openrouter model"),
+        }
+    }
+
+    #[test]
+    fn an_anthropic_openrouter_model_without_a_cache_block_resolves_to_an_explicit_prefix() {
+        use dekopon_model::openrouter::settings::{Cache, CacheStyle};
+        assert_eq!(
+            resolved_cache("anthropic/claude-sonnet-4.5", ""),
+            Some(Cache {
+                style: CacheStyle::ExplicitPrefix,
+                ttl: None
+            })
+        );
+    }
+
+    #[test]
+    fn an_authored_automatic_cache_stays_automatic_on_an_anthropic_model() {
+        use dekopon_model::openrouter::settings::{Cache, CacheStyle};
+        assert_eq!(
+            resolved_cache(
+                "anthropic/claude-sonnet-4.5",
+                "    cache: {style: automatic}\n"
+            ),
+            Some(Cache {
+                style: CacheStyle::Automatic,
+                ttl: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_anthropic_openrouter_model_without_a_cache_block_stays_automatic() {
+        assert_eq!(resolved_cache("openai/gpt-5", ""), None);
     }
 
     #[test]

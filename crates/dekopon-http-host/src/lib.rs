@@ -108,7 +108,55 @@ pub enum PolicyViolation {
     RedirectRefused,
     HostCallLimit,
     InvalidHttpRequest,
-    ByteLimit,
+    ByteLimit(Option<ByteLimitExceeded>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ByteLimitKey {
+    MaxRequestBytes,
+    MaxResponseBytes,
+}
+
+impl ByteLimitKey {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxRequestBytes => "maxRequestBytes",
+            Self::MaxResponseBytes => "maxResponseBytes",
+        }
+    }
+
+    const fn code(self) -> ErrorCode {
+        match self {
+            Self::MaxRequestBytes => ErrorCode::RequestTooLarge,
+            Self::MaxResponseBytes => ErrorCode::ResponseTooLarge,
+        }
+    }
+
+    const fn direction(self) -> &'static str {
+        match self {
+            Self::MaxRequestBytes => "request",
+            Self::MaxResponseBytes => "response",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ByteLimitExceeded {
+    pub key: ByteLimitKey,
+    pub limit: u64,
+    pub observed: u64,
+}
+
+impl fmt::Display for ByteLimitExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "the grant allows {} bytes and the {} is at least {} bytes",
+            self.limit,
+            self.key.direction(),
+            self.observed
+        )
+    }
 }
 
 impl PolicyViolation {
@@ -118,18 +166,20 @@ impl PolicyViolation {
             Self::RedirectRefused => "redirect-refused",
             Self::HostCallLimit => "host-call-limit",
             Self::InvalidHttpRequest => "invalid-http-request",
-            Self::ByteLimit => "byte-limit",
+            Self::ByteLimit(_) => "byte-limit",
         }
     }
 
-    fn from_code(code: ErrorCode) -> Option<Self> {
-        match code {
+    fn from_error(error: &HttpError) -> Option<Self> {
+        match error.code {
             ErrorCode::Denied => Some(Self::Denied),
             ErrorCode::HostCallLimit => Some(Self::HostCallLimit),
             ErrorCode::InvalidMethod | ErrorCode::InvalidUri | ErrorCode::InvalidHeader => {
                 Some(Self::InvalidHttpRequest)
             }
-            ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => Some(Self::ByteLimit),
+            ErrorCode::RequestTooLarge | ErrorCode::ResponseTooLarge => {
+                Some(Self::ByteLimit(error.byte_limit))
+            }
             ErrorCode::Dns
             | ErrorCode::Connect
             | ErrorCode::Tls
@@ -144,6 +194,7 @@ impl PolicyViolation {
 pub struct HttpError {
     pub code: ErrorCode,
     pub message: String,
+    pub byte_limit: Option<ByteLimitExceeded>,
 }
 
 impl fmt::Display for HttpError {
@@ -880,6 +931,8 @@ impl BufferedHttpClient {
             "dekopon.http.response.accounted_bytes" = tracing::field::Empty,
             "error.code" = tracing::field::Empty,
             "error.message" = tracing::field::Empty,
+            "dekopon.http.byte_limit.key" = tracing::field::Empty,
+            "dekopon.http.byte_limit.bytes" = tracing::field::Empty,
             "url.full" = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
@@ -903,6 +956,7 @@ impl BufferedHttpClient {
     ) {
         let outcome = outcome_label(result);
         let failure = result.as_ref().err();
+        let byte_limit = failure.and_then(|error| error.byte_limit);
         span.in_scope(|| {
             let evidence = self.evidence.get(evidence_index);
             if let Some(evidence) = evidence {
@@ -926,6 +980,10 @@ impl BufferedHttpClient {
                 span.record("error.code", tracing::field::debug(error.code));
                 span.record("error.message", error.message.as_str());
             }
+            if let Some(exceeded) = byte_limit {
+                span.record("dekopon.http.byte_limit.key", exceeded.key.as_str());
+                span.record("dekopon.http.byte_limit.bytes", exceeded.limit);
+            }
             span.record("outcome", outcome);
 
             tracing::info!(
@@ -941,6 +999,8 @@ impl BufferedHttpClient {
                         evidence.map(|evidence| evidence.response_bytes),
                     "error.code" = failure.map(|error| tracing::field::debug(error.code)),
                     "error.message" = failure.map(|error| error.message.as_str()),
+                    "dekopon.http.byte_limit.key" = byte_limit.map(|exceeded| exceeded.key.as_str()),
+                    "dekopon.http.byte_limit.bytes" = byte_limit.map(|exceeded| exceeded.limit),
                     outcome = outcome,
                 },
                 "accounting.http.request"
@@ -948,8 +1008,7 @@ impl BufferedHttpClient {
         });
 
         if let Some(error) = failure {
-            self.policy_violation =
-                PolicyViolation::from_code(error.code).or(self.policy_violation);
+            self.policy_violation = PolicyViolation::from_error(error).or(self.policy_violation);
         }
     }
 
@@ -1158,8 +1217,10 @@ impl BufferedHttpClient {
             encoded_request_bytes(method.as_str(), &request.uri, 0, bounded_body_bytes)
                 .ok_or_else(|| http_error(ErrorCode::RequestTooLarge, "request size overflowed"))?;
         if minimum_request_bytes > grant.max_request_bytes {
-            return Err(http_error(
-                ErrorCode::RequestTooLarge,
+            return Err(byte_limit_error(
+                ByteLimitKey::MaxRequestBytes,
+                grant.max_request_bytes,
+                minimum_request_bytes,
                 "request exceeds the authorized byte limit",
             ));
         }
@@ -1290,8 +1351,10 @@ impl BufferedHttpClient {
         )
         .ok_or_else(|| http_error(ErrorCode::RequestTooLarge, "request size overflowed"))?;
         if request_bytes > grant.max_request_bytes {
-            return Err(http_error(
-                ErrorCode::RequestTooLarge,
+            return Err(byte_limit_error(
+                ByteLimitKey::MaxRequestBytes,
+                grant.max_request_bytes,
+                request_bytes,
                 "request exceeds the authorized byte limit",
             ));
         }
@@ -1478,9 +1541,15 @@ impl BufferedHttpClient {
             ResponseMetadata::SignedDownload => None,
         };
         let output_head = returned_head_bytes(&headers);
-        if output_head > grant.max_response_bytes
-            || (redactor.is_some() && output_head > self.ceilings.max_header_bytes as u64)
-        {
+        if output_head > grant.max_response_bytes {
+            return Err(byte_limit_error(
+                ByteLimitKey::MaxResponseBytes,
+                grant.max_response_bytes,
+                output_head,
+                "redacted headers exceed the authorized byte limit",
+            ));
+        }
+        if redactor.is_some() && output_head > self.ceilings.max_header_bytes as u64 {
             return Err(http_error(
                 ErrorCode::ResponseTooLarge,
                 "redacted headers exceed the authorized byte limit",
@@ -1496,8 +1565,10 @@ impl BufferedHttpClient {
                 })?;
             self.evidence[evidence_index].response_bytes += chunk.len() as u64;
             if response_bytes > grant.max_response_bytes {
-                return Err(http_error(
-                    ErrorCode::ResponseTooLarge,
+                return Err(byte_limit_error(
+                    ByteLimitKey::MaxResponseBytes,
+                    grant.max_response_bytes,
+                    response_bytes,
                     "response exceeds the authorized byte limit",
                 ));
             }
@@ -1927,6 +1998,24 @@ pub(crate) fn http_error(code: ErrorCode, message: impl AsRef<str>) -> HttpError
     HttpError {
         code,
         message: bounded_message(message.as_ref()),
+        byte_limit: None,
+    }
+}
+
+pub(crate) fn byte_limit_error(
+    key: ByteLimitKey,
+    limit: u64,
+    observed: u64,
+    message: &str,
+) -> HttpError {
+    HttpError {
+        code: key.code(),
+        message: bounded_message(message),
+        byte_limit: Some(ByteLimitExceeded {
+            key,
+            limit,
+            observed,
+        }),
     }
 }
 
@@ -1963,34 +2052,36 @@ fn response_head_bytes(
         ));
     }
     let mut bytes = 16_u64;
-    if bytes > ceilings.max_header_bytes as u64 || bytes > maximum {
-        return Err(http_error(
-            ErrorCode::ResponseTooLarge,
-            "response headers exceed an authorized bound",
-        ));
-    }
+    head_within(bytes, ceilings, maximum)?;
     for (name, value) in headers {
         bytes = bytes
             .checked_add((name.as_str().len() + value.as_bytes().len() + 4) as u64)
             .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
-        if bytes > ceilings.max_header_bytes as u64 || bytes > maximum {
-            return Err(http_error(
-                ErrorCode::ResponseTooLarge,
-                "response headers exceed an authorized bound",
-            ));
-        }
+        head_within(bytes, ceilings, maximum)?;
     }
     Ok(bytes)
 }
 
-fn violation_label(code: ErrorCode) -> Option<&'static str> {
-    PolicyViolation::from_code(code).map(PolicyViolation::label)
+fn head_within(bytes: u64, ceilings: &HttpHostCeilings, maximum: u64) -> Result<(), HttpError> {
+    const MESSAGE: &str = "response headers exceed an authorized bound";
+    if bytes > maximum {
+        return Err(byte_limit_error(
+            ByteLimitKey::MaxResponseBytes,
+            maximum,
+            bytes,
+            MESSAGE,
+        ));
+    }
+    if bytes > ceilings.max_header_bytes as u64 {
+        return Err(http_error(ErrorCode::ResponseTooLarge, MESSAGE));
+    }
+    Ok(())
 }
 
 fn outcome_label<T>(result: &Result<T, HttpError>) -> &'static str {
     match result {
         Ok(_) => "succeeded",
-        Err(error) => violation_label(error.code).unwrap_or("failed"),
+        Err(error) => PolicyViolation::from_error(error).map_or("failed", PolicyViolation::label),
     }
 }
 
@@ -3676,6 +3767,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_oversized_request_names_max_request_bytes_and_its_least_size() {
+        let mut limited = grant("127.0.0.1:9".to_owned(), "POST");
+        limited.max_request_bytes = 64;
+        let mut client = BufferedHttpClient::authorized(
+            limited,
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(Request {
+                method: "POST".to_owned(),
+                uri: "http://127.0.0.1:9/upload".to_owned(),
+                headers: Vec::new(),
+                body: vec![b'x'; 128],
+            })
+            .await
+            .expect_err("the request bound refuses before sending");
+        assert!(matches!(
+            error.byte_limit,
+            Some(super::ByteLimitExceeded {
+                key: super::ByteLimitKey::MaxRequestBytes,
+                limit: 64,
+                observed,
+            }) if observed > 128
+        ));
+        assert_eq!(
+            client.policy_violation(),
+            Some(PolicyViolation::ByteLimit(error.byte_limit))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn response_headers_over_max_response_bytes_name_the_key() {
+        let wire = format!(
+            "HTTP/1.1 200 OK\r\nx-pad: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "p".repeat(256)
+        );
+        let server = LoopbackServer::once(wire.as_bytes());
+        let authority = server.authority().to_owned();
+        let mut limited = grant(authority.clone(), "GET");
+        limited.max_response_bytes = 128;
+        let mut client = BufferedHttpClient::authorized(
+            limited,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: format!("http://{authority}/headers"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("the head alone exceeds the response bound");
+        assert_eq!(error.code, ErrorCode::ResponseTooLarge);
+        assert!(matches!(
+            error.byte_limit,
+            Some(super::ByteLimitExceeded {
+                key: super::ByteLimitKey::MaxResponseBytes,
+                limit: 128,
+                observed,
+            }) if observed > 128
+        ));
+        server.join();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn streams_into_response_bound_and_never_follows_redirects() {
         let body = "x".repeat(512);
@@ -3704,7 +3865,14 @@ mod tests {
             .await
             .expect_err("response bound must stop buffering");
         assert_eq!(error.code, ErrorCode::ResponseTooLarge);
-        assert_eq!(client.policy_violation(), Some(PolicyViolation::ByteLimit));
+        assert!(matches!(
+            client.policy_violation(),
+            Some(PolicyViolation::ByteLimit(Some(super::ByteLimitExceeded {
+                key: super::ByteLimitKey::MaxResponseBytes,
+                limit: 128,
+                observed,
+            }))) if observed > 128
+        ));
         server.join();
 
         let server = LoopbackServer::once(

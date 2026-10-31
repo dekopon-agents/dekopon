@@ -53,8 +53,9 @@ use std::{
 };
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Effect, Entities, Entity, EntityId, EntityTypeName, EntityUid,
-    PolicyId, PolicySet, RestrictedExpression, Schema, ValidationMode, Validator,
+    ActionConstraint, Authorizer, Context, Decision, Effect, Entities, Entity, EntityId,
+    EntityTypeName, EntityUid, PolicyId, PolicySet, RestrictedExpression, Schema, ValidationMode,
+    Validator,
 };
 use dekopon_capability::EffectKind;
 use dekopon_core::{
@@ -511,8 +512,14 @@ pub struct PolicyEngine {
     entity_types: EntityTypes,
     authorizer: Authorizer,
     referenced_capabilities: BTreeSet<CapabilityId>,
+    permit_reach: PermitReach,
     policy_count: usize,
     digest: String,
+}
+
+enum PermitReach {
+    AnyAction,
+    Named(BTreeSet<CapabilityId>),
 }
 
 #[derive(Debug)]
@@ -605,6 +612,7 @@ impl PolicyEngine {
         // Classification must run before schema generation; a tolerated name needs to already be in
         // the schema before Cedar's strict validator runs.
         let (referenced_capabilities, unresolved) = classify_policies(&policies, world, handling)?;
+        let permit_reach = permit_reach(&policies, world);
         let effective = world.with_phantoms(&unresolved);
 
         let schema = Schema::from_json_value(effective.schema_json()).map_err(|source| {
@@ -635,6 +643,7 @@ impl PolicyEngine {
                 entity_types: EntityTypes::parse()?,
                 authorizer: Authorizer::new(),
                 referenced_capabilities,
+                permit_reach,
                 digest,
             },
             unresolved,
@@ -698,6 +707,14 @@ impl PolicyEngine {
 
     pub fn referenced_capabilities(&self) -> impl Iterator<Item = &CapabilityId> {
         self.referenced_capabilities.iter()
+    }
+
+    #[must_use]
+    pub fn names_in_a_permit(&self, capability: &CapabilityId) -> bool {
+        match &self.permit_reach {
+            PermitReach::AnyAction => true,
+            PermitReach::Named(named) => named.contains(capability),
+        }
     }
 
     #[must_use]
@@ -1060,6 +1077,35 @@ fn classify_policies(
         }
     }
     Ok((referenced_capabilities, unresolved))
+}
+
+fn permit_reach(policies: &PolicySet, world: &PolicyWorld) -> PermitReach {
+    let groups = world.action_groups();
+    let mut named = BTreeSet::new();
+    for policy in policies.policies() {
+        match policy.effect() {
+            Effect::Permit => {}
+            Effect::Forbid => continue,
+        }
+        match policy.action_constraint() {
+            ActionConstraint::Any => return PermitReach::AnyAction,
+            ActionConstraint::In(_) | ActionConstraint::Eq(_) => {}
+        }
+        for uid in policy.entity_literals() {
+            if uid.type_name().to_string() != ACTION_TYPE {
+                continue;
+            }
+            let value = uid.id().unescaped();
+            if let Some(members) = groups.get(value) {
+                named.extend(members.iter().map(|&capability| capability.clone()));
+            } else if let Ok(capability) = value.parse::<CapabilityId>()
+                && world.capabilities.contains_key(&capability)
+            {
+                named.insert(capability);
+            }
+        }
+    }
+    PermitReach::Named(named)
 }
 
 fn action_group_provider(value: &str) -> Option<ProviderId> {

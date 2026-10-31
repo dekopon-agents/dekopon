@@ -1270,6 +1270,14 @@ async fn a_response_over_max_response_bytes_tells_the_model_byte_limit() {
     .await
     .expect("the host refusal is returned as an invocation result");
     assert_eq!(result.result.error.as_deref(), Some("byte-limit"));
+    assert_eq!(
+        result
+            .result
+            .detail
+            .as_ref()
+            .map(|detail| detail.code.as_str()),
+        Some("maxResponseBytes")
+    );
     let wire = server.request_text();
     let mut lines = wire.lines();
     assert_eq!(lines.next(), Some("GET /large HTTP/1.1"));
@@ -3601,9 +3609,14 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
         )
         .expect("an unnamed or tolerated unexecutable grant starts");
         if leniency == Leniency::Tolerant {
-            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings.len(), 2, "{warnings:?}");
             assert!(matches!(
                 &warnings[0],
+                StartupWarning::UnreachableCapability { capability }
+                    if capability.as_str() == "cli-probe.upper"
+            ));
+            assert!(matches!(
+                &warnings[1],
                 StartupWarning::UnconstrainedCapability { capability }
                     if capability.as_str() == "cli-probe.reverse"
             ));
