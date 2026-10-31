@@ -4021,6 +4021,14 @@ impl ChatDriver for RecordingDriver {
         _target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        match _target {
+            ReplyTarget::GithubTrace | ReplyTarget::Local { .. } => assert!(reply.footer.is_none()),
+            ReplyTarget::Slack { .. }
+            | ReplyTarget::Fauxlack { .. }
+            | ReplyTarget::Discord { .. }
+            | ReplyTarget::Telegram { .. }
+            | ReplyTarget::WhatsApp { .. } => {}
+        }
         if let Some(kind) = self.charge_reply() {
             return Err(injected(kind));
         }
@@ -17208,8 +17216,8 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         let peer = MediaPeer::new(move |origin, index| match index {
             0 => metadata(origin, mime, bytes),
             1 => bytes_reply(bytes),
-            2 | 4 | 6 => json_reply(json!({"id":"987"})),
-            3 | 5 | 7 => accepted(),
+            2 | 5 | 8 => json_reply(json!({"id":"987"})),
+            3 | 4 | 6 | 7 | 9 | 10 => accepted(),
             _ => panic!("no retry or extra media calls"),
         })
         .await;
@@ -17365,19 +17373,33 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             let requests = peer.requests.lock();
             assert_eq!(
                 requests.len(),
-                8,
-                "one inbound fetch reused by model and provider, then three uploads/sends"
+                11,
+                "one inbound fetch reused by model and provider, then three uploads, image sends and footer messages"
             );
             for edit in 0..3 {
                 assert!(
-                    requests[edit * 2 + 2]
+                    requests[edit * 3 + 2]
                         .body
                         .windows(PNG.len())
                         .any(|window| window == PNG)
                 );
                 let sent: Value =
-                    serde_json::from_slice(&requests[edit * 2 + 3].body).expect("image send");
-                assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
+                    serde_json::from_slice(&requests[edit * 3 + 3].body).expect("image send");
+                assert_eq!(sent["image"], json!({"id":"987"}));
+                let posted: Value = serde_json::from_slice(&requests[edit * 3 + 4].body)
+                    .expect("answer and footer send");
+                let text = posted["text"]["body"].as_str().unwrap();
+                let seconds = text
+                    .strip_prefix("Edited image.\n\n_portable · 4 steps · ")
+                    .unwrap()
+                    .strip_suffix(" s_")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                assert_eq!(
+                    text,
+                    format!("Edited image.\n\n_portable · 4 steps · {seconds} s_")
+                );
             }
         }
         peer.finish().await;

@@ -188,6 +188,7 @@ async fn native_history_drops_the_bot_footer_before_the_model_sees_it() {
     let driver = HistoryDriver::new(Ok(vec![
         past("0000000001", "U1", "tel.16035550101", user),
         bot_past("0000000002", "Earlier answer.\n\n-# model · 1 step · 7 s"),
+        bot_past("0000000003", "-# model · 1 step · 7 s"),
     ]));
     run_session(
         runner(broker, Arc::clone(&models), 4),
@@ -200,14 +201,120 @@ async fn native_history_drops_the_bot_footer_before_the_model_sees_it() {
     assert_eq!(
         prompt
             .iter()
-            .find(|(role, _)| role == "assistant")
-            .unwrap()
-            .1,
-        "Earlier answer."
+            .filter(|(role, _)| role == "assistant")
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["Earlier answer."]
     );
     assert!(
         prompt
             .iter()
             .any(|(role, text)| role == "user" && text.ends_with(user))
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn github_webhook_and_local_answers_carry_no_footer() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("Webhook answer."), answer("Local answer.")]);
+    let runner = runner(broker, models, 4);
+    let driver = Arc::new(RecordingDriver::default());
+    for target in [
+        ReplyTarget::GithubTrace,
+        ReplyTarget::Local { connection: 1 },
+    ] {
+        let mut incoming = message("answer");
+        incoming.reply = target;
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            incoming,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+    assert_eq!(driver.replies(), ["Webhook answer.", "Local answer."]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_chat_answer_carries_no_footer() {
+    let http = spawn_http_mock(slack_handler(Vec::new()));
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::results([Err(InferenceError::Protocol(
+        dekopon_model::error::ProtocolFailure::NoChoices,
+    ))]);
+    let mut incoming = message("answer");
+    incoming.reply = ReplyTarget::Slack {
+        channel: "d0123abc".into(),
+        thread_ts: None,
+    };
+    run_session(
+        runner(broker, models, 4),
+        route(model_config()),
+        incoming,
+        slack(&http.base).driver(),
+    )
+    .await;
+    let posts = http
+        .calls()
+        .into_iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| serde_json::from_str::<Value>(&body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(
+        posts[0]["blocks"],
+        json!([{"type":"markdown", "text":FAILURE_REPLY}])
+    );
+    assert_eq!(posts[0]["text"], FAILURE_REPLY);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_chat_answer_carries_no_footer() {
+    let http = spawn_http_mock(slack_handler(Vec::new()));
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = InterruptibleModel::new([answer("must not be posted")]);
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&models)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let mut incoming = message("answer");
+    incoming.reply = ReplyTarget::Slack {
+        channel: "d0123abc".into(),
+        thread_ts: None,
+    };
+    let running = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route(model_config()),
+        incoming,
+        slack(&http.base).driver(),
+    ));
+    models.wait_until_entered().await;
+    assert_eq!(
+        runner
+            .gate
+            .cancel(&cancel(SUBJECT, CancelVia::NativeStop))
+            .running,
+        CancelOutcome::Cancelled
+    );
+    running.await.unwrap();
+    let posts = http
+        .calls()
+        .into_iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| serde_json::from_str::<Value>(&body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(
+        posts[0]["blocks"],
+        json!([{"type":"markdown", "text":crate::session::STOPPED_REPLY}])
+    );
+    assert_eq!(posts[0]["text"], crate::session::STOPPED_REPLY);
 }

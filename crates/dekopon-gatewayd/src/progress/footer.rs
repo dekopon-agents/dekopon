@@ -48,7 +48,11 @@ impl Footer {
     }
 
     pub(crate) fn without_discord_footer(text: &str) -> &str {
-        let Some((answer, line)) = text.rsplit_once("\n\n-# ") else {
+        let (answer, line) = if let Some(line) = text.strip_prefix("-# ") {
+            ("", line)
+        } else if let Some(pair) = text.rsplit_once("\n\n-# ") {
+            pair
+        } else {
             return text;
         };
         let Some((models, rest)) = line.split_once(" · ") else {
@@ -115,6 +119,10 @@ mod tests {
         assert_eq!(
             Footer::without_discord_footer("answer\n\n-# model · 1 step · 7 s"),
             "answer"
+        );
+        assert_eq!(
+            Footer::without_discord_footer("-# model · 1 step · 7 s"),
+            ""
         );
         for text in [
             "answer\n\n-# a conclusion",

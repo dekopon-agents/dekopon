@@ -841,13 +841,11 @@ impl ChatDriver for TelegramDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply {
-            text,
-            images,
-            footer,
-        } = reply;
-        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Photos)?;
-        let mut images = super::hydration::ImageQueue::new(images);
+        let mut reply = reply;
+        super::hydration::validate_types(&reply.images, super::hydration::AcceptedTypes::Photos)?;
+        let mut images = super::hydration::ImageQueue::new(std::mem::take(&mut reply.images));
+        let text = &reply.text;
+        let footer = reply.footer.as_ref();
         let ReplyTarget::Telegram {
             chat_id,
             reply_to,
@@ -881,25 +879,11 @@ impl ChatDriver for TelegramDriver {
                 return accepted.then_some(()).ok_or(TransportError::Response);
             }
             return self
-                .send_text_chunks(
-                    chat_id,
-                    reply_to,
-                    message_thread_id,
-                    &text,
-                    true,
-                    footer.as_ref(),
-                )
+                .send_text_chunks(chat_id, reply_to, message_thread_id, &reply, true)
                 .await;
         }
-        self.send_text_chunks(
-            chat_id,
-            reply_to,
-            message_thread_id,
-            &text,
-            false,
-            footer.as_ref(),
-        )
-        .await
+        self.send_text_chunks(chat_id, reply_to, message_thread_id, &reply, false)
+            .await
     }
 
     fn typing(&self) -> Option<&dyn TypingLease> {
@@ -933,26 +917,31 @@ impl TelegramDriver {
         chat_id: i64,
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
-        text: &str,
+        reply: &OutboundReply,
         prior_accepted: bool,
-        footer: Option<&crate::progress::Footer>,
     ) -> Result<(), TransportError> {
         let mut accepted = prior_accepted;
         let mut delivered = false;
-        for (index, chunk) in crate::progress::Footer::chunks(
-            text,
+        let footer = reply.footer.as_ref();
+        let chunks = crate::progress::Footer::chunks(
+            &reply.text,
             footer.map(crate::progress::Footer::line),
             MAX_MESSAGE_CHARS,
             TextUnit::Utf16,
-        )
-        .into_iter()
-        .enumerate()
-        {
+        );
+        let last = chunks.len().saturating_sub(1);
+        for (index, chunk) in chunks.into_iter().enumerate() {
             let first_text_reply = (!prior_accepted && index == 0)
                 .then_some(reply_to)
                 .flatten();
             match self
-                .send_text(chat_id, first_text_reply, message_thread_id, chunk, footer)
+                .send_text(
+                    chat_id,
+                    first_text_reply,
+                    message_thread_id,
+                    chunk,
+                    if index == last { footer } else { None },
+                )
                 .await
             {
                 Ok(()) => {

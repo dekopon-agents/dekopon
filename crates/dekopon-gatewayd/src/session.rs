@@ -1466,6 +1466,9 @@ fn platform_window(
             next_asset_id += 1;
         }
         if message.from_bot {
+            if text.is_empty() {
+                continue;
+            }
             let user = if pending_user.is_empty() {
                 "[gateway: earlier in this conversation]".to_owned()
             } else {

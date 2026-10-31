@@ -1290,7 +1290,7 @@ impl SlackReplier {
         let mut body = json!({
             "channel": channel,
             "text": text,
-            "blocks": answer_blocks(&text, footer),
+            "blocks": answer_blocks(text, footer),
         });
         if let Some(thread_ts) = thread_ts {
             body["thread_ts"] = Value::String(thread_ts.to_owned());
@@ -1656,7 +1656,11 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
 }
 
 fn answer_blocks(text: &str, footer: Option<&crate::progress::Footer>) -> Value {
-    let mut blocks = vec![markdown_block(text)];
+    let mut blocks = if text.is_empty() && footer.is_some() {
+        Vec::new()
+    } else {
+        vec![markdown_block(text)]
+    };
     if let Some(footer) = footer {
         blocks.push(
             json!({"type": "context", "elements": [{"type": "plain_text", "text": footer.line()}]}),
@@ -2977,6 +2981,16 @@ mod driver_tests {
         }
         assert!(calls[2].1.get("unfurl_links").is_none());
         assert!(calls[2].1.get("unfurl_media").is_none());
+    }
+
+    #[test]
+    fn an_attachment_only_answer_has_a_footer_without_an_empty_markdown_block() {
+        let footer =
+            crate::progress::Footer::new(&["model-a".into()], 1, std::time::Duration::from_secs(7));
+        assert_eq!(
+            super::answer_blocks("", Some(&footer)),
+            json!([{"type":"context", "elements":[{"type":"plain_text", "text":"model-a · 1 step · 7 s"}]}])
+        );
     }
 
     #[tokio::test]
