@@ -1988,11 +1988,7 @@ fn decode_slack_text(raw: &str) -> String {
         let (target, label) = inner
             .split_once('|')
             .map_or((inner, None), |(target, label)| (target, Some(label)));
-        if target.starts_with(['@', '#', '!']) {
-            text.push_str(target);
-        } else {
-            push_decoded(&mut text, target);
-        }
+        text.push_str(target);
         if let Some(label) = label {
             text.push('|');
             push_decoded(&mut text, label);
@@ -3683,7 +3679,7 @@ mod driver_tests {
         assert_eq!(inbound.addressed, Some(true));
         assert_eq!(
             inbound.text,
-            format!("<@{BOT_USER}> see <https://x?a=1&b=2|a & b> in <#C0123ABC|ops > dev>")
+            format!("<@{BOT_USER}> see <https://x?a=1&amp;b=2|a & b> in <#C0123ABC|ops > dev>")
         );
     }
 
