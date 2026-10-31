@@ -803,7 +803,7 @@ dependencies = [
  "document-features",
  "futures-core",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rustix",
  "signal-hook",
  "signal-hook-mio",
@@ -936,7 +936,7 @@ dependencies = [
  "getrandom 0.4.3",
  "opentelemetry",
  "opentelemetry_sdk",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rustix",
  "serde",
  "serde_json",
@@ -964,7 +964,7 @@ dependencies = [
  "dekopon-test-support",
  "getrandom 0.4.3",
  "opentelemetry",
- "parking_lot",
+ "parking_lot 0.13.0",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -989,7 +989,7 @@ dependencies = [
  "dekopon-storage-host",
  "dekopon-test-support",
  "getrandom 0.4.3",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rcgen",
  "rustix",
  "rustls",
@@ -1051,7 +1051,7 @@ dependencies = [
  "libc",
  "opentelemetry",
  "opentelemetry_sdk",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rayon",
  "rcgen",
  "reqwest",
@@ -1168,7 +1168,7 @@ dependencies = [
  "mime",
  "opentelemetry",
  "opentelemetry_sdk",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rcgen",
  "reqwest",
  "rustix",
@@ -1205,7 +1205,7 @@ dependencies = [
  "http-body",
  "opentelemetry",
  "opentelemetry_sdk",
- "parking_lot",
+ "parking_lot 0.13.0",
  "percent-encoding",
  "rcgen",
  "reqwest",
@@ -1235,7 +1235,7 @@ dependencies = [
  "http-body",
  "opentelemetry",
  "opentelemetry_sdk",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rcgen",
  "reqwest",
  "rustls",
@@ -1266,7 +1266,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rcgen",
  "reqwest",
  "rustls",
@@ -1287,7 +1287,7 @@ version = "0.75.0"
 dependencies = [
  "dekopon-core",
  "dekopon-test-support",
- "parking_lot",
+ "parking_lot 0.13.0",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1351,7 +1351,7 @@ dependencies = [
  "dekopon-test-support",
  "hyper",
  "hyper-util",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rcgen",
  "rustls",
  "schemars 1.2.3",
@@ -1377,7 +1377,7 @@ dependencies = [
  "jaq-core",
  "jaq-json",
  "jaq-std",
- "parking_lot",
+ "parking_lot 0.13.0",
  "regex-bites",
  "rustix",
  "serde_json",
@@ -1395,7 +1395,7 @@ dependencies = [
  "dekopon-core",
  "dekopon-test-support",
  "getrandom 0.4.3",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rustix",
  "serde",
  "serde_json",
@@ -1416,7 +1416,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "parking_lot",
+ "parking_lot 0.13.0",
  "reqwest",
  "serde",
  "serde_json",
@@ -1436,7 +1436,7 @@ dependencies = [
  "dekopon-model",
  "dekopon-process",
  "dekopon-shell",
- "parking_lot",
+ "parking_lot 0.13.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -1461,7 +1461,7 @@ dependencies = [
  "dekopon-test-support",
  "futures-util",
  "opentelemetry-proto",
- "parking_lot",
+ "parking_lot 0.13.0",
  "prost",
  "ratatui",
  "rustix",
@@ -1648,7 +1648,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2520,6 +2520,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2914,8 +2923,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -2926,7 +2945,19 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link",
 ]
@@ -3174,7 +3205,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3363,6 +3394,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
+dependencies = [
+ "bitflags 2.13.1",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3535,7 +3575,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3935,7 +3975,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf776ba3fa74f83bf4b63c3dcbbf82173db2632ed8452cb2d891d33f459de70f"
 dependencies = [
  "new_debug_unreachable",
- "parking_lot",
+ "parking_lot 0.12.5",
  "phf_shared",
  "precomputed-hash",
 ]
@@ -4031,7 +4071,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4954,7 +4994,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
