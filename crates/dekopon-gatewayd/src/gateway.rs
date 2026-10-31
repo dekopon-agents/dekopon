@@ -707,22 +707,36 @@ impl Gateway {
                 return;
             }
         }
-        let Some((route_id, route)) = generation.routes.route_index(&message) else {
-            tracing::debug!(
-                event = "gateway_message_ignored",
-                transport = %message.transport,
-                reason = "unrouted",
-                conversation.kind = message.conversation.kind.as_str(),
-                conversation.container = message.conversation.container.as_deref().unwrap_or_default(),
-                "gateway.message.ignored"
-            );
-            return;
-        };
         let addressed = message.addressed.unwrap_or_else(|| {
             self.identities
                 .get(&message.transport)
                 .is_some_and(|identity| identity.is_addressed(&message.text))
         });
+        let Some((route_id, route)) = generation.routes.route_index(&message) else {
+            let direct_message = message.conversation.kind == ConversationKind::DirectMessage;
+            if addressed || direct_message {
+                tracing::info!(
+                    event = "gateway_message_ignored",
+                    transport = %message.transport,
+                    reason = "unrouted",
+                    conversation.kind = message.conversation.kind.as_str(),
+                    conversation.container = message.conversation.container.as_deref().unwrap_or_default(),
+                    mention = addressed,
+                    direct_message,
+                    "gateway.message.ignored"
+                );
+            } else {
+                tracing::debug!(
+                    event = "gateway_message_ignored",
+                    transport = %message.transport,
+                    reason = "unrouted",
+                    conversation.kind = message.conversation.kind.as_str(),
+                    conversation.container = message.conversation.container.as_deref().unwrap_or_default(),
+                    "gateway.message.ignored"
+                );
+            }
+            return;
+        };
         let inherited_thread = message
             .thread_continuation
             .as_ref()
