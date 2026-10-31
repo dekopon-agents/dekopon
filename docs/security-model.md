@@ -129,3 +129,10 @@ API offers on a granted model. The budget bounds the spend.
 - A GitHub webhook delivery carries no signed timestamp, so a captured delivery can be replayed.
 - The gateway's own chat calls (replies, reactions, downloads) are not Cedar-governed; Cedar governs
   provider effects.
+- A provider credential is one account at its destination: every sender granted the capability acts
+  as that account, a GitHub token's user for example.
+- A fine-grained GitHub token limited to selected repositories still reads every public repository.
+- A grant decides who may run a command, not who sees the answer: in a shared channel, every member
+  reads the reply.
+- A ChatGPT subscription credential calls an undocumented backend; the OpenAI API's retention terms
+  don't cover it.
