@@ -855,66 +855,39 @@ impl ChatDriver for SlackReplier {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, images } = reply;
+        let OutboundReply {
+            text,
+            images,
+            footer,
+        } = reply;
         super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
         let images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Slack { channel, thread_ts } = target else {
             return Err(TransportError::Response);
         };
-        if !images.is_empty() {
-            return self
-                .upload_attachments(channel.clone(), thread_ts.clone(), text, images)
-                .await;
+        let attachments = !images.is_empty();
+        if attachments {
+            if footer.is_none() {
+                return self
+                    .upload_attachments(channel.clone(), thread_ts.clone(), text, images)
+                    .await;
+            }
+            self.upload_attachments(channel.clone(), thread_ts.clone(), String::new(), images)
+                .await?;
         }
-        let mut body = json!({
-            "channel": channel,
-            "text": text,
-            "blocks": [markdown_block(&text)],
-        });
-        if let Some(thread_ts) = thread_ts {
-            body["thread_ts"] = Value::String(thread_ts.clone());
+        let result = self
+            .post_answer(channel, thread_ts.as_deref(), &text, footer.as_ref())
+            .await;
+        match result {
+            Err(error) if attachments => {
+                tracing::error!(
+                    category = error.category(),
+                    "gateway.reply.failed.after_attachments"
+                );
+                Err(TransportError::PartialDelivery)
+            }
+            result => result,
         }
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map \
-                      keys and serde_json::Number rejects non-finite floats"
-        )]
-        let encoded = serde_json::to_vec(&body).map_err(|_| TransportError::Response)?;
-        let post = || {
-            self.http
-                .post(format!("{}/api/chat.postMessage", self.endpoint))
-                .header(
-                    "authorization",
-                    format!("Bearer {}", self.bot_token.expose()),
-                )
-                .header("content-type", "application/json; charset=utf-8")
-                .body(encoded.clone())
-                .send()
-        };
-        let mut response = post()
-            .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let backoff = retry_after(response.headers()).as_secs();
-            tracing::warn!(
-                event = "gateway_reply_rate_limited",
-                transport = "slack",
-                retry_after_seconds = backoff,
-                "gateway.reply.rate.limited"
-            );
-            drop(response);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            response = post()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-        }
-        let body = check_ok(response).await?;
-        let response_channel = body["channel"].as_str().ok_or(TransportError::Response)?;
-        let timestamp = body["ts"].as_str().ok_or(TransportError::Response)?;
-        if response_channel != channel.as_str() || !canonical_timestamp(timestamp) {
-            return Err(TransportError::Response);
-        }
-        Ok(())
     }
 
     fn status(&self) -> Option<&dyn NativeStatus> {
@@ -1287,7 +1260,7 @@ impl ProgressMessage for SlackReplier {
             "channel": channel_id,
             "ts": message.id,
             "text": reply.text,
-            "blocks": [markdown_block(&reply.text)],
+            "blocks": answer_blocks(&reply.text, reply.footer.as_ref()),
         });
         self.liveness_call("chat.update", &body).await.map(|_| ())
     }
@@ -1307,6 +1280,64 @@ impl CancelButton for SlackReplier {
 }
 
 impl SlackReplier {
+    async fn post_answer(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+        footer: Option<&crate::progress::Footer>,
+    ) -> Result<(), TransportError> {
+        let mut body = json!({
+            "channel": channel,
+            "text": text,
+            "blocks": answer_blocks(&text, footer),
+        });
+        if let Some(thread_ts) = thread_ts {
+            body["thread_ts"] = Value::String(thread_ts.to_owned());
+        }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map \
+                      keys and serde_json::Number rejects non-finite floats"
+        )]
+        let encoded = serde_json::to_vec(&body).map_err(|_| TransportError::Response)?;
+        let post = || {
+            self.http
+                .post(format!("{}/api/chat.postMessage", self.endpoint))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", self.bot_token.expose()),
+                )
+                .header("content-type", "application/json; charset=utf-8")
+                .body(encoded.clone())
+                .send()
+        };
+        let mut response = post()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let backoff = retry_after(response.headers()).as_secs();
+            tracing::warn!(
+                event = "gateway_reply_rate_limited",
+                transport = "slack",
+                retry_after_seconds = backoff,
+                "gateway.reply.rate.limited"
+            );
+            drop(response);
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            response = post()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?;
+        }
+        let body = check_ok(response).await?;
+        let response_channel = body["channel"].as_str().ok_or(TransportError::Response)?;
+        let timestamp = body["ts"].as_str().ok_or(TransportError::Response)?;
+        if response_channel != channel || !canonical_timestamp(timestamp) {
+            return Err(TransportError::Response);
+        }
+        Ok(())
+    }
+
     async fn upload_attachments(
         &self,
         channel: String,
@@ -1622,6 +1653,16 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(DEFAULT_PROGRESS_COOLDOWN, Duration::from_secs);
     seconds.min(MAX_PROGRESS_COOLDOWN)
+}
+
+fn answer_blocks(text: &str, footer: Option<&crate::progress::Footer>) -> Value {
+    let mut blocks = vec![markdown_block(text)];
+    if let Some(footer) = footer {
+        blocks.push(
+            json!({"type": "context", "elements": [{"type": "plain_text", "text": footer.line()}]}),
+        );
+    }
+    Value::Array(blocks)
 }
 
 fn markdown_block(text: &str) -> Value {
@@ -2936,6 +2977,27 @@ mod driver_tests {
         }
         assert!(calls[2].1.get("unfurl_links").is_none());
         assert!(calls[2].1.get("unfurl_media").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_finalized_answer_ends_with_its_footer_context() {
+        let mock = spawn_slack_mock(accepting);
+        let replier = replier(&mock.base, SlackExperience::Classic);
+        let reply =
+            OutboundReply::text("All good.").with_footer(Some(crate::progress::Footer::new(
+                &["model-a".into()],
+                1,
+                std::time::Duration::from_millis(7999),
+            )));
+        ProgressMessage::finalize(&replier, &progress_message(), &reply)
+            .await
+            .unwrap();
+        let body = mock.body("/api/chat.update");
+        assert_eq!(body["text"], "All good.");
+        assert_eq!(
+            body["blocks"],
+            json!([{"type":"markdown", "text":"All good."}, {"type":"context", "elements":[{"type":"plain_text", "text":"model-a · 1 step · 7 s"}]}])
+        );
     }
 
     #[tokio::test]

@@ -867,6 +867,7 @@ where
     let mut skill_reads = SkillReads::default();
     let mut suggestions = Vec::new();
 
+    let mut models = Vec::new();
     let mut completed_turns = 0;
     loop {
         if completed_turns == limits.max_steps {
@@ -908,6 +909,10 @@ where
             source.prepare_request(&mut request_messages, asset_bytes.text)
         });
         let inventory = asset_request.inventory;
+        let upstream = model.model_key().upstream().to_owned();
+        if !models.contains(&upstream) {
+            models.push(upstream);
+        }
         let completion = {
             let mut on_event = |event| stream.observe(event);
             model.complete(&request_messages, &model_tools, options, &mut on_event)
@@ -1122,6 +1127,7 @@ where
             emit(
                 progress,
                 ProgressEvent::Finished {
+                    models,
                     outcome: SessionOutcome::Answered,
                     elapsed: session_started.elapsed(),
                     turns: model_turns,
@@ -1186,6 +1192,7 @@ where
                 emit(
                     progress,
                     ProgressEvent::Finished {
+                        models,
                         outcome: SessionOutcome::Declined,
                         elapsed: session_started.elapsed(),
                         turns: model_turns,
@@ -2184,6 +2191,7 @@ mod tests {
     };
 
     struct ScriptedModel {
+        models: Vec<dekopon_model::model::ModelKey>,
         turns: Mutex<VecDeque<AssistantTurn>>,
         observed_tools: Mutex<Vec<Vec<ModelTool>>>,
         observed_messages: Mutex<Vec<Vec<ModelMessage>>>,
@@ -2192,6 +2200,10 @@ mod tests {
     impl ScriptedModel {
         fn new(turns: impl IntoIterator<Item = AssistantTurn>) -> Self {
             Self {
+                models: vec![dekopon_model::model::ModelKey::new(
+                    dekopon_model::model::Backend::OpenAiCompatible,
+                    "portable",
+                )],
                 turns: Mutex::new(turns.into_iter().collect()),
                 observed_tools: Mutex::new(Vec::new()),
                 observed_messages: Mutex::new(Vec::new()),
@@ -2230,6 +2242,15 @@ mod tests {
     }
 
     impl ChatModel for ScriptedModel {
+        fn model_key(&self) -> dekopon_model::model::ModelKey {
+            self.models[self
+                .observed_messages
+                .lock()
+                .len()
+                .min(self.models.len() - 1)]
+            .clone()
+        }
+
         fn complete(
             &self,
             messages: &[ModelMessage],
@@ -2246,6 +2267,38 @@ mod tests {
                     dekopon_model::error::ProtocolFailure::NoChoices,
                 ))
         }
+    }
+
+    #[test]
+    fn a_finished_turn_lists_distinct_configured_models_in_first_use_order() {
+        use dekopon_model::model::{Backend, ModelKey};
+        let mut model = ScriptedModel::new([
+            script_call("a", "true"),
+            script_call("b", "true"),
+            answer("done"),
+        ]);
+        model.models = ["model-b", "model-a", "model-b"]
+            .into_iter()
+            .map(|id| {
+                ModelKey::new(Backend::OpenAiCompatible, id)
+                    .with_reported(Some("reported-model".to_owned()))
+            })
+            .collect();
+        let (sink, progress) = recording_sink();
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("work", limits(3, 3)).with_progress(progress),
+            &[],
+        )
+        .0
+        .unwrap();
+        let events = sink.events.lock();
+        let Some(ProgressEvent::Finished { models, turns, .. }) = events.last() else {
+            panic!("the session finished");
+        };
+        assert_eq!(models, &["model-b", "model-a"]);
+        assert_eq!(*turns, 3);
     }
 
     struct RecordingRuntime {

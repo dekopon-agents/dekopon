@@ -34,7 +34,7 @@ use crate::{
         AssetFetcher, ChatDriver, ChatTransport, InboundMessage, LivenessTarget, MessageId,
         OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError, TransportEvent,
         TransportIdentity, TypingLease, bound_inbound, credential_client, receive_span,
-        record_conversation, split_message,
+        record_conversation,
         webhook::{
             self, MAX_WEBHOOK_CONCURRENCY, VerifyFailure, WEBHOOK_REQUEST_TIMEOUT, content_free,
             text_response,
@@ -721,7 +721,12 @@ impl ChatDriver for WhatsappDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, images } = reply;
+        let OutboundReply {
+            text,
+            images,
+            footer,
+        } = reply;
+        let suffix = footer.as_ref().map(|footer| format!("_{}_", footer.line()));
         super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Photos)?;
         let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::WhatsApp { recipient } = target else {
@@ -735,7 +740,9 @@ impl ChatDriver for WhatsappDriver {
         {
             return Err(media::failure("image-too-large"));
         }
-        let caption_fits = !images.is_empty() && text.chars().count() <= media::MAX_CAPTION_CHARS;
+        let caption_fits = footer.is_none()
+            && !images.is_empty()
+            && text.chars().count() <= media::MAX_CAPTION_CHARS;
         let mut accepted = 0_usize;
         while let Some(read) = images.next().await {
             let (index, image) = match read {
@@ -751,7 +758,12 @@ impl ChatDriver for WhatsappDriver {
         if caption_fits {
             return Ok(());
         }
-        for chunk in split_message(&text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar) {
+        for chunk in crate::progress::Footer::chunks(
+            &text,
+            suffix.as_deref(),
+            MAX_WHATSAPP_TEXT_CHARS,
+            TextUnit::Scalar,
+        ) {
             match self.send_text(recipient, &chunk).await {
                 Ok(()) => accepted += 1,
                 Err(error) => return Err(self.reply_failure(error, accepted)),
@@ -1386,7 +1398,7 @@ mod tests {
     }
 
     fn split(text: &str) -> Vec<String> {
-        split_message(text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar)
+        super::super::split_message(text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar)
     }
 
     #[test]

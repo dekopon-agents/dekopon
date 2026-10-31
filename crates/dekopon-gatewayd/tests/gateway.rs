@@ -791,6 +791,8 @@ struct Timing {
     fauxlack: Option<dekopon_gatewayd::fauxlack::Fauxlack>,
     #[cfg(feature = "fauxlack")]
     fauxlack_servers: Vec<String>,
+    #[cfg(feature = "fauxlack")]
+    fauxlack_memory: bool,
     jobs: bool,
     route_seen_only: bool,
     keep_alive: Option<Value>,
@@ -903,6 +905,11 @@ async fn boot_with(
     #[cfg(feature = "fauxlack")]
     if timing.fauxlack.is_some() {
         fauxlack::configure_gateway(&mut config, &timing.fauxlack_servers);
+        if timing.fauxlack_memory {
+            for route in config["routes"].as_array_mut().unwrap() {
+                route["memory"] = json!({"mode":"persistent"});
+            }
+        }
     }
     #[cfg(feature = "fauxlack")]
     if let Some(settings) = &timing.subscriptions {

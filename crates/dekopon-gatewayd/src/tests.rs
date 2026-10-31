@@ -3217,6 +3217,7 @@ async fn telegram_call_failures_never_render_bot_tokens() {
                     .reply(
                         &answering,
                         OutboundReply {
+                            footer: None,
                             text: "a caption".to_owned(),
                             images: generated_images(1),
                         },
@@ -24084,3 +24085,6 @@ pub(super) async fn native_join<F: std::future::Future>(join: F) -> F::Output {
 
 #[path = "tests/digests.rs"]
 mod digests;
+
+#[path = "tests/footer.rs"]
+mod footer;

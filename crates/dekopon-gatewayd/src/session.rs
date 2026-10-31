@@ -69,7 +69,7 @@ use crate::{
     routes::BoundRoute,
     transport::{
         AssetFetcher, CancelRequest, ChatDriver, InboundMessage, MessageId, OutboundReply,
-        PastMessage, ThreadOwnership, TransportError, bound_inbound, bound_outbound,
+        PastMessage, ReplyTarget, ThreadOwnership, TransportError, bound_inbound, bound_outbound,
         credential_from,
     },
     wake::{Anchor, SessionWakes},
@@ -1451,7 +1451,11 @@ fn platform_window(
     let mut next_asset_id = 1;
     for message in messages {
         let label = names.label(&message);
-        let mut text = message.text;
+        let mut text = if message.from_bot {
+            crate::progress::Footer::without_discord_footer(&message.text).to_owned()
+        } else {
+            message.text
+        };
         for asset in message.assets {
             text.push_str(&asset::attached_marker(next_asset_id, &asset.name));
             assets.push(RecalledAsset {
@@ -2748,7 +2752,6 @@ async fn session_turn(
             .with_participant(asker_handle.map(participants::Handle::as_str)),
         ));
     }
-    drop(sink);
     let space_access = leg.space_grants().is_some() && !is_space_wake;
     let review_progress = message
         .message_id
@@ -3350,8 +3353,16 @@ async fn session_turn(
             } else {
                 OutboundReply::with_images(text.clone(), images)
             };
+            let footer = match message.reply {
+                ReplyTarget::Slack { .. }
+                | ReplyTarget::Fauxlack { .. }
+                | ReplyTarget::Discord { .. }
+                | ReplyTarget::Telegram { .. }
+                | ReplyTarget::WhatsApp { .. } => sink.take_footer(),
+                ReplyTarget::GithubTrace | ReplyTarget::Local { .. } => None,
+            };
             (
-                Terminal::Answered(reply),
+                Terminal::Answered(reply.with_footer(footer)),
                 MessageOutcome::Answered,
                 Some(text),
             )

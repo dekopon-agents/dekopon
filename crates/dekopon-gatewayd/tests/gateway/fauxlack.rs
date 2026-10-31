@@ -557,3 +557,57 @@ async fn shutting_down_a_fixture_joins_a_model_with_unconsumed_responses() {
     assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 0);
     let _directory = fixture.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_names_its_models_and_the_next_prompt_has_no_footer() {
+    let _audit = Audit::exclusive().await;
+    let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
+    let fixture = boot_with(
+        temporary(),
+        vec![
+            final_answer("First answer."),
+            final_answer("Second answer."),
+        ],
+        None,
+        "plain",
+        false,
+        &Timing {
+            fauxlack: Some(chat.clone()),
+            fauxlack_servers: vec!["acme".into()],
+            fauxlack_memory: true,
+            ..Timing::default()
+        },
+    )
+    .await;
+    let alice = chat.server("acme").user("ualice");
+    let root = alice.post("dalice", "first question").await.unwrap();
+    let first = root.thread().next_from("udekopon", WAIT).await;
+    assert_eq!(first.text, "First answer.");
+    let footer = first.context.as_deref().unwrap();
+    let seconds = footer
+        .strip_prefix("test-model · 1 step · ")
+        .unwrap()
+        .strip_suffix(" s")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(footer, format!("test-model · 1 step · {seconds} s"));
+    alice.reply(&root, "second question").await.unwrap();
+    let second = root.thread().next_from("udekopon", WAIT).await;
+    assert_eq!(second.text, "Second answer.");
+    let prompt = fixture.prompt(1);
+    assert_eq!(
+        prompt
+            .iter()
+            .filter(|(role, _)| role == "assistant")
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["First answer."]
+    );
+    assert!(prompt.iter().all(|(_, text)| !text.contains(footer)));
+    println!(
+        "posted answer: {:?}; context footer: {:?}; next prompt: {:?}",
+        first.text, footer, prompt
+    );
+    let _directory = fixture.shutdown().await;
+}
