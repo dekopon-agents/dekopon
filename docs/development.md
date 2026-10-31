@@ -6,7 +6,7 @@ page holds what CI and the code don't tell you.
 ## Validation
 
 Start with `git diff --check` and pass `--locked` to Cargo. The shell's differential tests need GNU
-Bash 5.2 on `PATH`, which macOS lacks. As root, two permission tests cannot set up their failure
+Bash on `PATH`, which macOS lacks. As root, two permission tests cannot set up their failure
 (`a_secret_file_that_cannot_be_opened_still_names_its_errno` and
 `a_rotated_credential_completes_the_turn_when_the_write_fails`); report them as unverified.
 
@@ -14,7 +14,7 @@ Bash 5.2 on `PATH`, which macOS lacks. As root, two permission tests cannot set 
 
 The toolchain-free `documentation checks` job, required through `quality (stable)`, fails when
 tracked Markdown outside `CHANGELOG.md`, `AGENTS.md` and the paths `ci.yml` excludes exceeds its
-word budget, or `docs/` holds more than seven files. A Markdown-only change needs no Rust build.
+word budget, or `docs/` holds more than seven Markdown files. A Markdown-only change needs no Rust build.
 
 ## Provider contract or host
 
@@ -49,7 +49,7 @@ architectures, as a non-required check.
 
 ## Releases
 
-Pull requests never edit `CHANGELOG.md`. Each user-visible change is one unwrapped commit-message
+Feature pull requests never edit `CHANGELOG.md`. Each user-visible change is one unwrapped commit-message
 line, `Changelog: <Added|Changed|Deprecated|Removed|Fixed|Security>: <text>`.
 
 1. A prep pull request moves the workspace version (Cargo regenerates `Cargo.lock`, the optimized

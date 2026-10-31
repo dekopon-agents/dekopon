@@ -42,8 +42,9 @@ omitted and the model is told which, never silently lost.
 summarized afresh each turn, changes the prompt's first bytes and makes every request a full-price
 miss. Between repacks, everything older than the hot edge is byte-identical from one request to the
 next, and a summary that finishes late waits for the next repack rather than rewriting a record in
-place. A repack costs one miss, and the quarter of headroom means one never follows another. The
-per-conversation cache key is a routing hint, never isolation.
+place. A repack costs one miss, and with a hot window of four or more turns the quarter of headroom means
+one never follows another. The per-conversation cache key is a routing hint, never isolation, and it
+lets the model provider link a conversation's turns.
 
 ## Reading back and pinning
 
@@ -62,7 +63,7 @@ the next repack; a refusal or invalid answer leaves the ladder in charge.
 
 ## Attachment summaries
 
-Off by default. `summaries.attachments` turns on images, documents or both: the gateway describes
+`summaries.attachments` turns on images, documents or both: the gateway describes
 each attached file it still holds, after the reply, through the summary model, and downloads nothing
 for it. The attachment then replays as its description. Pinned to `native`, an image or binary
 document replays as the file itself when the replying model accepts it; text documents have no
@@ -74,7 +75,7 @@ locator, and is evicted with its record.
 
 ## Scope: who the history replays to
 
-`scope: privateConversation`, the default, gives each authenticated sender their own history in a
+`scope: privateConversation` gives each authenticated sender their own history in a
 conversation. `sharedConversation` drops the sender: everyone in that one group DM, channel or
 thread shares it, and one participant's earlier prompt and answer replay to all of them. It is never
 cross-agent or cross-conversation memory. A record replays only under the capability set it was

@@ -1,7 +1,7 @@
 # Dekopon Helm chart
 
-Deploys Dekopon as one pod: `dekopon-brokerd` as a native sidecar and, when enabled,
-`dekopon-gatewayd` beside it, under separate UIDs that talk only over a Unix socket. There is no
+Deploys Dekopon as one pod: `dekopon-brokerd`, plus `dekopon-gatewayd` when enabled (the broker then
+runs as a native sidecar), under separate UIDs that talk only over a Unix socket. There is no
 TCP path between them, because the broker identifies each caller by the socket peer's UID. Out of the
 box the broker starts with a probe provider and grants nothing.
 

@@ -33,7 +33,7 @@ deny-by-default scoping, not separation.
 | Process | Holds | Never holds |
 |---|---|---|
 | `dekopon-gatewayd` | chat tokens, model keys, conversation history and journals, the model proxy's TLS key | provider credentials, policy, constraint sets |
-| `dekopon-brokerd` | policy, constraint sets, peer and principal maps, provider credentials and the secret map, provider storage | the gateway's model keys and chat tokens, a model loop |
+| `dekopon-brokerd` | policy, constraint sets, peer and principal maps, provider credentials and the secret map, provider storage | the gateway's model keys, a model loop, chat tokens unless the owner also binds one as a provider credential |
 | A Wasm provider | its input, in a fresh store per invocation | a credential: the host injects it after the request passes its checks |
 | The model | prompts and command output | a credential or any authority |
 | A VM behind the model proxy | its own work | a model key |
@@ -121,3 +121,11 @@ API offers on a granted model. The budget bounds the spend.
 - Audit lives in the trace and dies with the exporter ([trace as audit](design.md#trace-as-audit)).
 - Whoever reads the telemetry store reads every conversation.
 - If something hostile already runs as root or as the broker's user, you've lost.
+- Gateway history in memory can reach swap and core dumps; the daemon controls neither.
+- Chat memory with `continuityPolicy: stable`, and shared, agent and space storage always, stay
+  readable after the capability, constraints or credential that wrote them change.
+- A GitHub issue template can apply labels for an outsider, so never permit on a label. Logins are
+  chosen by their owners; trust the numeric actor ID.
+- A GitHub webhook delivery carries no signed timestamp, so a captured delivery can be replayed.
+- The gateway's own chat calls (replies, reactions, downloads) are not Cedar-governed; Cedar governs
+  provider effects.

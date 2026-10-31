@@ -19,6 +19,11 @@ the reference. The defaults start a broker with nothing to run; a chat deploymen
 
 What the values don't make obvious:
 
+- **The broker must map the gateway.** The gateway runs as UID 65533 and the broker as 65532. With
+  `broker.configDirectory.peers` the chart renders that mapping, with the gateway's `attestor`
+  grant. Inline configuration writes it into the broker's `identities` itself and sets the gateway's
+  `broker.socketPath: /run/dekopon/broker.sock` and `broker.serverUid: 65532`; otherwise the broker
+  refuses the gateway.
 - **An init container copies the broker's files.** The broker refuses a configuration, policy or
   credential file that is a symlink, has a second link, belongs to another UID or is group-readable.
   A projected Secret key is a symlink and a `subPath` file is root-owned, so no volume passes. The
@@ -41,7 +46,7 @@ What the values don't make obvious:
   dekopon-gatewayd auth chatgpt export --expose-credential --namespace dekopon | kubectl apply -f -
   ```
 
-  Set `gateway.chatgpt.enabled` and `existingSecret`. Init copies the file onto the state claim
+  Set `gateway.chatgpt.enabled` and `existingSecret: dekopon-chatgpt-auth`, the Secret `export` emits. Init copies the file onto the state claim
   only when none is there. The gateway rotates the refresh token and writes it back, so after the
   first refresh the Secret is a retired token; never copy it back. That rotation is why the
   Deployment is one replica with `Recreate`. After a deliberate re-login, set

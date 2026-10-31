@@ -147,8 +147,8 @@ Docs are for humans: what a principal engineer cannot derive from the code. Agen
 Everything else is the code, `check` and `--help`. Errors are loud and name the key.
 
 1. **Budget.** Tracked Markdown, except the files the `docs` CI job excludes (`CHANGELOG.md`, this
-   file and fixtures), stays within the word budget that job enforces, with at most seven files in
-   `docs/`. A change over budget cuts as much as it adds, or cites the owner's raise.
+   file and fixtures), stays within the word budget that job enforces, with at most seven Markdown
+   files in `docs/`. A change over budget cuts as much as it adds, or cites the owner's raise.
 2. **Whole file first.** A pull request that touches a doc gives it a KEEP, MERGE or DELETE verdict
    in its body before any line is edited.
 3. **Derivation test.** No doc states a key, field, default, event, error, limit or command that a
