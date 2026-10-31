@@ -90,6 +90,12 @@ waits on them. A full console queue drops lines and later logs how many it dropp
 lines are gone; nothing reconstructs them. The telemetry store holds every prompt and output; it
 sits inside the operator's trust boundary.
 
+A `telemetry` block in each daemon's configuration turns the export on
+([broker](../crates/dekopon-brokerd/src/config.rs), [gateway](../crates/dekopon-gatewayd/src/config.rs);
+[example](../examples/conditional-write/broker.yaml)).
+What the model was sent lands in `agent.model.prompt` records, and what it returned in
+`agent.model.answer` ([`prompt.rs`](../crates/dekopon-agent/src/prompt.rs)).
+
 ## Keyless model access for outside VMs
 
 Coding agents in Firecracker VMs, such as `claude`, `pi` and `codex`, need a model. A key inside the

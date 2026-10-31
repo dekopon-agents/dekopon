@@ -48,6 +48,25 @@ Driving an agent is its own statement: action `Dekopon::Action::"agent.prompt"` 
 never allowed is refused before the gateway calls a model. Capabilities imply no session, and a
 session no capabilities.
 
+## Conversation attributes
+
+Policy sees where a message arrived as `context.conversation`
+([schema](../crates/dekopon-policy/src/lib.rs)): `kind`, `container`, `id` and `thread`. `container`
+and `thread` are optional, so a policy that reads either guards with `has` or fails to load.
+`id` is the channel; `container` is the Slack team, Discord guild or GitHub owner; `thread` is
+the Slack thread root's timestamp (a top-level message is its own root), the Discord thread's channel
+id or the GitHub issue or pull request. Direct messages carry no `thread`, except in Slack's agent
+experience.
+
+To keep an agent's comments in one Slack thread, forbid every other conversation:
+
+```cedar
+@id("comments-stay-in-one-thread")
+forbid(principal, action == Dekopon::Action::"gh.pull-request.comment", resource)
+unless { context has conversation && context.conversation has thread
+      && context.conversation.thread == "1761900000.000100" };
+```
+
 ## `secret.use` and public DRNs
 
 A DRN (`drn:…`) publicly names a secret; knowing one grants nothing. The model passes it on a

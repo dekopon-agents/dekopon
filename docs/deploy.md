@@ -2,7 +2,8 @@
 
 Kubernetes is the preferred deployment. The Mac path serves people moving from OpenClaw or Hermes.
 Both run `dekopon-brokerd`, holding policy and provider credentials, and `dekopon-gatewayd`, holding
-chat and model credentials, under separate UIDs joined by one Unix socket.
+chat and model credentials, under separate UIDs joined by one Unix socket. Write policy as the [authorization
+example](authorization.md#example) does, including the `forbid` that fences each outbound request.
 
 ## Kubernetes
 
