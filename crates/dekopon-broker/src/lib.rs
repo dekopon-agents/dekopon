@@ -2516,8 +2516,12 @@ where
     }
 
     #[must_use]
-    pub fn display_principal(&self, subject: &Subject) -> Option<PrincipalId> {
-        self.identities.resolve(subject).cloned()
+    pub fn display_principal(&self, subjects: &AttestedSubject) -> Option<PrincipalId> {
+        self.identities
+            .resolve_attested(subjects)
+            .ok()
+            .flatten()
+            .cloned()
     }
 
     #[must_use]

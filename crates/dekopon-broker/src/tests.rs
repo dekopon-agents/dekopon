@@ -3324,7 +3324,12 @@ async fn the_capability_ceiling_lists_each_available_capability_with_its_words_a
         Some("maintainer".parse().expect("principal"))
     );
     assert_eq!(
-        broker.display_principal(&"drn:slack:user:t0123abc:u1".parse().expect("subject")),
+        broker.display_principal(
+            &dekopon_core::AttestedSubject::one(
+                "drn:slack:user:t0123abc:u1".parse().expect("subject")
+            )
+            .expect("one form"),
+        ),
         Some("ann".parse().expect("principal"))
     );
     let memory = broker.chat_memory_ceiling().expect("memory is configured");
@@ -3341,7 +3346,12 @@ async fn without_memory_or_identities_the_ceilings_are_absent() {
     let broker = SurfaceBroker::new(root.path(), &[]).build().await;
     assert_eq!(broker.principal_ceiling(), None);
     assert_eq!(
-        broker.display_principal(&"drn:slack:user:t0123abc:u1".parse().expect("subject")),
+        broker.display_principal(
+            &dekopon_core::AttestedSubject::one(
+                "drn:slack:user:t0123abc:u1".parse().expect("subject")
+            )
+            .expect("one form"),
+        ),
         None
     );
     assert!(broker.chat_memory_ceiling().is_none());

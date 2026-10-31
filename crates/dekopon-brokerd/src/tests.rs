@@ -1450,7 +1450,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         actual_words,
         actual_help,
         memory,
-        broker.display_principal(claim.subjects.name()),
+        broker.display_principal(&claim.subjects),
     )
     .with_space(Some(actual_space));
     let actual_bytes = serde_json::to_vec(&actual_response)

@@ -115,9 +115,9 @@ API offers on a granted model. The budget bounds the spend.
 - A compromised gateway speaks for every subject inside its attestor namespaces. A `*` kind spans
   every kind its other fields admit: `drn:github:*:*:42` covers repository and login `42` as well
   as ids `42`.
-- A principal mapped only by a GitHub name follows the name: a repository later created under a
-  renamed or deleted name speaks for it. Map the `repo-id` form for a stable identity; mapping
-  both forms to one principal turns a later divergence into a `split-subject` refusal.
+- A GitHub name mapping follows the name: a repository later created under a renamed or deleted
+  name speaks for that principal, even beside a mapped `repo-id`. Map only the `repo-id` form for
+  a stable identity.
 - The provider lock pins bytes by digest. A digest proves identity, not publisher, and there's no
   provenance check or revocation.
 - Wasmtime bounds memory, fuel and time per invocation; it isn't claimed as a production sandbox.

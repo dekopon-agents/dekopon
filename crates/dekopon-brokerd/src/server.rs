@@ -560,7 +560,7 @@ where
                         chat_memory,
                         attestation
                             .as_ref()
-                            .and_then(|claim| broker.display_principal(claim.subjects.name())),
+                            .and_then(|claim| broker.display_principal(&claim.subjects)),
                     )
                     .with_space(broker.space_grants(
                         context,

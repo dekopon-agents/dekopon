@@ -1152,14 +1152,14 @@ async fn attested_capabilities_over_the_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn github_repo_prompt_grant_is_enforced_on_the_broker_socket() {
+async fn an_id_only_github_mapping_names_its_principal_on_the_broker_socket() {
     let uid = current_uid();
     let directory = private_directory();
     let socket_path = directory.path().join("github.sock");
     let listener = bind_fixture(&socket_path);
     let mappings = IdentityDirectory::new([
         (
-            Subject::github_repo("owner", "repo").unwrap(),
+            "drn:github:repo-id::7".parse().unwrap(),
             "repo-principal".parse().unwrap(),
         ),
         (
@@ -1205,8 +1205,9 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
     let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
     let client = BrokerClient::new(&socket_path, uid, limits.frame).unwrap();
     let github_claim = |repo: &str, thread: &str| {
+        let id = if repo == "repo" { 7 } else { 1 };
         Attestation::for_chat(
-            dekopon_core::AttestedSubject::github_repository("owner", repo, 1).unwrap(),
+            dekopon_core::AttestedSubject::github_repository("owner", repo, id).unwrap(),
             agent("chat-agent"),
             ChatScopeClaim {
                 participant: None,
