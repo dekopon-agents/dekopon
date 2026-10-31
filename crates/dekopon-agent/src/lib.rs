@@ -594,25 +594,29 @@ impl CapabilityInvoker for BrokerLeg {
         streams: dekopon_shell::Streams,
         tree: &TreeContext,
     ) -> dekopon_shell::RunResult {
-        let word = CommandWord::new(&call.word);
-        self.emit(ProgressEvent::ToolStarted {
-            word: word.clone(),
-            argument_count: bounded_count(call.argv.len()),
-            calls_used: self.calls.used(),
-            calls_max: self.calls.maximum(),
+        let reported = self.command_words.contains(&call.word).then(|| {
+            let word = CommandWord::new(&call.word);
+            self.emit(ProgressEvent::ToolStarted {
+                word: word.clone(),
+                argument_count: bounded_count(call.argv.len()),
+                calls_used: self.calls.used(),
+                calls_max: self.calls.maximum(),
+            });
+            (word, Instant::now())
         });
-        let started = Instant::now();
         let outcome = self.run_call(call, streams, tree);
         let result = match &outcome {
             dekopon_shell::RunResult::Invoked { result, .. }
             | dekopon_shell::RunResult::Returned(result)
             | dekopon_shell::RunResult::Uncertain(result) => result,
         };
-        self.emit(ProgressEvent::ToolFinished {
-            word,
-            outcome: call_outcome(result),
-            duration: started.elapsed(),
-        });
+        if let Some((word, started)) = reported {
+            self.emit(ProgressEvent::ToolFinished {
+                word,
+                outcome: call_outcome(result),
+                duration: started.elapsed(),
+            });
+        }
         outcome
     }
 

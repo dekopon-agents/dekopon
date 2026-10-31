@@ -3942,7 +3942,10 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
     let (broker, _) = Broker::start(
         registry,
         principal("broker-test"),
-        engine("", ["caller"], [("cli-probe.upper", "cli-probe")]),
+        probe_engine(
+            &probe_policy("caller", "provider-test", "cli-probe.upper"),
+            ["caller"],
+        ),
         catalog([(
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
