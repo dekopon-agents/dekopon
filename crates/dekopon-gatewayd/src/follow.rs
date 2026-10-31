@@ -833,7 +833,7 @@ mod tests {
             ResponseEnvelope,
         };
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::tests::temporary();
         let response = ResponseEnvelope {
             api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Ran { outcome },
