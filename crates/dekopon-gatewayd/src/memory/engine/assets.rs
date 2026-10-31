@@ -1,7 +1,6 @@
 use super::super::journal::records::Header;
 use super::*;
 use crate::{asset::SummaryInput, memory::record::AssetSideLine};
-use dekopon_core::asset::AssetKind;
 use dekopon_model::model::ContentPart;
 
 impl Sender {
@@ -114,7 +113,7 @@ pub(super) fn load_input(
         .iter()
         .find(|asset| asset.number == number)
         .ok_or(crate::asset::NotReadable::NotResident)?;
-    tracing::Span::current().record("asset.kind", kind_label(asset.kind));
+    tracing::Span::current().record("asset.kind", asset.kind.label());
     let result = task
         .access
         .as_ref()
@@ -129,15 +128,6 @@ pub(super) fn load_input(
             tracing::Span::current().record("asset.read", refusal.label());
             Err(refusal)
         }
-    }
-}
-
-fn kind_label(kind: AssetKind) -> &'static str {
-    match kind {
-        AssetKind::Image => "image",
-        AssetKind::TextDocument => "text-document",
-        AssetKind::BinaryDocument => "binary-document",
-        AssetKind::Other => "other",
     }
 }
 

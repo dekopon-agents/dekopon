@@ -156,6 +156,13 @@ pub(crate) enum Subject {
 }
 
 impl Subject {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::Asset(_) => "asset",
+        }
+    }
+
     pub(crate) const fn is_record(&self) -> bool {
         match self {
             Self::Record => true,

@@ -1428,13 +1428,13 @@ async fn admission_remains_held_until_the_record_is_appended() {
     assert_eq!(journal_records(&path).len(), 2);
 }
 
-struct Vendor {
-    endpoint: String,
-    bodies: Arc<Mutex<Vec<Value>>>,
+pub(crate) struct Vendor {
+    pub(crate) endpoint: String,
+    pub(crate) bodies: Arc<Mutex<Vec<Value>>>,
     _server: tokio::task::JoinSet<()>,
 }
 
-async fn vendor(responses: Vec<String>) -> Vendor {
+pub(crate) async fn vendor(responses: Vec<String>) -> Vendor {
     use tokio::io::AsyncWriteExt as _;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!(
@@ -1477,7 +1477,7 @@ fn router_sse(chunk: Value) -> String {
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
 }
 
-fn router_answer(text: &str) -> String {
+pub(crate) fn router_answer(text: &str) -> String {
     router_sse(
         json!({"model":"vendor/model","choices":[{"delta":{"content":text},"finish_reason":"stop"}]}),
     )
@@ -2288,6 +2288,7 @@ async fn a_degrade_never_orphans_a_call() {
             max_turns: 12,
             max_bytes: budget,
             model: &key,
+            assets: None,
         })
         .unwrap();
         let mut messages = vec![ModelMessage::system("Answer briefly.")];
@@ -2317,7 +2318,7 @@ async fn a_degrade_never_orphans_a_call() {
 
 #[test]
 fn a_narrowed_grant_or_a_seal_stops_admission_past_side_lines() {
-    use dekopon_agent::memory_tools::{MemoryRefusal, MemoryTools as _, Rung};
+    use dekopon_agent::memory_tools::{MemoryRefusal, MemoryTools as _, Rung, Target};
     let journal_dir = temporary();
     let journal = crate::journal::Journal::open(
         journal_dir.path(),
@@ -2404,14 +2405,18 @@ fn a_narrowed_grant_or_a_seal_stops_admission_past_side_lines() {
     assert!(after_narrowing.grant_boundary);
     let narrowed = tools(&narrow, None);
     assert!(matches!(
-        narrowed.read(wide_record.0.get(), "native", None),
+        narrowed.read(Target::Record(wide_record.0.get()), "native", None),
         Err(MemoryRefusal::RecordIneligible)
     ));
     assert!(matches!(
-        narrowed.set_pin(wide_record.0.get(), "metadata"),
+        narrowed.set_pin(Target::Record(wide_record.0.get()), "metadata"),
         Err(MemoryRefusal::RecordIneligible)
     ));
-    assert!(narrowed.read(narrow_record.0.get(), "native", None).is_ok());
+    assert!(
+        narrowed
+            .read(Target::Record(narrow_record.0.get()), "native", None)
+            .is_ok()
+    );
     assert!(narrowed.into_pins().is_empty());
 
     let sealed_at = SystemTime::now();
@@ -2431,14 +2436,18 @@ fn a_narrowed_grant_or_a_seal_stops_admission_past_side_lines() {
     assert!(!after_seal.grant_boundary);
     let sealed = tools(&narrow, Some(crate::journal::millis(sealed_at)));
     assert!(matches!(
-        sealed.read(narrow_record.0.get(), "native", None),
+        sealed.read(Target::Record(narrow_record.0.get()), "native", None),
         Err(MemoryRefusal::RecordIneligible)
     ));
     assert!(matches!(
-        sealed.set_pin(narrow_record.0.get(), "native"),
+        sealed.set_pin(Target::Record(narrow_record.0.get()), "native"),
         Err(MemoryRefusal::RecordIneligible)
     ));
-    assert!(sealed.read(resumed.0.get(), "native", None).is_ok());
+    assert!(
+        sealed
+            .read(Target::Record(resumed.0.get()), "native", None)
+            .is_ok()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -2602,4 +2611,156 @@ fn assert_asset_summary_request(body: &Value, index: usize) {
     ] {
         assert!(!body.to_string().contains(canary));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_native_pin_replays_the_file_and_shares_the_request_bound() {
+    use crate::{
+        asset::{MemoryAssets, retention_tests::NoScripts},
+        memory::{
+            engine::tests::assets::World,
+            journal::{JournalMemoryTools, records::tests::fixture, tools::Admission},
+            project::{ProjectionInput, project},
+        },
+    };
+    use dekopon_agent::{
+        memory_tools::{MemoryTools as _, Target},
+        prompt::{SessionInputs, run_prompt_session},
+    };
+    let world = World::with_budget(64 * 1024 * 1024);
+    let header = world.arrive(&["image/png"; 5], None, 1);
+    let size = 36 * 1024 * 1024 / 5;
+    for (index, asset) in header.arrived.iter().enumerate() {
+        drop(
+            world
+                .store
+                .admit(
+                    &world.access,
+                    asset.number.get(),
+                    &vec![(index + 1) as u8; size],
+                )
+                .unwrap(),
+        );
+    }
+    let tools = JournalMemoryTools::new(
+        &world.journal,
+        world.stem.clone(),
+        Admission {
+            grant: fixture().grant,
+            horizon_ms: 0,
+            sealed_at_ms: None,
+        },
+    )
+    .with_assets(MemoryAssets {
+        store: &world.store,
+        access: &world.access,
+        images_supported: true,
+    });
+    for asset in &header.arrived {
+        tools
+            .set_pin(Target::Asset(asset.number), "native")
+            .unwrap();
+    }
+    for line in tools.into_pins() {
+        assert!(world.journal.write_pin(&world.stem, line).unwrap());
+    }
+    world.arrive(&["application/pdf"], Some(&vec![9; 6 * 1024 * 1024]), 1);
+    let snapshot = world.snapshot();
+    let make_projection = |prior| {
+        project(&ProjectionInput {
+            file: &snapshot.file,
+            records: &snapshot.records,
+            prior,
+            hot_turns: 1,
+            max_turns: 4,
+            max_bytes: 64 * 1024,
+            model: &fixture().model,
+            assets: Some(MemoryAssets {
+                store: &world.store,
+                access: &world.access,
+                images_supported: true,
+            }),
+        })
+        .unwrap()
+    };
+    let first = make_projection(&[]);
+    assert_eq!(first.assets.native_bytes, (size * 5) as u64);
+    assert_eq!(first.assets.rungs.native, 5);
+    let models = ModelScript::new([
+        tool_call("pdf", "fetch_chat_asset", json!({"id":6})),
+        answer("done"),
+        answer("again"),
+    ]);
+    models.capture_images.store(true, Ordering::Relaxed);
+    let session_assets = || {
+        SessionAssets::new(
+            Arc::clone(&world.store),
+            world.access.clone(),
+            None,
+            tokio::runtime::Handle::current(),
+            true,
+        )
+    };
+    let current = tokio::runtime::Handle::current();
+    let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+    let model = models
+        .build_bound(&Arc::new(model_config()), current, cancelled)
+        .unwrap();
+    let prior = first.prior.clone();
+    let runner = Arc::clone(&models);
+    let first_assets = session_assets();
+    tokio::task::spawn_blocking(move || {
+        run_prompt_session(
+            model.as_ref(),
+            &NoScripts,
+            SessionInputs::new(
+                "fetch the PDF",
+                PromptLimits {
+                    max_steps: 3,
+                    max_capability_calls: 0,
+                },
+            )
+            .with_assets(&first_assets)
+            .with_native_asset_bytes(first.assets.native_bytes as usize),
+            &first.messages,
+        )
+        .0
+        .unwrap();
+        let refused = tool_message(&runner, 1);
+        assert!(refused.contains("the model request would exceed the 40 MiB decoded asset limit"));
+    })
+    .await
+    .unwrap();
+    let next = make_projection(&prior);
+    assert_eq!(next.assets.native_bytes, (size * 5) as u64);
+    let current = tokio::runtime::Handle::current();
+    let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+    let model = models
+        .build_bound(&Arc::new(model_config()), current, cancelled)
+        .unwrap();
+    let session_assets = session_assets();
+    tokio::task::spawn_blocking(move || {
+        run_prompt_session(
+            model.as_ref(),
+            &NoScripts,
+            SessionInputs::new(
+                "again",
+                PromptLimits {
+                    max_steps: 1,
+                    max_capability_calls: 0,
+                },
+            )
+            .with_assets(&session_assets)
+            .with_native_asset_bytes(next.assets.native_bytes as usize),
+            &next.messages,
+        )
+        .0
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    let images = models.image_bytes.lock();
+    assert_eq!(images.len(), 15);
+    assert_eq!(&images[..5], &images[10..]);
+    assert_eq!(models.requests(), 3);
 }

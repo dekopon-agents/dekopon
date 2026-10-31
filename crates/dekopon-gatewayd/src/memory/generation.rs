@@ -86,11 +86,12 @@ pub(crate) fn report_policy(route: &BoundRoute) {
     );
 }
 
-fn pin_dropped(record: RecordId, reason: &'static str) {
+fn pin_dropped(record: RecordId, subject: super::record::Subject, reason: &'static str) {
     tracing::info!(
         event = "gateway_memory_pin_dropped",
         memory.record.id = record.0.get(),
         memory.pin.reason = reason,
+        memory.summary.subject = subject.label(),
         "gateway.memory.pin.dropped"
     );
 }
@@ -120,7 +121,7 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
     } = deferred;
     if record.is_none() {
         for pin in &pins {
-            pin_dropped(pin.record, "turn-not-persisted");
+            pin_dropped(pin.record, pin.subject, "turn-not-persisted");
         }
     }
     let journal = runner.journal.as_ref().map(Arc::clone);
@@ -182,8 +183,9 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
             };
             for pin in pins {
                 let record = pin.record;
+                let subject = pin.subject;
                 if appended.is_none() || !matches!(journal.write_pin(&stem, pin), Ok(true)) {
-                    pin_dropped(record, "record-gone");
+                    pin_dropped(record, subject, "record-gone");
                 }
             }
             if let Some(choice) = choice

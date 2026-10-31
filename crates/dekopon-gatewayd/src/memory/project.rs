@@ -1,5 +1,6 @@
 use std::{fs::File, num::NonZeroU8, sync::Arc};
 
+mod assets;
 mod object;
 
 use dekopon_agent::memory_tools::Rung;
@@ -19,24 +20,33 @@ use super::{
     record::{RecordId, Slot},
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PriorAsset {
+    pub number: dekopon_core::AssetNumber,
+    pub rung: Rung,
+    pub pin: Option<Rung>,
+}
+
 /// One record's place in the previous turn's projection, kept in the conversation slot so the
 /// next turn changes only what entered or left.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Prior {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PriorRecord {
     pub record: RecordId,
     pub rung: Option<Rung>,
     pub pin: Option<Rung>,
     pub hot: bool,
+    pub assets: Vec<PriorAsset>,
 }
 
 pub(crate) struct ProjectionInput<'a> {
     pub file: &'a Arc<File>,
     pub records: &'a [Head],
-    pub prior: &'a [Prior],
+    pub prior: &'a [PriorRecord],
     pub hot_turns: usize,
     pub max_turns: usize,
     pub max_bytes: usize,
     pub model: &'a ModelKey,
+    pub assets: Option<crate::asset::MemoryAssets<'a>>,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -48,12 +58,13 @@ pub(crate) struct RungCounts {
 
 pub(crate) struct Projected {
     pub messages: Vec<ModelMessage>,
-    pub prior: Vec<Prior>,
+    pub prior: Vec<PriorRecord>,
     pub omitted: Vec<RecordId>,
     pub opaque_dropped: u32,
     pub repacked: bool,
     pub rungs: RungCounts,
     pub bytes: u64,
+    pub assets: assets::Counts,
 }
 
 const EARLIER: &str = "[gateway: earlier conversation]";
@@ -157,6 +168,7 @@ struct Native {
     messages: Vec<ReplayMessage>,
     bytes: u64,
     opaque_dropped: u32,
+    positions: Vec<(u32, usize)>,
 }
 
 #[derive(Default)]
@@ -207,6 +219,19 @@ fn is_object(file: &File, offset: u64, len: u64) -> Result<bool, JournalError> {
     })
 }
 
+fn asset_positions(
+    head: &Head,
+    item: u32,
+    next_item: u32,
+    at: usize,
+) -> impl Iterator<Item = (u32, usize)> {
+    head.header
+        .arrived
+        .iter()
+        .filter(move |asset| asset.item > item && asset.item < next_item)
+        .map(move |asset| (asset.item, at))
+}
+
 /// Verbatim steps within the record's share: text items first, then exchanges, cutting only
 /// result text; an argument that does not fit, or is not an object, becomes `{"cut":N}`.
 fn native(
@@ -214,6 +239,7 @@ fn native(
     head: &Head,
     share: u64,
     model: &ModelKey,
+    asset_bytes: u64,
 ) -> Result<Native, JournalError> {
     let spans = &head.header.spans;
     let text_bytes: u64 = spans
@@ -226,12 +252,13 @@ fn native(
         })
         .map(|span| span.len)
         .sum();
-    let mut left = share.saturating_sub(text_bytes);
+    let mut left = share.saturating_sub(text_bytes.saturating_add(asset_bytes));
     let mut out = Vec::new();
     let mut step = Step::default();
     let mut bytes = text_bytes;
     let mut opaque_dropped = 0;
     let mut index = 0;
+    let mut positions = Vec::new();
     while index < spans.len() {
         let item = spans[index].item;
         let end = spans[index..]
@@ -250,6 +277,8 @@ fn native(
                     first.rel_offset,
                     first.len,
                 )?]));
+                let next_item = spans.get(index).map_or(u32::MAX, |span| span.item);
+                positions.extend(asset_positions(head, item, next_item, out.len()));
             }
             Field::Assistant { .. } => {
                 if step.started() {
@@ -360,6 +389,7 @@ fn native(
         messages: out,
         bytes,
         opaque_dropped,
+        positions,
     })
 }
 
@@ -373,48 +403,89 @@ fn cost(head: &Head, rung: Option<Rung>, native_bytes: u64) -> u64 {
     }
 }
 
+fn asset_text(rows: &[assets::Row]) -> u64 {
+    rows.iter().map(assets::Row::text_bytes).sum()
+}
+
+fn projected_cost(head: &Head, rung: Option<Rung>, native: &Native, rows: &[assets::Row]) -> u64 {
+    let text = match rung {
+        Some(Rung::Native) => asset_text(rows),
+        Some(Rung::Summary(_)) => rows
+            .iter()
+            .filter_map(assets::Row::line)
+            .map(|line| line.len() as u64 + 1)
+            .sum(),
+        Some(Rung::Metadata) | None => 0,
+    };
+    cost(head, rung, native.bytes) + text
+}
+
+fn asset_visible(rung: Option<Rung>) -> bool {
+    match rung {
+        Some(Rung::Native | Rung::Summary(_)) => true,
+        Some(Rung::Metadata) | None => false,
+    }
+}
+
 pub(crate) fn project(input: &ProjectionInput<'_>) -> Result<Projected, JournalError> {
     let records = input.records;
     let hot_turns = input.hot_turns.max(1);
     let hot_from = records.len().saturating_sub(hot_turns);
     let share = (input.max_bytes / hot_turns) as u64;
-    let mut natives = Vec::with_capacity(records.len());
-    for head in records {
-        natives.push(native(input.file, head, share, input.model)?);
-    }
     let prior_of = |record: RecordId| input.prior.iter().find(|prior| prior.record == record);
-    let fresh = |index: usize, head: &Head| -> Option<Rung> {
+    let fresh = |index: usize, head: &Head| {
         if index >= hot_from {
             Some(Rung::Native)
         } else {
             Some(ladder_start(head))
         }
     };
-    let mut rungs: Vec<Option<Rung>> = records
+    let mut rungs: Vec<_> = records
+        .iter()
+        .enumerate()
+        .map(|(index, head)| match prior_of(head.header.id) {
+            Some(prior) if prior.hot == (index >= hot_from) && prior.pin == head.header.pin => {
+                prior.rung.filter(|rung| ladder(head).contains(rung))
+            }
+            Some(_) | None => fresh(index, head),
+        })
+        .collect();
+    let mut rows: Vec<Vec<_>> = records
         .iter()
         .enumerate()
         .map(|(index, head)| {
-            let hot = index >= hot_from;
-            match prior_of(head.header.id) {
-                Some(prior) if prior.hot == hot && prior.pin == head.header.pin => {
-                    prior.rung.filter(|rung| ladder(head).contains(rung))
-                }
-                Some(_) | None => fresh(index, head),
-            }
+            let prior = prior_of(head.header.id);
+            let stable = prior.is_some_and(|prior| prior.hot == (index >= hot_from));
+            head.header
+                .arrived
+                .iter()
+                .filter(|_| input.assets.is_some())
+                .map(|asset| assets::Row::new(asset, head, prior, stable))
+                .collect()
         })
         .collect();
-    let total = |rungs: &[Option<Rung>]| -> u64 {
-        rungs
+    for (index, row) in rows.iter_mut().enumerate() {
+        for asset in row {
+            asset.prepare(&records[index], input.assets, asset_visible(rungs[index]));
+        }
+    }
+    let mut natives: Vec<_> = records
+        .iter()
+        .zip(&rows)
+        .map(|(head, rows)| native(input.file, head, share, input.model, asset_text(rows)))
+        .collect::<Result<_, _>>()?;
+    let total = |rungs: &[Option<Rung>], natives: &[Native], rows: &[Vec<assets::Row>]| -> u64 {
+        records
             .iter()
-            .zip(records)
-            .zip(&natives)
-            .map(|((rung, head), native)| cost(head, *rung, native.bytes))
+            .enumerate()
+            .map(|(i, head)| projected_cost(head, rungs[i], &natives[i], &rows[i]))
             .sum()
     };
+    fit_natives(input, &rungs, &mut rows, &mut natives, share)?;
     let budget = input.max_bytes as u64;
     let shown = rungs.iter().filter(|rung| rung.is_some()).count();
     let mut repacked = false;
-    if total(&rungs) > budget
+    if total(&rungs, &natives, &rows) > budget
         || shown > input.max_turns.saturating_mul(2)
         || (input.prior.is_empty() && records.len() >= input.max_turns.saturating_mul(2))
     {
@@ -422,78 +493,208 @@ pub(crate) fn project(input: &ProjectionInput<'_>) -> Result<Projected, JournalE
         rungs = records
             .iter()
             .enumerate()
-            .map(|(index, head)| fresh(index, head))
+            .map(|(i, head)| fresh(i, head))
             .collect();
-        let keep_from = records.len().saturating_sub(input.max_turns);
-        for rung in rungs.iter_mut().take(keep_from) {
+        for (i, assets) in rows.iter_mut().enumerate() {
+            for asset in assets {
+                asset.reset();
+                asset.prepare(&records[i], input.assets, asset_visible(rungs[i]));
+            }
+        }
+        for rung in rungs
+            .iter_mut()
+            .take(records.len().saturating_sub(input.max_turns))
+        {
             *rung = None;
         }
+        fit_natives(input, &rungs, &mut rows, &mut natives, share)?;
+        for (i, head) in records.iter().enumerate() {
+            natives[i] = native(input.file, head, share, input.model, asset_text(&rows[i]))?;
+        }
         let target = budget.saturating_mul(3) / 4;
-        while total(&rungs) > target {
-            let older = (0..hot_from).find(|index| rungs[*index].is_some());
-            if let Some(index) = older {
-                rungs[index] = step_down(&records[index], rungs[index]);
+        while total(&rungs, &natives, &rows) > target {
+            let asset = (0..records.len())
+                .filter(|i| asset_visible(rungs[*i]))
+                .find_map(|i| {
+                    rows[i]
+                        .iter_mut()
+                        .find_map(|asset| asset.step().then_some(i))
+                });
+            if let Some(i) = asset {
+                natives[i] = native(
+                    input.file,
+                    &records[i],
+                    share,
+                    input.model,
+                    asset_text(&rows[i]),
+                )?;
                 continue;
             }
-            match (hot_from..records.len()).find(|index| rungs[*index].is_some()) {
-                Some(index) => rungs[index] = None,
+            if let Some(i) = (0..hot_from).find(|i| rungs[*i].is_some()) {
+                rungs[i] = step_down(&records[i], rungs[i]);
+                continue;
+            }
+            match (hot_from..records.len()).find(|i| rungs[*i].is_some()) {
+                Some(i) => rungs[i] = None,
                 None => break,
             }
         }
     }
+    assemble(input, rungs, rows, natives, repacked)
+}
+
+fn fit_natives(
+    input: &ProjectionInput<'_>,
+    rungs: &[Option<Rung>],
+    rows: &mut [Vec<assets::Row>],
+    natives: &mut [Native],
+    share: u64,
+) -> Result<(), JournalError> {
+    while rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| asset_visible(rungs[*i]))
+        .flat_map(|(_, rows)| rows)
+        .map(assets::Row::bytes)
+        .sum::<u64>()
+        > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES as u64
+    {
+        let Some(i) = (0..input.records.len())
+            .filter(|i| asset_visible(rungs[*i]))
+            .find_map(|i| {
+                rows[i]
+                    .iter_mut()
+                    .find(|asset| asset.bytes() > 0)
+                    .map(|asset| {
+                        asset.step();
+                        i
+                    })
+            })
+        else {
+            break;
+        };
+        natives[i] = native(
+            input.file,
+            &input.records[i],
+            share,
+            input.model,
+            asset_text(&rows[i]),
+        )?;
+    }
+    Ok(())
+}
+
+fn flush_earlier(texts: &mut Vec<Text>, messages: &mut Vec<ModelMessage>) {
+    if !texts.is_empty() {
+        messages.push(ModelMessage::Journal {
+            message: ReplayMessage::User(std::mem::take(texts)),
+        });
+    }
+}
+
+fn assemble(
+    input: &ProjectionInput<'_>,
+    rungs: Vec<Option<Rung>>,
+    mut rows: Vec<Vec<assets::Row>>,
+    natives: Vec<Native>,
+    repacked: bool,
+) -> Result<Projected, JournalError> {
     let mut messages = Vec::new();
     let mut earlier = Vec::new();
+    let mut earlier_messages = Vec::new();
     let mut omitted = Vec::new();
-    let mut prior = Vec::with_capacity(records.len());
+    let mut prior = Vec::with_capacity(input.records.len());
     let mut counts = RungCounts::default();
+    let mut asset_counts = assets::Counts::default();
     let mut opaque_dropped = 0;
     let mut bytes = 0;
-    for (index, ((head, rung), native)) in records.iter().zip(&rungs).zip(natives).enumerate() {
-        prior.push(Prior {
+    let hot_from = input.records.len().saturating_sub(input.hot_turns.max(1));
+    for (i, ((head, rung), native)) in input.records.iter().zip(&rungs).zip(natives).enumerate() {
+        prior.push(PriorRecord {
             record: head.header.id,
             rung: *rung,
             pin: head.header.pin,
-            hot: index >= hot_from,
+            hot: i >= hot_from,
+            assets: rows[i]
+                .iter()
+                .map(|asset| PriorAsset {
+                    number: asset.number,
+                    rung: asset.rung,
+                    pin: asset.pin,
+                })
+                .collect(),
         });
-        bytes += cost(head, *rung, native.bytes);
+        bytes += projected_cost(head, *rung, &native, &rows[i]);
+        asset_counts.lines += head.asset_lines.len() as u64;
+        for asset in &rows[i] {
+            asset.count(&mut asset_counts, asset_visible(*rung));
+        }
         match rung {
             None => omitted.push(head.header.id),
             Some(Rung::Native) => {
                 counts.native += 1;
                 opaque_dropped += native.opaque_dropped;
-                messages.extend(
-                    native
-                        .messages
-                        .into_iter()
-                        .map(|message| ModelMessage::Journal { message }),
-                );
+                for (index, message) in native.messages.into_iter().enumerate() {
+                    messages.push(ModelMessage::Journal { message });
+                    for asset in &mut rows[i] {
+                        if native
+                            .positions
+                            .iter()
+                            .any(|(item, at)| *item == asset.item && *at == index + 1)
+                            && let Some(message) = asset.message()
+                        {
+                            messages.push(message);
+                        }
+                    }
+                }
             }
             Some(rung @ (Rung::Summary(_) | Rung::Metadata)) => {
                 match rung {
                     Rung::Summary(_) => counts.summary += 1,
                     Rung::Native | Rung::Metadata => counts.metadata += 1,
                 }
-                earlier.push(Text::Owned(format!("\n{}", envelope_text(head, *rung))));
+                if earlier.is_empty() && earlier_messages.is_empty() {
+                    earlier.push(Text::Owned(EARLIER.to_owned()));
+                }
+                let mut text = envelope(head, *rung);
+                if let Rung::Summary(part) = rung {
+                    text.push('\n');
+                    text.push_str(&summary_text(head, *part));
+                }
+                if asset_visible(Some(*rung)) {
+                    for asset in &rows[i] {
+                        if let Some(line) = asset.line() {
+                            text.push('\n');
+                            text.push_str(&line);
+                        }
+                    }
+                }
+                text.push_str(&tool_lines(head));
+                earlier.push(Text::Owned(format!("\n{text}")));
+                if asset_visible(Some(*rung)) {
+                    for asset in &mut rows[i] {
+                        if asset.shown == Rung::Native
+                            && let Some(message) = asset.message()
+                        {
+                            flush_earlier(&mut earlier, &mut earlier_messages);
+                            earlier_messages.push(message);
+                        }
+                    }
+                }
             }
         }
     }
-    if !earlier.is_empty() {
-        earlier.insert(0, Text::Owned(EARLIER.to_owned()));
-        messages.insert(
-            0,
-            ModelMessage::Journal {
-                message: ReplayMessage::User(earlier),
-            },
-        );
-    }
+    flush_earlier(&mut earlier, &mut earlier_messages);
+    earlier_messages.extend(messages);
     Ok(Projected {
-        messages,
+        messages: earlier_messages,
         prior,
         omitted,
         opaque_dropped,
         repacked,
         rungs: counts,
         bytes,
+        assets: asset_counts,
     })
 }
 
@@ -657,3 +858,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod asset_tests;

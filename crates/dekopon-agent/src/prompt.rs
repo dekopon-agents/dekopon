@@ -437,9 +437,16 @@ pub struct SessionInputs<'a> {
     capture_cap: usize,
     memory_tools: Option<&'a dyn crate::memory_tools::MemoryTools>,
     memory_notice: Option<&'a MemoryNotice>,
+    native_asset_bytes: usize,
 }
 
 impl<'a> SessionInputs<'a> {
+    #[must_use]
+    pub const fn with_native_asset_bytes(mut self, bytes: usize) -> Self {
+        self.native_asset_bytes = bytes;
+        self
+    }
+
     #[must_use]
     pub const fn new(prompt: &'a str, limits: PromptLimits) -> Self {
         Self {
@@ -464,6 +471,7 @@ impl<'a> SessionInputs<'a> {
             capture_cap: dekopon_process::DEFAULT_MAX_OUTPUT_BYTES,
             memory_tools: None,
             memory_notice: None,
+            native_asset_bytes: 0,
         }
     }
 
@@ -617,6 +625,7 @@ struct SessionExtensions<'a> {
     progress_notes: bool,
     wakes: Option<&'a dyn WakeRegistrar>,
     memory_tools: Option<&'a dyn crate::memory_tools::MemoryTools>,
+    native_asset_bytes: usize,
 }
 
 pub fn run_prompt_session<M, R>(
@@ -651,6 +660,7 @@ where
         capture_cap,
         memory_tools,
         memory_notice,
+        native_asset_bytes,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
@@ -694,6 +704,7 @@ where
         SessionExtensions {
             record: &mut record,
             memory_tools,
+            native_asset_bytes,
             options: &options,
             assets,
             reply_assets,
@@ -813,6 +824,7 @@ where
         progress_notes,
         wakes,
         memory_tools,
+        native_asset_bytes,
     } = extensions;
     let mut script = script_tool(&runtime.command_words(), &runtime.command_word_help());
     if progress_notes {
@@ -834,8 +846,8 @@ where
     if wakes.is_some() {
         model_tools.push(wake::wake_tool());
     }
-    if memory_tools.is_some() {
-        model_tools.extend(crate::memory_tools::tools());
+    if let Some(memory) = memory_tools {
+        model_tools.extend(crate::memory_tools::tools(memory.attachment_targets()));
     }
     let request_assets = assets;
     let assets = assets.filter(|source| source.offers_fetch());
@@ -857,7 +869,10 @@ where
     let mut capability_invocations = 0_u32;
     let mut tool_calls = 0_u32;
     let mut transcribed = Vec::new();
-    let mut asset_bytes = AssetBytes::default();
+    let mut asset_bytes = AssetBytes {
+        total: native_asset_bytes,
+        text: 0,
+    };
     let mut agent_config_shown = false;
     let mut first_rejected_turn = None;
     let mut skill_reads = SkillReads::default();
@@ -6354,21 +6369,41 @@ mod tests {
 
     #[test]
     fn one_shot_offers_no_memory_tools_and_journal_session_dispatches_reads() {
-        struct LocalMemory;
+        struct LocalMemory(crate::memory_tools::Target);
         impl crate::memory_tools::MemoryTools for LocalMemory {
+            fn attachment_targets(&self) -> crate::memory_tools::AttachmentTargets {
+                match self.0 {
+                    crate::memory_tools::Target::Record(_) => {
+                        crate::memory_tools::AttachmentTargets::Off
+                    }
+                    crate::memory_tools::Target::Asset(_) => {
+                        crate::memory_tools::AttachmentTargets::On
+                    }
+                }
+            }
             fn read(
                 &self,
-                id: u64,
+                id: crate::memory_tools::Target,
                 representation: &str,
                 range: Option<(u64, u64)>,
             ) -> Result<String, MemoryRefusal> {
-                assert_eq!((id, representation, range), (7, "summary", Some((0, 4))));
+                assert_eq!(
+                    (id, representation, range),
+                    (self.0, "summary", Some((0, 4)))
+                );
                 Ok("text".into())
             }
-            fn set_pin(&self, _: u64, _: &str) -> Result<String, MemoryRefusal> {
+            fn set_pin(
+                &self,
+                _: crate::memory_tools::Target,
+                _: &str,
+            ) -> Result<String, MemoryRefusal> {
                 Ok("pinned".into())
             }
-            fn clear_pin(&self, _: Option<u64>) -> Result<String, MemoryRefusal> {
+            fn clear_pin(
+                &self,
+                _: Option<crate::memory_tools::Target>,
+            ) -> Result<String, MemoryRefusal> {
                 Ok("cleared".into())
             }
         }
@@ -6409,17 +6444,57 @@ mod tests {
         run_prompt_session(
             &model,
             &runtime,
-            SessionInputs::new("hi", limits(2, 2)).with_memory_tools(&LocalMemory),
+            SessionInputs::new("hi", limits(2, 2))
+                .with_memory_tools(&LocalMemory(crate::memory_tools::Target::Record(7))),
             &[],
         )
         .0
         .expect("read");
         assert_eq!(last_tool_results(&model), vec!["text"]);
-        assert!(
-            model.observed_tools.lock()[0]
-                .iter()
-                .any(|tool| tool.name == "read_memory_record")
-        );
+        let offered = model.observed_tools.lock();
+        for expected in crate::memory_tools::tools(crate::memory_tools::AttachmentTargets::Off) {
+            assert_eq!(
+                offered[0].iter().find(|tool| tool.name == expected.name),
+                Some(&expected)
+            );
+        }
+        drop(offered);
+        let asset = dekopon_core::AssetNumber::try_from(8).unwrap();
+        let model = ScriptedModel::new([
+            tool_call(
+                "read-asset",
+                "read_memory_record",
+                json!({"asset":8,"representationId":"summary","range":[0,4]}),
+            ),
+            answer("done"),
+        ]);
+        run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("hi", limits(2, 2))
+                .with_memory_tools(&LocalMemory(crate::memory_tools::Target::Asset(asset))),
+            &[],
+        )
+        .0
+        .expect("asset read");
+        assert_eq!(last_tool_results(&model), vec!["text"]);
+        for arguments in [
+            json!({"recordId":7,"asset":8,"representationId":"summary"}),
+            json!({"representationId":"summary"}),
+        ] {
+            let model =
+                ScriptedModel::new([tool_call("bad-target", "read_memory_record", arguments)]);
+            let error = run_prompt_session(
+                &model,
+                &runtime,
+                SessionInputs::new("hi", limits(2, 2))
+                    .with_memory_tools(&LocalMemory(crate::memory_tools::Target::Record(7))),
+                &[],
+            )
+            .0
+            .expect_err("exactly one target");
+            assert!(matches!(error, PromptError::InvalidArguments { .. }));
+        }
     }
 
     #[test]

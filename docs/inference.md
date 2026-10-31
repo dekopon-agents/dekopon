@@ -302,6 +302,9 @@ best-effort, after the reply. No reply waits for it, and a summary that fails is
 failed, never faked. Provider reasoning that only its own model can read is replayed only to
 that model.
 
+A file that arrived with a turn replays as its arrival line. With `summaries.attachments` enabled,
+it replays as its description once one exists or, when pinned, as the file itself.
+
 The newest `hotTurns` records replay verbatim. Older records replay as their deepest
 generated summary, or verbatim if none exists yet. When the window is short, the oldest
 record steps down (summary, metadata, a counted omission), so a turn is shortened, never

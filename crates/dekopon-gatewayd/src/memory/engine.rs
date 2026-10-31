@@ -333,7 +333,7 @@ fn summarize_span(task: &SlotTask, since: &Instant) -> tracing::Span {
         "memory.summarize",
         memory.record.id = task.record.0.get(),
         memory.summary.part = task.part.get(),
-        memory.summary.subject = subject_label(task.subject),
+        memory.summary.subject = task.subject.label(),
         asset.number = match task.subject {
             Subject::Record => None,
             Subject::Asset(number) => Some(u64::from(number)),
@@ -764,7 +764,7 @@ fn dropped(task: &SlotTask, reason: Dropped) {
         event = "gateway_memory_summary_dropped",
         memory.record.id = task.record.0.get(),
         memory.summary.part = task.part.get(),
-        memory.summary.subject = subject_label(task.subject),
+        memory.summary.subject = task.subject.label(),
         memory.summary.failure = match reason {
             Dropped::Overflow => "overflow",
             Dropped::Evicted => "evicted",
@@ -998,11 +998,4 @@ fn mark_later(
 }
 
 #[cfg(test)]
-mod tests;
-
-fn subject_label(subject: Subject) -> &'static str {
-    match subject {
-        Subject::Record => "record",
-        Subject::Asset(_) => "asset",
-    }
-}
+pub(crate) mod tests;

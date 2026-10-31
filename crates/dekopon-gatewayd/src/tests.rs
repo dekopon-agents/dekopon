@@ -18411,7 +18411,7 @@ mod jobs_burn_in;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
 #[path = "tests/memory.rs"]
-mod memory;
+pub(crate) mod memory;
 #[path = "tests/memory_notice.rs"]
 mod memory_notice;
 mod participants;
@@ -22883,15 +22883,25 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         },
     );
     let record = header["id"].as_u64().unwrap();
-    let read = dekopon_agent::memory_tools::MemoryTools::read(&tools, record, "native", None)
-        .expect("the record is readable");
+    let read = dekopon_agent::memory_tools::MemoryTools::read(
+        &tools,
+        dekopon_agent::memory_tools::Target::Record(record),
+        "native",
+        None,
+    )
+    .expect("the record is readable");
     assert!(read.contains("[request] "), "{read}");
     assert!(read.contains("printf result-sentinel"), "{read}");
     assert!(read.contains("[result]"), "{read}");
     assert!(read.contains("[tool: bash, outcome: exit 0]"), "{read}");
     assert!(!read.contains("do the work"));
     assert!(!read.contains("done"));
-    let refused = dekopon_agent::memory_tools::MemoryTools::read(&tools, record, "missing", None);
+    let refused = dekopon_agent::memory_tools::MemoryTools::read(
+        &tools,
+        dekopon_agent::memory_tools::Target::Record(record),
+        "missing",
+        None,
+    );
     assert!(matches!(
         refused,
         Err(dekopon_agent::memory_tools::MemoryRefusal::UnknownRepresentation { ref available })
