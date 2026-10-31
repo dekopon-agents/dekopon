@@ -2610,8 +2610,12 @@ impl<'a> Evaluator<'a> {
                 self.completed(outcome)
             }
             Resolution::NotFound => {
-                self.write_line(&format!("dekopon-shell: {command}: command not found"));
-                Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)))
+                let call = crate::RunCall {
+                    word: command.to_owned(),
+                    argv: typed_arguments.to_vec(),
+                };
+                let outcome = self.run_provider(call, input, stdout_sink);
+                self.completed(outcome)
             }
         }
     }

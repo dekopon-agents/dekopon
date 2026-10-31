@@ -2679,7 +2679,7 @@ async fn a_console_scope_refusal_answers_before_the_guest_parses() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_memory_word_refused_by_a_gate_is_not_found_and_refunded() {
+async fn a_memory_word_refused_by_a_gate_is_not_granted_and_refunded() {
     struct Memory(BrokerLeg);
     impl CapabilityInvoker for Memory {
         fn granted(&self) -> Vec<String> {
@@ -2720,7 +2720,10 @@ async fn a_memory_word_refused_by_a_gate_is_not_found_and_refunded() {
         .await
         .unwrap();
     assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
-    assert_eq!(outcome.output, "dekopon-shell: probe: command not found");
+    assert_eq!(
+        outcome.output,
+        "dekopon-shell: probe: not granted in this conversation"
+    );
     assert_eq!(calls.used(), 0);
     assert!(harness.audit.records().is_empty());
     harness.stop().await;
