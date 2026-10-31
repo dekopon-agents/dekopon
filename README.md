@@ -26,7 +26,7 @@ and local image builds; [development](docs/development.md) covers building and c
 
 ## Design documentation
 
-Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/inference.md`](docs/inference.md) traces Slack model calls through prompt caching and bounded memory down to literal Rust and wire JSON. `docs/README.md` provides task-based reading paths; repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md). See [`CHANGELOG.md`](CHANGELOG.md) for the history of every application and chart tag.
+Start with [`docs/design.md`](docs/design.md) for the product model, authority flow, component boundaries, and accepted decisions. [`docs/development.md`](docs/development.md) maps source, tests, generated artifacts, separate workspaces, and validation. [`docs/inference.md`](docs/inference.md) traces Slack model calls through prompt caching and bounded memory down to literal Rust and wire JSON. Repository-wide agent instructions live in [`AGENTS.md`](AGENTS.md). See [`CHANGELOG.md`](CHANGELOG.md) for the history of every application and chart tag.
 
 ## What it does
 
@@ -87,8 +87,6 @@ Run its loading and authority tests with `cargo test -p dekopon-config --test ex
 
 The `reviewer` may read pull requests and may propose a review comment only through the explicit `github.pull-request.comment` external-write capability. The `reviewer` also mounts one skill directory, `skills/pull-request-review`, whose `SKILL.md` name and description the model sees and whose body it reads on demand with `read_skill`. It has no approval capability, just like the end-to-end example above: approval is a separately named action rather than a stronger grade of “write.” This local file is catalog-only; the flagship example adds the broker policy, execution constraints, credential boundary, gateway route, and audit proof needed to make its comment real. The disabled `snooper` has one read-only repository capability.
 
-See `docs/cli.md` for model-auth commands, formats, and exit codes.
-
 ## Providers and sandboxed scripts
 
 Provider components execute only through the separate authorization broker. See the
@@ -109,10 +107,6 @@ and a real gateway/broker smoke test. Model inference and credential contracts a
 Proposals carry untrusted intent; authorization, provider credentials, privileged host I/O, evidence, and audit records belong to a separate boundary ([constitution](docs/design.md#constitution)). Rust type visibility reinforces that distinction but never replaces process isolation, authentication, or policy enforcement. `dekopon-brokerd` establishes trusted context only from Unix peer credentials and an owner-controlled exact mapping; payloads cannot claim identity or authority. Its authorization decisions come from Cedar and its execution bounds from a separate owner-authored constraint catalog, so a policy edit can broaden who may act and can never widen how far an action reaches. The gateway never creates or receives authorized invocations; it submits untrusted proposals and receives public broker results.
 
 Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions and current limitations.
-
-## Roadmap
-
-Sequencing, the next milestones, and deferred scope live in `docs/roadmap.md`; roadmap items are intentions, not shipped features.
 
 ## Maintainer release process
 

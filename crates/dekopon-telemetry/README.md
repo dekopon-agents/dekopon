@@ -87,6 +87,3 @@ crate speaks raw identifier bytes rather than a Dekopon wire type; `dekopon-brok
 process that configured no OTLP trace exporter: the identifiers are absent rather than invalid, and
 no depth of span nesting produces them. A caller that must put a trace on a wire mints its own
 instead — see `dekopon_agent::session_trace_parent`.
-
-`docs/observability.md` is the
-authoritative account of the trace identifier every record carries.

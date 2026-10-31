@@ -8,7 +8,7 @@ From the repository root (`Cargo.toml`, `AGENTS.md`, and `docs/` should be prese
 
 1. Run `git status --short --branch` and preserve unrelated work.
 2. Classify the change as **Current**, **Committed direction**, or **Exploration** ([`design.md`](design.md#constitution)).
-3. Select the relevant contracts from the area index; identify which process owns the data and which owns the authority.
+3. Identify which process owns the data and which owns the authority.
 4. Find the implementation and its nearest tests before editing.
 5. Check whether the change crosses the root workspace, a separate provider workspace, a generated artifact, or a mirrored contract.
 
@@ -50,7 +50,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
 
-Tests intentionally live beside the crate that owns the behavior. The top-level `tests/` directory remains a map to package-owned suites; the repository-level observability smoke test lives with its runnable example under `examples/otel-traces/`.
+Tests intentionally live beside the crate that owns the behavior. The repository-level observability smoke test lives under `examples/otel-traces/`.
 
 Scaffolding that more than one suite needs lives in `dekopon-test-support` instead of being copied: the provider-fixture path, loopback HTTP servers, a fake broker on a Unix socket, the `tracing` capture layer, and the directory-tree snapshot. It is `publish = false` and is added only under `[dev-dependencies]` as a path entry with no version — Cargo strips that from a published manifest, so it stays out of `.github/release-crates.txt`, out of every `cargo package` archive, and out of the dependency tree CI checks for broker crates inside `dekopon-gatewayd`. Anything that is genuinely one suite's own — a bespoke subscriber keyed by span id, a transport mock driven by a handler closure — stays with that suite.
 
@@ -81,13 +81,13 @@ text stays text. Gateway-built proposals retain `Invoke`; no proposal JSON walk 
 numbering, retention and output sniffing. Update the descriptor, lifetime, queue, transport and
 failure-note tests together. See asset handles.
 
-Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered on every session, and its record carries model-authored text same as every other model-authored record (goal 2). The contract is in `improvement.md`.
+Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered on every session, and its record carries model-authored text same as every other model-authored record (goal 2).
 
 Provider JSON Schemas are exposed to the model, but there is no general JSON Schema validator in the host. The host requires an object-shaped schema and object invocation input; each provider must validate its own capability-specific fields and constraints.
 
 ### Provider contract or host
 
-A capability or provider change also updates the catalog example, owner-authored constraint set and Cedar policy, `catalog.md`, `security-model.md`, and the relevant fixture/build script and import-inspection tests.
+A capability or provider change also updates the catalog example, owner-authored constraint set and Cedar policy, `security-model.md`, and the relevant fixture/build script and import-inspection tests.
 
 The SDK and host provider WIT files are mirrored and must remain byte-identical:
 
@@ -316,9 +316,9 @@ Privileged broker path:
 - `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, maps distinct configured peer UIDs, bounds concurrent connections, and serves with `TraceOnlyAuditLog`, so its audit is the log record alone.
 - `dekopon-brokerd provider` is a separate operator mode. Exact-reference `sync` and `sync --locked` are the only network-capable lifecycle commands; `list`, `verify`, `skills --out DIR`, and daemon startup construct no registry request. A managed lock passes expected component length, SHA-256, and provider ID into the host so its one artifact read is both verified and compiled. The daemon embeds a narrow strict OCI-reference parser and bounded distribution path over `http-auth` and the rustls `reqwest` client.
 - The service enforces the [current local process boundary](security-model.md#current-local-process-boundary). Auth does not invoke it. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, `dekopon-policy`, `dekopon-console`, or `dekopon-tui` in the normal dependency tree of `dekopon-gatewayd`. In the reverse direction, CI rejects `dekopon-agent`, `dekopon-shell`, `dekopon-process`, `dekopon-config`, `dekopon-console`, or `dekopon-tui` in the normal dependency tree of `dekopon-brokerd`; `dekopon-model` is allowed for the shared `chatgpt::CredentialFile` refresh implementation. Both gates allow the shared `dekopon-broker-protocol` client.
-- `dekopon-gatewayd` is the unprivileged agent daemon on the other side of that boundary: strict owner-controlled configuration naming environment variables rather than secrets, chat transports, first-match routing to catalog agents, admission-bounded sessions, optional bounded conversation history in process memory (private per authenticated subject by default, explicitly shareable only within one agent/transport/conversation), and attested on-behalf-of proposals. Its attested `capabilities` gate refuses an unauthorized subject before any model call; the broker answers it only when policy permits `agent.prompt` for that principal and agent. See `gatewayd.md`.
+- `dekopon-gatewayd` is the unprivileged agent daemon on the other side of that boundary: strict owner-controlled configuration naming environment variables rather than secrets, chat transports, first-match routing to catalog agents, admission-bounded sessions, optional bounded conversation history in process memory (private per authenticated subject by default, explicitly shareable only within one agent/transport/conversation), and attested on-behalf-of proposals. Its attested `capabilities` gate refuses an unauthorized subject before any model call; the broker answers it only when policy permits `agent.prompt` for that principal and agent.
 
-See `gatewayd.md` for the user-facing contract, `observability.md` for OTLP signal and redaction behavior, and [`security-model.md`](security-model.md) for the trust boundary.
+See [`security-model.md`](security-model.md) for the trust boundary.
 
 ### In-process multi-participant gateway tests
 
@@ -344,7 +344,7 @@ Two permission tests assume a non-root user: `dekopon-brokerd`'s `a_secret_file_
 
 Record the exact tested head or artifact, the commands and outcomes actually observed, and remaining verification gaps. Verify required remote checks on the exact submitted head; local success does not prove remote CI passed. Never describe future behavior as tested or an unobserved remote operation as successful.
 
-For deployment diagnosis, inspect the deployed runtime version/ref and provider component digest, not checkout HEAD or an old report. Browser, fixture, native-host, provider-loading, and live-provider-request acceptance exercise different boundaries; none proves the others. State precisely which boundary and bytes were exercised. Use the area index for deployment and operational contracts.
+For deployment diagnosis, inspect the deployed runtime version/ref and provider component digest, not checkout HEAD or an old report. Browser, fixture, native-host, provider-loading, and live-provider-request acceptance exercise different boundaries; none proves the others. State precisely which boundary and bytes were exercised.
 
 ### Root workspace
 
@@ -421,8 +421,8 @@ Only `dekopon-gatewayd` packages `tests/**`; every other published crate's `incl
 
 The `documentation checks` job runs without a Rust toolchain and the required `quality (stable)`
 context aggregates it, so a Markdown-only pull request is gated even though it selects no Rust
-lane. Its one step fails when tracked Markdown, excluding `CHANGELOG.md`, `AGENTS.md` and test
-fixtures, exceeds the word budget set in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+lane. Its one step fails when tracked Markdown, minus the files it excludes, exceeds the word
+budget set in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml).
 
 ### macOS Homebrew compatibility
 

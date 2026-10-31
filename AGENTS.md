@@ -71,8 +71,9 @@ Audits and plans default to over-building, and the owner reels them back. Before
   redundant primitive instead of adding coordination.
 - **Enforcement is compiler-native only:** `clippy.toml` `disallowed-*` with a `reason`, a site
   `#[expect(..., reason)]`, workspace lints. No CI checker scripts, grep gates, exception
-  registries, negative-fixture suites or per-boundary inventory docs. The one exception is the
-  documentation word budget ([Documentation](#documentation)), which no compiler can enforce.
+  registries, negative-fixture suites or per-boundary inventory docs. The exceptions are the
+  dependency-boundary gates and the documentation word budget ([Documentation](#documentation)),
+  which no compiler can enforce.
 - **Fail fast, one rich trace record, a reset path.** No quarantine, integrity MACs or detection
   that cannot fix anything ([non-goals](docs/design.md#non-goals)).
 - **Calibrate severity to the one deployment,** a Raspberry Pi serving family chats. Owner-only
@@ -138,10 +139,12 @@ Docs are for humans: what a principal engineer cannot derive from the code. Agen
   - **credentials the agent never holds:** the model proposes through one bash-like script, and the
     broker, its own process and UID, runs Wasm providers and injects a destination-bound credential
     after the provider builds the request;
-  - **two-layer authority:** Cedar decides who may act, from the gateway's attestation; operator
-    constraint sets decide how far, and policy cannot widen them; Cedar checks each outbound request;
+  - **two-layer authority:** the broker alone maps an authenticated subject to a principal and Cedar
+    decides whether it may act; operator constraint sets decide how far, and policy cannot widen
+    them; Cedar also checks each outbound request;
   - **the memory ladder:** journaled turns replay through summaries written ahead of time, and a
-    record changes rung only at a repack, so the prompt cache stays warm; memory never grants authority;
+    record keeps its rung until a repack, until it leaves the hot window or until its pin changes,
+    so the prompt cache stays warm; memory never grants authority;
   - **keyless model access for outside VMs:** coding agents reach models through the gateway's proxy,
     which injects the key and charges the agent's token budget;
 - a design reason the code cannot show;
@@ -150,9 +153,9 @@ Docs are for humans: what a principal engineer cannot derive from the code. Agen
 
 Everything else is the code, `check` and `--help`. Errors are loud and name the key.
 
-1. **Budget.** Tracked Markdown, excluding `CHANGELOG.md`, this file and test fixtures, stays within
-   the word budget the `docs` CI job enforces, with at most seven files in `docs/`. A change over
-   budget cuts as much as it adds, or cites the owner's raise.
+1. **Budget.** Tracked Markdown, except the files the `docs` CI job excludes (`CHANGELOG.md`, this
+   file and fixtures), stays within the word budget that job enforces. A change over budget cuts as
+   much as it adds, or cites the owner's raise.
 2. **Whole file first.** A pull request that touches a doc gives it a KEEP, MERGE or DELETE verdict
    in its body before any line is edited.
 3. **Derivation test.** No doc states a key, field, default, event, error, limit or command that a
@@ -163,8 +166,8 @@ Everything else is the code, `check` and `--help`. Errors are loud and name the 
 6. **No indexes, history, proposals or receipts.** `README.md` is the only index, `CHANGELOG.md`
    the only history, and issues hold proposals. No "previously", migration steps, version minimums,
    CI run IDs, patch versions or "we tested".
-7. **Code names no docs.** Errors and comments name config keys, not doc paths; only packaging
-   (`release.yml`, the Homebrew formula) names doc files.
+7. **Code names no docs.** Errors, comments and config name keys, not doc paths. Only packaging
+   (`release.yml`, the Homebrew formula, the chart) names doc files, and anything may cite AGENTS.md.
 8. **Delete, don't reword.** When a change makes a sentence wrong, delete it unless it passes rules
    3–5. A doc diff that adds more words than it removes says why.
 

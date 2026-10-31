@@ -2,7 +2,7 @@
 
 A change is judged by the three goals in the [constitution](docs/design.md#constitution); a subsystem that serves none of them is a deletion candidate. Small, reviewable changes with explicit trust assumptions beat speculative framework code.
 
-For behavior or architecture changes, read the relevant sections of [`docs/design.md`](docs/design.md). Select the applicable [change map](docs/development.md#change-maps) and [validation group](docs/development.md#validation), using the [repository map](docs/development.md#repository-map) to locate source and tests. Other contracts are routed by the area index; reading every manual is not a prerequisite.
+For behavior or architecture changes, read the relevant sections of [`docs/design.md`](docs/design.md). Select the applicable [change map](docs/development.md#change-maps) and [validation group](docs/development.md#validation), using the [repository map](docs/development.md#repository-map) to locate source and tests.
 
 ## Development setup
 

@@ -139,10 +139,6 @@ authenticated transport": it trusts its local caller to declare a subject. It gr
 nothing by doing so — the broker's attestor grant and identity mapping gate everything — but it
 is a development tool, not a production transport.
 
-Configuration, transport semantics, session bounds, telemetry, the conversation contract,
-and the distinct-UID deployment boundary are documented in
-`docs/gatewayd.md`.
-
 WhatsApp media-first collection uses `debounceMs` (5000ms quiet by default) and
 `debounceMaxWaitMs` (15000ms maximum from the first receipt). Zero quiet time bypasses collection;
 an enabled maximum must be at least the quiet interval. See the
@@ -171,7 +167,7 @@ record failure cannot change an already delivered answer. Receipts do not prove 
 
 `dekopon-gatewayd auth chatgpt {login,status,logout,export}` runs before gateway configuration,
 telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
-ordinary serving requires `--config PATH`. See `docs/cli.md` for auth-only flags, output, exit codes and both export guards.
+ordinary serving requires `--config PATH`.
 
 Asset retention shares one `sessions.assetRetentionBytes` budget, defaulting to 1073741824 bytes
 (1 GiB). With `sessions.journal`, the required `sessions.assets.path` holds content-addressed files

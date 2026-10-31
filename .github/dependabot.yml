@@ -46,7 +46,7 @@ updates:
 
   # The Dockerfile's runtime base, pinned by tag and digest. It is the only image the container
   # build depends on; the binaries come from a published release. A bump to a different Debian
-  # changes the glibc the release binaries must fit inside; see docs/container-image.md.
+  # changes the glibc the release binaries must fit inside.
   - package-ecosystem: docker
     directory: /
     schedule:

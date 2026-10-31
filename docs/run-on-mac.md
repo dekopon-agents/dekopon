@@ -139,8 +139,8 @@ Create the Slack app and a dedicated OpenRouter key, choose one model, and colle
 
 1. Create the app from the
    [released Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.75.0/examples/slack/manifest-agent.yaml)
-   and get its `xapp-…` and `xoxb-…` tokens with the
-   Slack setup guide. The workspace
+   and get its `xapp-…` app-level token (scope `connections:write`) and its `xoxb-…`
+   bot token. The workspace
    plan and admin policy must allow Slack's Agent features; otherwise choose the
    [classic manifest](../examples/slack/manifest.yaml) and `experience: classic` deliberately.
 2. For the review channel, invite the bot to one private channel whose members may see the

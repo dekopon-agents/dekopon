@@ -27,7 +27,7 @@ noticing.
 
 ## 1. Create the Slack app
 
-Follow `../slack/README.md`: create the app from
+Create the app from
 [`manifest-agent.yaml`](../slack/manifest-agent.yaml) (this example's `gatewayd.yaml` sets
 `experience: agent`; the classic `manifest.yaml` pairs with `experience: classic`), generate the
 app-level token (`xapp-…`, scope `connections:write`), install it for the bot token (`xoxb-…`), and
@@ -300,10 +300,9 @@ not enabled here.
 
 ## Related
 
-- `../slack/` — the Slack app manifest, both tokens, and finding the `T…`/`U…` identifiers.
+- `../slack/` — the Slack app manifests.
 - `../providers/http-probe/` — the component this deployment executes, and the `http-probe.purge` it never grants.
 - [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh) — the same shape at nineteen capabilities, shipped from its own repository.
-- `../../docs/gatewayd.md` — transports, routing, session bounds, and the authorization flow.
 - [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) — every configuration field, and the audit and shutdown contract.
 - [`../../crates/dekopon-policy/README.md`](../../crates/dekopon-policy/README.md) — what Cedar decides here and what it does not.
 - [`../catalog/dekopon.yaml`](../catalog/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and holds no approval capability.

@@ -98,7 +98,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
                     [path],
                     "run_rust",
                     "run_otel",
-                        )
+                )
 
     def test_otel_fixture_preserves_rust_and_smoke_coverage(self) -> None:
         self.assert_selected(

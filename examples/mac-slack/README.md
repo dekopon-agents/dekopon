@@ -17,8 +17,7 @@ Apply it in this order:
    directories and `credentials.env` in
    [Prepare the broker and gateway](../../docs/run-on-mac.md#prepare-the-broker-and-gateway).
    Create the Slack app from the
-   [0.74.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml)
-   with Slack setup.
+   [0.74.0 Agent manifest](https://github.com/dekopon-agents/dekopon/blob/v0.74.0/examples/slack/manifest-agent.yaml).
 2. Here, create five files, each mode `0600`, then [check them](#validate-and-accept):
    - in `/usr/local/etc/dekopon/broker/`, owned by `_dekopon_broker`:
      `jsonplaceholder-provider.wasm`, `broker.yaml` and `policies.cedar`;
