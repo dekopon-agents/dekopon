@@ -57,13 +57,13 @@ transport fills them:
 
 | Transport | `container` | `id` | `thread` |
 |---|---|---|---|
-| [Slack](../crates/dekopon-gatewayd/src/transport/slack.rs) | team | channel | thread root timestamp (a top-level message is its own root); none in a classic-experience DM |
-| [Discord](../crates/dekopon-gatewayd/src/transport/discord.rs) | guild; none in a DM | channel, or a thread's parent | the thread's channel id |
+| [Slack](../crates/dekopon-gatewayd/src/transport/slack.rs) | team | channel | thread root timestamp (a top-level message is its own root); none in classic DMs |
+| [Discord](../crates/dekopon-gatewayd/src/transport/discord.rs) | guild; none in a DM | channel or thread parent | the thread's channel id |
 | [Telegram](../crates/dekopon-gatewayd/src/transport/telegram.rs) | none | chat | topic |
 | [WhatsApp](../crates/dekopon-gatewayd/src/transport/whatsapp.rs) | `waba_id:phone_number_id` | sender | none |
 | [GitHub](../crates/dekopon-gatewayd/src/transport/github.rs) | owner | `owner.repo` | issue, pull request or discussion number, else [`repository`](../crates/dekopon-core/src/github.rs) |
 | [Fauxlack](../crates/dekopon-gatewayd/src/transport/fauxlack.rs) | server | channel | thread |
-| [local](../crates/dekopon-gatewayd/src/transport/local.rs) | none | `dev` | none |
+| [local](../crates/dekopon-gatewayd/src/transport/local.rs) | the caller's; default none | the caller's; default `dev` | the caller's; default none |
 
 This `forbid` limits pull-request comments to one Slack thread:
 
@@ -74,7 +74,7 @@ unless { context has conversation && context.conversation has thread
       && context.conversation.thread == "1761900000.000100" };
 ```
 
-It fences that capability only; the agent's Slack replies are not fenced.
+It fences that capability only, not the agent's Slack replies.
 
 ## `secret.use` and public DRNs
 

@@ -93,7 +93,7 @@ sits inside the operator's trust boundary.
 A `telemetry` block in each daemon's configuration turns the export on
 ([broker](../crates/dekopon-brokerd/src/config.rs), [gateway](../crates/dekopon-gatewayd/src/config.rs);
 [example](../examples/conditional-write/broker.yaml)).
-What the model was sent lands in `agent.model.prompt` records, and what it returned in
+The model's prompt lands in `agent.model.prompt` records and its reply in
 `agent.model.answer` ([`prompt.rs`](../crates/dekopon-agent/src/prompt.rs)).
 
 ## Keyless model access for outside VMs
