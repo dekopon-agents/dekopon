@@ -77,6 +77,13 @@ fn selected<'a>(root: &'a Value, schema: &'a Value, input: &Value) -> &'a Value 
     else {
         return schema;
     };
+    if !input.is_null() && variants.len() == 2 {
+        for (index, variant) in variants.iter().enumerate() {
+            if resolved(root, variant).get("type").and_then(Value::as_str) == Some("null") {
+                return selected(root, &variants[1 - index], input);
+            }
+        }
+    }
     let Some(properties) = variants
         .first()
         .and_then(|variant| variant.get("properties"))
@@ -403,7 +410,7 @@ mod tests {
     }
 
     #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
-    #[serde(tag = "kind")]
+    #[serde(tag = "kind", deny_unknown_fields)]
     enum TaggedInput {
         Read { path: String },
         Count { limit: u128 },
@@ -413,6 +420,40 @@ mod tests {
     fn an_internally_tagged_enum_refusal_names_the_failing_field() {
         let failure = refusal::<TaggedInput>(r#"{"kind":"Read","path":null}"#);
         assert_eq!(failure.to_string(), "invalid input: path: wrong type");
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    struct NullableInput {
+        operation: Option<TaggedInput>,
+    }
+
+    #[test]
+    fn a_nullable_tagged_enum_refusal_names_a_wrong_type_field() {
+        let failure = refusal::<NullableInput>(r#"{"operation":{"kind":"Read","path":null}}"#);
+        assert_eq!(
+            failure.to_string(),
+            "invalid input: operation.path: wrong type"
+        );
+    }
+
+    #[test]
+    fn a_nullable_tagged_enum_refusal_names_a_missing_field() {
+        let failure = refusal::<NullableInput>(r#"{"operation":{"kind":"Read"}}"#);
+        assert_eq!(
+            failure.to_string(),
+            "invalid input: operation.path: missing field"
+        );
+    }
+
+    #[test]
+    fn a_nullable_tagged_enum_refusal_names_an_unknown_field() {
+        let failure = refusal::<NullableInput>(
+            r#"{"operation":{"kind":"Read","path":"valid","extra":"SENTINEL-INPUT-VALUE"}}"#,
+        );
+        assert_eq!(
+            failure.to_string(),
+            "invalid input: operation.extra: unknown field"
+        );
     }
 
     #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
