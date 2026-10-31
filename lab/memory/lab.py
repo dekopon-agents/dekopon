@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fakemodel  # noqa: E402
 
-SUBJECT = "tel.16034700182"
+SUBJECT = "drn:tel:number::16034700182"
 AGENT = "lab-agent"
 ROUTES = ("summary", "plain", "none")
 SUMMARIZER_TIMEOUT_MS = 20000
@@ -100,7 +100,7 @@ class Lab:
             "providers": [str(wasm)],
             "identities": [{"uid": self.ids["gateway"], "principal": "dekopon-gatewayd",
                             "actor": {"type": "service", "principal": "dekopon-gatewayd"},
-                            "attestor": {"namespaces": ["tel"]}}],
+                            "attestor": {"namespaces": ["drn:tel:*:*:*"]}}],
             "principals": {"lab-user": {"subjects": [SUBJECT]}},
             "capabilities": {"cli-probe": {"constraints": {"timeoutMs": 30000},
                                            "capabilities": {"cli-probe.upper": {}}}},
