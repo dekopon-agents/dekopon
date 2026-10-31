@@ -4668,6 +4668,7 @@ fn message(text: &str) -> InboundMessage {
         constituents: Vec::new(),
         folded: Vec::new(),
         asset_overflow: false,
+        input_refusal: None,
     }
 }
 
@@ -4755,6 +4756,7 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         constituents: Vec::new(),
         folded: Vec::new(),
         asset_overflow: false,
+        input_refusal: None,
     }
 }
 
@@ -17438,6 +17440,219 @@ async fn unauthorized_and_unrouted_whatsapp_photos_fetch_nothing() {
         }
         assert_eq!(models.requests(), 0);
         assert!(peer.requests.lock().is_empty());
+        peer.finish().await;
+    }
+}
+
+fn fetch_asset_call(id: u64) -> AssistantTurn {
+    AssistantTurn::new(
+        Some(String::new()),
+        vec![ModelToolCall {
+            id: "asset-call".into(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: "fetch_chat_asset".to_owned(),
+                arguments: json!({ "id": id }).to_string(),
+            },
+        }],
+        None,
+    )
+}
+
+fn model_files(models: &ModelScript, index: usize) -> Vec<(String, String, Vec<u8>)> {
+    models.prompts.lock()[index]
+        .iter()
+        .filter_map(ModelMessage::parts)
+        .flatten()
+        .filter_map(|part| match part {
+            dekopon_model::model::ContentPart::File { name, mime, data } => Some((
+                name.clone(),
+                mime.clone(),
+                data.read().expect("file lease reads"),
+            )),
+            dekopon_model::model::ContentPart::Text(_)
+            | dekopon_model::model::ContentPart::Image { .. } => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_pdf_reaches_the_model_as_a_file_part_with_its_bytes_name_and_mime() {
+    use crate::transport::whatsapp::tests_media::{
+        MediaPeer, PDF, admitted, bytes_reply, document_webhook, metadata,
+    };
+    for captioned in [true, false] {
+        let peer = MediaPeer::new(|origin, index| match index {
+            0 => metadata(origin, "application/pdf", PDF),
+            1 => bytes_reply(PDF),
+            _ => panic!("one metadata and one download request"),
+        })
+        .await;
+        let mut document =
+            json!({"id":"789", "mime_type":"application/pdf", "filename":"invoice.pdf"});
+        if captioned {
+            document["caption"] = json!("What is the total?");
+        }
+        let (transport, upload) = admitted(&peer.origin, &document_webhook(document)).await;
+        let directory = temporary();
+        let capabilities = || {
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+        };
+        let (broker, _observed) =
+            stub_broker(directory.path(), vec![capabilities(), capabilities()]).await;
+        let models = ModelScript::new(if captioned {
+            vec![fetch_asset_call(1), answer("The total is 4,217.50.")]
+        } else {
+            vec![
+                answer("Received invoice.pdf."),
+                fetch_asset_call(1),
+                answer("The total is 4,217.50."),
+            ]
+        });
+        let mut runner = runner(broker, Arc::clone(&models), 4);
+        Arc::get_mut(&mut runner)
+            .expect("unique runner")
+            .asset_fetchers
+            .insert("wa".to_owned(), transport.asset_fetcher().expect("fetcher"));
+        let mut route = persistent_route(model_config(), window());
+        route.transport = "wa".to_owned();
+        let driver = Arc::new(RecordingDriver::default());
+        let mut turns = vec![upload.clone()];
+        if !captioned {
+            let mut question = upload.clone();
+            question.assets.clear();
+            question.text = "What is the total?".to_owned();
+            question.message_id = MessageId::Native("wamid.question".to_owned());
+            turns.push(question);
+        }
+        for message in turns {
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                message,
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            )
+            .await;
+        }
+        let read = models.requests() - 1;
+        assert_eq!(
+            model_files(&models, read),
+            [(
+                "invoice.pdf".to_owned(),
+                "application/pdf".to_owned(),
+                PDF.to_vec()
+            )]
+        );
+        assert!(tool_message(&models, read).contains("follows in the next message"));
+        assert_eq!(
+            driver.replies().last().map(String::as_str),
+            Some("The total is 4,217.50.")
+        );
+        assert_eq!(peer.requests.lock().len(), 2);
+        peer.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_whatsapp_pdf_tells_the_model_the_limit_and_sends_no_file() {
+    use crate::transport::whatsapp::tests_media::{
+        MediaPeer, admitted, document_webhook, json_reply,
+    };
+    let peer = MediaPeer::new(|origin, index| match index {
+        0 => json_reply(json!({"id":"789", "mime_type":"application/pdf",
+            "file_size": 8 * 1024 * 1024 + 1,
+            "url": format!("{origin}/whatsapp_business/attachments/?signed=URL_SENTINEL")})),
+        _ => panic!("an oversized PDF is never downloaded"),
+    })
+    .await;
+    let document = json!({"id":"789", "mime_type":"application/pdf", "caption":"Total?"});
+    let (transport, upload) = admitted(&peer.origin, &document_webhook(document)).await;
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+            BTreeMap::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([fetch_asset_call(1), answer("That PDF is too large.")]);
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    Arc::get_mut(&mut runner)
+        .expect("unique runner")
+        .asset_fetchers
+        .insert("wa".to_owned(), transport.asset_fetcher().expect("fetcher"));
+    let mut route = route(model_config());
+    route.transport = "wa".to_owned();
+    run_session(runner, route, upload, Arc::new(RecordingDriver::default())).await;
+    assert_eq!(
+        tool_message(&models, 1),
+        "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read."
+    );
+    assert!(model_files(&models, 1).is_empty());
+    assert_eq!(peer.requests.lock().len(), 1);
+    peer.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupported_whatsapp_document_gets_one_refusal_only_when_routed() {
+    use crate::transport::whatsapp::tests_media::{MediaPeer, admitted, document_webhook};
+    for routed in [true, false] {
+        let peer = MediaPeer::new(|_, _| panic!("a refused document is never fetched")).await;
+        let word = json!({"id":"789", "mime_type":"application/msword", "caption":"read"});
+        let (_transport, message) = admitted(&peer.origin, &document_webhook(word)).await;
+        let directory = temporary();
+        let mut doc = document(directory.path());
+        doc["transports"][0] = json!({
+            "name": "wa", "kind": "whatsappCloudApi", "appSecretEnv": "APP",
+            "verifyTokenEnv": "VERIFY", "accessTokenEnv": "ACCESS", "bind": "127.0.0.1:9080",
+            "callbackPath": "/wa", "wabaId": "123", "phoneNumberId": "456",
+            "graphApiVersion": "v25.0"
+        });
+        doc["routes"][0]["transport"] = json!("wa");
+        let routes = if routed {
+            let config = resolved(directory.path(), &doc).await;
+            Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap())
+        } else {
+            Arc::new(RoutingTable::default())
+        };
+        let (broker, mut observed) = stub_broker(directory.path(), Vec::new()).await;
+        let models = ModelScript::forbidden();
+        let runner = runner(broker, Arc::clone(&models), 4);
+        let driver = Arc::new(RecordingDriver::default());
+        let drivers =
+            BTreeMap::from([("wa".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+        let mut sessions = tokio::task::JoinSet::new();
+        crate::dispatch(
+            &runner,
+            &routes,
+            &BTreeMap::new(),
+            &drivers,
+            &[],
+            &mut sessions,
+            &mut crate::collection::Collector::new(&[], 4),
+            &mut crate::follow::Debounce::default(),
+            message,
+        );
+        while sessions.join_next().await.is_some() {}
+        assert_eq!(
+            driver.replies(),
+            if routed {
+                vec![
+                    "I can only read PDF documents and text. Please send the file as a PDF or paste its text."
+                        .to_owned(),
+                ]
+            } else {
+                Vec::new()
+            }
+        );
+        assert_eq!(models.requests(), 0);
+        assert!(observed.try_recv().is_err());
         peer.finish().await;
     }
 }

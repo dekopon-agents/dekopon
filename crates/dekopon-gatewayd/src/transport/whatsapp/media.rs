@@ -2,7 +2,7 @@ use std::{net::IpAddr, time::Instant};
 
 use tracing::Instrument as _;
 
-use crate::transport::{asset_buffer, hydration::HydratedImage, reserve_for_chunk};
+use crate::transport::{asset_buffer, floor_boundary, hydration::HydratedImage, reserve_for_chunk};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
@@ -10,6 +10,8 @@ use super::*;
 
 pub(crate) const MAX_IMAGE_BYTES: usize = 5_000_000;
 pub(super) const MAX_CAPTION_CHARS: usize = 1024;
+const MAX_DOCUMENT_NAME_BYTES: usize = 128;
+const PDF: &str = "application/pdf";
 const DOWNLOAD_HOST: &str = "lookaside.fbsbx.com";
 const DOWNLOAD_PATH: &str = "/whatsapp_business/attachments/";
 
@@ -39,12 +41,112 @@ pub(super) fn inbound_image(image: &Value) -> Option<PendingAsset> {
     })
 }
 
-pub(super) fn failure(reason: &str) -> TransportError {
+pub(super) fn inbound_document(
+    document: &Value,
+) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+    let caption = match document.get("caption") {
+        None => Some(""),
+        Some(Value::String(caption)) => Some(caption.as_str()),
+        Some(_) => None,
+    };
+    match (caption, pdf(document)) {
+        (Some(caption), Some(asset)) => (caption, vec![asset], None),
+        (caption, _) => (
+            caption.unwrap_or_default(),
+            Vec::new(),
+            Some(InputRefusal::UnsupportedDocument),
+        ),
+    }
+}
+
+fn pdf(document: &Value) -> Option<PendingAsset> {
+    let id = document.get("id")?.as_str()?;
+    if document.get("mime_type")?.as_str()? != PDF || !media_id(id) {
+        return None;
+    }
+    Some(PendingAsset {
+        name: document_name(document.get("filename").and_then(Value::as_str)),
+        mime: PDF.to_owned(),
+        size: None,
+        source: Some(AssetSourceRef::WhatsApp {
+            media_id: id.to_owned(),
+            mime: PDF.to_owned(),
+        }),
+    })
+}
+
+fn document_name(filename: Option<&str>) -> String {
+    let base = filename
+        .unwrap_or_default()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    let name: String = base
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let name = name.trim();
+    let name = &name[..floor_boundary(name, MAX_DOCUMENT_NAME_BYTES)];
+    if name.is_empty() || name.chars().all(|character| character == '.') {
+        "document.pdf".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Media {
+    Png,
+    Jpeg,
+    Pdf,
+}
+
+impl Media {
+    fn of(mime: &str) -> Option<Self> {
+        match mime {
+            "image/png" => Some(Self::Png),
+            "image/jpeg" => Some(Self::Jpeg),
+            PDF => Some(Self::Pdf),
+            _ => None,
+        }
+    }
+
+    fn limit(self, max_bytes: u64) -> u64 {
+        match self {
+            Self::Png | Self::Jpeg => max_bytes.min(MAX_IMAGE_BYTES as u64),
+            Self::Pdf => max_bytes,
+        }
+    }
+
+    fn oversized(self, size: u64) -> TransportError {
+        match self {
+            Self::Png | Self::Jpeg => failure("image-too-large"),
+            Self::Pdf if size == 0 => failure("media-size"),
+            Self::Pdf => {
+                refused("document-too-large");
+                TransportError::AssetTooLarge { size }
+            }
+        }
+    }
+
+    const fn signature_reason(self) -> &'static str {
+        match self {
+            Self::Png | Self::Jpeg => "image-signature",
+            Self::Pdf => "document-signature",
+        }
+    }
+}
+
+fn refused(reason: &str) {
     tracing::warn!(
         event = "gateway_whatsapp_media_refused",
         reason,
         "gateway.whatsapp.media.refused"
     );
+}
+
+pub(super) fn failure(reason: &str) -> TransportError {
+    refused(reason);
     TransportError::Service {
         code: reason.to_owned(),
     }
@@ -262,10 +364,10 @@ impl AssetFetcher for WhatsappDriver {
         };
         let (id, mime) = (id.clone(), mime.clone());
         Box::pin(async move {
-            if !media_id(&id) || !matches!(mime.as_str(), "image/png" | "image/jpeg") {
+            let Some(kind) = Media::of(&mime).filter(|_| media_id(&id)) else {
                 return Err(failure("asset-metadata"));
-            }
-            let limit = max_bytes.min(MAX_IMAGE_BYTES as u64) as usize;
+            };
+            let limit = usize::try_from(kind.limit(max_bytes)).unwrap_or(usize::MAX);
             let response = self
                 .http
                 .get(format!("{}/{}/{}", self.endpoint, self.version, id))
@@ -285,7 +387,7 @@ impl AssetFetcher for WhatsappDriver {
                 .and_then(|size| size.as_u64().or_else(|| size.as_str()?.parse::<u64>().ok()))
                 .ok_or_else(|| failure("media-size"))?;
             if size == 0 || size > limit as u64 {
-                return Err(failure("image-too-large"));
+                return Err(kind.oversized(size));
             }
             let url = self.download_url(
                 metadata
@@ -304,13 +406,8 @@ impl AssetFetcher for WhatsappDriver {
             if bytes.len() as u64 != size {
                 return Err(failure("media-size-mismatch"));
             }
-            let valid = match mime.as_str() {
-                "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-                "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-                _ => false,
-            };
-            if !valid {
-                return Err(failure("image-signature"));
+            if crate::asset::signature_mime(&bytes) != Some(mime.as_str()) {
+                return Err(failure(kind.signature_reason()));
             }
             Ok(bytes)
         })

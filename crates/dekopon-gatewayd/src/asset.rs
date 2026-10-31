@@ -1300,6 +1300,9 @@ impl Attempt {
                 .await
                 .map_err(|_elapsed| AssetFailure::TimedOut)?
                 .map_err(|error| {
+                    if let crate::transport::TransportError::AssetTooLarge { size } = error {
+                        return AssetFailure::TooLarge { size };
+                    }
                     if let Retry::Refetch = self.ticket.retry
                         && let crate::transport::TransportError::Service { code } = &error
                         && matches!(
@@ -2138,8 +2141,11 @@ fn sniff(blob: &DiskBlob, encoding: AssetEncoding) -> Result<Option<&'static str
             result?
         }
     };
-    let prefix = &decoded[..count];
-    Ok(if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
+    Ok(signature_mime(&decoded[..count]))
+}
+
+pub(crate) fn signature_mime(prefix: &[u8]) -> Option<&'static str> {
+    if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if prefix.starts_with(b"\xff\xd8\xff") {
         Some("image/jpeg")
@@ -2151,7 +2157,7 @@ fn sniff(blob: &DiskBlob, encoding: AssetEncoding) -> Result<Option<&'static str
         Some("application/pdf")
     } else {
         None
-    })
+    }
 }
 
 #[cfg(test)]

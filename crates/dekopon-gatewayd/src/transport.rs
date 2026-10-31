@@ -53,6 +53,7 @@ pub(crate) struct InboundMessage {
     pub pull_request_links: Option<crate::pull_request_links::PullRequestLinkContext>,
     pub assets: Vec<PendingAsset>,
     pub asset_overflow: bool,
+    pub input_refusal: Option<InputRefusal>,
     pub addressed: Option<bool>,
     pub thread_continuation: Option<ThreadContinuation>,
     pub reply: ReplyTarget,
@@ -62,6 +63,19 @@ pub(crate) struct InboundMessage {
     pub native_group: Option<String>,
     pub constituents: Vec<tracing::Span>,
     pub folded: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputRefusal {
+    UnsupportedDocument,
+}
+
+impl InputRefusal {
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::UnsupportedDocument => "unsupported-document",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -651,6 +665,8 @@ pub enum TransportError {
     Request(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("chat service returned an error: {code}")]
     Service { code: String },
+    #[error("chat service media is {size} bytes, over the limit the gateway will read")]
+    AssetTooLarge { size: u64 },
     #[error(
         "Discord refused the requested gateway intents (close 4014): messageContent: true needs \
          Developer Portal > Bot > Privileged Gateway Intents > Message Content Intent turned on"
@@ -693,6 +709,7 @@ impl TransportError {
             Self::NonUtf8Credential { .. } => "non-utf8-credential",
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
+            Self::AssetTooLarge { .. } => "asset-too-large",
             Self::DisallowedIntents => "disallowed-intents",
             Self::Response => "response",
             Self::MalformedResponse(_) => "malformed-response",

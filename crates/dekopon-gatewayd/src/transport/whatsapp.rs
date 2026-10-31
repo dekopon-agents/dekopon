@@ -31,8 +31,8 @@ use crate::{
     asset::{AssetSourceRef, PendingAsset},
     config::{LivenessMode, LivenessSettings},
     transport::{
-        AssetFetcher, ChatDriver, ChatTransport, InboundMessage, LivenessTarget, MessageId,
-        OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError, TransportEvent,
+        AssetFetcher, ChatDriver, ChatTransport, InboundMessage, InputRefusal, LivenessTarget,
+        MessageId, OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError, TransportEvent,
         TransportIdentity, TypingLease, bound_inbound, credential_client, receive_span,
         record_conversation, split_message,
         webhook::{
@@ -432,7 +432,7 @@ fn parse_delivery(
                 ) else {
                     continue;
                 };
-                let (text, assets) = match message.get("type").and_then(Value::as_str) {
+                let (text, assets, refusal) = match message.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         let Some(text) = message.pointer("/text/body").and_then(Value::as_str)
                         else {
@@ -441,7 +441,7 @@ fn parse_delivery(
                         if text.trim().is_empty() {
                             continue;
                         }
-                        (text, Vec::new())
+                        (text, Vec::new(), None)
                     }
                     Some("image") => {
                         let Some(asset) = media::inbound_image(&message["image"]) else {
@@ -457,8 +457,9 @@ fn parse_delivery(
                             Some(Value::String(caption)) => caption,
                             Some(_) => continue,
                         };
-                        (caption, vec![asset])
+                        (caption, vec![asset], None)
                     }
+                    Some("document") => media::inbound_document(&message["document"]),
                     _ => continue,
                 };
                 let individual = contacts.is_some_and(|contacts| {
@@ -527,6 +528,7 @@ fn parse_delivery(
                     constituents: Vec::new(),
                     folded: Vec::new(),
                     asset_overflow: false,
+                    input_refusal: refusal,
                 });
             }
         }
