@@ -148,6 +148,15 @@ pub enum Toggle {
 }
 
 impl AttachmentSummaries {
+    pub(crate) fn memory_targets(self) -> dekopon_agent::memory_tools::AttachmentTargets {
+        use dekopon_agent::memory_tools::AttachmentTargets;
+        match (self.images, self.documents) {
+            (Toggle::Off, Toggle::Off) => AttachmentTargets::Off,
+            (Toggle::Summarize, Toggle::Off | Toggle::Summarize)
+            | (Toggle::Off, Toggle::Summarize) => AttachmentTargets::On,
+        }
+    }
+
     pub(crate) fn summarizes(self, kind: dekopon_core::asset::AssetKind) -> bool {
         use dekopon_core::asset::AssetKind;
         match match kind {
@@ -461,4 +470,72 @@ pub fn resolve_knobs(inputs: &KnobInputs<'_>) -> Result<MemoryKnobs, PolicyProbl
         capture_max_item_bytes,
         selection,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dekopon_agent::memory_tools::AttachmentTargets;
+
+    #[test]
+    fn attachment_targets_follow_the_resolved_route_override() {
+        let enabled = SummariesConfig::On(SummaryParts {
+            attachments: AttachmentSummaries {
+                images: Toggle::Summarize,
+                documents: Toggle::Off,
+            },
+            ..SummaryParts::default()
+        });
+        for (agent, route, expected) in [
+            (Some(enabled.clone()), None, AttachmentTargets::On),
+            (
+                Some(enabled.clone()),
+                Some(SummariesConfig::Off(Off::Off)),
+                AttachmentTargets::Off,
+            ),
+            (
+                Some(enabled.clone()),
+                Some(SummariesConfig::On(SummaryParts::default())),
+                AttachmentTargets::Off,
+            ),
+            (None, Some(enabled), AttachmentTargets::On),
+            (
+                None,
+                Some(SummariesConfig::On(SummaryParts {
+                    attachments: AttachmentSummaries {
+                        images: Toggle::Off,
+                        documents: Toggle::Summarize,
+                    },
+                    ..SummaryParts::default()
+                })),
+                AttachmentTargets::On,
+            ),
+        ] {
+            let agent = AgentMemory {
+                summaries: agent,
+                ..AgentMemory::default()
+            };
+            let route = KnobOverrides {
+                summaries: route,
+                ..KnobOverrides::default()
+            };
+            let resolved = resolve_knobs(&KnobInputs {
+                route: &route,
+                agent: Some(&agent),
+                max_turns: 4,
+                journal_recall: JournalRecall::Replays,
+                models: &BTreeSet::new(),
+                proxy_only: &BTreeSet::new(),
+            })
+            .unwrap();
+            assert_eq!(
+                resolved
+                    .summaries
+                    .map_or(AttachmentTargets::Off, |summaries| summaries
+                        .attachments
+                        .memory_targets()),
+                expected
+            );
+        }
+    }
 }

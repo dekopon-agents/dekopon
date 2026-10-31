@@ -846,8 +846,8 @@ where
     if wakes.is_some() {
         model_tools.push(wake::wake_tool());
     }
-    if memory_tools.is_some() {
-        model_tools.extend(crate::memory_tools::tools());
+    if let Some(memory) = memory_tools {
+        model_tools.extend(crate::memory_tools::tools(memory.attachment_targets()));
     }
     let request_assets = assets;
     let assets = assets.filter(|source| source.offers_fetch());
@@ -6371,6 +6371,16 @@ mod tests {
     fn one_shot_offers_no_memory_tools_and_journal_session_dispatches_reads() {
         struct LocalMemory(crate::memory_tools::Target);
         impl crate::memory_tools::MemoryTools for LocalMemory {
+            fn attachment_targets(&self) -> crate::memory_tools::AttachmentTargets {
+                match self.0 {
+                    crate::memory_tools::Target::Record(_) => {
+                        crate::memory_tools::AttachmentTargets::Off
+                    }
+                    crate::memory_tools::Target::Asset(_) => {
+                        crate::memory_tools::AttachmentTargets::On
+                    }
+                }
+            }
             fn read(
                 &self,
                 id: crate::memory_tools::Target,
@@ -6441,11 +6451,14 @@ mod tests {
         .0
         .expect("read");
         assert_eq!(last_tool_results(&model), vec!["text"]);
-        assert!(
-            model.observed_tools.lock()[0]
-                .iter()
-                .any(|tool| tool.name == "read_memory_record")
-        );
+        let offered = model.observed_tools.lock();
+        for expected in crate::memory_tools::tools(crate::memory_tools::AttachmentTargets::Off) {
+            assert_eq!(
+                offered[0].iter().find(|tool| tool.name == expected.name),
+                Some(&expected)
+            );
+        }
+        drop(offered);
         let asset = dekopon_core::AssetNumber::try_from(8).unwrap();
         let model = ScriptedModel::new([
             tool_call(

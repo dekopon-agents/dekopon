@@ -2885,6 +2885,13 @@ async fn session_turn(
     let leave_request = invoker.leave_request();
     let pending_follows = invoker.pending_follows();
     let knobs = route.memory_knobs.clone();
+    let attachment_targets = knobs
+        .as_ref()
+        .and_then(|knobs| knobs.summaries.as_ref())
+        .map_or(
+            dekopon_agent::memory_tools::AttachmentTargets::Off,
+            |summaries| summaries.attachments.memory_targets(),
+        );
     let capture_cap = knobs
         .as_ref()
         .filter(|_| runner.journal.is_some())
@@ -2968,7 +2975,12 @@ async fn session_turn(
                             max_turns: window.limits.max_turns,
                             max_bytes: window.limits.max_bytes,
                             model: &model_key,
-                            assets: Some(assets.memory_assets()),
+                            assets: match attachment_targets {
+                                dekopon_agent::memory_tools::AttachmentTargets::Off => None,
+                                dekopon_agent::memory_tools::AttachmentTargets::On => {
+                                    Some(assets.memory_assets())
+                                }
+                            },
                         },
                     ) {
                         Ok(projected) => {
@@ -3108,7 +3120,7 @@ async fn session_turn(
             // instructions, which are still the system prompt, so this is not secrecy from a determined
             // user.
             let memory_tools = memory_journal.as_ref().map(|journal| {
-                crate::memory::journal::JournalMemoryTools::new(
+                let tools = crate::memory::journal::JournalMemoryTools::new(
                     journal,
                     memory_stem,
                     Admission {
@@ -3124,8 +3136,13 @@ async fn session_turn(
                         )),
                         sealed_at_ms: memory_seal.map(journal::millis),
                     },
-                )
-                .with_assets(assets.memory_assets())
+                );
+                match attachment_targets {
+                    dekopon_agent::memory_tools::AttachmentTargets::Off => tools,
+                    dekopon_agent::memory_tools::AttachmentTargets::On => {
+                        tools.with_assets(assets.memory_assets())
+                    }
+                }
             });
             if let Some(tools) = memory_tools.as_ref() {
                 inputs = inputs.with_memory_tools(tools);

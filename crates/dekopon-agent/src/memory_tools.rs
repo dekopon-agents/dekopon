@@ -76,6 +76,20 @@ pub enum MemoryRefusal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentTargets {
+    Off,
+    On,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+enum TargetError {
+    #[error("attachment memory is off")]
+    AttachmentsOff,
+    #[error("select exactly one of recordId and asset")]
+    ExactlyOne,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Target {
     Record(u64),
     Asset(AssetNumber),
@@ -83,21 +97,27 @@ pub enum Target {
 
 impl Target {
     fn parse(
+        attachments: AttachmentTargets,
         record: Option<u64>,
         asset: Option<AssetNumber>,
-    ) -> Result<Option<Self>, serde_json::Error> {
+    ) -> Result<Option<Self>, TargetError> {
+        match (attachments, asset) {
+            (AttachmentTargets::Off, Some(_)) => return Err(TargetError::AttachmentsOff),
+            (AttachmentTargets::Off, None) | (AttachmentTargets::On, _) => {}
+        }
         match (record, asset) {
             (Some(record), None) => Ok(Some(Self::Record(record))),
             (None, Some(asset)) => Ok(Some(Self::Asset(asset))),
             (None, None) => Ok(None),
-            (Some(_), Some(_)) => Err(serde_json::Error::custom(
-                "select exactly one of recordId and asset",
-            )),
+            (Some(_), Some(_)) => Err(TargetError::ExactlyOne),
         }
     }
 }
 
 pub trait MemoryTools: Send + Sync {
+    fn attachment_targets(&self) -> AttachmentTargets {
+        AttachmentTargets::Off
+    }
     fn read(
         &self,
         target: Target,
@@ -107,7 +127,11 @@ pub trait MemoryTools: Send + Sync {
     fn set_pin(&self, target: Target, representation_id: &str) -> Result<String, MemoryRefusal>;
     fn clear_pin(&self, target: Option<Target>) -> Result<String, MemoryRefusal>;
 }
-pub fn tools() -> [ModelTool; 3] {
+pub fn tools(attachments: AttachmentTargets) -> [ModelTool; 3] {
+    match attachments {
+        AttachmentTargets::Off => return record_tools(),
+        AttachmentTargets::On => {}
+    }
     [
         ModelTool {
             name: "read_memory_record".into(),
@@ -123,6 +147,25 @@ pub fn tools() -> [ModelTool; 3] {
             name: "clear_memory_pin".into(),
             description: "Clear exactly one recordId or asset number, or omit both to clear every record and asset pin in this conversation.".into(),
             parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"},"asset":{"type":"integer","minimum":1}},"not":{"required":["recordId","asset"]},"additionalProperties":false}),
+        },
+    ]
+}
+fn record_tools() -> [ModelTool; 3] {
+    [
+        ModelTool {
+            name: "read_memory_record".into(),
+            description: "Read a retained record by ID. representationId is `native` (the original turn), `summary-<n>` (generated summary part n) or `metadata` (the record's envelope). Range is a UTF-8 byte interval [start,end). A summary that was not generated is not available.".into(),
+            parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"},"representationId":{"type":"string"},"range":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2}},"required":["recordId","representationId"],"additionalProperties":false}),
+        },
+        ModelTool {
+            name: "set_memory_pin".into(),
+            description: "Pin a record to `native`, `summary-<n>` or `metadata` for future included history; a pin does not force inclusion.".into(),
+            parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"},"representationId":{"type":"string"}},"required":["recordId","representationId"],"additionalProperties":false}),
+        },
+        ModelTool {
+            name: "clear_memory_pin".into(),
+            description: "Clear one record's pin, or omit recordId to clear all pins in this conversation.".into(),
+            parameters: json!({"type":"object","properties":{"recordId":{"type":"integer"}},"additionalProperties":false}),
         },
     ]
 }
@@ -173,15 +216,11 @@ pub fn dispatch(
                         tool: name.to_owned(),
                         source,
                     })?;
-                let target = Target::parse(args.record_id, args.asset)
-                    .and_then(|target| {
-                        target.ok_or_else(|| {
-                            serde_json::Error::custom("select exactly one of recordId and asset")
-                        })
-                    })
+                let target = Target::parse(memory.attachment_targets(), args.record_id, args.asset)
+                    .and_then(|target| target.ok_or(TargetError::ExactlyOne))
                     .map_err(|source| PromptError::InvalidArguments {
                         tool: name.to_owned(),
-                        source,
+                        source: serde_json::Error::custom(source),
                     })?;
                 if name == "read_memory_record" {
                     memory.read(target, &args.representation_id, args.range)
@@ -197,12 +236,11 @@ pub fn dispatch(
                             source,
                         }
                     })?;
-                let target = Target::parse(args.record_id, args.asset).map_err(|source| {
-                    PromptError::InvalidArguments {
+                let target = Target::parse(memory.attachment_targets(), args.record_id, args.asset)
+                    .map_err(|source| PromptError::InvalidArguments {
                         tool: name.to_owned(),
-                        source,
-                    }
-                })?;
+                        source: serde_json::Error::custom(source),
+                    })?;
                 memory.clear_pin(target)
             }
             _ => return Ok(Dispatched::NotMemory),
@@ -213,4 +251,36 @@ pub fn dispatch(
     };
     messages.push(ModelMessage::tool(call.id.clone(), text));
     Ok(dispatched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_memory_off_preserves_the_base_tool_json() {
+        let expected = [
+            r#"{"name":"read_memory_record","description":"Read a retained record by ID. representationId is `native` (the original turn), `summary-<n>` (generated summary part n) or `metadata` (the record's envelope). Range is a UTF-8 byte interval [start,end). A summary that was not generated is not available.","parameters":{"type":"object","properties":{"recordId":{"type":"integer"},"representationId":{"type":"string"},"range":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2}},"required":["recordId","representationId"],"additionalProperties":false}}"#,
+            r#"{"name":"set_memory_pin","description":"Pin a record to `native`, `summary-<n>` or `metadata` for future included history; a pin does not force inclusion.","parameters":{"type":"object","properties":{"recordId":{"type":"integer"},"representationId":{"type":"string"}},"required":["recordId","representationId"],"additionalProperties":false}}"#,
+            r#"{"name":"clear_memory_pin","description":"Clear one record's pin, or omit recordId to clear all pins in this conversation.","parameters":{"type":"object","properties":{"recordId":{"type":"integer"}},"additionalProperties":false}}"#,
+        ];
+        for (tool, expected) in tools(AttachmentTargets::Off).iter().zip(expected) {
+            // Workspace policy enables preserve_order; the base fixture must use the active map order.
+            let base: serde_json::Value = serde_json::from_str(expected).unwrap();
+            let expected = format!(
+                r#"{{"name":{},"description":{},"parameters":{}}}"#,
+                base["name"], base["description"], base["parameters"]
+            );
+            assert_eq!(serde_json::to_string(tool).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn an_off_attachment_target_is_refused_by_the_parser() {
+        let number = AssetNumber::try_from(1).unwrap();
+        assert_eq!(
+            Target::parse(AttachmentTargets::Off, None, Some(number)),
+            Err(TargetError::AttachmentsOff)
+        );
+    }
 }

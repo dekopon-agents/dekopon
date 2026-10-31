@@ -213,10 +213,10 @@ OTLP trace and log fields carry prompts, model responses, command arguments and 
   File *contents* are untrusted in the same way. Each attachment is named in the prompt as
   `chat-asset:N`, and the gateway downloads its bytes only for a model's use: a `fetch_chat_asset`
   call, or a provider command that names it. They reach the replying model only through that call,
-  or through a pin, which passes the same checks. Where a journal-recall route turns on
-  `summaries.attachments`, the gateway also sends bytes it already holds for a conversation to the
-  route's `summaries.model` and no other endpoint, after the reply, without the replying model
-  asking for it:
+  or through a pin, which passes the same checks and requires `summaries.attachments` to enable
+  images or documents. Where a journal-recall route turns on `summaries.attachments`, the gateway
+  also sends bytes it already holds for a conversation to the route's `summaries.model` and no other
+  endpoint, after the reply, without the replying model asking for it:
   - PNG, JPEG, WebP and GIF images, and PDF, Word, Excel, PowerPoint and RTF documents, whole,
     up to 8 MiB;
   - at most the first 256 KiB of the textual documents `fetch_chat_asset` shows.

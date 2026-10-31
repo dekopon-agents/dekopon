@@ -12,6 +12,15 @@ pub enum AssetKind {
 }
 
 impl AssetKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::TextDocument => "text-document",
+            Self::BinaryDocument => "binary-document",
+            Self::Other => "other",
+        }
+    }
+
     pub fn of(mime: &str) -> Self {
         match mime {
             "image/png" | "image/jpeg" | "image/webp" | "image/gif" => Self::Image,

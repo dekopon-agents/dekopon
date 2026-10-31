@@ -93,9 +93,9 @@ impl Row {
                 prior
                     .assets
                     .iter()
-                    .find(|(number, _, pin)| *number == asset.number && *pin == row.pin)
+                    .find(|prior| prior.number == asset.number && prior.pin == row.pin)
             })
-            .map(|(_, rung, _)| *rung)
+            .map(|prior| prior.rung)
             .filter(|rung| row.ladder().contains(rung))
             .unwrap_or_else(|| row.start());
         row.shown = row.rung;

@@ -1,6 +1,6 @@
 use std::{io, num::NonZeroU64, time::SystemTime};
 
-use dekopon_agent::memory_tools::{MemoryRefusal, MemoryTools, Rung, Target};
+use dekopon_agent::memory_tools::{AttachmentTargets, MemoryRefusal, MemoryTools, Rung, Target};
 use parking_lot::Mutex;
 
 use super::{
@@ -57,7 +57,14 @@ impl<'a> JournalMemoryTools<'a> {
                     .ok_or(MemoryRefusal::RecordUnknown)?;
                 self.journal.record_lookup(&self.stem, record)
             }
-            Target::Asset(_) => self.journal.record_snapshot(&self.stem, false),
+            Target::Asset(_) => {
+                if self.assets.is_none() {
+                    return Err(MemoryRefusal::RepresentationUnavailable {
+                        available: Vec::new(),
+                    });
+                }
+                self.journal.record_snapshot(&self.stem, false)
+            }
         }
         .map_err(|error| match error {
             JournalError::Io {
@@ -88,6 +95,15 @@ impl<'a> JournalMemoryTools<'a> {
         if !self.admitted(&head) {
             return Err(MemoryRefusal::RecordIneligible);
         }
+        let asset_summaries = match target {
+            Target::Record(_) => None,
+            Target::Asset(number) => head
+                .header
+                .arrived
+                .iter()
+                .find(|asset| asset.number == number)
+                .map(|asset| asset.join(&head.asset_lines).summaries),
+        };
         Ok(Located {
             head,
             file,
@@ -95,6 +111,7 @@ impl<'a> JournalMemoryTools<'a> {
                 Target::Record(_) => Subject::Record,
                 Target::Asset(number) => Subject::Asset(number),
             },
+            asset_summaries,
         })
     }
 
@@ -105,26 +122,6 @@ impl<'a> JournalMemoryTools<'a> {
             self.admission.horizon_ms,
             self.admission.sealed_at_ms,
         )
-    }
-
-    fn record_rung(head: &Head, representation_id: &str) -> Result<Rung, MemoryRefusal> {
-        let available = available(head);
-        let rung: Rung =
-            representation_id
-                .parse()
-                .map_err(|_unknown| MemoryRefusal::UnknownRepresentation {
-                    available: available.clone(),
-                })?;
-        match rung {
-            Rung::Native | Rung::Metadata => Ok(rung),
-            Rung::Summary(part) => match head.header.summaries.get(usize::from(part.get() - 1)) {
-                None => Err(MemoryRefusal::UnknownRepresentation { available }),
-                Some(Slot::Generated(_)) => Ok(rung),
-                Some(Slot::Queued | Slot::Running | Slot::Error(_)) => {
-                    Err(MemoryRefusal::RepresentationUnavailable { available })
-                }
-            },
-        }
     }
 
     fn pinned(&self, record: RecordId, subject: Subject) -> Option<Option<Rung>> {
@@ -202,9 +199,16 @@ struct Located {
     head: Head,
     file: std::sync::Arc<std::fs::File>,
     subject: Subject,
+    asset_summaries: Option<Vec<Slot>>,
 }
 
 impl Located {
+    fn summaries(&self) -> &[Slot] {
+        self.asset_summaries
+            .as_deref()
+            .unwrap_or(&self.head.header.summaries)
+    }
+
     fn asset(&self) -> Option<&crate::memory::record::ArrivedAsset> {
         match self.subject {
             Subject::Record => None,
@@ -218,28 +222,60 @@ impl Located {
     }
 }
 
+enum Purpose {
+    Read,
+    Pin,
+}
+
+enum Representation<'a> {
+    Native,
+    Summary {
+        part: std::num::NonZeroU8,
+        text: &'a str,
+    },
+    Metadata,
+}
+
+impl Representation<'_> {
+    fn rung(&self) -> Rung {
+        match self {
+            Self::Native => Rung::Native,
+            Self::Summary { part, .. } => Rung::Summary(*part),
+            Self::Metadata => Rung::Metadata,
+        }
+    }
+}
+
 impl JournalMemoryTools<'_> {
-    fn rung(&self, located: &Located, id: &str, pin: bool) -> Result<Rung, MemoryRefusal> {
-        let Some(asset) = located.asset() else {
-            return Self::record_rung(&located.head, id);
-        };
-        let state = asset.join(&located.head.asset_lines);
-        let native = pin
-            && self
+    fn rung<'a>(
+        &self,
+        located: &'a Located,
+        id: &str,
+        purpose: Purpose,
+    ) -> Result<Representation<'a>, MemoryRefusal> {
+        let asset = located.asset();
+        let native = match (asset, purpose) {
+            (None, Purpose::Read | Purpose::Pin) => true,
+            (Some(_), Purpose::Read) => false,
+            (Some(asset), Purpose::Pin) => self
                 .assets
-                .is_some_and(|assets| assets.native_eligible(asset.number, asset.kind));
-        let available = asset_available(&state.summaries, native);
+                .is_some_and(|assets| assets.native_eligible(asset.number, asset.kind)),
+        };
+        let available = match asset {
+            Some(_) => asset_available(located.summaries(), native),
+            None => available(&located.head),
+        };
         let rung: Rung = id
             .parse()
             .map_err(|_unknown| MemoryRefusal::UnknownRepresentation {
                 available: available.clone(),
             })?;
         match rung {
-            Rung::Metadata => Ok(rung),
-            Rung::Native if native => Ok(rung),
+            Rung::Metadata => Ok(Representation::Metadata),
+            Rung::Native if native => Ok(Representation::Native),
             Rung::Native => Err(MemoryRefusal::RepresentationUnavailable { available }),
-            Rung::Summary(part) => match state.summaries.get(usize::from(part.get() - 1)) {
-                Some(Slot::Generated(_)) => Ok(rung),
+            Rung::Summary(part) => match located.summaries().get(usize::from(part.get() - 1)) {
+                Some(Slot::Generated(text)) => Ok(Representation::Summary { part, text }),
                 Some(Slot::Queued | Slot::Running | Slot::Error(_)) => {
                     Err(MemoryRefusal::RepresentationUnavailable { available })
                 }
@@ -268,13 +304,7 @@ pub(crate) fn asset_available(slots: &[Slot], native: bool) -> Vec<Rung> {
 }
 
 fn asset_metadata(head: &Head, asset: &crate::memory::record::ArrivedAsset) -> String {
-    use dekopon_core::asset::AssetKind;
-    let kind = match asset.kind {
-        AssetKind::Image => "image",
-        AssetKind::TextDocument => "text-document",
-        AssetKind::BinaryDocument => "binary-document",
-        AssetKind::Other => "other",
-    };
+    let kind = asset.kind.label();
     let bytes = asset
         .bytes
         .map_or_else(|| "size unknown".to_owned(), |bytes| format!("{bytes} B"));
@@ -286,6 +316,12 @@ fn asset_metadata(head: &Head, asset: &crate::memory::record::ArrivedAsset) -> S
 }
 
 impl MemoryTools for JournalMemoryTools<'_> {
+    fn attachment_targets(&self) -> AttachmentTargets {
+        match self.assets {
+            Some(_) => AttachmentTargets::On,
+            None => AttachmentTargets::Off,
+        }
+    }
     fn read(
         &self,
         target: Target,
@@ -293,56 +329,24 @@ impl MemoryTools for JournalMemoryTools<'_> {
         range: Option<(u64, u64)>,
     ) -> Result<String, MemoryRefusal> {
         let located = self.lookup(target)?;
-        let rung = self.rung(&located, representation_id, false)?;
-        let text = match located.asset() {
-            Some(asset) => match rung {
-                Rung::Summary(part) => match &asset.join(&located.head.asset_lines).summaries
-                    [usize::from(part.get() - 1)]
-                {
-                    Slot::Generated(text) => text.clone(),
-                    Slot::Queued | Slot::Running | Slot::Error(_) => {
-                        return Err(MemoryRefusal::RepresentationUnavailable {
-                            available: asset_available(
-                                &asset.join(&located.head.asset_lines).summaries,
-                                false,
-                            ),
-                        });
-                    }
-                },
-                Rung::Metadata => asset_metadata(&located.head, asset),
-                Rung::Native => {
-                    return Err(MemoryRefusal::RepresentationUnavailable {
-                        available: asset_available(
-                            &asset.join(&located.head.asset_lines).summaries,
-                            false,
-                        ),
-                    });
-                }
-            },
-            None => match rung {
-                Rung::Native => {
-                    let total = record_text(&located.file, &located.head, None)
+        let representation = self.rung(&located, representation_id, Purpose::Read)?;
+        let text = match representation {
+            Representation::Native => {
+                let total = record_text(&located.file, &located.head, None)
+                    .map_err(storage)?
+                    .total;
+                let (start, end) = window(total, range)?;
+                return utf8(
+                    record_text(&located.file, &located.head, Some((start, end)))
                         .map_err(storage)?
-                        .total;
-                    let (start, end) = window(total, range)?;
-                    return utf8(
-                        record_text(&located.file, &located.head, Some((start, end)))
-                            .map_err(storage)?
-                            .selected,
-                        total,
-                    );
-                }
-                Rung::Summary(part) => {
-                    match &located.head.header.summaries[usize::from(part.get() - 1)] {
-                        Slot::Generated(text) => text.clone(),
-                        Slot::Queued | Slot::Running | Slot::Error(_) => {
-                            return Err(MemoryRefusal::RepresentationUnavailable {
-                                available: available(&located.head),
-                            });
-                        }
-                    }
-                }
-                Rung::Metadata => envelope(&located.head, Rung::Metadata),
+                        .selected,
+                    total,
+                );
+            }
+            Representation::Summary { text, .. } => text.to_owned(),
+            Representation::Metadata => match located.asset() {
+                Some(asset) => asset_metadata(&located.head, asset),
+                None => envelope(&located.head, Rung::Metadata),
             },
         };
         let total = text.len() as u64;
@@ -354,7 +358,7 @@ impl MemoryTools for JournalMemoryTools<'_> {
 
     fn set_pin(&self, target: Target, representation_id: &str) -> Result<String, MemoryRefusal> {
         let located = self.lookup(target)?;
-        let rung = self.rung(&located, representation_id, true)?;
+        let rung = self.rung(&located, representation_id, Purpose::Pin)?.rung();
         self.queued.lock().push(PinLine {
             at_ms: millis(SystemTime::now()),
             record: located.head.header.id,
@@ -399,7 +403,7 @@ impl MemoryTools for JournalMemoryTools<'_> {
                         pin: None,
                     });
                 }
-                for asset in &head.header.arrived {
+                for asset in head.header.arrived.iter().filter(|_| self.assets.is_some()) {
                     let subject = Subject::Asset(asset.number);
                     if self
                         .pinned(head.header.id, subject)

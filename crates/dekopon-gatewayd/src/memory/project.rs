@@ -20,6 +20,13 @@ use super::{
     record::{RecordId, Slot},
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PriorAsset {
+    pub number: dekopon_core::AssetNumber,
+    pub rung: Rung,
+    pub pin: Option<Rung>,
+}
+
 /// One record's place in the previous turn's projection, kept in the conversation slot so the
 /// next turn changes only what entered or left.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,7 +35,7 @@ pub(crate) struct PriorRecord {
     pub rung: Option<Rung>,
     pub pin: Option<Rung>,
     pub hot: bool,
-    pub assets: Vec<(dekopon_core::AssetNumber, Rung, Option<Rung>)>,
+    pub assets: Vec<PriorAsset>,
 }
 
 pub(crate) struct ProjectionInput<'a> {
@@ -452,6 +459,7 @@ pub(crate) fn project(input: &ProjectionInput<'_>) -> Result<Projected, JournalE
             head.header
                 .arrived
                 .iter()
+                .filter(|_| input.assets.is_some())
                 .map(|asset| assets::Row::new(asset, head, prior, stable))
                 .collect()
         })
@@ -609,7 +617,11 @@ fn assemble(
             hot: i >= hot_from,
             assets: rows[i]
                 .iter()
-                .map(|asset| (asset.number, asset.rung, asset.pin))
+                .map(|asset| PriorAsset {
+                    number: asset.number,
+                    rung: asset.rung,
+                    pin: asset.pin,
+                })
                 .collect(),
         });
         bytes += projected_cost(head, *rung, &native, &rows[i]);

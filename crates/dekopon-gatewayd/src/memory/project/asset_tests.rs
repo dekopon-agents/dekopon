@@ -190,7 +190,7 @@ async fn a_native_pin_steps_down_when_the_reply_model_cannot_see_images() {
     let down = project_world(&world, &first.prior, false);
     assert_eq!(down.assets.rungs.summary, 1);
     assert_eq!(down.assets.native_unshowable, 1);
-    assert_eq!(down.prior[0].assets[0].2, Some(Rung::Native));
+    assert_eq!(down.prior[0].assets[0].pin, Some(Rung::Native));
     let restored = project_world(&world, &down.prior, true);
     assert_eq!(restored.assets.rungs.native, 1);
     let down_request = request(&world, down).await;
@@ -255,7 +255,7 @@ async fn an_evicted_native_pin_keeps_its_summary_without_a_download() {
     assert_eq!(projected.assets.native_unresident, 1);
     assert_eq!(projected.assets.rungs.summary, 1);
     assert_eq!(projected.assets.native_bytes, 0);
-    assert_eq!(projected.prior[0].assets[0].2, Some(Rung::Native));
+    assert_eq!(projected.prior[0].assets[0].pin, Some(Rung::Native));
     assert_eq!(world.slots(&header, 0), [Slot::Generated("caption".into())]);
     let body = request(&world, projected).await;
     assert!(body["messages"].as_array().unwrap().iter().any(|message| {
@@ -364,4 +364,60 @@ async fn a_native_attachment_follows_its_summarized_record_envelope() {
             bytes
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attachment_memory_off_refuses_asset_pins_and_keeps_their_replay_inert() {
+    let world = World::new();
+    let header = world.arrive(&["image/png"], Some(b"pixels"), 1);
+    let project_off = |prior| {
+        let snapshot = world.snapshot();
+        project(&ProjectionInput {
+            file: &snapshot.file,
+            records: &snapshot.records,
+            prior,
+            hot_turns: 1,
+            max_turns: 4,
+            max_bytes: 64 * 1024,
+            model: &fixture().model,
+            assets: None,
+        })
+        .unwrap()
+    };
+    let baseline = request(&world, project_off(&[])).await;
+    world.generate(&header, 0, "caption").await;
+    pin(&world, &header, 0, "native");
+    let enabled = project_world(&world, &[], true);
+    assert_eq!(enabled.assets.rungs.native, 1);
+    let prior = enabled.prior.clone();
+    drop(enabled);
+    let off = JournalMemoryTools::new(
+        &world.journal,
+        world.stem.clone(),
+        Admission {
+            grant: fixture().grant,
+            horizon_ms: 0,
+            sealed_at_ms: None,
+        },
+    );
+    let number = header.arrived[0].number;
+    assert_eq!(
+        off.attachment_targets(),
+        dekopon_agent::memory_tools::AttachmentTargets::Off
+    );
+    assert!(
+        matches!(off.set_pin(Target::Asset(number), "native"), Err(MemoryRefusal::RepresentationUnavailable { available }) if available.is_empty())
+    );
+    assert!(
+        matches!(off.read(Target::Asset(number), "summary-1", None), Err(MemoryRefusal::RepresentationUnavailable { available }) if available.is_empty())
+    );
+    off.clear_pin(None).unwrap();
+    assert!(off.into_pins().is_empty());
+    let projected = project_off(&prior);
+    assert_eq!(projected.assets.native_bytes, 0);
+    assert_eq!(projected.assets.rungs, RungCounts::default());
+    assert!(projected.prior[0].assets.is_empty());
+    assert_eq!(request(&world, projected).await, baseline);
+    let restored = project_world(&world, &[], true);
+    assert_eq!(restored.assets.rungs.native, 1);
 }
