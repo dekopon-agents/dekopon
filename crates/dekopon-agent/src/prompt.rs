@@ -2191,6 +2191,7 @@ mod tests {
         turns: Mutex<VecDeque<AssistantTurn>>,
         observed_tools: Mutex<Vec<Vec<ModelTool>>>,
         observed_messages: Mutex<Vec<Vec<ModelMessage>>>,
+        observed_options: Mutex<Vec<CompletionOptions>>,
     }
 
     impl ScriptedModel {
@@ -2199,6 +2200,7 @@ mod tests {
                 turns: Mutex::new(turns.into_iter().collect()),
                 observed_tools: Mutex::new(Vec::new()),
                 observed_messages: Mutex::new(Vec::new()),
+                observed_options: Mutex::new(Vec::new()),
             }
         }
 
@@ -2238,11 +2240,12 @@ mod tests {
             &self,
             messages: &[ModelMessage],
             tools: &[ModelTool],
-            _options: &CompletionOptions,
+            options: &CompletionOptions,
             _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         ) -> Result<AssistantTurn, InferenceError> {
             self.observed_tools.lock().push(tools.to_vec());
             self.observed_messages.lock().push(messages.to_vec());
+            self.observed_options.lock().push(options.clone());
             self.turns
                 .lock()
                 .pop_front()
@@ -2407,26 +2410,7 @@ mod tests {
 
     #[test]
     fn the_memory_notice_follows_the_stable_system_prefix() {
-        struct SystemModel {
-            scripted: ScriptedModel,
-            seen: Mutex<Option<(Option<usize>, Vec<ModelMessage>)>>,
-        }
-        impl ChatModel for SystemModel {
-            fn complete(
-                &self,
-                messages: &[ModelMessage],
-                tools: &[ModelTool],
-                options: &CompletionOptions,
-                on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
-            ) -> Result<AssistantTurn, InferenceError> {
-                *self.seen.lock() = Some((options.stable_system(), messages.to_vec()));
-                self.scripted.complete(messages, tools, options, on_event)
-            }
-        }
-        let model = SystemModel {
-            scripted: ScriptedModel::new([answer("one")]),
-            seen: Mutex::new(None),
-        };
+        let model = ScriptedModel::new([answer("one")]);
         let notice =
             super::MemoryNotice::new(&[super::MemoryFact::GrantBoundary], None).expect("notice");
         run_prompt_session(
@@ -2439,9 +2423,9 @@ mod tests {
         )
         .0
         .expect("answered");
-        let (stable, messages) = model.seen.lock().take().expect("model called");
+        let stable = model.observed_options.lock()[0].stable_system();
         assert_eq!(stable, Some(1));
-        assert_eq!(messages[1].content(), Some(notice.text()));
+        assert_eq!(model.first_request()[1].content(), Some(notice.text()));
     }
 
     #[test]
