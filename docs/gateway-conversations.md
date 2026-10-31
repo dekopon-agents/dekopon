@@ -307,8 +307,10 @@ A journal-recall route projects its recalled records before the model call:
 - Provider reasoning replays only to the model that produced it.
 - An older record replays at its pin, else its decider choice, else its deepest generated summary,
   else verbatim. Summary and metadata rungs are envelopes (`[memory #41 · time · summary 3/3]`, the
-  summary, one line per tool call) in one leading `[gateway: earlier conversation]` message, never
-  executable tool calls.
+  summary, one line per tool call). These envelopes start in one leading
+  `[gateway: earlier conversation]` user message and never replay executable tool calls. Each
+  native-pinned attachment follows its record's envelope as a separate native user message; later
+  envelopes continue after it.
 - A repack runs when the projection exceeds `maxBytes`, holds more than `2 × maxTurns` records, or
   is absent while at least `2 × maxTurns` records exist.
   It keeps the newest `maxTurns` records, then steps the oldest down a rung (summary, metadata,

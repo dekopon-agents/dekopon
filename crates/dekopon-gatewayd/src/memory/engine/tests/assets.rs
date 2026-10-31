@@ -88,6 +88,18 @@ impl World {
             stem,
         }
     }
+    pub(crate) fn direct(&self) -> Self {
+        let mut world = self.another();
+        let key = ConversationKey::private(
+            &"reviewer".parse().unwrap(),
+            "slack",
+            "direct",
+            &"tel.15550000001".parse().unwrap(),
+        );
+        world.stem = key.journal_stem();
+        world.access = AssetAccess::persistent(key, 1, Arc::clone(&world.fence));
+        world
+    }
     pub(crate) fn arrive(&self, mimes: &[&str], resident: Option<&[u8]>, parts: usize) -> Header {
         let pending = mimes
             .iter()

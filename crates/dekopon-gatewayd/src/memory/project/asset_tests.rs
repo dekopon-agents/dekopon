@@ -8,7 +8,7 @@ use crate::{
             records::{Header, tests::fixture},
             tools::Admission,
         },
-        record::AssetSideLine,
+        record::{AssetSideLine, SlotLine, Subject},
     },
 };
 use dekopon_agent::memory_tools::{MemoryRefusal, MemoryTools as _, Target};
@@ -104,6 +104,7 @@ fn no_source_fields(value: &serde_json::Value) {
 
 #[tokio::test(start_paused = true)]
 async fn an_asset_summary_replays_to_every_participant_of_a_space() {
+    let (capture, _guard) = crate::tests::capture_spans();
     let world = World::shared();
     for _ in 0..6 {
         world.arrive(&[], None, 1);
@@ -144,7 +145,7 @@ async fn an_asset_summary_replays_to_every_participant_of_a_space() {
             AssetSideLine::Pin(line) => no_source_fields(&serde_json::to_value(line).unwrap()),
         }
     }
-    let dm = World::new();
+    let dm = world.direct();
     dm.arrive(&[], None, 1);
     let dm_request = request(&dm, project_world(&dm, &[], true)).await;
     assert!(
@@ -156,6 +157,26 @@ async fn an_asset_summary_replays_to_every_participant_of_a_space() {
                 .as_str()
                 .is_some_and(|text| text.contains("chat-asset:")))
     );
+    let records = capture.records();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.field("memory.summary.subject") == Some("asset"))
+    );
+    for record in records {
+        for key in [
+            "url",
+            "file_id",
+            "media_id",
+            "attachment_id",
+            "file.name",
+            "asset.name",
+            "asset.source",
+        ] {
+            assert_eq!(record.field(key), None, "{record:?}");
+        }
+        assert_ne!(record.field("name"), Some("sender-name-canary"));
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -172,6 +193,18 @@ async fn a_native_pin_steps_down_when_the_reply_model_cannot_see_images() {
     assert_eq!(down.prior[0].assets[0].2, Some(Rung::Native));
     let restored = project_world(&world, &down.prior, true);
     assert_eq!(restored.assets.rungs.native, 1);
+    let down_request = request(&world, down).await;
+    assert!(
+        down_request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"].as_str().is_some_and(|text| {
+                    text.contains("[gateway: chat-asset:1 summary 1/1 — caption]")
+                })
+            })
+    );
     assert_eq!(
         request(&world, first).await,
         request(&world, restored).await
@@ -224,6 +257,12 @@ async fn an_evicted_native_pin_keeps_its_summary_without_a_download() {
     assert_eq!(projected.assets.native_bytes, 0);
     assert_eq!(projected.prior[0].assets[0].2, Some(Rung::Native));
     assert_eq!(world.slots(&header, 0), [Slot::Generated("caption".into())]);
+    let body = request(&world, projected).await;
+    assert!(body["messages"].as_array().unwrap().iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("[gateway: chat-asset:1 summary 1/1 — caption]"))
+    }));
 }
 
 #[tokio::test(start_paused = true)]
@@ -249,5 +288,80 @@ async fn clearing_all_pins_covers_each_record_and_asset_subject() {
     assert_eq!(snapshot.records[0].header.pin, None);
     for asset in &snapshot.records[0].header.arrived {
         assert_eq!(asset.join(&snapshot.records[0].asset_lines).pin, None);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_native_attachment_follows_its_summarized_record_envelope() {
+    let world = World::new();
+    let first = world.arrive(&["image/png"], Some(b"first pixels"), 1);
+    let second = world.arrive(&["image/png"], Some(b"second pixels"), 1);
+    for (header, caption) in [(&first, "first record"), (&second, "second record")] {
+        assert!(
+            world
+                .journal
+                .write_slot(
+                    &world.stem,
+                    SlotLine {
+                        at_ms: 1,
+                        record: header.id,
+                        subject: Subject::Record,
+                        part: NonZeroU8::MIN,
+                        slot: Slot::Generated(caption.into()),
+                    }
+                )
+                .unwrap()
+        );
+        pin(&world, header, 0, "native");
+    }
+    world.arrive(&[], None, 1);
+    let projected = project_world(&world, &[], true);
+    assert_eq!(projected.rungs.summary, 2);
+    assert_eq!(projected.assets.rungs.native, 2);
+    let body = request(&world, projected).await;
+    let messages = body["messages"].as_array().unwrap();
+    let first_at = messages
+        .iter()
+        .position(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("first record"))
+        })
+        .unwrap();
+    let second_at = messages
+        .iter()
+        .position(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("second record"))
+        })
+        .unwrap();
+    assert!(
+        messages[first_at]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(EARLIER)
+    );
+    assert_eq!(second_at, first_at + 2);
+    for (at, number, bytes) in [
+        (first_at + 1, 1, b"first pixels".as_slice()),
+        (second_at + 1, 2, b"second pixels".as_slice()),
+    ] {
+        assert_eq!(messages[at]["role"], "user");
+        let parts = messages[at]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0],
+            serde_json::json!({"type":"text", "text":format!("chat-asset:{number}:")})
+        );
+        use base64::Engine as _;
+        let image = parts[1]["image_url"]["url"].as_str().unwrap();
+        let encoded = image.strip_prefix("data:image/png;base64,").unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            bytes
+        );
     }
 }
