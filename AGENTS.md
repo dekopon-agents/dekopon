@@ -50,8 +50,8 @@ The model proposes; a separate broker authorizes and executes provider effects.
 
 ## Committed direction
 
-Decided by the owner on 2026-09-29. Code follows in the 0.28 to 0.33 releases. Design new work
-against these; a change that moves away from one stops for a human decision.
+Decided by the owner. Design new work against these; a change that moves away from one stops for
+a human decision.
 
 - **No call-site rules.** Anything that can run, runs from any depth: a model's script, a
   provider, a nested provider, a job. Bounds are memory, time, output and the turn's call budget,
