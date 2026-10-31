@@ -520,3 +520,43 @@ async fn a_short_whatsapp_image_answer_is_one_captioned_message_ending_with_its_
         json!({"id":"987","caption":"Here is your kitty.\n\n_model-a · 1 step · 7 s_"})
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_telegram_footer_that_outgrows_the_caption_leaves_the_answer_on_the_image() {
+    let http = spawn_http_mock(|_, _| {
+        json!({"ok":true,"result":{
+            "message_id":12,"chat":{"id":42},"photo":[{"file_id":"photo"}]
+        }})
+    });
+    let text = "🐈".repeat(510);
+    telegram(&http.base)
+        .driver()
+        .reply(
+            &ReplyTarget::Telegram {
+                chat_id: 42,
+                reply_to: Some(3),
+                message_thread_id: None,
+            },
+            OutboundReply::with_images(&text, generated_images(1)).with_footer(Some(
+                crate::progress::Footer::new(&["model-a".into()], 1, Duration::from_secs(7)),
+            )),
+        )
+        .await
+        .unwrap();
+    let calls = http.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].0.ends_with("/sendPhoto"));
+    assert!(
+        calls[0]
+            .1
+            .contains(&format!("name=\"caption\"\r\n\r\n{text}\r\n"))
+    );
+    assert!(!calls[0].1.contains("caption_entities"));
+    assert!(calls[1].0.ends_with("/sendMessage"));
+    let footer: Value = serde_json::from_str(&calls[1].1).unwrap();
+    assert_eq!(footer["text"], "model-a · 1 step · 7 s");
+    assert_eq!(
+        footer["entities"],
+        json!([{"type":"italic","offset":0,"length":22}])
+    );
+}

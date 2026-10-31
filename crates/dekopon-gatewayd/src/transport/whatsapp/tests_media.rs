@@ -675,3 +675,36 @@ async fn a_stalled_download_times_out_without_exposing_the_signed_url() {
     assert_eq!(peer.requests.lock().len(), 2);
     drop(peer);
 }
+
+#[tokio::test]
+async fn a_whatsapp_footer_that_outgrows_the_caption_leaves_the_answer_on_the_image() {
+    let peer = MediaPeer::new(|_, index| {
+        if index == 0 {
+            json_reply(json!({"id":"987"}))
+        } else {
+            accepted()
+        }
+    })
+    .await;
+    let text = "🐈".repeat(1020);
+    driver(&peer.origin)
+        .reply(
+            &target(),
+            OutboundReply::with_images(&text, vec![png()]).with_footer(Some(
+                crate::progress::Footer::new(&["model-a".into()], 1, Duration::from_secs(7)),
+            )),
+        )
+        .await
+        .unwrap();
+    {
+        let requests = peer.requests.lock();
+        assert_eq!(requests.len(), 3);
+        let image: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(image["type"], "image");
+        assert_eq!(image["image"], json!({"id":"987","caption":text}));
+        let footer: Value = serde_json::from_slice(&requests[2].body).unwrap();
+        assert_eq!(footer["type"], "text");
+        assert_eq!(footer["text"]["body"], "_model-a · 1 step · 7 s_");
+    }
+    peer.finish().await;
+}
