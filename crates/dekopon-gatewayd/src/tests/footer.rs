@@ -1,4 +1,5 @@
 use super::*;
+use dekopon_broker_protocol::ChatTransportKind;
 
 async fn exchange(driver: Arc<dyn ChatDriver>, target: ReplyTarget) {
     let directory = temporary();
@@ -179,25 +180,38 @@ async fn whatsapp_posts_the_exact_italic_footer_and_the_next_prompt_has_none() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn native_history_drops_the_bot_footer_before_the_model_sees_it() {
+async fn cold_recall(
+    transport_kind: ChatTransportKind,
+    prior: Vec<crate::transport::PastMessage>,
+) -> Vec<(String, String)> {
     let directory = temporary();
     let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
     let models = ModelScript::new([answer("done")]);
-    let user = "literal\n\n-# model · 1 step · 7 s";
-    let driver = HistoryDriver::new(Ok(vec![
-        past("0000000001", "U1", "tel.16035550101", user),
-        bot_past("0000000002", "Earlier answer.\n\n-# model · 1 step · 7 s"),
-        bot_past("0000000003", "-# model · 1 step · 7 s"),
-    ]));
+    let driver = HistoryDriver::new(Ok(prior));
+    let mut incoming = message("continue");
+    incoming.transport_kind = transport_kind;
     run_session(
         runner(broker, Arc::clone(&models), 4),
         persistent_route(model_config(), recall_window(RecallSource::Platform)),
-        message("continue"),
-        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        incoming,
+        driver as Arc<dyn ChatDriver>,
     )
     .await;
-    let prompt = models.prompt(0);
+    models.prompt(0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_history_drops_the_bot_footer_before_the_model_sees_it() {
+    let user = "literal\n\n-# model · 1 step · 7 s";
+    let prompt = cold_recall(
+        ChatTransportKind::Discord,
+        vec![
+            past("0000000001", "U1", "tel.16035550101", user),
+            bot_past("0000000002", "Earlier answer.\n\n-# model · 1 step · 7 s"),
+            bot_past("0000000003", "-# model · 1 step · 7 s"),
+        ],
+    )
+    .await;
     assert_eq!(
         prompt
             .iter()
@@ -210,6 +224,44 @@ async fn native_history_drops_the_bot_footer_before_the_model_sees_it() {
         prompt
             .iter()
             .any(|(role, text)| role == "user" && text.ends_with(user))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_discord_subtext_answer_keeps_its_text_without_the_footer_on_cold_recall() {
+    let prompt = cold_recall(
+        ChatTransportKind::Discord,
+        vec![bot_past(
+            "0000000001",
+            "-# brief answer\n\n-# model-a · 1 step · 7 s",
+        )],
+    )
+    .await;
+    assert_eq!(
+        prompt
+            .iter()
+            .filter(|(role, _)| role == "assistant")
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["-# brief answer"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_cold_recall_preserves_footer_shaped_answer_text() {
+    let answer = "Example footer:\n\n-# model-a · 1 step · 7 s";
+    let prompt = cold_recall(
+        ChatTransportKind::Slack,
+        vec![bot_past("0000000001", answer)],
+    )
+    .await;
+    assert_eq!(
+        prompt
+            .iter()
+            .filter(|(role, _)| role == "assistant")
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>(),
+        [answer]
     );
 }
 

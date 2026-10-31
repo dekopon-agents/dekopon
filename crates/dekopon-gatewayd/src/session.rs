@@ -23,7 +23,7 @@ use dekopon_agent::{
     },
 };
 use dekopon_broker_protocol::{
-    Attestation, ChatScopeClaim, ClientError, ConversationKind, DeliveredAnswer,
+    Attestation, ChatScopeClaim, ChatTransportKind, ClientError, ConversationKind, DeliveredAnswer,
     DeliveredTurnRequest, DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT,
     ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED,
     InvocationOutcome, InvocationResult, SessionRefusal,
@@ -1306,7 +1306,12 @@ impl Recall<'_> {
                     delta = 0,
                     "gateway.recalled"
                 );
-                Some(platform_window(messages, &names, window))
+                Some(platform_window(
+                    messages,
+                    &names,
+                    window,
+                    self.message.transport_kind,
+                ))
             }
         }
     }
@@ -1443,6 +1448,7 @@ fn platform_window(
     messages: Vec<PastMessage>,
     names: &Names,
     window: MemoryWindow,
+    transport_kind: ChatTransportKind,
 ) -> RecalledWindow {
     let newest = messages.last().map(|message| message.id.clone());
     let mut turns = Vec::new();
@@ -1452,7 +1458,17 @@ fn platform_window(
     for message in messages {
         let label = names.label(&message);
         let mut text = if message.from_bot {
-            crate::progress::Footer::without_discord_footer(&message.text).to_owned()
+            match transport_kind {
+                ChatTransportKind::Discord => {
+                    crate::progress::Footer::without_discord_footer(&message.text).to_owned()
+                }
+                ChatTransportKind::Fauxlack
+                | ChatTransportKind::Slack
+                | ChatTransportKind::Telegram
+                | ChatTransportKind::Whatsapp
+                | ChatTransportKind::Github
+                | ChatTransportKind::Local => message.text,
+            }
         } else {
             message.text
         };

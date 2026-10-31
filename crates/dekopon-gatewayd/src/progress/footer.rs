@@ -48,10 +48,10 @@ impl Footer {
     }
 
     pub(crate) fn without_discord_footer(text: &str) -> &str {
-        let (answer, line) = if let Some(line) = text.strip_prefix("-# ") {
-            ("", line)
-        } else if let Some(pair) = text.rsplit_once("\n\n-# ") {
+        let (answer, line) = if let Some(pair) = text.rsplit_once("\n\n-# ") {
             pair
+        } else if let Some(line) = text.strip_prefix("-# ") {
+            ("", line)
         } else {
             return text;
         };
