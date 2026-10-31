@@ -53,7 +53,7 @@ session no capabilities.
 Policy sees where a message arrived as `context.conversation`
 ([schema](../crates/dekopon-policy/src/lib.rs)): `kind`, `container`, `id` and `thread`. `container`
 and `thread` are optional, so a policy that reads either guards with `has` or fails to load. Each
-transport fills them differently:
+transport fills them:
 
 | Transport | `container` | `id` | `thread` |
 |---|---|---|---|
@@ -65,7 +65,7 @@ transport fills them differently:
 | [Fauxlack](../crates/dekopon-gatewayd/src/transport/fauxlack.rs) | server | channel | thread |
 | [local](../crates/dekopon-gatewayd/src/transport/local.rs) | none | `dev` | none |
 
-This `forbid` allows pull-request comments only from the Slack thread under one message:
+This `forbid` limits pull-request comments to one Slack thread:
 
 ```cedar
 @id("comments-stay-in-one-thread")
