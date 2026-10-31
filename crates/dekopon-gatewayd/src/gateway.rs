@@ -809,7 +809,7 @@ impl Gateway {
                         "collection-full" => "Busy collecting other requests. Please try again shortly.",
                         "incompatible-group" => "Another media group is still being collected. Please retry this group separately.",
                         "deadline-overflow" => "Input refused: the configured media collection deadline cannot be represented.",
-                        "unsupported-document" => "I can only read PDF documents and text. Please send the file as a PDF or paste its text.",
+                        "unsupported-message" => "I can only read text, PDF documents, and PNG or JPEG images. Please send your message in one of those forms.",
                         _ => "Input refused: too many attachments or messages, or too much text. Please send a smaller request.",
                     };
                     session::answer(&driver, &message, reply).await;

@@ -17631,13 +17631,12 @@ async fn a_whatsapp_pdf_fetch_refusal_tells_the_model_its_cause_and_sends_no_fil
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unsupported_whatsapp_document_gets_one_refusal_only_when_routed() {
-    use crate::transport::whatsapp::tests_media::{MediaPeer, admitted, document_webhook};
+async fn refused_once_when_routed_and_silent_when_unrouted(kind: &str, body: Value) {
+    use crate::transport::whatsapp::tests_media::{MediaPeer, admitted, message_webhook};
     for routed in [true, false] {
-        let peer = MediaPeer::new(|_, _| panic!("a refused document is never fetched")).await;
-        let word = json!({"id":"789", "mime_type":"application/msword", "caption":"read"});
-        let (_transport, message) = admitted(&peer.origin, &document_webhook(word)).await;
+        let peer = MediaPeer::new(|_, _| panic!("a refused message is never fetched")).await;
+        let (_transport, message) =
+            admitted(&peer.origin, &message_webhook(kind, body.clone())).await;
         let directory = temporary();
         let mut doc = document(directory.path());
         doc["transports"][0] = json!({
@@ -17676,16 +17675,82 @@ async fn an_unsupported_whatsapp_document_gets_one_refusal_only_when_routed() {
             driver.replies(),
             if routed {
                 vec![
-                    "I can only read PDF documents and text. Please send the file as a PDF or paste its text."
+                    "I can only read text, PDF documents, and PNG or JPEG images. Please send your message in one of those forms."
                         .to_owned(),
                 ]
             } else {
                 Vec::new()
-            }
+            },
+            "{kind} routed={routed}"
         );
         assert_eq!(models.requests(), 0);
         assert!(observed.try_recv().is_err());
         peer.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupported_whatsapp_document_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "document",
+        json!({"id":"789", "mime_type":"application/msword", "caption":"read"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_voice_note_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "audio",
+        json!({"id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_video_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "video",
+        json!({"id":"789", "mime_type":"video/mp4", "caption":"watch"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_sticker_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "sticker",
+        json!({"id":"789", "mime_type":"image/webp", "animated":false}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_location_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "location",
+        json!({"latitude":1.5, "longitude":2.5, "name":"somewhere"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_contact_card_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "contacts",
+        json!([{"name":{"formatted_name":"A Person"}, "phones":[{"phone":"+15550000002"}]}]),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_webp_or_gif_image_gets_one_refusal_only_when_routed() {
+    for mime in ["image/webp", "image/gif"] {
+        refused_once_when_routed_and_silent_when_unrouted(
+            "image",
+            json!({"id":"789", "mime_type":mime, "caption":"edit"}),
+        )
+        .await;
     }
 }
 

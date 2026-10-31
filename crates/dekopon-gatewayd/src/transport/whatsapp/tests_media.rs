@@ -136,16 +136,20 @@ pub(crate) fn photo_webhook(mime: &str, caption: Option<&str>) -> Value {
     }}]}]})
 }
 
-pub(crate) fn document_webhook(document: Value) -> Value {
+pub(crate) fn message_webhook(kind: &str, body: Value) -> Value {
     let mut webhook = photo_webhook("image/png", None);
     let message = &mut webhook["entry"][0]["changes"][0]["value"]["messages"][0];
-    message["id"] = json!("wamid.document");
-    message["type"] = json!("document");
-    message["document"] = document;
+    message["id"] = json!(format!("wamid.{kind}"));
+    message["type"] = json!(kind);
     if let Some(object) = message.as_object_mut() {
         object.remove("image");
     }
+    message[kind] = body;
     webhook
+}
+
+pub(crate) fn document_webhook(document: Value) -> Value {
+    message_webhook("document", document)
 }
 
 #[tokio::test]
@@ -600,16 +604,17 @@ pub(crate) async fn admitted(origin: &str, webhook: &Value) -> (WhatsappTranspor
 #[tokio::test]
 async fn invalid_image_envelopes_and_unsigned_photos_enqueue_nothing() {
     for case in [
-        "unsigned", "scope", "phone", "mime", "media-id", "caption", "group", "contact", "self",
+        "unsigned", "scope", "phone", "group", "contact", "self", "reaction",
     ] {
         let (state, mut receiver) = super::tests::state_and_receiver();
         let mut body = photo_webhook("image/png", Some("edit"));
         let value = &mut body["entry"][0]["changes"][0]["value"];
         match case {
             "phone" => value["metadata"]["phone_number_id"] = json!("999"),
-            "mime" => value["messages"][0]["image"]["mime_type"] = json!("image/webp"),
-            "media-id" => value["messages"][0]["image"]["id"] = json!("../trap?token"),
-            "caption" => value["messages"][0]["image"]["caption"] = json!(32),
+            "reaction" => {
+                value["messages"][0]["type"] = json!("reaction");
+                value["messages"][0]["reaction"] = json!({"message_id":"wamid.x", "emoji":"👍"});
+            }
             "group" => value["messages"][0]["group_id"] = json!("group"),
             "contact" => value["contacts"] = json!([]),
             "self" => value["metadata"]["display_phone_number"] = json!("+1 555 000 0001"),
@@ -832,7 +837,7 @@ async fn an_unreadable_signed_document_is_marked_for_refusal_and_never_fetched()
         let (_transport, message) = admitted(&peer.origin, &document_webhook(document)).await;
         assert_eq!(
             message.input_refusal,
-            Some(InputRefusal::UnsupportedDocument),
+            Some(InputRefusal::Unsupported),
             "{case}"
         );
         assert!(message.assets.is_empty(), "{case}");
@@ -856,5 +861,44 @@ async fn an_unsigned_or_group_document_enqueues_nothing() {
         }
         receive_webhook(State(state), request).await;
         assert!(receiver.try_recv().is_err(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn an_unhandled_message_kind_or_refused_image_is_marked_for_refusal_and_never_fetched() {
+    for (kind, body) in [
+        (
+            "audio",
+            json!({"id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true}),
+        ),
+        ("video", json!({"id":"789", "mime_type":"video/mp4"})),
+        (
+            "sticker",
+            json!({"id":"789", "mime_type":"image/webp", "animated":false}),
+        ),
+        ("location", json!({"latitude":1.5, "longitude":2.5})),
+        ("contacts", json!([{"name":{"formatted_name":"A"}}])),
+        ("image", json!({"id":"789", "mime_type":"image/webp"})),
+        ("image", json!({"id":"789", "mime_type":"image/gif"})),
+        (
+            "image",
+            json!({"id":"../trap?token", "mime_type":"image/png"}),
+        ),
+        (
+            "image",
+            json!({"id":"789", "mime_type":"image/png", "caption":32}),
+        ),
+    ] {
+        let peer = MediaPeer::new(|_, _| panic!("a refused message is never fetched")).await;
+        let (_transport, message) = admitted(&peer.origin, &message_webhook(kind, body)).await;
+        assert_eq!(
+            message.input_refusal,
+            Some(InputRefusal::Unsupported),
+            "{kind}"
+        );
+        assert!(message.assets.is_empty(), "{kind}");
+        assert_eq!(message.text, "", "{kind}");
+        assert!(peer.requests.lock().is_empty());
+        peer.finish().await;
     }
 }

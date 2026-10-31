@@ -443,24 +443,10 @@ fn parse_delivery(
                         }
                         (text, Vec::new(), None)
                     }
-                    Some("image") => {
-                        let Some(asset) = media::inbound_image(&message["image"]) else {
-                            tracing::debug!(
-                                event = "gateway_message_ignored",
-                                reason = "image-metadata",
-                                "gateway.message.ignored"
-                            );
-                            continue;
-                        };
-                        let caption = match message["image"].get("caption") {
-                            None => "",
-                            Some(Value::String(caption)) => caption,
-                            Some(_) => continue,
-                        };
-                        (caption, vec![asset], None)
-                    }
+                    Some("image") => media::inbound_image(&message["image"]),
                     Some("document") => media::inbound_document(&message["document"]),
-                    _ => continue,
+                    None | Some("reaction" | "system") => continue,
+                    Some(_) => ("", Vec::new(), Some(InputRefusal::Unsupported)),
                 };
                 let individual = contacts.is_some_and(|contacts| {
                     contacts
@@ -1030,9 +1016,13 @@ mod tests {
                 ]}
             ]
         });
-        let messages = parse_delivery(&state(), &payload, &received()).expect("delivery");
-        assert_eq!(messages.len(), 1);
+        let delivered = parse_delivery(&state(), &payload, &received()).expect("delivery");
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].message_id.to_string(), "one");
+        assert_eq!(delivered[0].input_refusal, Some(InputRefusal::Unsupported));
+        let messages = &delivered[1..];
         assert_eq!(messages[0].message_id.to_string(), "two");
+        assert_eq!(messages[0].input_refusal, None);
         assert_eq!(messages[0].subject.canonical(), "whatsapp.1603");
         assert_eq!(
             messages[0].conversation.container.as_deref(),

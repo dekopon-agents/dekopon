@@ -19,7 +19,7 @@ fn media_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-pub(super) fn inbound_image(image: &Value) -> Option<PendingAsset> {
+fn photo(image: &Value) -> Option<PendingAsset> {
     let id = image.get("id")?.as_str()?;
     let mime = image.get("mime_type")?.as_str()?;
     let extension = match mime {
@@ -41,20 +41,31 @@ pub(super) fn inbound_image(image: &Value) -> Option<PendingAsset> {
     })
 }
 
+pub(super) fn inbound_image(image: &Value) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+    captioned(image, photo(image))
+}
+
 pub(super) fn inbound_document(
     document: &Value,
 ) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
-    let caption = match document.get("caption") {
+    captioned(document, pdf(document))
+}
+
+fn captioned(
+    media: &Value,
+    asset: Option<PendingAsset>,
+) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+    let caption = match media.get("caption") {
         None => Some(""),
         Some(Value::String(caption)) => Some(caption.as_str()),
         Some(_) => None,
     };
-    match (caption, pdf(document)) {
+    match (caption, asset) {
         (Some(caption), Some(asset)) => (caption, vec![asset], None),
         (caption, _) => (
             caption.unwrap_or_default(),
             Vec::new(),
-            Some(InputRefusal::UnsupportedDocument),
+            Some(InputRefusal::Unsupported),
         ),
     }
 }

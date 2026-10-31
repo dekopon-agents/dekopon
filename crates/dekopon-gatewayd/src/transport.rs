@@ -74,13 +74,13 @@ pub enum MediaRefusal {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputRefusal {
-    UnsupportedDocument,
+    Unsupported,
 }
 
 impl InputRefusal {
     pub(crate) const fn reason(self) -> &'static str {
         match self {
-            Self::UnsupportedDocument => "unsupported-document",
+            Self::Unsupported => "unsupported-message",
         }
     }
 }
