@@ -677,11 +677,15 @@ where
             "This is a PR subscription re-review. Refresh the subscribed PR's head-pinned GitHub review using your granted tools. You may call decline_chat_reply when blocking findings are unchanged only if every capability invocation in the turn successfully refreshed the subscribed PR's review. Any other invocation, including a failed review or a review of another PR, requires a chat report even if the subscribed review was refreshed."
         )),
     }
+    let stable_system = messages.len();
     if let Some(notice) = memory_notice {
         messages.push(ModelMessage::system(notice.text()));
     }
     messages.extend_from_slice(prior);
-    let options = options.clone().with_stable_prefix(messages.len());
+    let options = options
+        .clone()
+        .with_stable_prefix(messages.len())
+        .with_stable_system(stable_system);
     messages.push(ModelMessage::user(prompt));
 
     let mut record = RecordBuilder::new(recorded.unwrap_or(prompt), model.model_key(), capture_cap);
@@ -2399,6 +2403,45 @@ mod tests {
                 (Some(3), "user".to_owned(), "msg2".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn the_memory_notice_follows_the_stable_system_prefix() {
+        struct SystemModel {
+            scripted: ScriptedModel,
+            seen: Mutex<Option<(Option<usize>, Vec<ModelMessage>)>>,
+        }
+        impl ChatModel for SystemModel {
+            fn complete(
+                &self,
+                messages: &[ModelMessage],
+                tools: &[ModelTool],
+                options: &CompletionOptions,
+                on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+            ) -> Result<AssistantTurn, InferenceError> {
+                *self.seen.lock() = Some((options.stable_system(), messages.to_vec()));
+                self.scripted.complete(messages, tools, options, on_event)
+            }
+        }
+        let model = SystemModel {
+            scripted: ScriptedModel::new([answer("one")]),
+            seen: Mutex::new(None),
+        };
+        let notice =
+            super::MemoryNotice::new(&[super::MemoryFact::GrantBoundary], None).expect("notice");
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg", limits(1, 1))
+                .with_system(Some("rules"))
+                .with_memory_notice(Some(&notice)),
+            &[],
+        )
+        .0
+        .expect("answered");
+        let (stable, messages) = model.seen.lock().take().expect("model called");
+        assert_eq!(stable, Some(1));
+        assert_eq!(messages[1].content(), Some(notice.text()));
     }
 
     #[test]

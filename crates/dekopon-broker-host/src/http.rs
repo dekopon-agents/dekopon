@@ -170,6 +170,7 @@ mod tests {
             let mapped = map_error(NativeHttpError {
                 code: native,
                 message: "bounded".to_owned(),
+                byte_limit: None,
             });
             assert_eq!(mapped.code, wit);
             assert_eq!(mapped.message, "bounded");

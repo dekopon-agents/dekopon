@@ -379,8 +379,10 @@ impl BufferedHttpClient {
                 .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
             self.evidence[index].response_bytes += chunk.len() as u64;
             if response_bytes > grant.max_response_bytes {
-                return Err(http_error(
-                    ErrorCode::ResponseTooLarge,
+                return Err(super::byte_limit_error(
+                    super::ByteLimitKey::MaxResponseBytes,
+                    grant.max_response_bytes,
+                    response_bytes,
                     "response exceeds the authorized byte limit",
                 ));
             }
@@ -597,9 +599,15 @@ impl BufferedHttpClient {
             super::ResponseMetadata::Ordinary => {
                 super::signed_download::redact_api_locations(&mut headers);
                 let returned_bytes = super::returned_head_bytes(&headers);
-                if returned_bytes > self.ceilings.max_header_bytes as u64
-                    || returned_bytes > grant.max_response_bytes
-                {
+                if returned_bytes > grant.max_response_bytes {
+                    return Err(super::byte_limit_error(
+                        super::ByteLimitKey::MaxResponseBytes,
+                        grant.max_response_bytes,
+                        returned_bytes,
+                        "redacted headers exceed the authorized byte limit",
+                    ));
+                }
+                if returned_bytes > self.ceilings.max_header_bytes as u64 {
                     return Err(http_error(
                         ErrorCode::ResponseTooLarge,
                         "redacted headers exceed the authorized byte limit",

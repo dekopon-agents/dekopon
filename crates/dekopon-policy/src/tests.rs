@@ -1900,3 +1900,42 @@ fn a_policy_id_annotation_that_is_empty_or_overlong_is_refused() {
         );
     }
 }
+
+#[test]
+fn only_a_permit_naming_a_capability_or_its_group_or_any_action_reaches_it() {
+    let named = |policy: &str, world: &PolicyWorld| {
+        let engine = PolicyEngine::new(policy, world).expect("policy loads");
+        ["cli-probe.upper", "cli-probe.reverse"]
+            .map(|capability| engine.names_in_a_permit(&capability.parse().expect("capability")))
+    };
+    assert_eq!(
+        named(
+            r#"@id("upper")
+            permit(principal == Dekopon::Principal::"cpetersen",
+                   action in [Dekopon::Action::"cli-probe.upper"],
+                   resource);
+            @id("no-reverse")
+            forbid(principal, action == Dekopon::Action::"cli-probe.reverse", resource);"#,
+            &world(),
+        ),
+        [true, false]
+    );
+    assert_eq!(
+        named(
+            r#"@id("reads")
+            permit(principal == Dekopon::Principal::"cpetersen",
+                   action in Dekopon::Action::"cli-probe:read-only",
+                   resource);"#,
+            &grouped_world(),
+        ),
+        [true, false]
+    );
+    assert_eq!(
+        named(
+            r#"@id("anything")
+            permit(principal == Dekopon::Principal::"cpetersen", action, resource);"#,
+            &world(),
+        ),
+        [true, true]
+    );
+}

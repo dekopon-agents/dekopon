@@ -478,6 +478,7 @@ pub enum Leniency {
 pub enum StartupWarning {
     UnroutedConstraintSet { capability: CapabilityId },
     UnconstrainedCapability { capability: CapabilityId },
+    UnreachableCapability { capability: CapabilityId },
 }
 
 impl StartupWarning {
@@ -486,6 +487,7 @@ impl StartupWarning {
         match self {
             Self::UnroutedConstraintSet { .. } => "unrouted-constraint-set",
             Self::UnconstrainedCapability { .. } => "unconstrained-capability",
+            Self::UnreachableCapability { .. } => "unreachable-capability",
         }
     }
 
@@ -493,7 +495,8 @@ impl StartupWarning {
     pub const fn capability(&self) -> &CapabilityId {
         match self {
             Self::UnroutedConstraintSet { capability }
-            | Self::UnconstrainedCapability { capability } => capability,
+            | Self::UnconstrainedCapability { capability }
+            | Self::UnreachableCapability { capability } => capability,
         }
     }
 }
@@ -509,6 +512,11 @@ impl fmt::Display for StartupWarning {
                 formatter,
                 "policy could permit {capability}, which has no constraint set; every invocation \
                  of it will be denied unconstrained-capability"
+            ),
+            Self::UnreachableCapability { capability } => write!(
+                formatter,
+                "constraint set for {capability} is named by no permit policy, directly or \
+                 through an action group; every invocation of it will be denied"
             ),
         }
     }
@@ -1881,6 +1889,13 @@ where
             }
         }
         constraints.validate(&registry, &credentials, limits.max_constraint_sets)?;
+        for capability in constraints.sets.keys() {
+            if !policy.names_in_a_permit(capability) {
+                warnings.push(StartupWarning::UnreachableCapability {
+                    capability: capability.clone(),
+                });
+            }
+        }
         for capability in policy.referenced_capabilities() {
             if constraints.get(capability).is_none() {
                 match leniency {
@@ -5214,6 +5229,16 @@ fn provider_failure_detail(error: &BrokerHostError) -> Option<ProviderFailureDet
         } => Some(ProviderFailureDetail::new(
             "redirect-refused",
             "signed download redirect refused",
+        )),
+        BrokerHostError::HostCallRejected {
+            reason:
+                dekopon_broker_host::HostCallRejection::Http(
+                    dekopon_broker_host::PolicyViolation::ByteLimit(Some(exceeded)),
+                ),
+            ..
+        } => Some(ProviderFailureDetail::new(
+            exceeded.key.as_str(),
+            &exceeded.to_string(),
         )),
         _ => None,
     }

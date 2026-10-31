@@ -198,7 +198,7 @@ impl BufferedHttpClient {
                 DownloadError::Denied => Some(super::PolicyViolation::Denied),
                 DownloadError::RedirectRefused => Some(super::PolicyViolation::RedirectRefused),
                 DownloadError::RequestLimit => Some(super::PolicyViolation::HostCallLimit),
-                DownloadError::ResponseTooLarge => Some(super::PolicyViolation::ByteLimit),
+                DownloadError::ResponseTooLarge => Some(super::PolicyViolation::ByteLimit(None)),
                 DownloadError::Timeout
                 | DownloadError::Incomplete
                 | DownloadError::Storage
