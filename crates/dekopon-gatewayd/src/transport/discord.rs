@@ -668,6 +668,7 @@ impl DiscordTransport {
         let conversation_id = conversation.key();
 
         Ok(Some(InboundMessage {
+            control_text: None,
             pull_request_links: None,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Discord,

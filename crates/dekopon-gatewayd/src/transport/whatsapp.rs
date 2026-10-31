@@ -504,6 +504,7 @@ fn parse_delivery(
                 receipt.record("message.id", id);
                 record_conversation(&receipt, &conversation);
                 accepted.push(InboundMessage {
+                    control_text: None,
                     pull_request_links: None,
                     transport: state.name.clone(),
                     transport_kind: ChatTransportKind::Whatsapp,

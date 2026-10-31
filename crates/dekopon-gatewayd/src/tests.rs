@@ -4645,6 +4645,7 @@ fn model_config() -> ModelConfig {
 
 fn message(text: &str) -> InboundMessage {
     InboundMessage {
+        control_text: None,
         pull_request_links: None,
         transport: "dev".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Local,
@@ -4727,6 +4728,7 @@ fn slack_thread_continuation(inherited: bool) -> ThreadContinuation {
 
 fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
     InboundMessage {
+        control_text: None,
         pull_request_links: None,
         transport: "scientist-slack".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Slack,
@@ -23609,7 +23611,14 @@ async fn a_slack_follow_batch_keeps_both_speakers_and_authorizes_only_the_newest
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slack_follow_mute_and_lapse_close_the_ticket_without_a_model_call() {
-    for (text, age, cause) in [("mute", 0, "mute"), ("later", 86400, "lapse")] {
+    let mentioned = format!("<@{BOT_USER}> mute");
+    let escaped = format!("&lt;@{BOT_USER}&gt; mute");
+    for (text, age, cause) in [
+        ("mute", 0, Some("mute")),
+        (mentioned.as_str(), 0, Some("mute")),
+        (escaped.as_str(), 0, None),
+        ("later", 86400, Some("lapse")),
+    ] {
         let fixture = SlackFollowFixture::new().await;
         fixture
             .table
@@ -23649,6 +23658,18 @@ async fn slack_follow_mute_and_lapse_close_the_ticket_without_a_model_call() {
         while let Some(result) = sessions.join_next().await {
             result.unwrap();
         }
+        let Some(cause) = cause else {
+            assert!(matches!(
+                fixture.table.ticket(&fixture.key, SystemTime::now()),
+                crate::follow::FollowTicket::Active { .. }
+            ));
+            assert!(
+                capture
+                    .events_where("dekopon_gatewayd", &[("audit.event", "gateway.follow")])
+                    .is_empty()
+            );
+            continue;
+        };
         assert_eq!(
             fixture.table.ticket(&fixture.key, SystemTime::now()),
             crate::follow::FollowTicket::Absent
