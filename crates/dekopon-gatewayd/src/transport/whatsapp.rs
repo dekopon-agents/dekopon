@@ -21,7 +21,7 @@ use axum::{
 #[cfg(test)]
 use axum::{body::to_bytes, http::header};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
-use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_core::{AttestedSubject, Redacted, Subject};
 use futures_util::{StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -488,7 +488,8 @@ fn parse_delivery(
                 {
                     continue;
                 }
-                let Ok(subject) = ExternalSubject::whatsapp(sender) else {
+                let Ok(subject) = Subject::whatsapp_number(sender).and_then(AttestedSubject::one)
+                else {
                     continue;
                 };
                 if accepted.len() == MAX_MESSAGES_PER_DELIVERY {
@@ -1031,7 +1032,10 @@ mod tests {
         let messages = parse_delivery(&state(), &payload, &received()).expect("delivery");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id.to_string(), "two");
-        assert_eq!(messages[0].subject.canonical(), "whatsapp.1603");
+        assert_eq!(
+            messages[0].subject.name().canonical(),
+            "drn:whatsapp:number::1603"
+        );
         assert_eq!(
             messages[0].conversation.container.as_deref(),
             Some("123:456")

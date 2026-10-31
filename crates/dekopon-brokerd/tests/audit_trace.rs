@@ -26,8 +26,8 @@ use dekopon_broker_protocol::{
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, TransportId,
+    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, Subject,
+    TransportId,
 };
 use dekopon_test_support::{provider_fixture, shutdown_on};
 use opentelemetry::trace::TraceContextExt as _;
@@ -41,7 +41,7 @@ const CLIENT_TRACE_ID: [u8; 16] = [
 const CLIENT_SPAN_ID: [u8; 8] = [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
 const CLIENT_TRACE_HEX: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
 
-const SUBJECT: &str = "slack.t0123abc.u9xyz";
+const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
 const AGENT: &str = "chat-agent";
 
 const POLICY: &str = r#"
@@ -270,18 +270,24 @@ fn trace_parent() -> TraceParent {
 
 fn session() -> Attestation {
     Attestation::for_subject(
-        SUBJECT
-            .parse::<ExternalSubject>()
-            .expect("canonical subject fixture"),
+        dekopon_core::AttestedSubject::one(
+            SUBJECT
+                .parse::<Subject>()
+                .expect("canonical subject fixture"),
+        )
+        .expect("one-form subject"),
         AGENT.parse::<AgentId>().expect("valid agent fixture"),
     )
 }
 
 fn chat_claim() -> Attestation {
     Attestation::for_chat(
-        SUBJECT
-            .parse::<ExternalSubject>()
-            .expect("canonical subject fixture"),
+        dekopon_core::AttestedSubject::one(
+            SUBJECT
+                .parse::<Subject>()
+                .expect("canonical subject fixture"),
+        )
+        .expect("one-form subject"),
         AGENT.parse::<AgentId>().expect("valid agent fixture"),
         ChatScopeClaim {
             participant: None,
@@ -349,7 +355,7 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
             CredentialStore::empty(),
             IdentityDirectory::new([(
                 SUBJECT
-                    .parse::<ExternalSubject>()
+                    .parse::<Subject>()
                     .expect("canonical subject fixture"),
                 principal("cpetersen"),
             )])

@@ -12,8 +12,8 @@ use dekopon_broker_protocol::{
     ConversationKind, Trigger,
 };
 use dekopon_core::{
-    AgentId, CapabilityId, ExternalSubject, FileHygieneError, PrincipalId, ProviderId, TransportId,
-    error_chain,
+    AgentId, AttestedSubject, CapabilityId, FileHygieneError, PrincipalId, ProviderId, Subject,
+    TransportId, error_chain,
     fragments::{self, FragmentError},
 };
 use semver::Version;
@@ -32,7 +32,7 @@ pub(crate) struct EssentialWorkflows {
     #[serde(rename = "kind")]
     _kind: Kind,
     agent: AgentId,
-    subject: ExternalSubject,
+    subject: Subject,
     via: PrincipalId,
     scope: Scope,
     workflows: BTreeMap<String, Vec<Step>>,
@@ -105,6 +105,10 @@ pub enum WorkflowFileError {
     },
     #[error("essential workflows file {path} has an empty workflow map or step list")]
     Incomplete { path: PathBuf },
+    #[error(
+        "essential workflows file {path} names an id-form subject; name the repository or login"
+    )]
+    IdSubject { path: PathBuf },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,6 +274,9 @@ pub(crate) async fn load(
         if file.workflows.is_empty() || file.workflows.values().any(Vec::is_empty) {
             return Err(WorkflowFileError::Incomplete { path });
         }
+        if file.subject.kind().is_id_form() {
+            return Err(WorkflowFileError::IdSubject { path });
+        }
         files.push(file);
     }
     Ok(files)
@@ -307,7 +314,7 @@ pub(crate) async fn run(
     let mut refusals = Vec::new();
     for file in files {
         let claim = Attestation {
-            subject: file.subject.clone(),
+            subjects: AttestedSubject::configured(file.subject.clone()),
             agent: file.agent.clone(),
             scope: Some(ChatScopeClaim {
                 participant: None,
@@ -463,7 +470,7 @@ fn provider(
 fn conversation(
     transport: ChatTransportKind,
     kind: ConversationKind,
-    subject: &ExternalSubject,
+    subject: &Subject,
 ) -> Conversation {
     let part = |value: &str| Some(value.to_owned());
     let team = || part(subject.tenant().unwrap_or("t0"));
@@ -499,7 +506,7 @@ fn conversation(
         (
             ChatTransportKind::Telegram,
             ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage,
-        ) => (None, subject.subject().to_owned(), None),
+        ) => (None, subject.id().to_owned(), None),
         (ChatTransportKind::Telegram, ConversationKind::Channel) => (None, "-1".to_owned(), None),
         (ChatTransportKind::Telegram, ConversationKind::Thread) => {
             (None, "-1".to_owned(), part("1"))
@@ -510,7 +517,7 @@ fn conversation(
             | ConversationKind::GroupDirectMessage
             | ConversationKind::Channel
             | ConversationKind::Thread,
-        ) => (part("1:1"), subject.subject().to_owned(), None),
+        ) => (part("1:1"), subject.id().to_owned(), None),
         (
             ChatTransportKind::Github,
             ConversationKind::DirectMessage
@@ -519,11 +526,7 @@ fn conversation(
             | ConversationKind::Thread,
         ) => (
             subject.tenant().map(str::to_owned),
-            format!(
-                "{}.{}",
-                subject.tenant().unwrap_or_default(),
-                subject.subject()
-            ),
+            format!("{}.{}", subject.tenant().unwrap_or_default(), subject.id()),
             part("1"),
         ),
         (

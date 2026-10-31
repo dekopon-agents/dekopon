@@ -408,7 +408,7 @@ fn invocation_span(
             invocation = %request.id,
             capability = %request.capability,
             trace = %request.trace_parent.trace(),
-            subject = %claim.subject,
+            subject = %claim.subjects,
             agent = %claim.agent,
         ),
         None => tracing::info_span!(
@@ -560,7 +560,7 @@ where
                         chat_memory,
                         attestation
                             .as_ref()
-                            .and_then(|claim| broker.display_principal(&claim.subject)),
+                            .and_then(|claim| broker.display_principal(claim.subjects.name())),
                     )
                     .with_space(broker.space_grants(
                         context,
@@ -601,7 +601,7 @@ where
                     invocation = %invocation,
                     capability = tracing::field::Empty,
                     trace = %trace_parent.trace(),
-                    subject = %claim.subject,
+                    subject = %claim.subjects,
                     agent = %claim.agent,
                 ),
                 None => tracing::info_span!(
@@ -881,7 +881,7 @@ where
                 "broker.invocation",
                 invocation = %turn.id,
                 trace = %turn.trace_parent.trace(),
-                subject = %attestation.subject,
+                subject = %attestation.subjects,
                 agent = %attestation.agent,
             );
             adopt_trace_parent(&span, turn.trace_parent);
@@ -1335,7 +1335,10 @@ mod generation_tests {
         let mut client = DescriptorStream::new(client);
         let request = crate::tests::generation_invocation("held-before-revocation", false);
         let claim = Attestation::for_subject(
-            "slack.t0123abc.u9xyz".parse().unwrap(),
+            dekopon_core::AttestedSubject::one(
+                "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+            )
+            .unwrap(),
             "chat-agent".parse().unwrap(),
         )
         .bound_to(request.id.clone());
@@ -1461,7 +1464,7 @@ mod generation_tests {
             peer(
                 "dekopon-console",
                 Some(AttestorGrant {
-                    namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+                    namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
                 }),
             ),
         ];

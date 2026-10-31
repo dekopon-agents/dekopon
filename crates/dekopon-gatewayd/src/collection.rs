@@ -208,7 +208,7 @@ impl Collector {
             let lead = &batch.members[0];
             let owned = lead.transport == request.transport
                 && lead.conversation.key() == request.conversation_id
-                && lead.subject.canonical() == request.subject;
+                && lead.subject.name().canonical() == request.subject;
             if owned {
                 cancelled = true;
                 for member in &batch.members {
@@ -358,7 +358,10 @@ pub(crate) mod tests {
             pull_request_links: None,
             transport: "wa".into(),
             transport_kind: ChatTransportKind::Whatsapp,
-            subject: "whatsapp.15551234567".parse().unwrap(),
+            subject: dekopon_core::AttestedSubject::one(
+                "drn:whatsapp:number::15551234567".parse().expect("subject"),
+            )
+            .unwrap(),
             conversation: Conversation {
                 kind: ConversationKind::DirectMessage,
                 container: Some("123:456".into()),
@@ -519,7 +522,10 @@ pub(crate) mod tests {
             Offered::Refused(_, "batch-limit")
         ));
         let mut other = message(1, "");
-        other.subject = "whatsapp.15557654321".parse().unwrap();
+        other.subject = dekopon_core::AttestedSubject::one(
+            "drn:whatsapp:number::15557654321".parse().expect("subject"),
+        )
+        .unwrap();
         assert!(matches!(
             collector.offer(route("a"), other),
             Offered::Pending
@@ -649,7 +655,10 @@ pub(crate) mod tests {
         let mut collector = collector(0, 4);
         let mut member = message(1, "caption");
         member.transport_kind = ChatTransportKind::Telegram;
-        member.subject = "telegram.123456".parse().unwrap();
+        member.subject = dekopon_core::AttestedSubject::one(
+            "drn:telegram:user::123456".parse().expect("subject"),
+        )
+        .unwrap();
         member.native_group = Some("same-label".into());
         member.reply = ReplyTarget::Telegram {
             chat_id: 123,
@@ -676,7 +685,10 @@ pub(crate) mod tests {
             collector.offer(route("a"), text),
             Offered::Immediate(_)
         ));
-        member.subject = "telegram.654321".parse().unwrap();
+        member.subject = dekopon_core::AttestedSubject::one(
+            "drn:telegram:user::654321".parse().expect("subject"),
+        )
+        .unwrap();
         assert!(matches!(
             collector.offer(route("a"), member),
             Offered::Pending
@@ -746,7 +758,12 @@ pub(crate) mod tests {
             let mut other = first.clone();
             let mut agent = "a";
             match axis {
-                0 => other.subject = "whatsapp.15557654321".parse().unwrap(),
+                0 => {
+                    other.subject = dekopon_core::AttestedSubject::one(
+                        "drn:whatsapp:number::15557654321".parse().expect("subject"),
+                    )
+                    .unwrap()
+                }
                 1 => agent = "b",
                 2 => {
                     other.transport = "wa-other".into();
@@ -790,11 +807,11 @@ pub(crate) mod tests {
         let mut request = CancelRequest {
             transport: first.transport.clone(),
             conversation_id: first.conversation.key(),
-            subject: "whatsapp.15557654321".into(),
+            subject: "drn:whatsapp:number::15557654321".into(),
             via: dekopon_agent::CancelVia::StopReply,
         };
         assert!(!collector.cancel(&request));
-        request.subject = first.subject.canonical();
+        request.subject = first.subject.name().canonical();
         assert!(collector.cancel(&request));
         assert_eq!(collector.deadline(), None);
         assert!(matches!(

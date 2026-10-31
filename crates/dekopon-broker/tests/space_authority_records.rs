@@ -28,12 +28,12 @@ fn only(captured: &CaptureLayer, id: &str) -> Record {
 
 async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
     let mappings = [
-        ("fauxlack.team.uasker", "asker"),
-        ("fauxlack.team.cchannel", "space"),
-        ("slack.team.user", "asker"),
-        ("slack.team.other", "participant"),
-        ("slack.team.channel", "space"),
-        ("github.owner.repo", "repo"),
+        ("drn:fauxlack:user:team:uasker", "asker"),
+        ("drn:fauxlack:channel:team:cchannel", "space"),
+        ("drn:slack:user:team:user", "asker"),
+        ("drn:slack:user:team:other", "participant"),
+        ("drn:slack:channel:team:channel", "space"),
+        ("drn:github:repo:owner:repo", "repo"),
     ]
     .map(|(subject, id)| (subject.parse().expect("subject"), principal(id)));
     let world = PolicyWorld::new(
@@ -193,15 +193,22 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
     };
 
     for (id, form, scope) in [
-        ("channel-denial", "slack.team.user", slack_scope()),
-        ("fauxlack-denial", "fauxlack.team.uasker", fauxlack_scope()),
-        ("repository-denial", "github.owner.repo", github),
+        ("channel-denial", "drn:slack:user:team:user", slack_scope()),
+        (
+            "fauxlack-denial",
+            "drn:fauxlack:user:team:uasker",
+            fauxlack_scope(),
+        ),
+        ("repository-denial", "drn:github:repo:owner:repo", github),
     ] {
-        let claim = Attestation::for_chat(
-            form.parse().expect("subject"),
-            "test-agent".parse().expect("agent"),
-            scope,
-        );
+        let subject = form.parse::<dekopon_core::Subject>().expect("subject");
+        let subjects = if subject.namespace() == dekopon_core::Namespace::Github {
+            dekopon_core::AttestedSubject::github_repository("owner", subject.id(), 1)
+        } else {
+            dekopon_core::AttestedSubject::one(subject)
+        }
+        .expect("subject");
+        let claim = Attestation::for_chat(subjects, "test-agent".parse().expect("agent"), scope);
         assert_refused(&broker, &audit, id, claim, "policy-denied").await;
     }
     let record = only(&captured, "channel-denial");
@@ -267,7 +274,7 @@ async fn a_delivery_for_another_transport_is_refused() {
     for (id, subject, mut scope, delivery) in [
         (
             "invalid-delivery",
-            "slack.team.user",
+            "drn:slack:user:team:user",
             slack_scope(),
             DeliveryIdentity::Github {
                 delivery: "delivery-1".into(),
@@ -275,20 +282,20 @@ async fn a_delivery_for_another_transport_is_refused() {
         ),
         (
             "fauxlack-wrong-delivery",
-            "fauxlack.team.uasker",
+            "drn:fauxlack:user:team:uasker",
             fauxlack_scope(),
             slack_scope().delivery.unwrap(),
         ),
         (
             "slack-fauxlack-delivery",
-            "slack.team.user",
+            "drn:slack:user:team:user",
             slack_scope(),
             fauxlack_scope().delivery.unwrap(),
         ),
     ] {
         scope.delivery = Some(delivery);
         let claim = Attestation::for_chat(
-            subject.parse().expect("subject"),
+            dekopon_core::AttestedSubject::one(subject.parse().expect("subject")).expect("subject"),
             "test-agent".parse().expect("agent"),
             scope,
         );
@@ -300,21 +307,29 @@ async fn a_delivery_for_another_transport_is_refused() {
 async fn a_space_subject_cannot_be_an_attested_sender() {
     let (broker, audit) = broker_fixture().await;
     for (id, form, reason) in [
-        ("attested-space", "slack.team.channel", "attestation-denied"),
+        (
+            "attested-space",
+            "drn:slack:channel:team:channel",
+            "attestation-denied",
+        ),
         (
             "fauxlack-attested-space",
-            "fauxlack.team.cchannel",
+            "drn:fauxlack:channel:team:cchannel",
             "attestation-denied",
         ),
         (
             "fauxlack-unmapped-space",
-            "fauxlack.team.cother",
+            "drn:fauxlack:channel:team:cother",
             "unmapped-subject",
         ),
-        ("unmapped-space", "slack.team.cother", "unmapped-subject"),
+        (
+            "unmapped-space",
+            "drn:slack:channel:team:cother",
+            "unmapped-subject",
+        ),
     ] {
         let claim = Attestation::for_subject(
-            form.parse().expect("subject"),
+            dekopon_core::AttestedSubject::one(form.parse().expect("subject")).expect("subject"),
             "test-agent".parse().expect("agent"),
         );
         assert_refused(&broker, &audit, id, claim, reason).await;
@@ -338,9 +353,9 @@ async fn participant_capability_lookups_do_not_record_effect_decisions() {
     tracing::dispatcher::with_default(&dispatch, || {
         let turn = tracing::info_span!("gateway.session", turn.owner = "asker");
         let _turn = turn.enter();
-        for subject in ["slack.team.user", "slack.team.other"] {
+        for subject in ["drn:slack:user:team:user", "drn:slack:user:team:other"] {
             let claim = Attestation::for_chat(
-                subject.parse().unwrap(),
+                dekopon_core::AttestedSubject::one(subject.parse().expect("subject")).unwrap(),
                 "test-agent".parse().unwrap(),
                 slack_scope(),
             );
@@ -363,7 +378,8 @@ async fn participant_capability_lookups_do_not_record_effect_decisions() {
             .is_empty()
     );
     let claim = Attestation::for_chat(
-        "slack.team.user".parse().unwrap(),
+        dekopon_core::AttestedSubject::one("drn:slack:user:team:user".parse().expect("subject"))
+            .unwrap(),
         "test-agent".parse().unwrap(),
         slack_scope(),
     );
@@ -390,13 +406,18 @@ async fn participant_handles_are_recorded_without_selecting_the_authorizing_prin
     let captured = CaptureLayer::workspace();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(captured.clone()));
     for (id, subject, handle, expected_principal) in [
-        ("asker-p2", "slack.team.user", "p2", "asker"),
-        ("participant-p1", "slack.team.other", "p1", "participant"),
+        ("asker-p2", "drn:slack:user:team:user", "p2", "asker"),
+        (
+            "participant-p1",
+            "drn:slack:user:team:other",
+            "p1",
+            "participant",
+        ),
     ] {
         let mut scope = slack_scope();
         scope.participant = Some(handle.to_owned());
         let claim = Attestation::for_chat(
-            subject.parse().unwrap(),
+            dekopon_core::AttestedSubject::one(subject.parse().expect("subject")).unwrap(),
             "test-agent".parse().unwrap(),
             scope,
         );

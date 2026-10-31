@@ -46,9 +46,9 @@ use dekopon_capability::{
     StorageInterface, StorageRetention, StorageScope, broker::AuthorizationGate,
 };
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, PrincipalKind,
+    Actor, AgentId, AttestedSubject, CapabilityId, InvocationId, PrincipalId, PrincipalKind,
     ProviderFailureDetail, ProviderId, RiskLevel, SecretBytes, SecretDrn, SecretSinkKind,
-    SecretUseProposal, SubjectSegment, SubjectService, TraceId, error_chain,
+    SecretUseProposal, Subject, SubjectKind, SubjectScope, TraceId, error_chain,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{
@@ -244,7 +244,7 @@ pub struct AuthenticatedContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     via: Option<PrincipalId>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    attested_subject: Option<ExternalSubject>,
+    attested_subject: Option<Subject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_scope: Option<ChatScopeClaim>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,7 +278,7 @@ impl AuthenticatedContext {
         principal: PrincipalId,
         actor: Actor,
         via: PrincipalId,
-        subject: ExternalSubject,
+        subject: Subject,
     ) -> Result<Self, ContextError> {
         Self::build(principal, actor, Some(via), Some(subject), None)
     }
@@ -287,7 +287,7 @@ impl AuthenticatedContext {
         principal: PrincipalId,
         actor: Actor,
         via: PrincipalId,
-        subject: ExternalSubject,
+        subject: Subject,
         scope: ChatScopeClaim,
     ) -> Result<Self, ContextError> {
         Self::build(principal, actor, Some(via), Some(subject), Some(scope))
@@ -297,7 +297,7 @@ impl AuthenticatedContext {
         principal: PrincipalId,
         actor: Actor,
         via: Option<PrincipalId>,
-        attested_subject: Option<ExternalSubject>,
+        attested_subject: Option<Subject>,
         chat_scope: Option<ChatScopeClaim>,
     ) -> Result<Self, ContextError> {
         let actor_principal = match &actor {
@@ -318,7 +318,7 @@ impl AuthenticatedContext {
     }
 
     #[must_use]
-    fn with_refused_subject(&self, subject: ExternalSubject) -> Self {
+    fn with_refused_subject(&self, subject: Subject) -> Self {
         Self {
             principal: self.principal.clone(),
             actor: self.actor.clone(),
@@ -345,7 +345,7 @@ impl AuthenticatedContext {
     }
 
     #[must_use]
-    pub fn attested_subject(&self) -> Option<&ExternalSubject> {
+    pub fn attested_subject(&self) -> Option<&Subject> {
         self.attested_subject.as_ref()
     }
 
@@ -1133,58 +1133,36 @@ impl SecretCatalog {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AttestorGrant {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespaces: Option<Vec<String>>,
+    pub namespaces: Option<Vec<SubjectScope>>,
 }
 
 impl AttestorGrant {
     pub fn validate(&self) -> Result<(), BrokerBuildError> {
-        let Some(namespaces) = &self.namespaces else {
-            return Ok(());
-        };
-        if namespaces.is_empty() || namespaces.len() > MAX_POLICY_SCOPE_ENTRIES {
-            return Err(BrokerBuildError::InvalidAttestorScope {
-                scope: namespaces.len().to_string(),
-            });
-        }
-        for scope in namespaces {
-            let mut segments = scope.split('.');
-            let valid = segments
-                .next()
-                .unwrap_or_default()
-                .parse::<SubjectService>()
-                .is_ok_and(|service| {
-                    segments.clone().count() <= 2
-                        && segments.enumerate().all(|(index, segment)| {
-                            let position = if index == 0 && service.requires_tenant() {
-                                SubjectSegment::Tenant
-                            } else {
-                                SubjectSegment::Subject
-                            };
-                            service.admits_segment(position, segment)
-                        })
-                });
-            if !valid {
-                return Err(BrokerBuildError::InvalidAttestorScope {
-                    scope: scope.clone(),
-                });
+        match &self.namespaces {
+            Some(namespaces)
+                if namespaces.is_empty() || namespaces.len() > MAX_POLICY_SCOPE_ENTRIES =>
+            {
+                Err(BrokerBuildError::InvalidAttestorScope {
+                    scope: namespaces.len().to_string(),
+                })
             }
+            Some(_) | None => Ok(()),
         }
-        Ok(())
     }
 
     #[must_use]
-    pub fn permits(&self, subject: &ExternalSubject) -> bool {
-        self.namespaces.as_ref().is_none_or(|namespaces| {
-            namespaces
-                .iter()
-                .any(|namespace| subject.in_namespace(namespace))
+    pub fn permits(&self, subjects: &AttestedSubject) -> bool {
+        subjects.forms().all(|subject| {
+            self.namespaces
+                .as_ref()
+                .is_none_or(|scopes| scopes.iter().any(|scope| scope.covers(subject)))
         })
     }
 }
 
 #[derive(Debug, Default)]
 pub struct IdentityDirectory {
-    mappings: BTreeMap<ExternalSubject, PrincipalId>,
+    mappings: BTreeMap<Subject, PrincipalId>,
 }
 
 impl IdentityDirectory {
@@ -1194,7 +1172,7 @@ impl IdentityDirectory {
     }
 
     pub fn new(
-        entries: impl IntoIterator<Item = (ExternalSubject, PrincipalId)>,
+        entries: impl IntoIterator<Item = (Subject, PrincipalId)>,
     ) -> Result<Self, BrokerBuildError> {
         let mut mappings = BTreeMap::new();
         for (subject, principal) in entries {
@@ -1209,21 +1187,45 @@ impl IdentityDirectory {
     }
 
     #[must_use]
-    pub fn resolve(&self, subject: &ExternalSubject) -> Option<&PrincipalId> {
+    pub fn resolve(&self, subject: &Subject) -> Option<&PrincipalId> {
         self.mappings.get(subject)
+    }
+
+    pub fn resolve_attested(
+        &self,
+        subjects: &AttestedSubject,
+    ) -> Result<Option<&PrincipalId>, SplitSubject> {
+        let name = self.resolve(subjects.name());
+        let id = subjects.id_form().and_then(|id| self.resolve(id));
+        match (name, id) {
+            (Some(name_principal), Some(id_principal)) if name_principal != id_principal => {
+                Err(SplitSubject {
+                    name_principal: name_principal.clone(),
+                    id_principal: id_principal.clone(),
+                })
+            }
+            (Some(principal), _) | (None, Some(principal)) => Ok(Some(principal)),
+            (None, None) => Ok(None),
+        }
     }
 
     #[must_use]
     pub fn principal_kind(&self, principal: &PrincipalId) -> PrincipalKind {
         self.mappings
             .iter()
-            .find_map(|(subject, mapped)| (mapped == principal).then(|| subject.kind()))
+            .find_map(|(subject, mapped)| (mapped == principal).then(|| subject.principal_kind()))
             .unwrap_or(PrincipalKind::Service)
     }
 
     pub fn principals(&self) -> impl Iterator<Item = &PrincipalId> {
         self.mappings.values()
     }
+}
+
+#[derive(Debug)]
+pub struct SplitSubject {
+    name_principal: PrincipalId,
+    id_principal: PrincipalId,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1240,30 +1242,28 @@ impl Default for BrokerLimits {
     }
 }
 
-fn space_subject(scope: &ChatScopeClaim) -> Option<ExternalSubject> {
+fn space_subject(scope: &ChatScopeClaim) -> Option<Subject> {
     match scope.conversation.kind {
         ConversationKind::Channel | ConversationKind::Thread => {}
         ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => return None,
     }
-    let service = match scope.kind {
-        ChatTransportKind::Fauxlack => "fauxlack",
-        ChatTransportKind::Slack => "slack",
-        ChatTransportKind::Discord => "discord",
+    let kind = match scope.kind {
+        ChatTransportKind::Fauxlack => SubjectKind::FauxlackChannel,
+        ChatTransportKind::Slack => SubjectKind::SlackChannel,
+        ChatTransportKind::Discord => SubjectKind::DiscordChannel,
         ChatTransportKind::Telegram
         | ChatTransportKind::Whatsapp
         | ChatTransportKind::Github
         | ChatTransportKind::Local => return None,
     };
     let container = scope.conversation.container.as_deref()?;
-    format!("{service}.{container}.{}", scope.conversation.id)
-        .parse()
-        .ok()
+    Subject::new(kind, container, &scope.conversation.id).ok()
 }
 
 fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
     PolicyContext {
         via: context.via().map(|via| via.as_str().to_owned()),
-        subject: context.attested_subject().map(ExternalSubject::canonical),
+        subject: context.attested_subject().map(Subject::canonical),
         agent: match context.actor() {
             Actor::Agent { agent } => Some(agent.as_str().to_owned()),
             Actor::Human { .. } | Actor::Service { .. } => None,
@@ -1313,7 +1313,7 @@ fn turn_started_by(context: &AuthenticatedContext) -> Option<TurnStartedBy> {
         Trigger::Message
             if context
                 .attested_subject()
-                .is_some_and(|subject| subject.kind() == PrincipalKind::Person) =>
+                .is_some_and(|subject| subject.principal_kind() == PrincipalKind::Person) =>
         {
             TurnStartedBy::Person
         }
@@ -1652,7 +1652,7 @@ pub enum AuditEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<PrincipalId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        attested_subject: Option<ExternalSubject>,
+        attested_subject: Option<Subject>,
         capability: CapabilityId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret: Option<SecretDrn>,
@@ -1692,7 +1692,7 @@ pub enum AuditEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<PrincipalId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        attested_subject: Option<ExternalSubject>,
+        attested_subject: Option<Subject>,
         capability: CapabilityId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret: Option<SecretDrn>,
@@ -2404,7 +2404,7 @@ where
             Some(claim) => {
                 let (context, refusal) = self.resolve_context(peer, grant, claim);
                 if let Some(refusal) = refusal {
-                    report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
+                    report_inspection_refusal(&refusal, peer, claim.subjects.name(), &claim.agent);
                     if refusal.reason == CONSOLE_REAL_SCOPE_REASON {
                         return Ok(CommandRunOutcome::Rendered {
                             stdout: String::new(),
@@ -2516,7 +2516,7 @@ where
     }
 
     #[must_use]
-    pub fn display_principal(&self, subject: &ExternalSubject) -> Option<PrincipalId> {
+    pub fn display_principal(&self, subject: &Subject) -> Option<PrincipalId> {
         self.identities.resolve(subject).cloned()
     }
 
@@ -2574,7 +2574,7 @@ where
         };
         let (context, refusal) = self.resolve_context(peer, grant, claim);
         if let Some(refusal) = refusal {
-            report_inspection_refusal(&refusal, peer, &claim.subject, &claim.agent);
+            report_inspection_refusal(&refusal, peer, claim.subjects.name(), &claim.agent);
             return Err(refusal);
         }
         let (mut capabilities, mut words, mut help) = self.capability_view(&context);
@@ -2770,7 +2770,7 @@ where
         claim: &Attestation,
     ) -> (AuthenticatedContext, Option<Refusal>) {
         let refused = || {
-            let mut context = peer.with_refused_subject(claim.subject.clone());
+            let mut context = peer.with_refused_subject(claim.subjects.name().clone());
             context.chat_scope = claim.scope.clone();
             context
         };
@@ -2780,9 +2780,27 @@ where
         if self.console_real_scope_refused(peer, claim) {
             return (refused(), Some(console_real_scope_refusal()));
         }
-        let Some(principal) = self.identities.resolve(&claim.subject) else {
+        let resolved = match self.identities.resolve_attested(&claim.subjects) {
+            Ok(resolved) => resolved,
+            Err(split) => {
+                if !grant.permits(&claim.subjects) {
+                    return (refused(), Some(unevaluated_refusal("attestation-denied")));
+                }
+                tracing::warn!(
+                    event = "broker_subject_split",
+                    subject = %claim.subjects.name(),
+                    subject_id = claim.subjects.id_form().map(ToString::to_string),
+                    principal = %split.name_principal,
+                    id_principal = %split.id_principal,
+                    via = %peer.principal(),
+                    "broker.subject.split"
+                );
+                return (refused(), Some(unevaluated_refusal("split-subject")));
+            }
+        };
+        let Some(principal) = resolved else {
             let mut refusal = unevaluated_refusal("unmapped-subject");
-            if grant.permits(&claim.subject) {
+            if grant.permits(&claim.subjects) {
                 refusal.session = dekopon_broker_protocol::SessionRefusal::UnmappedSubject;
             }
             return (refused(), Some(refusal));
@@ -2795,7 +2813,7 @@ where
                 }) && scope.participant.is_none()
                     && scope.github.is_none()
                     && scope.delivery.is_none()
-                    && space_subject(scope).as_ref() == Some(&claim.subject)
+                    && space_subject(scope).as_ref() == Some(claim.subjects.name())
             })
         {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
@@ -2803,7 +2821,7 @@ where
         let actor = Actor::Agent {
             agent: claim.agent.clone(),
         };
-        if !grant.permits(&claim.subject) {
+        if !grant.permits(&claim.subjects) {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         }
         let scope = match &claim.scope {
@@ -2812,8 +2830,11 @@ where
                     return (refused(), Some(unevaluated_refusal(CONSOLE_SMOKE_REFUSAL)));
                 }
                 let mut derived = scope.clone();
-                derived.conversation.id =
-                    self.console_smoke_conversation(peer.principal(), &claim.subject, &claim.agent);
+                derived.conversation.id = self.console_smoke_conversation(
+                    peer.principal(),
+                    claim.subjects.name(),
+                    &claim.agent,
+                );
                 Some(derived)
             }
             scope => scope.clone(),
@@ -2822,7 +2843,7 @@ where
             Some(scope) => {
                 if !scope
                     .conversation
-                    .is_canonical_for(scope.kind, &claim.subject)
+                    .is_canonical_for(scope.kind, claim.subjects.name())
                 {
                     return (refused(), Some(unevaluated_refusal("attestation-denied")));
                 }
@@ -2834,7 +2855,8 @@ where
                     return (refused(), Some(unevaluated_refusal("attestation-denied")));
                 }
                 if let Some(batch) = &scope.github {
-                    let subject = match (claim.subject.tenant(), claim.subject.subject()) {
+                    let subject = match (claim.subjects.name().tenant(), claim.subjects.name().id())
+                    {
                         (Some(owner), repo) => format!("{owner}/{repo}"),
                         _ => String::new(),
                     };
@@ -2854,7 +2876,7 @@ where
                     principal.clone(),
                     actor,
                     peer.principal().clone(),
-                    claim.subject.clone(),
+                    claim.subjects.name().clone(),
                     scope,
                 )
             }
@@ -2862,7 +2884,7 @@ where
                 principal.clone(),
                 actor,
                 peer.principal().clone(),
-                claim.subject.clone(),
+                claim.subjects.name().clone(),
             ),
         };
         let Ok(mut context) = derived else {
@@ -2912,7 +2934,7 @@ where
     fn console_smoke_conversation(
         &self,
         via: &PrincipalId,
-        subject: &ExternalSubject,
+        subject: &Subject,
         agent: &AgentId,
     ) -> String {
         let mut hasher = Sha256::new();
@@ -4883,7 +4905,7 @@ fn denial_reason(decision: &EvaluatedDecision, denied: &'static str) -> &'static
 fn report_inspection_refusal(
     refusal: &Refusal,
     peer: &AuthenticatedContext,
-    subject: &ExternalSubject,
+    subject: &Subject,
     agent: &AgentId,
 ) {
     tracing::warn!(
@@ -5308,7 +5330,7 @@ struct DecisionMaterial<'a> {
     principal: &'a PrincipalId,
     actor: &'a Actor,
     via: Option<&'a PrincipalId>,
-    attested_subject: Option<&'a ExternalSubject>,
+    attested_subject: Option<&'a Subject>,
     capability: &'a CapabilityId,
     #[serde(skip_serializing_if = "Option::is_none")]
     secret_use: Option<&'a SecretUseProposal>,

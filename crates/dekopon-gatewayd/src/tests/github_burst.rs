@@ -123,7 +123,6 @@ async fn fixture_with_subscriptions(
             "https://github.com/owner/repo/pull/7",
         )
         .unwrap()
-        .unwrap()
         .targets
         .remove(0);
         for message in anchors {

@@ -8,7 +8,7 @@
 
 use dekopon_agent::{SessionInvoker, ShellRuntime, prompt::ScriptRuntime as _};
 use dekopon_broker_protocol::{BrokerClient, ChatScopeClaim, FrameLimits};
-use dekopon_core::{AgentId, ExternalSubject};
+use dekopon_core::{AgentId, Subject};
 use dekopon_core::{SecretDrn, SecretUseProposal};
 use dekopon_process::{CallBudget, Limits, TreeContext};
 use dekopon_shell::{
@@ -171,10 +171,10 @@ identities:
   - uid: {}
     principal: dekopon-console
     attestor:
-      namespaces: [slack.t0123abc]
+      namespaces: [drn:slack:*:t0123abc:*]
 principals:
   maintainer:
-    subjects: [slack.t0123abc.u9xyz]
+    subjects: [drn:slack:user:t0123abc:u9xyz]
 capabilities:
   {provider}:
     capabilities:
@@ -235,7 +235,7 @@ async fn console_shell_runs_provider_child_through_real_broker() {
     let fixture = broker_with_telemetry(true, false, true, None)
         .await
         .expect("broker executable supplied");
-    let subject = "slack.t0123abc.u9xyz".parse().unwrap();
+    let subject = "drn:slack:user:t0123abc:u9xyz".parse().unwrap();
     let mut options = ConsoleOptions::new(
         subject,
         "unused".into(),
@@ -282,7 +282,9 @@ async fn published_client_against_real_broker_allows_only_attested_agent_surface
         return;
     };
     let uid = rustix::process::geteuid().as_raw();
-    let subject: ExternalSubject = "slack.t0123abc.u9xyz".parse().expect("canonical subject");
+    let subject: Subject = "drn:slack:user:t0123abc:u9xyz"
+        .parse()
+        .expect("canonical subject");
     let mut options = ConsoleOptions::new(
         subject.clone(),
         "unused".into(),
@@ -349,7 +351,7 @@ async fn published_client_against_real_broker_allows_only_attested_agent_surface
         "model (default): test-model",
         "agent: reviewer",
         "profile: operator",
-        "subject: slack.t0123abc.u9xyz",
+        "subject: drn:slack:user:t0123abc:u9xyz",
         "console: dekopon-console",
         "session: subject-only",
     ] {
@@ -443,7 +445,7 @@ async fn published_client_against_real_broker_allows_only_attested_agent_surface
     assert!(
         open_agent(
             client.clone(),
-            "slack.other.u9xyz".parse().unwrap(),
+            "drn:slack:user:other:u9xyz".parse().unwrap(),
             "reviewer".parse().unwrap(),
             None
         )
@@ -494,7 +496,7 @@ async fn executed_asset_effect_registers_descriptor_through_real_broker() {
         return;
     };
     let assets_root = fixture._dir.path().join("assets");
-    let subject = "slack.t0123abc.u9xyz".parse().unwrap();
+    let subject = "drn:slack:user:t0123abc:u9xyz".parse().unwrap();
     let mut options = ConsoleOptions::new(
         subject,
         "unused".into(),
@@ -628,7 +630,7 @@ async fn console_shell_and_model_script_register_real_broker_asset_with_zero_exi
         eprintln!("asset fixture env absent; shell and model-script integration not exercised");
         return;
     };
-    let subject = "slack.t0123abc.u9xyz".parse().unwrap();
+    let subject = "drn:slack:user:t0123abc:u9xyz".parse().unwrap();
     let mut options = ConsoleOptions::new(
         subject,
         "unused".into(),
@@ -715,7 +717,7 @@ async fn real_broker_rejects_unmapped_peer_uid() {
         return;
     };
     let mut options = ConsoleOptions::new(
-        "slack.t0123abc.u9xyz".parse().unwrap(),
+        "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
         "unused".into(),
         dekopon_test_support::shell_threads(),
     );

@@ -2193,7 +2193,7 @@ pub(crate) mod retention_tests {
                 &"reviewer".parse().unwrap(),
                 "dev",
                 name,
-                &"tel.15550000001".parse().unwrap(),
+                &"drn:tel:number::15550000001".parse().unwrap(),
             ),
             1,
             Arc::new(AssetFence::new().with_grant(test_grant().hex())),

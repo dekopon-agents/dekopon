@@ -38,7 +38,7 @@ impl JobOwner {
         Self {
             transport: message.transport.clone(),
             conversation: message.conversation.key(),
-            subject: message.subject.canonical(),
+            subject: message.subject.name().canonical(),
         }
     }
 }

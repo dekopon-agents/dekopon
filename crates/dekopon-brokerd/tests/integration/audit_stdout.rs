@@ -86,7 +86,7 @@ permit(principal == Dekopon::Principal::"cpetersen",
                 "actor": {"type": "agent", "agent": "brokerd-test"},
                 "attestor": {},
             }],
-            "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}},
+            "principals": {"cpetersen": {"subjects": ["drn:slack:user:t0123abc:u9xyz"]}},
             "capabilities": {
                 "cli-probe": {
                     "constraints": {"timeoutMs": 30000},
@@ -136,7 +136,10 @@ permit(principal == Dekopon::Principal::"cpetersen",
     let result = client
         .invoke(
             Some(Attestation::for_subject(
-                "slack.t0123abc.u9xyz".parse().expect("canonical subject"),
+                dekopon_core::AttestedSubject::one(
+                    "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+                )
+                .expect("canonical subject"),
                 "chat-agent".parse().expect("valid agent"),
             )),
             InvocationRequest {

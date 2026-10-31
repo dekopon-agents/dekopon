@@ -610,7 +610,7 @@ jobs:
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set console.enabled=true --set console.image.tag=v0.1.0 \
-            --set console.subject=discord.1 > "$RUNNER_TEMP/console.yaml"
+            --set console.subject=drn:discord:user::1 > "$RUNNER_TEMP/console.yaml"
           assert_console_image() {
             expected=$1
             shift
@@ -638,7 +638,7 @@ jobs:
             --set state.existingClaim=dekopon-state > "$RUNNER_TEMP/config-directory.yaml"
           grep -q -- '"--config", "/etc/dekopon/broker.d"' "$RUNNER_TEMP/config-directory.yaml"
           grep -q -- '"--config", "/etc/dekopon-gateway"' "$RUNNER_TEMP/config-directory.yaml"
-          grep -q 'namespaces: \["discord.1"\]' "$RUNNER_TEMP/config-directory.yaml"
+          grep -q 'namespaces: \["drn:discord:user::1"\]' "$RUNNER_TEMP/config-directory.yaml"
           if helm template dekopon charts/dekopon -f charts/dekopon/ci/values-config-directory.yaml \
             --set broker.config.inline=x > /dev/null 2> "$RUNNER_TEMP/config-directory.err"; then
             echo "broker.config.inline beside broker.configDirectory.configMap was accepted" >&2

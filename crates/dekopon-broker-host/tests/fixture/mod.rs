@@ -24,8 +24,8 @@ pub use dekopon_capability::{
     StorageConstraints, StorageInterface, StorageScope,
 };
 pub use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, IdentifierError, InvocationId, PrincipalId,
-    ProviderId, SubjectError, TraceId,
+    Actor, AgentId, CapabilityId, IdentifierError, InvocationId, PrincipalId, ProviderId, Subject,
+    SubjectError, TraceId,
 };
 pub use dekopon_storage_host::{ContinuityPolicy, StorageHost, StorageHostError, StorageLimits};
 
@@ -117,7 +117,7 @@ impl Default for Scope {
     fn default() -> Self {
         Self {
             agent: "testkit-agent".to_owned(),
-            subject: "slack.t0123abc.u9xyz".to_owned(),
+            subject: "drn:slack:user:t0123abc:u9xyz".to_owned(),
             transport_kind: "slack".to_owned(),
             transport: "testkit-transport".to_owned(),
             channel: "c0123abc".to_owned(),
@@ -275,7 +275,7 @@ pub struct FixtureHost {
     storage_grant: Option<(StorageInterface, StorageAccess)>,
     provider: ProviderId,
     agent: AgentId,
-    subject: ExternalSubject,
+    subject: Subject,
     transport_kind: String,
     transport: String,
     channel: String,

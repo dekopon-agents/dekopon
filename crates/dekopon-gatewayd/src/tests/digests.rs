@@ -209,7 +209,6 @@ fn legacy_personal_and_s5_subscription_rows_load_beside_distinct_space_watch_and
         "https://github.com/acme/widget/pull/17",
     )
     .unwrap()
-    .unwrap()
     .targets
     .remove(0);
     store.subscribe(space.clone(), target, now).unwrap();

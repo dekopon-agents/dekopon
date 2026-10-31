@@ -70,7 +70,7 @@ impl Fixture {
             &route.agent,
             &route.transport,
             &inbound.conversation,
-            Some(&inbound.subject),
+            Some(inbound.subject.name()),
         )
         .journal_stem();
         Self {
@@ -178,7 +178,7 @@ async fn the_memory_notice_is_never_replayed_as_history() {
         &fixture.route.agent,
         &fixture.route.transport,
         &fixture.inbound.conversation,
-        Some(&fixture.inbound.subject),
+        Some(fixture.inbound.subject.name()),
     )
     .journal_stem();
     let path = fixture.journal_dir.path().join(format!("{stem}.jsonl"));

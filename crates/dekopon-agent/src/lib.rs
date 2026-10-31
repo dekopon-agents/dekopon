@@ -1671,9 +1671,7 @@ mod tests {
             InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope,
         };
         use dekopon_capability::DecisionReference;
-        use dekopon_core::{
-            AgentId, ExternalSubject, ProviderFailureDetail, SecretDrn, SecretUseProposal,
-        };
+        use dekopon_core::{AgentId, ProviderFailureDetail, SecretDrn, SecretUseProposal, Subject};
         use dekopon_process::CancelSignal;
         use dekopon_process::ExitCode;
         use dekopon_process::Limits;
@@ -1692,7 +1690,7 @@ mod tests {
         };
 
         const CAPABILITY: &str = "http-probe.fetch";
-        const SUBJECT: &str = "slack.t0123abc.u9xyz";
+        const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
 
         fn server_uid() -> u32 {
             rustix::process::geteuid().as_raw()
@@ -1991,9 +1989,12 @@ mod tests {
 
         fn attestation() -> Attestation {
             Attestation {
-                subject: SUBJECT
-                    .parse::<ExternalSubject>()
-                    .expect("canonical subject fixture"),
+                subjects: dekopon_core::AttestedSubject::one(
+                    SUBJECT
+                        .parse::<Subject>()
+                        .expect("canonical subject fixture"),
+                )
+                .expect("one-form subject"),
                 agent: "chat-agent"
                     .parse::<AgentId>()
                     .expect("valid agent fixture"),
@@ -2453,7 +2454,8 @@ mod tests {
                         trigger,
                     };
                     let attestation = Attestation::for_chat(
-                        SUBJECT.parse().expect("subject"),
+                        dekopon_core::AttestedSubject::one(SUBJECT.parse().expect("subject"))
+                            .expect("subject"),
                         "reviewer".parse().expect("agent"),
                         scope,
                     );
@@ -2520,7 +2522,8 @@ mod tests {
                         trigger,
                     };
                     let attestation = Attestation::for_chat(
-                        SUBJECT.parse().expect("subject"),
+                        dekopon_core::AttestedSubject::one(SUBJECT.parse().expect("subject"))
+                            .expect("subject"),
                         "chat-agent".parse().expect("agent"),
                         scope,
                     );
@@ -2984,7 +2987,7 @@ mod tests {
             else {
                 panic!("an attested leg must send an attested invoke frame: {request:?}");
             };
-            assert_eq!(attestation.subject.canonical(), SUBJECT);
+            assert_eq!(attestation.subjects.name().canonical(), SUBJECT);
             assert_eq!(attestation.agent.as_str(), "chat-agent");
             assert_eq!(attestation.invocation, Some(invocation.id));
             assert_eq!(invocation.capability.as_str(), CAPABILITY);

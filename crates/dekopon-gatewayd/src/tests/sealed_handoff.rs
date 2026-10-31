@@ -106,7 +106,11 @@ fn a_steer_during_the_capped_last_steps_tools_runs_next_before_newer_input() {
     route.steering = Steering::Boundary;
     let admission = held(&gate, &route);
     assert!(matches!(
-        admit(&gate, &route, native("tel.999", "other", "other")),
+        admit(
+            &gate,
+            &route,
+            native("drn:tel:number::999", "other", "other")
+        ),
         Admit::Queued
     ));
     let script = ModelScript::new([script_call("echo")]);
@@ -144,7 +148,7 @@ fn a_steer_during_the_capped_last_steps_tools_runs_next_before_newer_input() {
     ));
 
     let (admission, leftover) = admission.next_or_release().expect("the leftover runs");
-    assert_eq!(leftover.message.subject.canonical(), SUBJECT);
+    assert_eq!(leftover.message.subject.name().canonical(), SUBJECT);
     assert!(leftover.message.text.contains("older"));
     assert!(!leftover.message.text.contains("newer"));
     let (admission, other) = admission.next_or_release().expect("queued sender");
@@ -232,10 +236,10 @@ fn consecutive_same_sender_followups_fold_and_another_sender_breaks_the_run() {
     let route = route(model_config());
     let admission = held(&gate, &route);
     for (subject, id, text) in [
-        ("tel.999", "a1", "first part"),
-        ("tel.999", "a2", "second part"),
-        ("tel.888", "b1", "someone else"),
-        ("tel.999", "a3", "after the break"),
+        ("drn:tel:number::999", "a1", "first part"),
+        ("drn:tel:number::999", "a2", "second part"),
+        ("drn:tel:number::888", "b1", "someone else"),
+        ("drn:tel:number::999", "a3", "after the break"),
     ] {
         assert!(matches!(
             admit(&gate, &route, native(subject, id, text)),
@@ -244,7 +248,10 @@ fn consecutive_same_sender_followups_fold_and_another_sender_breaks_the_run() {
     }
 
     let (admission, folded) = admission.next_or_release().expect("the folded run");
-    assert_eq!(folded.message.subject.canonical(), "tel.999");
+    assert_eq!(
+        folded.message.subject.name().canonical(),
+        "drn:tel:number::999"
+    );
     assert_eq!(
         folded.message.message_id,
         MessageId::Native("a1".to_owned())
@@ -337,7 +344,7 @@ async fn every_id_of_a_taken_folded_steer_is_consumed_and_never_replayed() {
         let driver = HistoryDriver::new(Ok(vec![
             past("t2", "U1", SUBJECT, "lead"),
             past("t3", "U1", SUBJECT, "folded in"),
-            past("t4", "U2", "tel.16035550102", "unaddressed"),
+            past("t4", "U2", "drn:tel:number::16035550102", "unaddressed"),
         ]));
         let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 4);
         resident_since(&runner, "t1");

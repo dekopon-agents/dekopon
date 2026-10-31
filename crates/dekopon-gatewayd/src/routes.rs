@@ -7,7 +7,7 @@ use std::{
 use dekopon_agent::prompt::PromptLimits;
 use dekopon_broker_protocol::{Conversation, ConversationKind, ConversationMatch};
 use dekopon_config::{LocalCatalog, Skill};
-use dekopon_core::{AgentId, ExternalSubject};
+use dekopon_core::{AgentId, Subject};
 use thiserror::Error;
 
 use crate::{
@@ -29,7 +29,7 @@ pub(crate) struct BoundRoute {
     pub route_index: usize,
     pub transport: String,
     pub conversation: ConversationMatch,
-    pub subjects: Option<Vec<ExternalSubject>>,
+    pub subjects: Option<Vec<Subject>>,
     pub github_events: Option<Vec<GithubEvent>>,
     pub agent: AgentId,
     pub description: String,
@@ -232,7 +232,7 @@ impl RoutingTable {
         &self,
         transport: &str,
         conversation: &Conversation,
-        subject: &ExternalSubject,
+        subject: &Subject,
         event: GithubEvent,
     ) -> Option<&BoundRoute> {
         self.find(transport, conversation, subject)
@@ -250,7 +250,11 @@ impl RoutingTable {
     }
 
     pub(crate) fn route_index(&self, message: &InboundMessage) -> Option<(usize, &BoundRoute)> {
-        self.find(&message.transport, &message.conversation, &message.subject)
+        self.find(
+            &message.transport,
+            &message.conversation,
+            message.subject.name(),
+        )
     }
 
     pub(crate) fn route_for_anchor(&self, anchor: &Anchor) -> Option<&BoundRoute> {
@@ -267,7 +271,7 @@ impl RoutingTable {
         &self,
         transport: &str,
         conversation: &Conversation,
-        subject: &ExternalSubject,
+        subject: &Subject,
     ) -> Option<(usize, &BoundRoute)> {
         self.routes.iter().enumerate().find(|(_, route)| {
             route.transport == transport

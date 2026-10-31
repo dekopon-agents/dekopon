@@ -27,7 +27,7 @@ fn agent(name: &str) -> Agent {
 fn console() -> App {
     App::new(
         vec![agent("ville-github"), agent("snooper")],
-        "slack.t0123abc.u9xyz".to_owned(),
+        "drn:slack:user:t0123abc:u9xyz".to_owned(),
         "/run/dekopon/broker.sock".to_owned(),
         "/config/dekopon/chatgpt-auth.console.json".to_owned(),
     )
@@ -57,7 +57,12 @@ fn selection_saturates_rather_than_wrapping() {
 
 #[test]
 fn selection_on_an_empty_catalog_does_nothing() {
-    let mut app = App::new(Vec::new(), "tel.1".to_owned(), String::new(), String::new());
+    let mut app = App::new(
+        Vec::new(),
+        "drn:tel:number::1".to_owned(),
+        String::new(),
+        String::new(),
+    );
     app.move_selection(3);
     assert_eq!(app.selected_agent, 0);
     assert!(app.highlighted().is_none());

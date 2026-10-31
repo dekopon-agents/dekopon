@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use dekopon_agent::attachment::GeneratedImage;
 use dekopon_agent::wake::WakeId;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, Trigger};
-use dekopon_core::ExternalSubject;
+use dekopon_core::{AttestedSubject, Subject};
 use dekopon_model::ModelText;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -46,7 +46,7 @@ const MAX_RECONNECT_DOUBLINGS: u32 = 7;
 pub(crate) struct InboundMessage {
     pub transport: String,
     pub transport_kind: ChatTransportKind,
-    pub subject: ExternalSubject,
+    pub subject: AttestedSubject,
     pub conversation: Conversation,
     pub message_id: MessageId,
     pub text: String,
@@ -577,7 +577,7 @@ pub(crate) struct PastMessage {
     pub id: String,
     pub from_bot: bool,
     pub author: String,
-    pub subject: ExternalSubject,
+    pub subject: Subject,
     pub text: String,
     pub assets: Vec<PendingAsset>,
     pub at: std::time::SystemTime,

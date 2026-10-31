@@ -226,7 +226,7 @@ async fn a_stopped_broker_is_refused_by_the_exact_path_that_was_tried() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let absent = directory.path().join("broker.sock");
     let mut options = super::ConsoleOptions::new(
-        "slack.t0123abc.u9xyz"
+        "drn:slack:user:t0123abc:u9xyz"
             .parse()
             .expect("valid subject fixture"),
         "test-model".to_owned(),

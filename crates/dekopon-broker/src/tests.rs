@@ -150,7 +150,7 @@ async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
     let first = broker().await;
     let second = broker().await;
     let via = "peer".parse().expect("via");
-    let subject = "slack.t0123abc.u9xyz".parse().expect("subject");
+    let subject = "drn:slack:user:t0123abc:u9xyz".parse().expect("subject");
     let agent = "reviewer".parse().expect("agent");
     let digest = first.console_smoke_conversation(&via, &subject, &agent);
     assert!(digest.starts_with("smoke-") && digest.len() == 70);
@@ -170,7 +170,7 @@ async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
         digest,
         first.console_smoke_conversation(
             &via,
-            &"slack.t0123abc.uother".parse().expect("subject"),
+            &"drn:slack:user:t0123abc:uother".parse().expect("subject"),
             &agent,
         )
     );
@@ -1348,7 +1348,7 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
             agent: "provider-test".parse().unwrap(),
         },
         "gateway".parse().unwrap(),
-        "slack.team.user".parse().unwrap(),
+        "drn:slack:user:team:user".parse().unwrap(),
     )
     .unwrap();
     let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2346,40 +2346,22 @@ fn a_secret_map_revision_must_be_nonempty_unpadded_control_free_and_bounded() {
 }
 
 #[test]
-fn an_attestor_grant_needs_each_field_valid() {
+fn an_attestor_grant_is_bounded() {
     use super::{AttestorGrant, BrokerBuildError};
 
+    let scope: dekopon_core::SubjectScope = "drn:slack:*:t0123abc:*".parse().unwrap();
     let too_many = AttestorGrant {
-        namespaces: Some(vec![
-            "slack.t0123abc".to_owned();
-            super::MAX_POLICY_SCOPE_ENTRIES + 5
-        ]),
+        namespaces: Some(vec![scope.clone(); super::MAX_POLICY_SCOPE_ENTRIES + 5]),
     };
-    let one_segment_too_deep = AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc.u9xyz.u9xyz".to_owned()]),
-    };
-    for grant in [too_many, one_segment_too_deep] {
-        assert!(
-            matches!(
-                grant.validate(),
-                Err(BrokerBuildError::InvalidAttestorScope { .. })
-            ),
-            "{grant:?}"
-        );
+    assert!(matches!(
+        too_many.validate(),
+        Err(BrokerBuildError::InvalidAttestorScope { .. })
+    ));
+    AttestorGrant {
+        namespaces: Some(vec![scope]),
     }
-
-    let long_repository = format!("github.dekopon-agents.{}", "r".repeat(60));
-    for namespace in [
-        "slack.t0123abc.u9xyz",
-        "tel.16034700182",
-        long_repository.as_str(),
-    ] {
-        AttestorGrant {
-            namespaces: Some(vec![namespace.to_owned()]),
-        }
-        .validate()
-        .unwrap_or_else(|error| panic!("{namespace}: {error}"));
-    }
+    .validate()
+    .expect("one scope is within bounds");
 }
 
 #[test]
@@ -2704,7 +2686,7 @@ fn surface(broker: &Broker<InMemoryAuditLog>, memory_route: bool) -> Vec<u8> {
     use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
 
     let context = attested_agent_context(
-        "slack.t0123abc.u9xyz",
+        "drn:slack:user:t0123abc:u9xyz",
         chat_scope(
             ChatTransportKind::Slack,
             ConversationKind::Channel,
@@ -3275,11 +3257,11 @@ fn merge_space_decision_ands_each_verdict_and_unions_policy_ids() {
 fn an_identity_directory_lists_its_principals_and_the_ceiling_is_the_longest() {
     let directory = IdentityDirectory::new([
         (
-            "slack.t0123abc.u1".parse().expect("subject"),
+            "drn:slack:user:t0123abc:u1".parse().expect("subject"),
             "ann".parse().expect("principal"),
         ),
         (
-            "slack.t0123abc.u2".parse().expect("subject"),
+            "drn:slack:user:t0123abc:u2".parse().expect("subject"),
             "maintainer".parse().expect("principal"),
         ),
     ])
@@ -3298,8 +3280,8 @@ async fn the_capability_ceiling_lists_each_available_capability_with_its_words_a
     let broker = SurfaceBroker::new(root.path(), &[])
         .with_memory()
         .with_identities([
-            ("slack.t0123abc.u1", "ann"),
-            ("slack.t0123abc.u2", "maintainer"),
+            ("drn:slack:user:t0123abc:u1", "ann"),
+            ("drn:slack:user:t0123abc:u2", "maintainer"),
         ])
         .build()
         .await;
@@ -3342,7 +3324,7 @@ async fn the_capability_ceiling_lists_each_available_capability_with_its_words_a
         Some("maintainer".parse().expect("principal"))
     );
     assert_eq!(
-        broker.display_principal(&"slack.t0123abc.u1".parse().expect("subject")),
+        broker.display_principal(&"drn:slack:user:t0123abc:u1".parse().expect("subject")),
         Some("ann".parse().expect("principal"))
     );
     let memory = broker.chat_memory_ceiling().expect("memory is configured");
@@ -3359,7 +3341,7 @@ async fn without_memory_or_identities_the_ceilings_are_absent() {
     let broker = SurfaceBroker::new(root.path(), &[]).build().await;
     assert_eq!(broker.principal_ceiling(), None);
     assert_eq!(
-        broker.display_principal(&"slack.t0123abc.u1".parse().expect("subject")),
+        broker.display_principal(&"drn:slack:user:t0123abc:u1".parse().expect("subject")),
         None
     );
     assert!(broker.chat_memory_ceiling().is_none());
@@ -3413,7 +3395,7 @@ async fn memory_surface_requires_each_of_its_conditions() {
         .await;
     let reviewer: AgentId = "reviewer".parse().expect("agent");
     let stranger: AgentId = "stranger".parse().expect("agent");
-    let with_scope = attested_agent_context("slack.t0123abc.u9xyz", scope());
+    let with_scope = attested_agent_context("drn:slack:user:t0123abc:u9xyz", scope());
     let without_scope = AuthenticatedContext::new(
         "maintainer".parse().expect("principal"),
         Actor::Agent {
@@ -3466,7 +3448,7 @@ async fn reachable_providers_hides_storage_providers_outside_a_chat_scope() {
             .collect::<Vec<_>>()
     };
     let chat = attested_agent_context(
-        "slack.t0123abc.u9xyz",
+        "drn:slack:user:t0123abc:u9xyz",
         chat_scope(
             ChatTransportKind::Slack,
             ConversationKind::Channel,
@@ -3503,7 +3485,7 @@ async fn a_private_conversation_namespace_rotates_with_authority_and_other_scope
     use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
 
     let context = attested_agent_context(
-        "slack.t0123abc.u9xyz",
+        "drn:slack:user:t0123abc:u9xyz",
         chat_scope(
             ChatTransportKind::Slack,
             ConversationKind::Channel,
@@ -3576,7 +3558,7 @@ async fn a_refusal_from_authorization_carries_its_policy_evaluation() {
             Trigger::Message,
         )
     };
-    let context = attested_agent_context("slack.t0123abc.u9xyz", scope());
+    let context = attested_agent_context("drn:slack:user:t0123abc:u9xyz", scope());
 
     let erroring_secret_policy = permit("maintainer", "secret.use", "Secret", SECRET_DRN)
         .replace(");", ") when { 9223372036854775807 + 1 > 0 };");
@@ -3609,7 +3591,7 @@ async fn a_refusal_from_authorization_carries_its_policy_evaluation() {
         "a secret policy error is remembered on the capability decision"
     );
 
-    let identities = [("slack.t0123abc.u9xyz", "maintainer")];
+    let identities = [("drn:slack:user:t0123abc:u9xyz", "maintainer")];
     let agents = SurfaceBroker::new(dirs[1].path(), &[])
         .with_identities(identities)
         .build()
@@ -3626,7 +3608,10 @@ async fn a_refusal_from_authorization_carries_its_policy_evaluation() {
     thread_scope.conversation.kind = ConversationKind::Thread;
     thread_scope.conversation.thread = Some("1712345678.000100".to_owned());
     let claim = Attestation::for_chat(
-        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        dekopon_core::AttestedSubject::one(
+            "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+        )
+        .expect("subject"),
         "reviewer".parse().expect("agent"),
         thread_scope,
     );
@@ -3694,7 +3679,7 @@ async fn an_authorized_failure_before_the_provider_names_the_loaded_artifact() {
     .build()
     .await;
     let context = attested_agent_context(
-        "slack.t0123abc.u9xyz",
+        "drn:slack:user:t0123abc:u9xyz",
         chat_scope(
             dekopon_broker_protocol::ChatTransportKind::Slack,
             dekopon_broker_protocol::ConversationKind::Channel,
@@ -3809,7 +3794,7 @@ async fn a_successful_provider_that_wrote_stderr_carries_it_as_detail() {
             agent: "provider-test".parse().unwrap(),
         },
         "gateway".parse().unwrap(),
-        "slack.team.user".parse().unwrap(),
+        "drn:slack:user:team:user".parse().unwrap(),
     )
     .unwrap();
     let result = broker
@@ -3890,7 +3875,7 @@ async fn an_http_request_decision_digests_its_own_verdict_and_denial_reason() {
         .allowed_hosts = vec![authority.clone(), "127.0.0.1:1".to_owned()];
     let broker = builder.build().await;
     let context = attested_agent_context(
-        "slack.t0123abc.u9xyz",
+        "drn:slack:user:t0123abc:u9xyz",
         chat_scope(
             dekopon_broker_protocol::ChatTransportKind::Slack,
             dekopon_broker_protocol::ConversationKind::Channel,
