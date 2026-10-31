@@ -59,6 +59,15 @@ impl Problem {
 }
 
 impl Dialect {
+    pub(crate) const fn path(self) -> &'static str {
+        match self {
+            Self::Messages => "/v1/messages",
+            Self::CountTokens => "/v1/messages/count_tokens",
+            Self::Responses => "/v1/responses",
+            Self::Chat => "/v1/chat/completions",
+        }
+    }
+
     pub(crate) fn error(self, problem: Problem, message: &str) -> Response {
         let body = match self {
             Self::Messages | Self::CountTokens => json!({

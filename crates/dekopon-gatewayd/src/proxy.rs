@@ -7,8 +7,8 @@ use std::{
 
 use dekopon_core::{AgentId, Redacted};
 use dekopon_model_proxy::{
-    ANTHROPIC_ENDPOINT, CODEX_ENDPOINT, Grant, ModelProxy, OPENROUTER_ENDPOINT, ProxyModel,
-    Upstream,
+    ANTHROPIC_ENDPOINT, CODEX_ENDPOINT, Grant, Granted, ModelProxy, OPENROUTER_ENDPOINT,
+    ProxyModel, Upstream,
     tls::{Listener, TlsFiles},
 };
 use dekopon_model_token_governor::Metering;
@@ -17,6 +17,7 @@ use thiserror::Error;
 
 use crate::{
     config::ModelConfig,
+    routes::RoutingTable,
     session::{ConfiguredModels, ModelCredentialError, model_credential},
 };
 
@@ -50,8 +51,17 @@ pub struct ProxyTlsConfig {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GuestConfig {
     pub agent: String,
-    pub models: Vec<String>,
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Guest {
+    Listed(BTreeSet<String>),
+    Inherit,
+}
+
+pub(crate) type Grants = BTreeMap<String, (AgentId, Granted)>;
 
 #[derive(Debug, Error)]
 pub enum ProxyProblem {
@@ -63,6 +73,14 @@ pub enum ProxyProblem {
         "proxy guest {subject:?} names model {model:?}, whose kind openaiCompatible the proxy cannot serve"
     )]
     UnservableModel { subject: String, model: String },
+    #[error(
+        "proxy guest {subject:?} inherits the model of agent {agent:?}, whose routes resolve to several models: {models:?}"
+    )]
+    AgentModels {
+        subject: String,
+        agent: String,
+        models: Vec<String>,
+    },
     #[error("proxy guest subject must not be empty")]
     EmptySubject,
     #[error("proxy jailIdentity must be a URI")]
@@ -79,7 +97,7 @@ pub struct ResolvedProxy {
     pub files: TlsFiles,
     pub jail_identity: String,
     pub max_connections: usize,
-    pub guests: BTreeMap<String, (AgentId, BTreeSet<String>)>,
+    pub guests: BTreeMap<String, (AgentId, Guest)>,
 }
 
 pub(crate) fn resolve(
@@ -119,7 +137,7 @@ pub(crate) fn resolve(
                 subject: subject.clone(),
             });
         }
-        for (position, name) in guest.models.iter().enumerate() {
+        for (position, name) in guest.models.iter().flatten().enumerate() {
             match models.iter().find(|model| model.name() == name) {
                 None => problems.push(ProxyProblem::UnknownModel {
                     subject: subject.clone(),
@@ -139,7 +157,11 @@ pub(crate) fn resolve(
             }
         }
         if let Some(agent) = agent {
-            guests.insert(subject, (agent, guest.models.into_iter().collect()));
+            let granted = match guest.models {
+                Some(models) => Guest::Listed(models.into_iter().collect()),
+                None => Guest::Inherit,
+            };
+            guests.insert(subject, (agent, granted));
         }
     }
     Some(ResolvedProxy {
@@ -149,6 +171,79 @@ pub(crate) fn resolve(
         max_connections: config.max_connections,
         guests,
     })
+}
+
+pub(crate) fn listed_guests(proxy: Option<&ResolvedProxy>) -> impl Iterator<Item = &str> {
+    proxy
+        .map(|proxy| &proxy.guests)
+        .into_iter()
+        .flatten()
+        .filter_map(|(subject, (_, guest))| match guest {
+            Guest::Listed(_) => Some(subject.as_str()),
+            Guest::Inherit => None,
+        })
+}
+
+pub(crate) fn grants(
+    proxy: Option<&ResolvedProxy>,
+    routes: &RoutingTable,
+) -> Result<Grants, Vec<ProxyProblem>> {
+    let mut grants = Grants::new();
+    let mut problems = Vec::new();
+    for (subject, (agent, guest)) in proxy.map(|proxy| &proxy.guests).into_iter().flatten() {
+        let granted = match guest {
+            Guest::Listed(models) => Granted::Listed(models.clone()),
+            Guest::Inherit => {
+                let mut served = BTreeMap::new();
+                for route in routes.routes().iter().filter(|route| &route.agent == agent) {
+                    served.insert(route.model.name(), route.model.as_ref());
+                }
+                let mut served = served.into_iter();
+                match (served.next(), served.next()) {
+                    (None, _) => {
+                        problems.push(ProxyProblem::UnknownAgent {
+                            subject: subject.clone(),
+                        });
+                        continue;
+                    }
+                    (Some((name, ModelConfig::OpenaiCompatible { .. })), None) => {
+                        problems.push(ProxyProblem::UnservableModel {
+                            subject: subject.clone(),
+                            model: name.to_owned(),
+                        });
+                        continue;
+                    }
+                    (
+                        Some((
+                            name,
+                            ModelConfig::Openrouter { .. }
+                            | ModelConfig::ChatgptSubscription { .. }
+                            | ModelConfig::Anthropic { .. },
+                        )),
+                        None,
+                    ) => Granted::Inherited(name.to_owned()),
+                    (Some((first, _)), Some((second, _))) => {
+                        problems.push(ProxyProblem::AgentModels {
+                            subject: subject.clone(),
+                            agent: agent.to_string(),
+                            models: [first, second]
+                                .into_iter()
+                                .chain(served.map(|(name, _)| name))
+                                .map(str::to_owned)
+                                .collect(),
+                        });
+                        continue;
+                    }
+                }
+            }
+        };
+        grants.insert(subject.clone(), (agent.clone(), granted));
+    }
+    if problems.is_empty() {
+        Ok(grants)
+    } else {
+        Err(problems)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -161,6 +256,8 @@ pub enum ProxyStartError {
         #[source]
         source: Box<dekopon_model::error::InferenceError>,
     },
+    #[error("proxy model {model:?} settings could not be encoded")]
+    Settings { model: String },
     #[error(transparent)]
     Client(#[from] dekopon_model_proxy::ClientError),
     #[error(transparent)]
@@ -168,12 +265,12 @@ pub enum ProxyStartError {
 }
 
 pub(crate) fn build(
-    proxy: &ResolvedProxy,
+    grants: &Grants,
     models: &[ModelConfig],
     credentials: &ConfiguredModels,
     metering: &Arc<Metering>,
 ) -> Result<Arc<ModelProxy>, ProxyStartError> {
-    build_with(proxy, models, credentials, metering, |variable| {
+    build_with(grants, models, credentials, metering, |variable| {
         std::env::var_os(variable)
     })
 }
@@ -181,33 +278,33 @@ pub(crate) fn build(
 #[cfg(test)]
 pub(crate) async fn start_with(
     proxy: &ResolvedProxy,
+    grants: &Grants,
     models: &[ModelConfig],
-    credentials: &ConfiguredModels,
     metering: &Arc<Metering>,
     tasks: &mut tokio::task::JoinSet<()>,
     resolve: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<std::net::SocketAddr, ProxyStartError> {
-    let router = build_with(proxy, models, credentials, metering, resolve)?.router();
+    let credentials = ConfiguredModels::default();
+    let router = build_with(grants, models, &credentials, metering, resolve)?.router();
     listen(proxy, router, tasks).await
 }
 
 fn build_with(
-    proxy: &ResolvedProxy,
+    grants: &Grants,
     models: &[ModelConfig],
     credentials: &ConfiguredModels,
     metering: &Arc<Metering>,
     resolve: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<Arc<ModelProxy>, ProxyStartError> {
-    let granted = proxy
-        .guests
+    let granted = grants
         .values()
-        .flat_map(|(_, models)| models)
+        .flat_map(|(_, granted)| match granted {
+            Granted::Listed(models) => models.iter().map(String::as_str).collect::<Vec<_>>(),
+            Granted::Inherited(model) => vec![model.as_str()],
+        })
         .collect::<BTreeSet<_>>();
     let mut upstreams = Vec::new();
-    for model in models
-        .iter()
-        .filter(|model| granted.contains(&model.name().to_owned()))
-    {
+    for model in models.iter().filter(|model| granted.contains(model.name())) {
         let upstream = match model {
             ModelConfig::Anthropic {
                 name, api_key_env, ..
@@ -216,10 +313,26 @@ fn build_with(
                 api_key: Redacted::new(model_credential(name, api_key_env, resolve(api_key_env))?),
             },
             ModelConfig::Openrouter {
-                name, api_key_env, ..
+                name,
+                api_key_env,
+                generation,
+                reasoning,
+                routing,
+                cache,
+                ..
             } => Upstream::OpenRouter {
                 endpoint: OPENROUTER_ENDPOINT.to_owned(),
                 api_key: Redacted::new(model_credential(name, api_key_env, resolve(api_key_env))?),
+                settings: dekopon_model::openrouter::settings::Settings {
+                    generation: generation.clone(),
+                    reasoning: reasoning.clone(),
+                    routing: routing.clone(),
+                    cache: cache.clone(),
+                }
+                .request_fields()
+                .map_err(|_unencodable| ProxyStartError::Settings {
+                    model: name.clone(),
+                })?,
             },
             ModelConfig::ChatgptSubscription {
                 name,
@@ -253,15 +366,14 @@ fn build_with(
             upstream,
         });
     }
-    let guests = proxy
-        .guests
+    let guests = grants
         .iter()
-        .map(|(subject, (agent, models))| {
+        .map(|(subject, (agent, granted))| {
             (
                 subject.clone(),
                 Grant {
                     agent: agent.clone(),
-                    models: models.clone(),
+                    models: granted.clone(),
                 },
             )
         })
@@ -314,7 +426,10 @@ pub(crate) mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
-    use crate::config::{ConfigError, ConfigProblem, GatewaydConfig};
+    use crate::{
+        config::{ConfigError, ConfigProblem, GatewaydConfig},
+        routes::RouteProblem,
+    };
 
     pub(crate) const JAIL: &str = "spiffe://homelab/ns/vm-runner/sa/vm-runner-jail";
 
@@ -410,9 +525,15 @@ pub(crate) mod tests {
         ))
         .unwrap();
         let proxy = config.proxy.unwrap();
-        let (agent, models) = &proxy.guests["dekopon:gylmar-vm"];
+        let (agent, guest) = &proxy.guests["dekopon:gylmar-vm"];
         assert_eq!(agent.as_str(), "gylmar");
-        assert_eq!(models.len(), 2);
+        assert_eq!(
+            guest,
+            &Guest::Listed(BTreeSet::from([
+                "claude-opus".to_owned(),
+                "glm-flash".to_owned()
+            ]))
+        );
         assert_eq!(proxy.max_connections, 16);
 
         let root = tempfile::tempdir().unwrap();
@@ -444,25 +565,17 @@ pub(crate) mod tests {
         let Err(ConfigError::Invalid { problems, .. }) = resolved(&document) else {
             panic!("the proxy block is refused");
         };
-        let rendered = problems.iter().map(ToString::to_string).collect::<Vec<_>>();
-        for expected in [
-            "names an agent which no route serves",
-            "models[0] names an unknown model",
-            "model \"local\", whose kind openaiCompatible",
-            "TLS files are unusable",
-            "served only through the guest model proxy",
-            "maxConnections must be at least 1",
-        ] {
-            assert!(
-                rendered.iter().any(|problem| problem.contains(expected)),
-                "{expected}: {rendered:?}"
-            );
+        let expected: [fn(&ConfigProblem) -> bool; 6] = [
+            |problem| matches!(problem, ConfigProblem::Proxy(ProxyProblem::UnknownAgent { subject }) if subject == "dekopon:ghost-vm"),
+            |problem| matches!(problem, ConfigProblem::Proxy(ProxyProblem::UnknownModel { subject, position: 0 }) if subject == "dekopon:ghost-vm"),
+            |problem| matches!(problem, ConfigProblem::Proxy(ProxyProblem::UnservableModel { subject, model }) if subject == "dekopon:ghost-vm" && model == "local"),
+            |problem| matches!(problem, ConfigProblem::Proxy(ProxyProblem::Tls(_))),
+            |problem| matches!(problem, ConfigProblem::ProxyOnlyRouteModel { model } if model == "claude-opus"),
+            |problem| matches!(problem, ConfigProblem::Proxy(ProxyProblem::NoConnections)),
+        ];
+        for expected in expected {
+            assert!(problems.iter().any(expected), "{problems:?}");
         }
-        assert!(
-            problems
-                .iter()
-                .any(|problem| matches!(problem, ConfigProblem::ProxyOnlyRouteModel { .. }))
-        );
     }
 
     #[test]
@@ -521,8 +634,8 @@ pub(crate) mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         let address = start_with(
             config.proxy.as_ref().unwrap(),
+            &grants(config.proxy.as_ref(), &RoutingTable::default()).unwrap(),
             &config.models,
-            &ConfiguredModels::default(),
             &metering,
             &mut tasks,
             |_| Some("synthetic-key".into()),
@@ -555,5 +668,112 @@ pub(crate) mod tests {
         );
         tasks.shutdown().await;
         assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+    fn gylmar() -> dekopon_config::LocalCatalog {
+        dekopon_config::LocalCatalog::from_str(
+            Path::new("dekopon.yaml"),
+            &crate::tests::catalog_text(true, None).replace("reviewer", "gylmar"),
+        )
+        .unwrap()
+    }
+
+    const INHERITING: &str = "  guests:\n    'dekopon:gylmar-vm': {agent: gylmar}\n";
+
+    #[test]
+    fn an_agent_whose_routes_resolve_to_several_models_cannot_be_inherited() {
+        let pki = pki();
+        let document = document(pki.directory.path(), INHERITING)
+            .replace(
+                "[directMessage]}, agent: gylmar}",
+                "[directMessage]}, agent: gylmar, model: glm-flash}\n- {transport: dev, conversation: {kind: [directMessage]}, agent: gylmar, model: local}",
+            );
+        let config = resolved(&document).unwrap();
+        let Err(error) = RoutingTable::bind(&config, &gylmar()) else {
+            panic!("the inheriting guest is refused");
+        };
+        assert!(
+            error.problems.iter().any(|problem| matches!(
+                problem,
+                RouteProblem::Proxy(ProxyProblem::AgentModels { subject, agent, models })
+                    if subject == "dekopon:gylmar-vm"
+                        && agent == "gylmar"
+                        && models == &["glm-flash".to_owned(), "local".to_owned()]
+            )),
+            "{:?}",
+            error.problems
+        );
+    }
+
+    #[tokio::test]
+    async fn the_started_listener_serves_an_inheriting_guest_its_agents_model_only() {
+        let pki = pki();
+        let config = resolved(&document(pki.directory.path(), INHERITING).replace(
+            "[directMessage]}, agent: gylmar}",
+            "[directMessage]}, agent: gylmar, model: glm-flash}",
+        ))
+        .unwrap();
+        let routes = RoutingTable::bind(&config, &gylmar()).unwrap();
+        assert_eq!(
+            routes.guests()["dekopon:gylmar-vm"].1,
+            Granted::Inherited("glm-flash".to_owned())
+        );
+        let metering = Arc::new(Metering::new(Vec::new(), Metering::system_clock()));
+        let mut tasks = tokio::task::JoinSet::new();
+        let address = start_with(
+            config.proxy.as_ref().unwrap(),
+            routes.guests(),
+            &config.models,
+            &metering,
+            &mut tasks,
+            |_| Some("synthetic-key".into()),
+        )
+        .await
+        .unwrap();
+        let response = ask(
+            address,
+            &pki,
+            "dekopon:gylmar-vm",
+            r#"{"model":"claude-opus"}"#,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.contains(
+                "dekopon sandbox: this VM runs on its agent's model `glm-flash`, which is served on `/v1/chat/completions`, not `/v1/messages`."
+            ),
+            "{response}"
+        );
+        tasks.shutdown().await;
+    }
+    #[tokio::test]
+    async fn check_warns_once_for_a_guest_that_lists_models() {
+        let pki = pki();
+        let directory = pki.directory.path();
+        let config = document(
+            directory,
+            "  guests:\n    'dekopon:gylmar-vm': {agent: gylmar, models: [glm-flash]}\n    'dekopon:gylmar-ci': {agent: gylmar}\n",
+        )
+        .replace(
+            "[directMessage]}, agent: gylmar}",
+            "[directMessage]}, agent: gylmar, model: glm-flash}",
+        );
+        let path = directory.join("gatewayd.yaml");
+        std::fs::write(&path, config).unwrap();
+        std::fs::write(
+            directory.join("dekopon.yaml"),
+            crate::tests::catalog_text(true, None).replace("reviewer", "gylmar"),
+        )
+        .unwrap();
+        let report = crate::check(&path, None, None).await;
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let deprecated = report
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning, crate::CheckWarning::GuestModels { .. }))
+            .collect::<Vec<_>>();
+        assert!(
+            matches!(deprecated[..], [crate::CheckWarning::GuestModels { subject }] if subject == "dekopon:gylmar-vm"),
+            "{deprecated:?}"
+        );
     }
 }

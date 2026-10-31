@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 use thiserror::Error;
 
+use crate::wire::Field;
+
 #[derive(Clone, Debug, Default)]
 pub struct Settings {
     pub generation: Option<Generation>,
@@ -80,7 +82,43 @@ pub enum SettingsProblem {
     AutomaticTtl,
 }
 
+#[derive(Serialize)]
+struct Provider<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow_fallbacks: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    require_parameters: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    only: Option<&'a [String]>,
+}
+
 impl Settings {
+    pub fn request_fields(&self) -> Result<Vec<(Field, String)>, serde_json::Error> {
+        let generation = self.generation.as_ref();
+        let mut fields = Vec::new();
+        if let Some(value) = generation.and_then(|settings| settings.max_output_tokens) {
+            fields.push((Field::MaxTokens, serde_json::to_string(&value)?));
+        }
+        if let Some(value) = generation.and_then(|settings| settings.temperature) {
+            fields.push((Field::Temperature, serde_json::to_string(&value)?));
+        }
+        if let Some(value) = generation.and_then(|settings| settings.top_p) {
+            fields.push((Field::TopP, serde_json::to_string(&value)?));
+        }
+        if let Some(value) = &self.reasoning {
+            fields.push((Field::Reasoning, serde_json::to_string(value)?));
+        }
+        if let Some(routing) = &self.routing {
+            let provider = Provider {
+                allow_fallbacks: routing.allow_fallbacks,
+                require_parameters: routing.require_parameters,
+                only: routing.only.as_deref(),
+            };
+            fields.push((Field::Provider, serde_json::to_string(&provider)?));
+        }
+        Ok(fields)
+    }
+
     #[must_use]
     pub fn problems(&self) -> Vec<SettingsProblem> {
         let mut problems = Vec::new();
