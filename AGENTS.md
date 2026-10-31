@@ -71,7 +71,8 @@ Audits and plans default to over-building, and the owner reels them back. Before
   redundant primitive instead of adding coordination.
 - **Enforcement is compiler-native only:** `clippy.toml` `disallowed-*` with a `reason`, a site
   `#[expect(..., reason)]`, workspace lints. No CI checker scripts, grep gates, exception
-  registries, negative-fixture suites or per-boundary inventory docs.
+  registries, negative-fixture suites or per-boundary inventory docs. The one exception is the
+  documentation word budget ([Documentation](#documentation)), which no compiler can enforce.
 - **Fail fast, one rich trace record, a reset path.** No quarantine, integrity MACs or detection
   that cannot fix anything ([non-goals](docs/design.md#non-goals)).
 - **Calibrate severity to the one deployment,** a Raspberry Pi serving family chats. Owner-only
