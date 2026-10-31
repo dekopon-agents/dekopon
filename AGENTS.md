@@ -7,8 +7,8 @@ The model proposes; a separate broker authorizes and executes provider effects.
 
 - Start with the [constitution](docs/design.md#constitution), including its non-goals.
   For behavior or architecture changes, read the relevant design sections.
-- Use the [repository map](docs/development.md#repository-map) to find source and tests,
-  then the applicable [change map](docs/development.md#change-maps).
+- Find source and tests in the crate that owns the behavior; [development](docs/development.md)
+  covers what spans workspaces.
 - Read relevant [security model](docs/security-model.md) sections before changing identity,
   capabilities, credentials, providers, audit, or external effects.
 - The code is the reference for keys, fields, defaults, events and errors: read the types,
@@ -39,7 +39,7 @@ The model proposes; a separate broker authorizes and executes provider effects.
 - Publishing, releases, pushing or moving tags, adding credentials and protection changes require
   explicit human authorization. An execution contract the owner approved is that authorization for
   what it lists: cut each release it allows and journal the version. Follow the
-  [release procedure](README.md#maintainer-release-process), not memory.
+  [release procedure](docs/development.md#releases), not memory.
 - Inside an approved execution contract, merge, tag, release and deploy without waiting when the
   diff does what the plan said. The fresh adversarial review of the merged head or of a reviewed ancestor joined by clean base merges is the review.
   A coordinator-launched Astra review satisfies it, since each runs in a new thread; warm Claude
@@ -89,7 +89,7 @@ Audits and plans default to over-building, and the owner reels them back. Before
 - The RPi deploys the [memory-optimized Wasmtime build](docs/development.md#memory-optimized-wasmtime) on ARM64, and CI tests it on ARM64 and x86-64; stock Wasmtime remains the default everywhere else.
 - Confirm repository root, branch and status; preserve unrelated work and artifacts.
   Start follow-ups from current main, not an already-merged feature branch.
-- Follow the change map for companion tests, documentation and examples. Never edit `CHANGELOG.md` in a PR; write `Changelog: <Category>: <text>` lines in commit messages instead (`docs/development.md`).
+- Update the companion tests and examples. Never edit `CHANGELOG.md` in a PR; write `Changelog: <Category>: <text>` lines in commit messages instead (`docs/development.md`).
 - A change to a CI gate edits the sentence that describes it. An example config the change touches
   still starts, or is deleted.
 - Add no comments or doc comments unless they meet [Comments](#comments); delete the ones your
@@ -135,18 +135,11 @@ Docs are for humans: what a principal engineer cannot derive from the code. Agen
 
 **When to document.** Write a doc, a README section or a comment only for:
 
-- one of Dekopon's four ideas:
-  - **credentials the agent never holds:** the model proposes through one bash-like script, and the
-    broker, its own process and UID, runs Wasm providers and injects a destination-bound credential
-    after the provider builds the request;
-  - **two-layer authority:** the broker alone maps an authenticated subject to a principal and Cedar
-    decides whether it may act; operator constraint sets decide how far, and policy cannot widen
-    them; Cedar also checks each outbound request;
-  - **the memory ladder:** journaled turns replay through summaries written ahead of time, and a
-    record keeps its rung until a repack, until it leaves the hot window or until its pin changes,
-    so the prompt cache stays warm; memory never grants authority;
-  - **keyless model access for outside VMs:** coding agents reach models through the gateway's proxy,
-    which injects the key and charges the agent's token budget;
+- one of Dekopon's four ideas, each stated once in its doc:
+  - [credentials the agent never holds](docs/design.md#constitution);
+  - [two-layer authority](docs/authorization.md): Cedar decides who, constraint sets decide how far;
+  - [the memory ladder](docs/memory.md#the-ladder);
+  - [keyless model access for outside VMs](docs/design.md#keyless-model-access-for-outside-vms);
 - a design reason the code cannot show;
 - a security limit: what Dekopon deliberately does not protect;
 - a step a human performs outside the repository.
@@ -154,8 +147,8 @@ Docs are for humans: what a principal engineer cannot derive from the code. Agen
 Everything else is the code, `check` and `--help`. Errors are loud and name the key.
 
 1. **Budget.** Tracked Markdown, except the files the `docs` CI job excludes (`CHANGELOG.md`, this
-   file and fixtures), stays within the word budget that job enforces. A change over budget cuts as
-   much as it adds, or cites the owner's raise.
+   file and fixtures), stays within the word budget that job enforces, with at most seven files in
+   `docs/`. A change over budget cuts as much as it adds, or cites the owner's raise.
 2. **Whole file first.** A pull request that touches a doc gives it a KEEP, MERGE or DELETE verdict
    in its body before any line is edited.
 3. **Derivation test.** No doc states a key, field, default, event, error, limit or command that a

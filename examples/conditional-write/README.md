@@ -1,308 +1,37 @@
 # The conditional writer
 
-Xavier's boss sends a Slack DM — "set the incident record to resolved" — and the record is
-updated with Xavier's API token, under the boss's name, on the record. Or it is refused, because
-the record moved between the read and the write, and nobody's edit gets silently overwritten.
+A Slack DM asks an agent to update a shared record. [Cedar](policies.cedar) lets the mapped sender,
+`cpetersen`, reach two `http-probe` capabilities, only via the gateway, only for this agent. The
+write refuses if the record moved. The broker adds the API token; the model, shell and component
+never see it.
 
-The gateway authenticates the message and vouches for the sender; it decides nothing. The broker
-maps that Slack identity to the principal `cpetersen`, checks a Cedar policy, resolves the two
-capabilities that policy permits, injects an API token bound to `api.example.com`, executes the
-`http-probe` WebAssembly component, and emits metadata-only audit records naming the person
-who asked. The token is never visible to the model, the shell session, the agent, or the component
-that uses it — the broker's native HTTP engine adds the header after the guest's own headers have
-been validated, and audit records `credentialInjected: true` and never a value.
+## Run it
 
-| File | What it is | Who reads it |
-|---|---|---|
-| [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent and its standing orders | `dekopon-gatewayd` |
-| [`broker.yaml`](broker.yaml) | Broker configuration: identities, mappings, constraint sets | `dekopon-brokerd` |
-| [`policies.cedar`](policies.cedar) | Who may do what, and through which gateway | `dekopon-brokerd` |
-| [`broker-credentials.yaml.example`](broker-credentials.yaml.example) | The API token, after you copy it | `dekopon-brokerd` |
-| [`gatewayd.yaml`](gatewayd.yaml) | Gateway configuration: transport, model, route | `dekopon-gatewayd` |
-
-Nothing here is a mock. `crates/dekopon-brokerd/tests/examples.rs` loads the checked-in
-`http-probe` component, compiles this policy against the world these files declare, and asserts the
-decision table both directions, so the walkthrough cannot drift away from the machinery without CI
-noticing.
-
-## 1. Create the Slack app
-
-Create the app from
-[`manifest-agent.yaml`](../slack/manifest-agent.yaml) (this example's `gatewayd.yaml` sets
-`experience: agent`; the classic `manifest.yaml` pairs with `experience: classic`), generate the
-app-level token (`xapp-…`, scope `connections:write`), install it for the bot token (`xoxb-…`), and
-find the two identifiers you will need below — the workspace `T…` team ID and the sender's `U…`
-member ID. Socket Mode means no public HTTP endpoint and no inbound firewall hole.
-
-## 2. Create the token and the credentials file
-
-This example uses the current `credential`/`agents.<id>.credentials` binding path.
-*Committed direction:* it will be replaced by public DRNs
-([migration requirements](../../docs/design.md#legacy-credential-bindings)); keep the existing
-configuration until that migration ships.
-
-A bearer token for the upstream API, scoped as narrowly as that API allows:
-
-- **read** on the record — `http-probe.fetch`
-- **write** on the same record — `http-probe.conditional-write`
-
-Most APIs have no permission narrower than "write". The narrowing that matters happens here
-instead: the component exposes a `http-probe.purge` this deployment grants nowhere, and a
-capability no constraint set describes is unreachable regardless of what the token could do.
-
-Then:
-
-```console
-cp broker-credentials.yaml.example broker-credentials.yaml
-chmod 600 broker-credentials.yaml
-$EDITOR broker-credentials.yaml          # replace the replace-me_XXXX… placeholder
-```
-
-`chmod 600` is not advice. The broker checks this file harder than its own configuration — it
-rejects group or world *readability*, not just writability — and refuses to start otherwise.
-`broker-credentials.yaml` is absent from the repository and is in `.gitignore`, so following
-this step cannot commit a secret.
-
-## 3. Adjust the placeholders
-
-Exactly these, and nothing else:
-
-| Placeholder | File | Replace with |
-|---|---|---|
-| `/home/xavier/.local/run/dekopon/broker.sock` | `broker.yaml`, `gatewayd.yaml` | your own socket path, the same in both |
-| `uid: 501` | `broker.yaml` | your UID (`id -u`) |
-| `serverUid: 501` | `gatewayd.yaml` | the same UID |
-| `slack.t0123abcd` | `broker.yaml`, `attestor.namespaces` | `slack.` + your lowercased team ID |
-| `slack.t0123abcd.u0123abcd` | `broker.yaml`, `principals` | the lowercased `slack.<team>.<user>` of the person allowed to use this |
-| `replace-me_XXXX…` | `broker-credentials.yaml` | the token from step 2 |
-
-Everything else already resolves. Relative paths in both configurations resolve against the
-configuration file's own directory, so `../providers/http-probe-provider.wasm`, `policies.cedar`,
-`broker-credentials.yaml`, and `dekopon.yaml` work from a checkout with no editing.
-
-Two names appear in several files and must agree with each other rather than with anything of
-yours: the principal `cpetersen` (`broker.yaml` mapping, both statements in `policies.cedar`), the
-gateway principal `dekopon-gatewayd` (`broker.yaml` identity, both `via` conditions), and the agent
-`xaviers-conditional-writer` (`dekopon.yaml` metadata, `gatewayd.yaml` route, both policy statements).
-Rename them together or not at all.
-
-Then make the directories private and the configurations owner-only:
-
-```console
-mkdir -p ~/.local/run/dekopon
-chmod 700 ~/.local/run/dekopon
-chmod 600 broker.yaml policies.cedar gatewayd.yaml
-```
-
-The catalog half is checked before anything runs: the gateway loads and validates the complete
-typed catalog before starting transports, and `cargo test -p dekopon-config --test examples
---locked` pins this example's declared surface and its read/comment-without-approval boundary.
-
-## 4. Run the broker
-
-```console
-dekopon-brokerd --config broker.yaml
-```
-
-```json
-{"timestamp":"2026-01-14T09:12:03.114Z","level":"INFO","event":"broker_started","target":"dekopon_brokerd"}
-```
-
-Everything the broker will ever permit was decided by the time this line printed: the policy is
-compiled and strictly validated, every capability it can permit has a constraint set, and the
-credential is loaded and destination-bound. A misconfiguration here is a startup failure, never a
-surprise at 2 a.m.
-
-## 5. Run the gateway
-
-```console
-export DEKOPON_GATEWAYD_SLACK_APP_TOKEN=xapp-...
-export DEKOPON_GATEWAYD_SLACK_BOT_TOKEN=xoxb-...
-dekopon-gatewayd --config gatewayd.yaml
-```
-
-```json
-{"level":"INFO","event":"gateway_broker_ready","capability.count":0,"target":"dekopon-gatewayd"}
-{"level":"INFO","event":"gateway_transport_connected","transport":"workspace-slack","kind":"slackSocketMode","target":"dekopon-gatewayd"}
-{"level":"INFO","event":"gateway_started","transport.count":1,"route.count":1,"target":"dekopon-gatewayd"}
-```
-
-`capability.count: 0` is the point, not a warning. That probe asks the broker what the *gateway's
-own identity* may do, and the answer is nothing: both policy statements require `context.via`, and
-a directly connected peer has no `via`. The gateway can reach capabilities only while carrying a
-subject it is authorized to vouch for.
-
-The tokens live in the environment because `gatewayd.yaml` names variables and never values;
-pasting a token where a variable name belongs is a startup failure rather than a secret sitting in
-a config file.
-
-## 6. The DM
-
-> **cpetersen:** set the incident record to resolved
-
-The session:
-
-1. **Attestation.** `dekopon-gatewayd` derives the canonical subject `slack.t0123abcd.u0123abcd` from the
-   authenticated Slack envelope and opens a broker leg with `capabilities(subject, agent)`. The
-   broker checks its attestor grant covers that namespace, maps the subject to `cpetersen`, checks
-   `agent.prompt` on `Dekopon::Agent::"xaviers-conditional-writer"`, and answers with two
-   capabilities. A sender who fails any of those steps gets `You're not authorized to use this
-   agent.` and **no model call is made**.
-2. **The session.** The agent's `instructions` become the system prompt, and its only tool is the
-   sandboxed shell. It writes something like this — one tool call, several capability invocations:
+1. Create a Slack app from [`manifest-agent.yaml`](../slack/manifest-agent.yaml). Note both
+   tokens, the team ID and your member ID.
+2. Copy `broker-credentials.yaml.example` to `broker-credentials.yaml`, `chmod 600` it, and paste
+   your API's bearer token over `replace-me_…`.
+3. In `broker.yaml` and `gatewayd.yaml`, set your socket path, your UID for `501`, and your
+   lowercased team and member IDs for `t0123abcd` and `u0123abcd`. Set your API's host for
+   `api.example.com` in `broker.yaml` and the credentials file.
+4. Make the socket directory `0700`, and both configurations and `policies.cedar` `0600`.
+5. Serve the model `gatewayd.yaml` names; start each daemon in its own terminal:
 
    ```console
-   $ httpprobe fetch --uri https://api.example.com/records/incident-4711
-   {"status":200,"bodyBytes":8931,"headerCount":7,
-    "bodyText":"{\"id\":\"incident-4711\",\"state\":\"investigating\",\"etag\":\"\\\"v7\\\"\"}", ...}
-
-   $ httpprobe conditional-write --uri https://api.example.com/records/incident-4711 --expected-etag '"v7"'
-   {"observedEtag":"\"v7\"","readStatus":200,"writeStatus":200}
+   dekopon-brokerd --config broker.yaml
+   DEKOPON_GATEWAYD_SLACK_APP_TOKEN=xapp-… DEKOPON_GATEWAYD_SLACK_BOT_TOKEN=xoxb-… \
+     dekopon-gatewayd --config gatewayd.yaml
    ```
 
-   Each `httpprobe` subcommand proposes exactly one capability — `fetch` proposes
-   `http-probe.fetch`, `conditional-write` proposes `http-probe.conditional-write` — and the broker
-   authorizes each on its own. There is no binary and no subprocess behind the word, and there is no
-   generic passthrough: one would collapse two separately policed capabilities into "everything the
-   token can reach".
-3. **The answer.** The session's final text goes back to the DM:
+6. DM the bot a record URL and the state to set.
 
-   > **dekopon-gatewayd:** Set incident-4711 to resolved. Read and wrote against etag `"v7"`, both
-   > calls returned 200.
+## What the run shows
 
-   A failed session says exactly one thing instead: `The agent could not complete this request.` A
-   model's own error text, a provider message, and a transport diagnostic are all things chat is
-   the last place for; the operator reads the category from telemetry.
-4. **What the next message remembers.** The route is `mode: persistent` with
-   `scope: privateConversation`, so this exchange is kept as one `(question, answer)` pair in the
-   gateway's memory and replayed ahead of the next message from *this sender in this conversation*,
-   which is what makes a follow-up like "and 4712?" answerable. Only the question and the answer
-   are kept: the `http-probe.fetch` output above is dropped at write-back and never replayed.
-   Nothing is written to disk, nothing reaches the broker, and fifteen idle minutes or a narrowed
-   grant drops it. Set the route to `mode: oneShot` — or leave the `memory:` block out, which
-   means the same thing — and every message starts from an empty prompt again.
+- At startup the gateway, acting for itself, reports `capability.count: 0`.
+- Any other sender is refused before a model call.
+- `http-probe.purge` has no constraint set, so it never runs.
+- The broker's stdout records each execution with the principal, the policy and
+  `credentialInjected: true`, never the token.
 
-### The refusals worth knowing
-
-`http-probe.conditional-write` re-reads the resource before it writes anything and carries the
-etag it observed in an `if-match` header. The refusal happens before any write leaves the
-component:
-
-| Code | When |
-|---|---|
-| `precondition-failed` | the caller passed `expectedEtag` and the resource has moved since |
-| `http-failed` | the pre-read itself failed, so there is nothing to pin a write to |
-| `invalid-input` | no `uri`, which is refused without any host call at all |
-
-The capability's constraint set allows two requests and two methods: one `GET`, then one `POST`
-carrying an etag that was true a moment ago. A retry against an unchanged record converges; a retry
-after someone else's edit refuses instead of overwriting work nobody read.
-
-## 7. What the audit record holds
-
-Every decision the broker makes is one JSON line on its stdout — the terminal from step 4 —
-carrying `"audit.event":"broker.decision"` or `"audit.event":"broker.execution"`. That line is the
-audit record. Add a `telemetry` block to `broker.yaml` and the same record is also exported as an
-OTLP log record; without one, the broker's stdout is the only copy.
-`jq 'select(."audit.event" == "broker.execution")'` over that stdout keeps only the outcomes. This
-one is the write's, pretty-printed and trimmed to the record's fields and its invocation span:
-
-```json
-{
-  "level": "INFO",
-  "audit.event": "broker.execution",
-  "invocation.id": "4bf92f3577b34da6a3ce929d0e0e4736-3",
-  "capability.id": "http-probe.conditional-write",
-  "decision.id": "allow-4bf92f3577b34da6a3ce929d0e0e4736-3",
-  "principal": "cpetersen",
-  "actor.kind": "agent",
-  "actor.id": "xaviers-conditional-writer",
-  "via": "dekopon-gatewayd",
-  "subject": "slack.t0123abcd.u0123abcd",
-  "provider": "http-probe",
-  "authorized.by": "local-broker",
-  "policy.ids": "conditional-writer-surface",
-  "policy.digest": "sha256:7c31…",
-  "effect": "ExternalWrite",
-  "risk": "High",
-  "credential": "api-token",
-  "outcome": "Succeeded",
-  "duration_ms": 812,
-  "output.digest": "sha256:9ab4…",
-  "http.calls": "[{\"method\":\"GET\",\"authority\":\"api.example.com\",\"status\":200,\"requestBytes\":214,\"responseBytes\":8931,\"credentialInjected\":true},{\"method\":\"POST\",\"authority\":\"api.example.com\",\"status\":200,\"requestBytes\":486,\"responseBytes\":1204,\"credentialInjected\":true}]",
-  "target": "dekopon_broker::audit",
-  "spans": [
-    { "name": "broker.invocation", "trace": "4bf92f3577b34da6a3ce929d0e0e4736",
-      "invocation": "4bf92f3577b34da6a3ce929d0e0e4736-3", "capability": "http-probe.conditional-write",
-      "subject": "slack.t0123abcd.u0123abcd", "agent": "xaviers-conditional-writer" }
-  ]
-}
-```
-
-What each part is doing:
-
-- `principal: cpetersen` — the effect is attributed to the person who asked, not to the process
-  that relayed the message. `via: dekopon-gatewayd` records which gateway vouched, and `subject`
-  records the claim it made. All three, or none of them: a direct peer's record has no `via` and no
-  subject.
-- `policy.ids` — the `@id("…")` names from `policies.cedar`, comma-separated. That is why writing
-  them is worth it: positional names renumber when a policy is inserted above them. `policy.digest`
-  fingerprints the whole evaluated policy set, so two brokers reporting the same digest evaluated the
-  same surface.
-- Two entries in `http.calls` — the pre-read and the write, exactly the budget the constraint set
-  allowed. `credentialInjected: true` says broker-held authority was presented; the value appears
-  nowhere, and `requestBytes` excludes the injected header so its length cannot leak either.
-- `credential: api-token` — *which* authority, by the symbolic name in `broker.yaml`. This is the
-  current legacy binding, [planned to be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings).
-  One example
-  has one token, so it reads as redundant here; a deployment whose constraint set names a different
-  credential per agent is one where the two organizations' writes would otherwise be identical
-  records.
-- No record body, no request payload, no written text, no Slack message, no URL path or query in the
-  record's own fields. It records that something happened and to what; provider output is a digest.
-
-The audit lines before it are the rest of the same session — a `broker.decision` and a
-`broker.execution` for the read, then the `broker.decision` that allowed this write. The `trace` on
-`broker.invocation` is the session's W3C trace id, the same one the gateway's own spans carry, and
-each `invocation.id` extends it with a counter, so `grep 4bf92f3577b34da6a3ce929d0e0e4736` over the
-broker's stdout recovers the whole conversation's effects, and the same identifier pivots to its
-spans in the telemetry store.
-
-## 8. When it does not work
-
-| Symptom | Cause | Where it shows |
-|---|---|---|
-| Slack replies `I only talk to the Lange family. I've let my owner know you stopped by.` | the broker confirmed an unmapped subject within the gateway's attestor namespaces; an omitted `namespaces` list permits the unmapped cause for every subject | gateway stdout, `audit.event=gateway.session.rejected` with the attested subject and conversation; every refusal emits a notice, while replies share a one-per-second slot. No model or capability call occurs. |
-| Slack replies `Sorry <principal>, you don't have permission for this agent.` | the mapped principal cannot start this agent, or its attributed grant is empty | gateway stdout, `gateway_session_rejected` with `reason=agent-denied` or `unauthorized`; no owner-notice audit record or model call. Check `agent.prompt` and capability grants for the principal, agent and gateway. |
-| Slack replies `You're not authorized to use this agent.` | missing attestor authority, a subject outside the attestor namespaces, a policy error, or a legacy refusal without typed cause or principal attribution | gateway stdout; `broker_capabilities_refused` on broker stdout names the reason and determining policies without disclosing mapping outside the peer's namespaces. No model call occurs. |
-| The agent answers that it could not write | the write was denied or refused | broker stdout, a `broker.decision` with `"decision.allowed": false` and a `decision.reason` (`attestation-denied`, `unmapped-subject`, `agent-denied`, `unconstrained-capability`, or a deny-by-default with no `policy.ids`), or a `precondition-failed` provider error when the record moved |
-| Broker exits: `policy permits capability X, which has no constraint set` | `policies.cedar` names a capability `broker.yaml` does not constrain | startup, before the socket is bound |
-| Broker exits: `constraint set for X names unknown credential "api-token"` | `broker-credentials.yaml` was never copied, or names the credential differently | startup |
-| Broker exits: `broker credentials must be single-link, owned by the server UID, and unreadable by group and world` | `chmod 600 broker-credentials.yaml` | startup |
-| Broker exits: `constraint set for X allows host "…" outside credential "api-token" destinations` | an `allowedHosts` entry the credential is not bound to | startup |
-| Gateway exits at startup naming a variable | `DEKOPON_GATEWAYD_SLACK_APP_TOKEN` or `DEKOPON_GATEWAYD_SLACK_BOT_TOKEN` is unset — reported by name, never by value | startup |
-| Gateway exits: broker unreachable | the broker is not running, or the two socket paths disagree | the `gateway_broker_ready` probe never logs |
-
-The split matters when you are debugging: a session refused *before* it starts leaves a gateway log
-line without a broker audit record for that request, while anything refused *during* one leaves an audited denial naming
-the gateway, the subject, and the reason. Both refuse; only one of them ever proposed anything.
-
-## What this deployment does not buy yet
-
-`dekopon-gatewayd` and `dekopon-brokerd` run under one UID in this local walkthrough. The attestor grant
-buys attribution and deny-by-default scoping, not OS isolation: any process running as you can act
-as the configured gateway peer. That is an example choice — the chart splits the two UIDs and the
-IPC group; see the
-[current local process boundary](../../docs/security-model.md#current-local-process-boundary).
-
-The agent has no memory outliving the conversation's bounded window, and `sharedConversation` is
-not enabled here.
-
-## Related
-
-- `../slack/` — the Slack app manifests.
-- `../providers/http-probe/` — the component this deployment executes, and the `http-probe.purge` it never grants.
-- [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh) — the same shape at nineteen capabilities, shipped from its own repository.
-- [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) — every configuration field, and the audit and shutdown contract.
-- [`../../crates/dekopon-policy/README.md`](../../crates/dekopon-policy/README.md) — what Cedar decides here and what it does not.
-- [`../catalog/dekopon.yaml`](../catalog/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and holds no approval capability.
+Both daemons run as your UID here, so any process of yours can act as the gateway. The chart
+separates them.

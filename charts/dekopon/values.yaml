@@ -1,9 +1,9 @@
 # Dekopon — one pod, two private UIDs, one IPC group.
 #
-# Read charts/dekopon/README.md before changing anything here. Most of the values below are
-# constrained by what the daemons check at startup, not by taste: dekopon-brokerd validates the
-# owner, mode, link count and every path ancestor of every file it touches, and refuses to serve
-# when one is wrong. A pod that "looks configured" and never becomes ready is the normal symptom.
+# Most of the values below are constrained by what the daemons check at startup, not by taste:
+# dekopon-brokerd validates the owner, mode, link count and every path ancestor of every file it
+# touches, and refuses to serve when one is wrong. A pod that "looks configured" and never becomes
+# ready is the normal symptom.
 
 image:
   repository: ghcr.io/dekopon-agents/dekopon
@@ -114,13 +114,11 @@ broker:
   # Every file below is supplied either inline (the chart writes a Secret) or by naming an object
   # that already exists. Inline and existing are mutually exclusive; setting both is an error.
   #
-  # The chart never parses or generates these files. Their formats are documented in
-  # crates/dekopon-brokerd/README.md, and examples/conditional-write/ is a working set.
+  # The chart never parses or generates these files; examples/conditional-write/ is a working set.
   config:
-    # Chart default: the cli-probe example from crates/dekopon-brokerd/README.md, repointed at the
-    # chart's paths. It is a real, deny-by-default configuration that starts with the probe
-    # provider loaded and nothing executable — a broker you can install and watch become ready
-    # before you give it anything that matters. Replace it.
+    # Chart default: a real, deny-by-default configuration that starts with the cli-probe provider
+    # loaded and nothing executable — a broker you can install and watch become ready before you
+    # give it anything that matters. Replace it.
     inline: |
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
@@ -590,7 +588,7 @@ state:
   # Named annotation, not a comment: helm uninstall must not delete the live model credentials.
   keepOnUninstall: true
   # Bring your own claim instead. Init keeps its root 0:0/0700; each daemon mounts only
-  # its own private subdirectory. See the offline layout migration in the chart README.
+  # its own private subdirectory.
   existingClaim: ""
 
 # Optional provider storage is physically and lifecycle-separate from the state claim. The generated
