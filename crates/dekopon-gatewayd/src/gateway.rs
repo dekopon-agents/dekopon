@@ -1311,13 +1311,15 @@ impl ReloadState {
     }
 
     async fn activate(&mut self, candidate: Candidate) -> Result<(), Unsettled> {
-        let refreshed_proxy = if candidate.config.models != self.config.models {
+        let refreshed_proxy = if candidate.config.models != self.config.models
+            || candidate.routes.guests() != self.active.load().routes.guests()
+        {
             match (
                 self.active.load().proxy.is_some(),
                 candidate.config.proxy.as_ref(),
             ) {
-                (true, Some(proxy)) => match crate::proxy::build(
-                    proxy,
+                (true, Some(_)) => match crate::proxy::build(
+                    candidate.routes.guests(),
                     &candidate.config.models,
                     &self.credentials,
                     &self.metering,
@@ -1448,7 +1450,7 @@ impl ReloadState {
 mod snapshot_tests {
     use super::*;
     use dekopon_core::Redacted;
-    use dekopon_model_proxy::{Grant, ProxyModel, Upstream};
+    use dekopon_model_proxy::{Grant, Granted, ProxyModel, Upstream};
     use dekopon_model_token_governor::Tokens;
     use dekopon_test_support::LoopbackServer;
     use std::collections::{BTreeSet, HashMap};
@@ -1539,13 +1541,14 @@ mod snapshot_tests {
                         upstream: Upstream::OpenRouter {
                             endpoint: server.url(),
                             api_key: Redacted::new("synthetic-key".into()),
+                            settings: Vec::new(),
                         },
                     }],
                     HashMap::from([(
                         "vm".into(),
                         Grant {
                             agent: "reviewer".parse().unwrap(),
-                            models: BTreeSet::from(["fixture".into()]),
+                            models: Granted::Listed(BTreeSet::from(["fixture".into()])),
                         },
                     )]),
                     Arc::clone(&meter),

@@ -5,6 +5,7 @@ use std::{
 };
 
 use dekopon_core::Redacted;
+use dekopon_model::wire::Field;
 use dekopon_model_token_governor::{Budget, MeterSpec, Metering, Tokens, UnixMillis};
 use dekopon_test_support::{CODEX_RESPONSES_TWO_DELTAS, OPENAI_CHAT_COMPLETIONS_TWO_DELTAS};
 use parking_lot::Mutex;
@@ -14,8 +15,8 @@ use tokio::{
 };
 
 use crate::{
-    CurrentProxy, Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER, SUBJECT_HEADER,
-    Upstream,
+    CurrentProxy, Grant, Granted, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER,
+    SUBJECT_HEADER, Upstream,
 };
 
 const SUBJECT: &str = "dekopon:gylmar-vm";
@@ -158,6 +159,7 @@ fn models(
             upstream: Upstream::OpenRouter {
                 endpoint: endpoint.to_owned(),
                 api_key: Redacted::new("sk-or-proxy".to_owned()),
+                settings: Vec::new(),
             },
         },
         ProxyModel {
@@ -168,6 +170,7 @@ fn models(
             upstream: Upstream::OpenRouter {
                 endpoint: endpoint.to_owned(),
                 api_key: Redacted::new("sk-or-proxy".to_owned()),
+                settings: Vec::new(),
             },
         },
     ];
@@ -201,20 +204,25 @@ async fn proxy_with(
     codex: Option<Arc<dekopon_model::chatgpt::CredentialFile>>,
     ping: Duration,
 ) -> Running {
+    let granted = Granted::Listed(BTreeSet::from([
+        "claude-opus".to_owned(),
+        "glm-flash".to_owned(),
+        "astra".to_owned(),
+    ]));
+    serve(models(endpoint, codex), granted, limit, ping).await
+}
+
+async fn serve(models: Vec<ProxyModel>, granted: Granted, limit: u64, ping: Duration) -> Running {
     let metering = metering(limit);
     let guests = HashMap::from([(
         SUBJECT.to_owned(),
         Grant {
             agent: "gylmar".parse().unwrap(),
-            models: BTreeSet::from([
-                "claude-opus".to_owned(),
-                "glm-flash".to_owned(),
-                "astra".to_owned(),
-            ]),
+            models: granted,
         },
     )]);
     let proxy = Arc::new(
-        ModelProxy::new(models(endpoint, codex), guests, Arc::clone(&metering))
+        ModelProxy::new(models, guests, Arc::clone(&metering))
             .unwrap()
             .with_timing(ping, Duration::from_secs(30)),
     );
@@ -245,26 +253,20 @@ impl Running {
 }
 
 #[derive(Clone, Default)]
-struct MeterRecords(Arc<Mutex<Vec<String>>>);
+struct MeterRecords(Arc<Mutex<Vec<Fields>>>);
 
 impl<S> tracing_subscriber::Layer<S> for MeterRecords
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
-        struct EventFields(String);
-        impl tracing::field::Visit for EventFields {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push_str(&format!("{}={value:?} ", field.name()));
-            }
-        }
         if event.metadata().target() == "meter" {
-            let mut fields = EventFields(String::new());
-            event.record(&mut fields);
+            let mut fields = Fields::new();
+            event.record(&mut SpanFields(&mut fields));
             if let Some(parent) = ctx.event_span(event) {
-                fields.0.push_str(&format!("parent={:?} ", parent.id()));
+                fields.insert("parent".to_owned(), format!("{:?}", parent.id()));
             }
-            self.0.lock().push(fields.0);
+            self.0.lock().push(fields);
         }
     }
 }
@@ -358,7 +360,7 @@ async fn resident_router_resolves_each_request_against_the_current_model() {
             SUBJECT.to_owned(),
             Grant {
                 agent: "gylmar".parse().unwrap(),
-                models: BTreeSet::from(["glm-flash".to_owned()]),
+                models: Granted::Listed(BTreeSet::from(["glm-flash".to_owned()])),
             },
         )])
     };
@@ -875,12 +877,12 @@ async fn an_upstream_error_status_is_charged_nothing() {
     assert_eq!(span["usage.output_tokens"], "0");
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
-    for field in [
-        "outcome=\"failed\"",
-        "usage.input_tokens=0 ",
-        "usage.output_tokens=0 ",
+    for (field, value) in [
+        ("outcome", "failed"),
+        ("usage.input_tokens", "0"),
+        ("usage.output_tokens", "0"),
     ] {
-        assert!(records[0].contains(field), "{field}: {records:?}");
+        assert_eq!(records[0][field], value, "{field}: {records:?}");
     }
 }
 
@@ -992,8 +994,8 @@ async fn a_client_disconnect_mid_stream_charges_what_was_observed_once() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
-    assert!(records[0].contains("outcome=\"cancelled\""), "{records:?}");
-    assert!(records[0].contains("meter.via=\"proxy\""), "{records:?}");
+    assert_eq!(records[0]["outcome"], "cancelled", "{records:?}");
+    assert_eq!(records[0]["meter.via"], "proxy", "{records:?}");
     let input = Tokens::from_bytes(body.replace("glm-flash", "z-ai/glm-4.5-air").len()).0;
     assert_eq!(
         used(&running.metering),
@@ -1035,10 +1037,141 @@ async fn a_client_that_drops_the_stream_records_cancelled_under_the_call_span() 
     assert_eq!(span["outcome"], "cancelled");
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
-    assert!(records[0].contains("outcome=\"cancelled\""), "{records:?}");
-    assert!(
-        records[0].contains(&format!("parent={id:?} ")),
-        "{id:?}: {records:?}"
+    assert_eq!(records[0]["outcome"], "cancelled", "{records:?}");
+    assert_eq!(records[0]["parent"], format!("{id:?}"), "{records:?}");
+}
+
+const AGENT_SETTINGS: [(Field, &str); 3] = [
+    (Field::Temperature, "0.3"),
+    (Field::MaxTokens, "512"),
+    (Field::Provider, r#"{"allow_fallbacks":false}"#),
+];
+
+async fn inheriting(endpoint: &str) -> Running {
+    let mut models = models(endpoint, None);
+    for model in &mut models {
+        if let Upstream::OpenRouter { settings, .. } = &mut model.upstream {
+            *settings = AGENT_SETTINGS
+                .iter()
+                .map(|(field, raw)| (*field, (*raw).to_owned()))
+                .collect();
+        }
+    }
+    serve(
+        models,
+        Granted::Inherited("glm-flash".to_owned()),
+        100_000,
+        Duration::from_secs(20),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_inheriting_guest_reaches_one_upstream_call_on_its_agents_model_and_settings() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    let body = r#"{"model":"anything","messages":[],"stream":false,"temperature":1.5,"top_p":0.9}"#;
+    let response = running
+        .post("/v1/chat/completions", body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
+    assert_eq!(upstream.requests.lock().len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&upstream.body()).unwrap(),
+        serde_json::json!({
+            "model": "z-ai/glm-4.5-air",
+            "messages": [],
+            "stream": false,
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "max_tokens": 512,
+            "provider": {"allow_fallbacks": false},
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_inheriting_guests_meter_record_names_the_agents_model_and_draws_on_its_budget() {
+    let (records, _, _guard) = capture();
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    let response = running
+        .post(
+            "/v1/chat/completions",
+            r#"{"model":"claude-opus","messages":[]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let records = records.0.lock().clone();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["agent"], "gylmar");
+    assert_eq!(records[0]["model.name"], "glm-flash");
+    assert_eq!(records[0]["meter.via"], "proxy");
+    assert_eq!(used(&running.metering), 7);
+}
+
+#[tokio::test]
+async fn a_guest_named_model_is_overwritten_never_forwarded() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    let response = running
+        .post(
+            "/v1/chat/completions",
+            r#"{"model":"glm-ungranted","messages":[]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let forwarded = upstream.body();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&forwarded).unwrap()["model"],
+        "z-ai/glm-4.5-air"
+    );
+    assert!(!forwarded.contains("glm-ungranted"), "{forwarded}");
+    assert!(!forwarded.contains("z-ai/glm-4.6"), "{forwarded}");
+}
+
+#[tokio::test]
+async fn a_dialect_the_inherited_model_cannot_serve_is_refused_before_any_upstream_call() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    let response = running
+        .post("/v1/messages", r#"{"model":"claude-opus","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    let message = sandbox_refusal(response, "/v1/messages", 403, "permission_error").await;
+    assert_eq!(
+        message,
+        "dekopon sandbox: this VM runs on its agent's model `glm-flash`, which is served on `/v1/chat/completions`, not `/v1/messages`. Call it on its own path."
+    );
+    assert!(upstream.requests.lock().is_empty());
+    assert_eq!(used(&running.metering), 0);
+}
+
+#[tokio::test]
+async fn a_listed_guest_forwards_duplicate_settings_keys_untouched() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let response = running
+        .post(
+            "/v1/chat/completions",
+            r#"{"model":"glm-flash","messages":[],"temperature":0.1,"temperature":0.2}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        upstream.body(),
+        r#"{"model":"z-ai/glm-4.5-air","messages":[],"temperature":0.1,"temperature":0.2}"#
     );
 }
 
