@@ -522,11 +522,21 @@ mod tests {
     use dekopon_process::{CallBudget, Limits, TreeContext};
 
     #[derive(Default)]
+    enum Completion {
+        #[default]
+        Parsed,
+        Uncertain,
+        NotExecuted,
+    }
+
+    #[derive(Default)]
     struct RecordingInvoker {
         secret_uses: Mutex<Vec<Option<SecretUseProposal>>>,
         scripts_finished: AtomicU32,
         tree: Option<TreeContext>,
         retained: Mutex<Vec<u64>>,
+        completion: Completion,
+        admitted: Mutex<Vec<u32>>,
     }
 
     impl RecordingInvoker {
@@ -585,6 +595,21 @@ mod tests {
             streams: crate::Streams,
             tree: &dekopon_process::TreeContext,
         ) -> crate::RunResult {
+            self.admitted.lock().push(tree.calls().used());
+            match self.completion {
+                Completion::Parsed => {}
+                Completion::Uncertain => {
+                    return crate::RunResult::Uncertain(CapabilityCallResult::Failed {
+                        error: "execution outcome is unknown".to_owned(),
+                        detail: None,
+                    });
+                }
+                Completion::NotExecuted => {
+                    return crate::RunResult::Returned(CapabilityCallResult::Denied {
+                        reason: "not granted".to_owned(),
+                    });
+                }
+            }
             let argv = call
                 .argv
                 .iter()
@@ -660,6 +685,58 @@ mod tests {
         ) -> CapabilityCallResult {
             CapabilityCallResult::NotFound
         }
+    }
+
+    #[test]
+    fn a_budget_of_n_never_executes_call_n_plus_one() {
+        for maximum in [0, 1, 3] {
+            let invoker = RecordingInvoker::default();
+            let limits = Limits {
+                max_capability_calls: maximum,
+                ..Limits::default()
+            };
+            let script = (0..=maximum)
+                .map(|_| "gh.pr-view")
+                .collect::<Vec<_>>()
+                .join("; ");
+            let outcome = Interpreter::new(limits, crate::test_threads()).run(&script, &invoker);
+            assert_eq!(
+                invoker.secret_uses.lock().len(),
+                usize::try_from(maximum).unwrap()
+            );
+            assert_eq!(outcome.capability_calls, maximum);
+            assert_eq!(*invoker.admitted.lock(), (1..=maximum).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn an_uncertain_outcome_stays_charged() {
+        let invoker = RecordingInvoker {
+            completion: Completion::Uncertain,
+            ..RecordingInvoker::default()
+        };
+        let limits = Limits {
+            max_capability_calls: 1,
+            ..Limits::default()
+        };
+        let outcome = Interpreter::new(limits, crate::test_threads()).run("late", &invoker);
+        assert_eq!(*invoker.admitted.lock(), vec![1]);
+        assert_eq!(outcome.capability_calls, 1);
+    }
+
+    #[test]
+    fn a_definite_not_executed_outcome_is_refunded() {
+        let invoker = RecordingInvoker {
+            completion: Completion::NotExecuted,
+            ..RecordingInvoker::default()
+        };
+        let limits = Limits {
+            max_capability_calls: 1,
+            ..Limits::default()
+        };
+        let outcome = Interpreter::new(limits, crate::test_threads()).run("late", &invoker);
+        assert_eq!(*invoker.admitted.lock(), vec![1]);
+        assert_eq!(outcome.capability_calls, 0);
     }
 
     #[test]

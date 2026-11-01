@@ -1440,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn a_word_without_a_broker_still_runs_its_fallback_when_the_call_budget_is_spent() {
+    fn a_word_without_a_broker_stays_behind_admission_when_the_budget_is_spent() {
         use crate::prompt::ScriptRuntime as _;
 
         let runtime = crate::ShellRuntime {
@@ -1459,10 +1459,10 @@ mod tests {
             "nosuchword || { echo status=$?; echo fallback; }; echo after",
             None,
         );
-        assert_eq!(result.exit_code, dekopon_process::ExitCode::SUCCESS);
+        assert_eq!(result.exit_code, dekopon_process::ExitCode::SYNTAX);
         assert_eq!(
             result.output,
-            "dekopon-shell: nosuchword: command not found\nstatus=127\nfallback\nafter"
+            "dekopon-shell: the turn's capability-call budget of 0 is spent"
         );
         assert_eq!(runtime.calls.used(), 0);
     }
@@ -1828,10 +1828,9 @@ mod tests {
             (leg_for(&socket), receiver, release)
         }
 
-        async fn assert_exhausted_word_refusal(
+        async fn assert_exhausted_word_admission(
             outcome: dekopon_broker_protocol::RunOutcome,
             word: &'static str,
-            expected: &str,
         ) {
             let directory = private_broker_directory();
             let response = ResponseEnvelope {
@@ -1854,43 +1853,33 @@ mod tests {
             let result = tokio::task::spawn_blocking(move || runtime.run_script(&script, None))
                 .await
                 .expect("the script completes");
-            assert_eq!(result.exit_code, ExitCode::SUCCESS);
+            assert_eq!(result.exit_code, ExitCode::SYNTAX);
             assert_eq!(
                 result.output,
-                format!("{expected}\nstatus=127\nfallback\nafter")
+                "dekopon-shell: the turn's capability-call budget of 0 is spent"
             );
             assert_eq!(calls.used(), 0);
-            let BrokerRequest::Run { word: received, .. } = observed
-                .try_recv()
-                .expect("the unresolved word reaches the broker")
-                .request
-            else {
-                panic!("the existing run request carries the unresolved word");
-            };
-            assert_eq!(received, word);
             assert!(observed.try_recv().is_err());
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn an_unknown_word_still_runs_its_fallback_when_the_call_budget_is_spent() {
-            assert_exhausted_word_refusal(
+        async fn an_unknown_word_stays_behind_admission_when_the_budget_is_spent() {
+            assert_exhausted_word_admission(
                 dekopon_broker_protocol::RunOutcome::NotFound,
                 "nosuchword",
-                "dekopon-shell: nosuchword: command not found",
             )
             .await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn an_ungranted_word_still_runs_its_fallback_when_the_call_budget_is_spent() {
-            assert_exhausted_word_refusal(
+        async fn an_ungranted_word_stays_behind_admission_when_the_budget_is_spent() {
+            assert_exhausted_word_admission(
                 dekopon_broker_protocol::RunOutcome::Rendered {
                     stdout: String::new(),
                     stderr: "dekopon-shell: ssh: not granted in this conversation\n".to_owned(),
                     status: 127,
                 },
                 "ssh",
-                "dekopon-shell: ssh: not granted in this conversation",
             )
             .await;
         }
