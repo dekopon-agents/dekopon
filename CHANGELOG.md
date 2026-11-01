@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.80.0] - 2026-11-01
+
+### Added
+
+- Proxy `meter` records for VM model calls carry `vm.session`, the jail's launch session; a missing or malformed session header records none.
+- A broker execution that launches a VM records the jail's launch session as `vm.session`, the same id its proxy `meter` records carry.
+
+### Fixed
+
+- New tasks receive a runtime-sampled UTC time reference.
+
+## [dekopon-chart-0.67.0] - 2026-11-01
+
+### Changed
+
+- Chart 0.67.0 targets core v0.80.0 and renders the `v0.80.0` image tag.
+
 ## [0.79.0] - 2026-11-01
 
 ### Added
