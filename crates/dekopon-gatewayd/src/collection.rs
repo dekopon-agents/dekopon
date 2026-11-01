@@ -359,6 +359,7 @@ pub(crate) mod tests {
 
     fn message(photos: usize, text: &str) -> InboundMessage {
         InboundMessage {
+            control_text: None,
             pull_request_links: None,
             transport: "wa".into(),
             transport_kind: ChatTransportKind::Whatsapp,

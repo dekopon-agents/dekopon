@@ -221,6 +221,7 @@ impl TelegramTransport {
         record_conversation(received, &conversation);
 
         Ok(Some(InboundMessage {
+            control_text: None,
             pull_request_links: None,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Telegram,
