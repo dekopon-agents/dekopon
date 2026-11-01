@@ -140,7 +140,11 @@ impl TreeContext {
         if self.is_cancelled() {
             return Err(LimitExceeded::Cancelled);
         }
-        self.check_deadline()?;
+        if self.script_timer_elapsed() {
+            return Err(LimitExceeded::Deadline {
+                timeout_ms: self.limits.timeout.as_millis(),
+            });
+        }
         self.steps
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(1)
@@ -177,18 +181,19 @@ impl TreeContext {
     }
 
     pub fn check_deadline(&self) -> Result<(), LimitExceeded> {
-        if Instant::now() >= self.deadline
-            || self
-                .cancel_deadline
-                .as_ref()
-                .is_some_and(|timer| timer.is_elapsed())
-        {
+        if Instant::now() >= self.deadline || self.script_timer_elapsed() {
             Err(LimitExceeded::Deadline {
                 timeout_ms: self.limits.timeout.as_millis(),
             })
         } else {
             Ok(())
         }
+    }
+
+    fn script_timer_elapsed(&self) -> bool {
+        self.cancel_deadline
+            .as_ref()
+            .is_some_and(|timer| timer.is_elapsed())
     }
 
     #[must_use]
