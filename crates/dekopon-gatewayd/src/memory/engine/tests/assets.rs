@@ -944,3 +944,39 @@ async fn an_image_model_removed_by_reload_stops_only_nonfinal_asset_parts() {
     assert_eq!(slots[2], Slot::Generated("kept".into()));
     assert_eq!(script.calls.load(Ordering::Relaxed), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_document_over_the_asset_ceiling_never_reaches_the_summary_model() {
+    let limit = dekopon_core::asset::MAX_DECODED_ASSET_BYTES;
+    for size in [limit, dekopon_model::asset::MAX_ATTACHMENT_BYTES] {
+        let world = World::with_budget(dekopon_model::asset::MAX_ATTACHMENT_BYTES);
+        let mut document = b"%PDF-1.4".to_vec();
+        document.resize(size, b' ');
+        let header = world.arrive(&["application/pdf"], Some(&document), 1);
+        drop(document);
+        let (resources, script) = world.resources([Action::Text("a scanned contract")]);
+        let _next = run(
+            Arc::new(resources),
+            Queued {
+                task: world.task(&header, 0),
+                since: Instant::now(),
+            },
+            watch::channel(false).1,
+        )
+        .await;
+        let parts = script.parts.lock();
+        if size == limit {
+            assert!(
+                matches!(&parts[..], [SeenPart::File { bytes, .. }] if bytes.len() == limit),
+                "a document at the asset ceiling is summarized"
+            );
+        } else {
+            assert!(
+                parts.is_empty(),
+                "a 100 MiB document reached the summary model"
+            );
+            assert_eq!(script.calls.load(Ordering::Relaxed), 0);
+            assert!(failed(&world.slots(&header, 0)[0], SummaryFailure::Refused));
+        }
+    }
+}

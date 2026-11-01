@@ -173,6 +173,10 @@ pub(super) fn complete(
         }
         SummaryInput::Binary { mime, blob } => {
             let bytes = blob.len();
+            // Chat documents may be 100 MiB; the summary model keeps the 8 MiB asset bound.
+            if bytes > dekopon_core::asset::MAX_DECODED_ASSET_BYTES {
+                return Completed::Refused;
+            }
             (
                 ModelMessage::user_with_parts(vec![ContentPart::File {
                     name: format!("chat-asset-{number}"),

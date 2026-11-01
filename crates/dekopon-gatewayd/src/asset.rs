@@ -2075,7 +2075,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
             };
             let len = usize::try_from(metadata.bytes).unwrap_or(usize::MAX);
             let result = retention.check_size(id, len).and_then(|()| DiskBlob::from_descriptor(descriptor, len)).and_then(|data| {
-                if GeneratedImage::new(data.clone(), metadata.content_type.clone(), metadata.encoding).decoded_len()? as u64 > byte_limit(&metadata.content_type) {
+                if GeneratedImage::new(data.clone(), metadata.content_type.clone(), metadata.encoding).decoded_len()? > dekopon_core::asset::MAX_DECODED_ASSET_BYTES {
                     return Err(BlobError::TooLarge);
                 }
                 let detected = sniff(&data, metadata.encoding)?;
