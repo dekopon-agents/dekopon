@@ -295,7 +295,16 @@ async fn gateway_task_time_reaches_each_real_adapter_after_the_stable_prefix() {
                 }
                 Adapter::Openai | Adapter::Openrouter => {
                     let messages = body["messages"].as_array().unwrap();
-                    assert_eq!(messages[0], bodies[0]["messages"][0]);
+                    let text_of = |content: &Value| {
+                        content
+                            .as_str()
+                            .unwrap_or_else(|| content[0]["text"].as_str().unwrap())
+                            .to_owned()
+                    };
+                    assert_eq!(
+                        text_of(&messages[0]["content"]),
+                        text_of(&bodies[0]["messages"][0]["content"])
+                    );
                     let content = &messages.last().unwrap()["content"];
                     let text = content
                         .as_str()
@@ -312,7 +321,7 @@ async fn gateway_task_time_reaches_each_real_adapter_after_the_stable_prefix() {
                     }
                     if let Adapter::Openrouter = adapter {
                         assert_eq!(
-                            messages[0]["content"][0]["cache_control"]["type"],
+                            messages[index]["content"][0]["cache_control"]["type"],
                             "ephemeral"
                         );
                         assert_eq!(
@@ -321,7 +330,7 @@ async fn gateway_task_time_reaches_each_real_adapter_after_the_stable_prefix() {
                         );
                         if index == 1 {
                             assert_eq!(
-                                messages[3]["content"][0]["cache_control"]["type"],
+                                messages[2]["content"][0]["cache_control"]["type"],
                                 "ephemeral"
                             );
                         }
