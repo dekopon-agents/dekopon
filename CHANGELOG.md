@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.79.0] - 2026-11-01
+
+### Added
+
+- A VM guest in `proxy.guests` without `models` runs on its agent's model and generation settings, charged to that agent's budget; a model the VM names is replaced.
+- Chat answers name the models used, step count and elapsed seconds in a footer line.
+
+### Deprecated
+
+- `proxy.guests.<subject>.models`; `check` and startup warn for each guest that still lists it.
+
+## [dekopon-chart-0.66.0] - 2026-11-01
+
+### Changed
+
+- Chart 0.66.0 targets core v0.79.0 and renders the `v0.79.0` image tag.
+
 ## [0.78.0] - 2026-11-01
 
 ### Changed
