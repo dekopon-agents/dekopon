@@ -439,13 +439,20 @@ pub(crate) trait ThreadOwnership: Send + Sync {
 
 #[derive(Debug)]
 pub(crate) struct OutboundReply {
+    pub footer: Option<crate::progress::Footer>,
     pub text: String,
     pub images: Vec<GeneratedImage>,
 }
 
 impl OutboundReply {
+    pub(crate) fn with_footer(mut self, footer: Option<crate::progress::Footer>) -> Self {
+        self.footer = footer;
+        self
+    }
+
     pub(crate) fn text(text: impl Into<String>) -> Self {
         Self {
+            footer: None,
             text: text.into(),
             images: Vec::new(),
         }
@@ -453,6 +460,7 @@ impl OutboundReply {
 
     pub(crate) fn with_images(text: impl Into<String>, images: Vec<GeneratedImage>) -> Self {
         Self {
+            footer: None,
             text: text.into(),
             images,
         }

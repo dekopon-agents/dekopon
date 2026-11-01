@@ -856,7 +856,11 @@ impl ChatDriver for SlackReplier {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, images } = reply;
+        let OutboundReply {
+            text,
+            images,
+            footer,
+        } = reply;
         super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
         let images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Slack { channel, thread_ts } = target else {
@@ -864,58 +868,17 @@ impl ChatDriver for SlackReplier {
         };
         if !images.is_empty() {
             return self
-                .upload_attachments(channel.clone(), thread_ts.clone(), text, images)
+                .upload_attachments(
+                    channel.clone(),
+                    thread_ts.clone(),
+                    text,
+                    images,
+                    footer.as_ref(),
+                )
                 .await;
         }
-        let mut body = json!({
-            "channel": channel,
-            "text": text,
-            "blocks": [markdown_block(&text)],
-        });
-        if let Some(thread_ts) = thread_ts {
-            body["thread_ts"] = Value::String(thread_ts.clone());
-        }
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map \
-                      keys and serde_json::Number rejects non-finite floats"
-        )]
-        let encoded = serde_json::to_vec(&body).map_err(|_| TransportError::Response)?;
-        let post = || {
-            self.http
-                .post(format!("{}/api/chat.postMessage", self.endpoint))
-                .header(
-                    "authorization",
-                    format!("Bearer {}", self.bot_token.expose()),
-                )
-                .header("content-type", "application/json; charset=utf-8")
-                .body(encoded.clone())
-                .send()
-        };
-        let mut response = post()
+        self.post_answer(channel, thread_ts.as_deref(), &text, footer.as_ref())
             .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let backoff = retry_after(response.headers()).as_secs();
-            tracing::warn!(
-                event = "gateway_reply_rate_limited",
-                transport = "slack",
-                retry_after_seconds = backoff,
-                "gateway.reply.rate.limited"
-            );
-            drop(response);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            response = post()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-        }
-        let body = check_ok(response).await?;
-        let response_channel = body["channel"].as_str().ok_or(TransportError::Response)?;
-        let timestamp = body["ts"].as_str().ok_or(TransportError::Response)?;
-        if response_channel != channel.as_str() || !canonical_timestamp(timestamp) {
-            return Err(TransportError::Response);
-        }
-        Ok(())
     }
 
     fn status(&self) -> Option<&dyn NativeStatus> {
@@ -1288,7 +1251,7 @@ impl ProgressMessage for SlackReplier {
             "channel": channel_id,
             "ts": message.id,
             "text": reply.text,
-            "blocks": [markdown_block(&reply.text)],
+            "blocks": answer_blocks(&reply.text, reply.footer.as_ref()),
         });
         self.liveness_call("chat.update", &body).await.map(|_| ())
     }
@@ -1308,12 +1271,71 @@ impl CancelButton for SlackReplier {
 }
 
 impl SlackReplier {
+    async fn post_answer(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+        footer: Option<&crate::progress::Footer>,
+    ) -> Result<(), TransportError> {
+        let mut body = json!({
+            "channel": channel,
+            "text": text,
+            "blocks": answer_blocks(text, footer),
+        });
+        if let Some(thread_ts) = thread_ts {
+            body["thread_ts"] = Value::String(thread_ts.to_owned());
+        }
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map \
+                      keys and serde_json::Number rejects non-finite floats"
+        )]
+        let encoded = serde_json::to_vec(&body).map_err(|_| TransportError::Response)?;
+        let post = || {
+            self.http
+                .post(format!("{}/api/chat.postMessage", self.endpoint))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", self.bot_token.expose()),
+                )
+                .header("content-type", "application/json; charset=utf-8")
+                .body(encoded.clone())
+                .send()
+        };
+        let mut response = post()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let backoff = retry_after(response.headers()).as_secs();
+            tracing::warn!(
+                event = "gateway_reply_rate_limited",
+                transport = "slack",
+                retry_after_seconds = backoff,
+                "gateway.reply.rate.limited"
+            );
+            drop(response);
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            response = post()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?;
+        }
+        let body = check_ok(response).await?;
+        let response_channel = body["channel"].as_str().ok_or(TransportError::Response)?;
+        let timestamp = body["ts"].as_str().ok_or(TransportError::Response)?;
+        if response_channel != channel || !canonical_timestamp(timestamp) {
+            return Err(TransportError::Response);
+        }
+        Ok(())
+    }
+
     async fn upload_attachments(
         &self,
         channel: String,
         thread_ts: Option<String>,
         text: String,
         mut images: super::hydration::ImageQueue,
+        footer: Option<&crate::progress::Footer>,
     ) -> Result<(), TransportError> {
         let mut accepted = false;
         while let Some(read) = images.next().await {
@@ -1326,7 +1348,13 @@ impl SlackReplier {
                 .then_some(text.as_str())
                 .filter(|text| !text.is_empty());
             match self
-                .upload_attachment(&channel, thread_ts.as_deref(), comment, image)
+                .upload_attachment(
+                    &channel,
+                    thread_ts.as_deref(),
+                    comment,
+                    image,
+                    (index == 0).then_some(footer).flatten(),
+                )
                 .await
             {
                 Ok(()) => accepted = true,
@@ -1343,6 +1371,7 @@ impl SlackReplier {
         thread_ts: Option<&str>,
         initial_comment: Option<&str>,
         image: super::hydration::HydratedImage,
+        footer: Option<&crate::progress::Footer>,
     ) -> Result<(), TransportError> {
         let filename = image.filename;
         let length = image.bytes.len().to_string();
@@ -1388,7 +1417,11 @@ impl SlackReplier {
             "files": [{"id": file_id, "title": filename}],
             "channel_id": channel,
         });
-        if let Some(initial_comment) = initial_comment {
+        if footer.is_some() {
+            body["blocks"] = Value::String(
+                answer_blocks(initial_comment.unwrap_or_default(), footer).to_string(),
+            );
+        } else if let Some(initial_comment) = initial_comment {
             body["initial_comment"] = Value::String(initial_comment.to_owned());
         }
         if let Some(thread_ts) = thread_ts {
@@ -1623,6 +1656,20 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(DEFAULT_PROGRESS_COOLDOWN, Duration::from_secs);
     seconds.min(MAX_PROGRESS_COOLDOWN)
+}
+
+fn answer_blocks(text: &str, footer: Option<&crate::progress::Footer>) -> Value {
+    let mut blocks = if text.is_empty() && footer.is_some() {
+        Vec::new()
+    } else {
+        vec![markdown_block(text)]
+    };
+    if let Some(footer) = footer {
+        blocks.push(
+            json!({"type": "context", "elements": [{"type": "plain_text", "text": footer.line()}]}),
+        );
+    }
+    Value::Array(blocks)
 }
 
 fn markdown_block(text: &str) -> Value {
@@ -2995,6 +3042,37 @@ mod driver_tests {
         }
         assert!(calls[2].1.get("unfurl_links").is_none());
         assert!(calls[2].1.get("unfurl_media").is_none());
+    }
+
+    #[test]
+    fn an_attachment_only_answer_has_a_footer_without_an_empty_markdown_block() {
+        let footer =
+            crate::progress::Footer::new(&["model-a".into()], 1, std::time::Duration::from_secs(7));
+        assert_eq!(
+            super::answer_blocks("", Some(&footer)),
+            json!([{"type":"context", "elements":[{"type":"plain_text", "text":"model-a · 1 step · 7 s"}]}])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finalized_answer_ends_with_its_footer_context() {
+        let mock = spawn_slack_mock(accepting);
+        let replier = replier(&mock.base, SlackExperience::Classic);
+        let reply =
+            OutboundReply::text("All good.").with_footer(Some(crate::progress::Footer::new(
+                &["model-a".into()],
+                1,
+                std::time::Duration::from_millis(7999),
+            )));
+        ProgressMessage::finalize(&replier, &progress_message(), &reply)
+            .await
+            .unwrap();
+        let body = mock.body("/api/chat.update");
+        assert_eq!(body["text"], "All good.");
+        assert_eq!(
+            body["blocks"],
+            json!([{"type":"markdown", "text":"All good."}, {"type":"context", "elements":[{"type":"plain_text", "text":"model-a · 1 step · 8 s"}]}])
+        );
     }
 
     #[tokio::test]

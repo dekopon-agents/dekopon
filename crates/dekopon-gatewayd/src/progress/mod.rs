@@ -8,12 +8,14 @@ use crate::session::{
 };
 
 mod adapter;
+mod footer;
 mod policy;
 mod text;
 
 #[cfg(test)]
 mod tests;
 
+pub(crate) use footer::Footer;
 pub(crate) use policy::{ProgressInputs, ProgressPolicy, Terminal, bounded};
 pub(crate) use text::{ProgressDetail, ProgressText, Templates};
 

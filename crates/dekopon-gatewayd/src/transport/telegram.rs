@@ -563,6 +563,7 @@ impl ProgressMessage for TelegramDriver {
             bounded(text.as_str()),
             cancel,
             LinkPreviews::Disabled,
+            None,
         )
         .await
     }
@@ -615,7 +616,7 @@ impl TextStream for TelegramDriver {
                 .post_text(target, rendered, cancel, LinkPreviews::Default)
                 .await;
         };
-        self.edit_text(message, rendered, cancel, LinkPreviews::Default)
+        self.edit_text(message, rendered, cancel, LinkPreviews::Default, None)
             .await?;
         Ok(message.clone())
     }
@@ -739,6 +740,7 @@ impl TelegramDriver {
         text: String,
         cancel: bool,
         previews: LinkPreviews,
+        footer: Option<&crate::progress::Footer>,
     ) -> Result<(), TransportError> {
         let (chat_id, message_thread_id, message_id) = addressed(message)?;
         let mut body = json!({
@@ -750,6 +752,7 @@ impl TelegramDriver {
         if let LinkPreviews::Disabled = previews {
             body["link_preview_options"] = json!({"is_disabled": true});
         }
+        add_footer_entity(&mut body, footer);
         match self.liveness_call("editMessageText", &body).await {
             Ok(_) => Ok(()),
             Err(TransportError::Service { ref code }) if code.contains(NOT_MODIFIED) => Ok(()),
@@ -762,14 +765,43 @@ impl TelegramDriver {
         message: &MessageRef,
         reply: &OutboundReply,
     ) -> Result<(), TransportError> {
-        if !reply.images.is_empty() || reply.text.encode_utf16().count() > MAX_MESSAGE_CHARS {
+        let chunks = crate::progress::Footer::chunks(
+            &reply.text,
+            reply.footer.as_ref().map(crate::progress::Footer::line),
+            MAX_MESSAGE_CHARS,
+            TextUnit::Utf16,
+        );
+        if !reply.images.is_empty() || chunks.len() != 1 {
             return Err(TransportError::Service {
                 code: "answer-does-not-fit".to_owned(),
             });
         }
-        self.edit_text(message, bounded(&reply.text), false, LinkPreviews::Default)
-            .await
+        self.edit_text(
+            message,
+            chunks[0].clone(),
+            false,
+            LinkPreviews::Default,
+            reply.footer.as_ref(),
+        )
+        .await
     }
+}
+
+fn add_footer_entity(body: &mut Value, footer: Option<&crate::progress::Footer>) {
+    if let Some(entities) = body["text"]
+        .as_str()
+        .and_then(|text| footer_entities(text, footer))
+    {
+        body["entities"] = entities;
+    }
+}
+
+fn footer_entities(text: &str, footer: Option<&crate::progress::Footer>) -> Option<Value> {
+    let footer = footer?;
+    let answer = text.strip_suffix(footer.line())?;
+    Some(
+        json!([{"type": "italic", "offset": answer.encode_utf16().count(), "length": footer.line().encode_utf16().count()}]),
+    )
 }
 
 fn addressed(message: &MessageRef) -> Result<(i64, Option<i64>, i64), TransportError> {
@@ -819,9 +851,11 @@ impl ChatDriver for TelegramDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, images } = reply;
-        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Photos)?;
-        let mut images = super::hydration::ImageQueue::new(images);
+        let mut reply = reply;
+        super::hydration::validate_types(&reply.images, super::hydration::AcceptedTypes::Photos)?;
+        let mut images = super::hydration::ImageQueue::new(std::mem::take(&mut reply.images));
+        let text = &reply.text;
+        let footer = reply.footer.as_ref();
         let ReplyTarget::Telegram {
             chat_id,
             reply_to,
@@ -833,6 +867,15 @@ impl ChatDriver for TelegramDriver {
         let (chat_id, reply_to, message_thread_id) = (*chat_id, *reply_to, *message_thread_id);
         if !images.is_empty() {
             let caption_fits = text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
+            let caption = footer.and_then(|footer| {
+                crate::progress::Footer::caption(
+                    text,
+                    footer.line(),
+                    MAX_PHOTO_CAPTION_CHARS,
+                    TextUnit::Utf16,
+                )
+            });
+            let caption_footer = caption.as_ref().and(footer);
             let mut accepted = false;
             while let Some(read) = images.next().await {
                 let (index, image) = match read {
@@ -840,7 +883,8 @@ impl ChatDriver for TelegramDriver {
                     Err(_) if accepted => return Err(TransportError::PartialDelivery),
                     Err(error) => return Err(error),
                 };
-                let caption = (index == 0 && caption_fits).then_some(text.as_str());
+                let caption = (index == 0 && caption_fits)
+                    .then_some((caption.as_deref().unwrap_or(text), caption_footer));
                 match self
                     .send_photo(chat_id, reply_to, message_thread_id, caption, image)
                     .await
@@ -850,14 +894,17 @@ impl ChatDriver for TelegramDriver {
                     Err(error) => return Err(error),
                 }
             }
-            if caption_fits {
+            if caption_fits && (footer.is_none() || caption.is_some()) {
                 return accepted.then_some(()).ok_or(TransportError::Response);
             }
+            if caption_fits {
+                reply.text.clear();
+            }
             return self
-                .send_text_chunks(chat_id, reply_to, message_thread_id, &text, true)
+                .send_text_chunks(chat_id, reply_to, message_thread_id, &reply, true)
                 .await;
         }
-        self.send_text_chunks(chat_id, reply_to, message_thread_id, &text, false)
+        self.send_text_chunks(chat_id, reply_to, message_thread_id, &reply, false)
             .await
     }
 
@@ -892,20 +939,31 @@ impl TelegramDriver {
         chat_id: i64,
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
-        text: &str,
+        reply: &OutboundReply,
         prior_accepted: bool,
     ) -> Result<(), TransportError> {
         let mut accepted = prior_accepted;
         let mut delivered = false;
-        for (index, chunk) in split_message(text, MAX_MESSAGE_CHARS, TextUnit::Utf16)
-            .into_iter()
-            .enumerate()
-        {
+        let footer = reply.footer.as_ref();
+        let chunks = crate::progress::Footer::chunks(
+            &reply.text,
+            footer.map(crate::progress::Footer::line),
+            MAX_MESSAGE_CHARS,
+            TextUnit::Utf16,
+        );
+        let last = chunks.len().saturating_sub(1);
+        for (index, chunk) in chunks.into_iter().enumerate() {
             let first_text_reply = (!prior_accepted && index == 0)
                 .then_some(reply_to)
                 .flatten();
             match self
-                .send_text(chat_id, first_text_reply, message_thread_id, chunk)
+                .send_text(
+                    chat_id,
+                    first_text_reply,
+                    message_thread_id,
+                    chunk,
+                    if index == last { footer } else { None },
+                )
                 .await
             {
                 Ok(()) => {
@@ -925,8 +983,10 @@ impl TelegramDriver {
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
         text: String,
+        footer: Option<&crate::progress::Footer>,
     ) -> Result<(), TransportError> {
         let mut body = json!({ "chat_id": chat_id, "text": text });
+        add_footer_entity(&mut body, footer);
         if let Some(reply_to) = reply_to {
             body["reply_to_message_id"] = json!(reply_to);
         }
@@ -972,7 +1032,7 @@ impl TelegramDriver {
         chat_id: i64,
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
-        caption: Option<&str>,
+        caption: Option<(&str, Option<&crate::progress::Footer>)>,
         image: super::hydration::HydratedImage,
     ) -> Result<(), TransportError> {
         let filename = image.filename;
@@ -988,8 +1048,11 @@ impl TelegramDriver {
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
             .part("photo", part);
-        if let Some(caption) = caption {
+        if let Some((caption, footer)) = caption {
             form = form.text("caption", caption.to_owned());
+            if let Some(entities) = footer_entities(caption, footer) {
+                form = form.text("caption_entities", entities.to_string());
+            }
         }
         if let Some(reply_to) = reply_to {
             form = form.text(
@@ -1905,5 +1968,25 @@ mod tests {
             .expect_err("a Discord surface is not a Telegram one");
         assert!(matches!(&error, TransportError::Response), "{error:?}");
         assert!(api.methods().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_finalized_answer_ends_with_an_italic_footer_at_a_utf16_offset() {
+        let api = bot_api(posting);
+        let driver = driver(&api.base);
+        let reply = OutboundReply::text("😀 done").with_footer(Some(crate::progress::Footer::new(
+            &["model-a".into()],
+            1,
+            Duration::from_millis(7999),
+        )));
+        ProgressMessage::finalize(&driver, &surface(), &reply)
+            .await
+            .unwrap();
+        let posted = api.body("editMessageText");
+        assert_eq!(posted["text"], "😀 done\n\nmodel-a · 1 step · 8 s");
+        assert_eq!(
+            posted["entities"],
+            json!([{"type":"italic", "offset":9,"length":22}])
+        );
     }
 }
