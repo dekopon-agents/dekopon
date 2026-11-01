@@ -7,6 +7,28 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.76.0] - 2026-10-31
+
+### Added
+
+- attachment summaries for resident images and documents, off by default (summaries.attachments)
+
+### Changed
+
+- The unrouted chat-memory refusal no longer points at docs/upgrading.md.
+- The docs are six files: design, authorization, memory, security-model, deploy and development.
+
+### Removed
+
+- Reference docs that restated the code; the types, `check` and `--help` are the reference.
+- Prose rustdoc from the workspace crates, including the provider SDK; its README is the guide.
+
+## [dekopon-chart-0.63.0] - 2026-10-31
+
+### Changed
+
+- Chart 0.63.0 targets core v0.76.0 and renders the `v0.76.0` image tag.
+
 ## [0.75.0] - 2026-10-30
 
 ### Changed
