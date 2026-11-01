@@ -1,6 +1,7 @@
 use crate::{StoreState, bindings::dekopon::asset::asset as wit};
 use dekopon_broker_protocol::{
-    AssetEncoding, AssetRow, MAX_ASSET_DESCRIPTORS, MAX_ASSET_ROWS, NewAsset,
+    AssetEncoding, AssetRow, MAX_ASSET_DESCRIPTORS, MAX_ASSET_ROWS, MAX_DECODED_INPUT_BYTES,
+    NewAsset,
 };
 use dekopon_capability::AssetConstraints;
 use dekopon_core::{
@@ -23,6 +24,7 @@ use wasmtime::component::Resource;
 
 const MAX_ASSET_BYTES: u64 = dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64;
 const MAX_INVOCATION_BYTES: u64 = dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES as u64;
+const MAX_INPUT_BYTES: u64 = MAX_DECODED_INPUT_BYTES as u64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssetAdmissionError {
@@ -237,7 +239,7 @@ impl AssetState {
                 total = total
                     .checked_add(decoded)
                     .ok_or(AssetAdmissionError::TooLarge)?;
-                if total > MAX_INVOCATION_BYTES {
+                if total > MAX_INPUT_BYTES {
                     return Err(AssetAdmissionError::TooLarge);
                 }
                 passed.push((AssetId(id), AssetReader::input(file, jobs.clone())));
@@ -1399,20 +1401,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn base64_input_sum_accepts_forty_decoded_mib_and_refuses_one_more() {
-        use std::io::Write as _;
+    async fn base64_input_sum_accepts_five_decoded_documents_and_refuses_one_more_byte() {
+        let document = dekopon_core::asset::MAX_DECODED_DOCUMENT_BYTES as u64;
+        let stored = base64::encoded_len(document).unwrap();
         for extra in [0, 1] {
             let mut inputs = AssetInputs::default();
             for id in 1..=5 {
-                let decoded = MAX_ASSET_BYTES as usize + if id == 5 { extra } else { 0 };
-                let encoded = base64::Engine::encode(&base64::STANDARD, vec![0; decoded]);
-                let mut file = tempfile::NamedTempFile::new().unwrap();
-                file.write_all(encoded.as_bytes()).unwrap();
+                let tail: &[u8] = if id == 5 && extra == 1 { b"A=" } else { b"==" };
+                let file = tempfile::NamedTempFile::new().unwrap();
+                file.as_file().set_len(stored).unwrap();
+                file.as_file().write_all_at(tail, stored - 2).unwrap();
                 inputs.rows.push(AssetRow {
                     id,
-                    content_type: "image/png".to_owned(),
+                    content_type: "application/pdf".to_owned(),
                     encoding: AssetEncoding::Base64,
-                    bytes: Some(encoded.len() as u64),
+                    bytes: Some(stored),
                     origin: "test".to_owned(),
                     sent: false,
                 });
@@ -1781,8 +1784,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_descriptor_lengths_accept_forty_mib_and_refuse_one_more() {
-        for bytes in [MAX_INVOCATION_BYTES, MAX_INVOCATION_BYTES + 1] {
+    async fn input_descriptor_lengths_accept_the_input_ceiling_and_refuse_one_more() {
+        for bytes in [MAX_INPUT_BYTES, MAX_INPUT_BYTES + 1] {
             let file = tempfile::NamedTempFile::new().unwrap();
             file.as_file().set_len(bytes).unwrap();
             let admitted = AssetState::invoke(
@@ -1792,7 +1795,7 @@ mod tests {
                 "provider:probe".to_owned(),
             )
             .await;
-            if bytes == MAX_INVOCATION_BYTES {
+            if bytes == MAX_INPUT_BYTES {
                 assert!(admitted.is_ok());
             } else {
                 assert!(matches!(admitted, Err(AssetAdmissionError::TooLarge)));

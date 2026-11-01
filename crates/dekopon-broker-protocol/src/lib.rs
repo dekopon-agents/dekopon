@@ -1037,6 +1037,8 @@ pub enum RunOutcome {
 
 pub const MAX_ASSET_ROWS: usize = MAX_ASSET_DESCRIPTORS;
 pub const MAX_ASSET_DESCRIPTORS: usize = 5;
+pub const MAX_DECODED_INPUT_BYTES: usize =
+    MAX_ASSET_DESCRIPTORS * dekopon_core::asset::MAX_DECODED_DOCUMENT_BYTES;
 pub const MAX_STREAM_DESCRIPTORS: usize = 2;
 pub const MAX_DESCRIPTORS_PER_FRAME: usize = 8;
 

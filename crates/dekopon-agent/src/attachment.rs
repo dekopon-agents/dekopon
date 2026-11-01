@@ -8,7 +8,7 @@ use std::{fmt, future::Future, io::Read, os::fd::OwnedFd, pin::Pin, sync::Arc};
 use thiserror::Error;
 
 pub use dekopon_model::asset::MAX_ATTACHMENT_BYTES;
-pub const MAX_INVOCATION_ASSET_BYTES: usize = dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES;
+pub const MAX_INVOCATION_ASSET_BYTES: usize = dekopon_broker_protocol::MAX_DECODED_INPUT_BYTES;
 
 pub struct GeneratedImage {
     data: DiskBlob,
@@ -88,6 +88,24 @@ impl GeneratedImage {
                     span.record("duration_us", start.elapsed().as_micros() as u64);
                     Ok(decoded)
                 })
+            }
+        }
+    }
+    pub fn prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        match self.encoding {
+            AssetEncoding::Identity => self.data.read_prefix(limit),
+            AssetEncoding::Base64 => {
+                let mut decoded = Vec::with_capacity(self.decoded_len()?.min(limit));
+                DecoderReader::new(
+                    BlobReader {
+                        blob: &self.data,
+                        offset: 0,
+                    },
+                    &STANDARD,
+                )
+                .take(limit as u64)
+                .read_to_end(&mut decoded)?;
+                Ok(decoded)
             }
         }
     }
@@ -305,7 +323,10 @@ pub enum ChatAssetRefusal {
     UnsupportedMedia,
     #[error("one invocation may reference at most {MAX_ASSET_DESCRIPTORS} distinct assets")]
     PerInvocationLimit,
-    #[error("the assets exceed the 40 MiB per-invocation decoded-byte budget")]
+    #[error(
+        "the assets exceed the {} MiB per-invocation decoded-byte budget",
+        MAX_INVOCATION_ASSET_BYTES / (1024 * 1024)
+    )]
     ByteBudget,
     #[error("the attachment's bytes could not be read")]
     Unavailable,
@@ -443,7 +464,7 @@ mod tests {
     fn decoded_limit_matches_the_shared_contract() {
         assert_eq!(
             MAX_INVOCATION_ASSET_BYTES,
-            dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES
+            dekopon_broker_protocol::MAX_DECODED_INPUT_BYTES
         );
     }
 
@@ -559,10 +580,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_eight_mib_inputs_fit() {
+    async fn five_full_size_documents_fit_one_invocation() {
         let inputs = ChatAssetInputs::new(Arc::new(Source {
             blobs: (0..5)
-                .map(|_| DiskBlob::from_bytes(&vec![0; MAX_ATTACHMENT_BYTES]).unwrap())
+                .map(|_| {
+                    let file = tempfile::tempfile().unwrap();
+                    file.set_len(MAX_ATTACHMENT_BYTES as u64).unwrap();
+                    DiskBlob::from_descriptor(file.into(), MAX_ATTACHMENT_BYTES).unwrap()
+                })
                 .collect(),
         }));
         let PreparedRun { assets, pins, .. } = inputs
@@ -752,6 +777,8 @@ mod tests {
             );
             assert_eq!(image.decoded_len().unwrap(), raw.len());
             assert_eq!(image.bytes().unwrap(), raw);
+            assert_eq!(image.prefix(9).unwrap(), &raw[..9]);
+            assert_eq!(image.prefix(usize::MAX).unwrap(), raw);
             assert!(!format!("{image:?}").contains("payload"));
         }
     }

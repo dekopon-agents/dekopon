@@ -1852,21 +1852,18 @@ fn fetch_asset_into(
             return Ok(RecordedOutcome::Refused);
         }
     };
-    let text = if is_textual(&asset.mime) {
-        match asset.data.read() {
-            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+    let (text, truncated) = if is_textual(&asset.mime) {
+        match textual_asset(&asset.data) {
+            Ok(Textual::Whole(text)) => (Some(text), false),
+            Ok(Textual::Truncated(text)) => (Some(text), true),
             Err(error) => {
                 messages.push(ModelMessage::tool(call.id.clone(), error.to_string()));
                 return Ok(RecordedOutcome::Failed);
             }
         }
     } else {
-        None
+        (None, false)
     };
-    let truncated = text
-        .as_ref()
-        .is_some_and(|text| text.len() > MAX_TEXTUAL_ASSET_BYTES);
-    let text = text.map(clamp_textual_asset);
     let bytes = text.as_ref().map_or(asset.data.len(), String::len);
     if bytes > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(asset_bytes.total) {
         let reason = format!(
@@ -1924,18 +1921,29 @@ fn fetch_asset_into(
     Ok(RecordedOutcome::Exit(0))
 }
 
-fn clamp_textual_asset(mut text: String) -> String {
-    let total = text.len();
-    if total <= MAX_TEXTUAL_ASSET_BYTES {
-        return text;
+enum Textual {
+    Whole(String),
+    Truncated(String),
+}
+
+fn textual_asset(
+    data: &dekopon_model::asset::BlobReference,
+) -> Result<Textual, dekopon_model::asset::BlobError> {
+    let total = data.len();
+    let prefix = data.read_prefix(MAX_TEXTUAL_ASSET_BYTES)?;
+    let lossy = String::from_utf8_lossy(&prefix);
+    if total <= MAX_TEXTUAL_ASSET_BYTES && lossy.len() <= MAX_TEXTUAL_ASSET_BYTES {
+        return Ok(Textual::Whole(lossy.into_owned()));
     }
-    let mut end = MAX_TEXTUAL_ASSET_BYTES;
-    while !text.is_char_boundary(end) {
+    let mut end = lossy.len().min(MAX_TEXTUAL_ASSET_BYTES);
+    while !lossy.is_char_boundary(end) {
         end -= 1;
     }
-    text.truncate(end);
-    text.push_str(&format!("\n[truncated at {end} bytes of {total}]"));
-    text
+    let notice = format!("\n[truncated at {end} bytes of {}]", total.max(lossy.len()));
+    let mut text = String::with_capacity(end + notice.len());
+    text.push_str(&lossy[..end]);
+    text.push_str(&notice);
+    Ok(Textual::Truncated(text))
 }
 
 #[expect(
@@ -2189,9 +2197,10 @@ mod tests {
         MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
         PromptLimits, PromptOutcome, ReplyDisposition, ReviewProgress, SCRIPT_TOOL_DESCRIPTION,
         SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, Seal, SessionInputs, Steer, SteerSource,
-        agent_config_tool, asset_argument, format_script_outcome, reject_tool_call, run_prompt,
-        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
-        script_argument, script_tool, unknown_tool_feedback,
+        Textual, agent_config_tool, asset_argument, format_script_outcome, reject_tool_call,
+        run_prompt, run_prompt_session, run_prompt_with_history,
+        run_prompt_with_history_and_options, script_argument, script_tool, textual_asset,
+        unknown_tool_feedback,
     };
 
     struct ScriptedModel {
@@ -5474,6 +5483,50 @@ mod tests {
         assert!(messages[0].ends_with(&trailer), "no truncation trailer");
         assert_eq!(messages[0].len(), retained + trailer.len());
         assert!(messages[0].starts_with('☃'));
+    }
+
+    #[test]
+    fn repeated_fetches_of_a_large_text_attachment_retain_only_the_textual_ceiling() {
+        struct PrefixOnly(Mutex<Vec<usize>>);
+        impl dekopon_model::asset::BlobSource for PrefixOnly {
+            fn pin(
+                &self,
+            ) -> Result<dekopon_model::asset::DiskBlob, dekopon_model::asset::BlobError>
+            {
+                panic!("a textual fetch pinned the whole document")
+            }
+            fn read(&self) -> Result<Vec<u8>, dekopon_model::asset::BlobError> {
+                panic!("a textual fetch read the whole document")
+            }
+            fn read_prefix(
+                &self,
+                limit: usize,
+            ) -> Result<Vec<u8>, dekopon_model::asset::BlobError> {
+                self.0.lock().push(limit);
+                Ok(vec![0xff; limit])
+            }
+        }
+        let source = Arc::new(PrefixOnly(Mutex::new(Vec::new())));
+        let document = dekopon_model::asset::BlobReference::new(
+            Arc::clone(&source) as Arc<dyn dekopon_model::asset::BlobSource>,
+            dekopon_model::asset::MAX_ATTACHMENT_BYTES,
+            1,
+        );
+        let retained: Vec<_> = (0..7)
+            .map(|_| match textual_asset(&document).unwrap() {
+                Textual::Truncated(text) => text,
+                Textual::Whole(_) => panic!("a 100 MiB document was not truncated"),
+            })
+            .collect();
+        for text in &retained {
+            assert!(text.len() <= text.capacity());
+            assert!(
+                text.capacity() <= MAX_TEXTUAL_ASSET_BYTES + 64,
+                "{}",
+                text.capacity()
+            );
+        }
+        assert_eq!(*source.0.lock(), [MAX_TEXTUAL_ASSET_BYTES; 7]);
     }
 
     #[test]

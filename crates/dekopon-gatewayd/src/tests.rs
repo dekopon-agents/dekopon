@@ -17752,17 +17752,17 @@ async fn a_whatsapp_pdf_fetch_refusal_tells_the_model_its_cause_and_sends_no_fil
         MediaPeer, PDF, admitted, bytes_reply, document_webhook, json_reply, metadata,
     };
     use axum::{http::StatusCode, response::IntoResponse as _};
-    const LIMIT: usize = 8 * 1024 * 1024;
+    const LIMIT: usize = dekopon_model::asset::MAX_ATTACHMENT_BYTES;
     for (case, requests, expected) in [
         (
             "advertised",
             1,
-            "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read.",
+            "chat-asset:1 is 100.0 MB which is over the 100.0 MB the gateway will read.",
         ),
         (
             "streamed",
             2,
-            "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read.",
+            "chat-asset:1 is 100.0 MB which is over the 100.0 MB the gateway will read.",
         ),
         (
             "signature",
