@@ -677,11 +677,15 @@ where
             "This is a PR subscription re-review. Refresh the subscribed PR's head-pinned GitHub review using your granted tools. You may call decline_chat_reply when blocking findings are unchanged only if every capability invocation in the turn successfully refreshed the subscribed PR's review. Any other invocation, including a failed review or a review of another PR, requires a chat report even if the subscribed review was refreshed."
         )),
     }
+    let stable_system = messages.len();
     if let Some(notice) = memory_notice {
         messages.push(ModelMessage::system(notice.text()));
     }
     messages.extend_from_slice(prior);
-    let options = options.clone().with_stable_prefix(messages.len());
+    let options = options
+        .clone()
+        .with_stable_prefix(messages.len())
+        .with_stable_system(stable_system);
     messages.push(ModelMessage::user(prompt));
 
     let mut record = RecordBuilder::new(recorded.unwrap_or(prompt), model.model_key(), capture_cap);
@@ -2195,6 +2199,7 @@ mod tests {
         turns: Mutex<VecDeque<AssistantTurn>>,
         observed_tools: Mutex<Vec<Vec<ModelTool>>>,
         observed_messages: Mutex<Vec<Vec<ModelMessage>>>,
+        observed_options: Mutex<Vec<CompletionOptions>>,
     }
 
     impl ScriptedModel {
@@ -2207,6 +2212,7 @@ mod tests {
                 turns: Mutex::new(turns.into_iter().collect()),
                 observed_tools: Mutex::new(Vec::new()),
                 observed_messages: Mutex::new(Vec::new()),
+                observed_options: Mutex::new(Vec::new()),
             }
         }
 
@@ -2255,11 +2261,12 @@ mod tests {
             &self,
             messages: &[ModelMessage],
             tools: &[ModelTool],
-            _options: &CompletionOptions,
+            options: &CompletionOptions,
             _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         ) -> Result<AssistantTurn, InferenceError> {
             self.observed_tools.lock().push(tools.to_vec());
             self.observed_messages.lock().push(messages.to_vec());
+            self.observed_options.lock().push(options.clone());
             self.turns
                 .lock()
                 .pop_front()
@@ -2452,6 +2459,26 @@ mod tests {
                 (Some(3), "user".to_owned(), "msg2".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn the_memory_notice_follows_the_stable_system_prefix() {
+        let model = ScriptedModel::new([answer("one")]);
+        let notice =
+            super::MemoryNotice::new(&[super::MemoryFact::GrantBoundary], None).expect("notice");
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg", limits(1, 1))
+                .with_system(Some("rules"))
+                .with_memory_notice(Some(&notice)),
+            &[],
+        )
+        .0
+        .expect("answered");
+        let stable = model.observed_options.lock()[0].stable_system();
+        assert_eq!(stable, Some(1));
+        assert_eq!(model.first_request()[1].content(), Some(notice.text()));
     }
 
     #[test]

@@ -321,9 +321,16 @@ async fn gateway_task_time_reaches_each_real_adapter_after_the_stable_prefix() {
                     }
                     if let Adapter::Openrouter = adapter {
                         assert_eq!(
-                            messages[index]["content"][0]["cache_control"]["type"],
+                            messages[0]["content"][0]["cache_control"]["type"],
                             "ephemeral"
                         );
+                        if index == 1 {
+                            assert_eq!(messages[1]["role"], "system");
+                            assert!(
+                                text_of(&messages[1]["content"]).starts_with("[gateway: memory]")
+                            );
+                            assert!(messages[1]["content"][0]["cache_control"].is_null());
+                        }
                         assert_eq!(
                             messages.last().unwrap()["content"][0]["cache_control"]["type"],
                             "ephemeral"

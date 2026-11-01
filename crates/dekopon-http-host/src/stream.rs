@@ -310,6 +310,8 @@ impl BufferedHttpClient {
             "dekopon.http.response.accounted_bytes" = tracing::field::Empty,
             "error.code" = tracing::field::Empty,
             "error.message" = tracing::field::Empty,
+            "dekopon.http.byte_limit.key" = tracing::field::Empty,
+            "dekopon.http.byte_limit.bytes" = tracing::field::Empty,
             outcome = tracing::field::Empty
         );
         let index = self.evidence.len();
@@ -379,8 +381,10 @@ impl BufferedHttpClient {
                 .ok_or_else(|| http_error(ErrorCode::ResponseTooLarge, "response size overflow"))?;
             self.evidence[index].response_bytes += chunk.len() as u64;
             if response_bytes > grant.max_response_bytes {
-                return Err(http_error(
-                    ErrorCode::ResponseTooLarge,
+                return Err(super::byte_limit_error(
+                    super::ByteLimitKey::MaxResponseBytes,
+                    grant.max_response_bytes,
+                    response_bytes,
                     "response exceeds the authorized byte limit",
                 ));
             }
@@ -597,9 +601,15 @@ impl BufferedHttpClient {
             super::ResponseMetadata::Ordinary => {
                 super::signed_download::redact_api_locations(&mut headers);
                 let returned_bytes = super::returned_head_bytes(&headers);
-                if returned_bytes > self.ceilings.max_header_bytes as u64
-                    || returned_bytes > grant.max_response_bytes
-                {
+                if returned_bytes > grant.max_response_bytes {
+                    return Err(super::byte_limit_error(
+                        super::ByteLimitKey::MaxResponseBytes,
+                        grant.max_response_bytes,
+                        returned_bytes,
+                        "redacted headers exceed the authorized byte limit",
+                    ));
+                }
+                if returned_bytes > self.ceilings.max_header_bytes as u64 {
                     return Err(http_error(
                         ErrorCode::ResponseTooLarge,
                         "redacted headers exceed the authorized byte limit",
@@ -1469,6 +1479,55 @@ mod tests {
             assert_eq!(
                 fetch(path, "POST", &response, maximum, None).await.err(),
                 Some(ErrorCode::ResponseTooLarge)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_response_over_max_response_bytes_records_its_key_on_send_and_stream() {
+        use dekopon_test_support::{CaptureLayer, Record};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        for path in [Path::Send, Path::Stream] {
+            let capture = CaptureLayer::workspace();
+            let refused = fetch(
+                path,
+                "POST",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                55,
+                None,
+            )
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await;
+            assert_eq!(refused.err(), Some(ErrorCode::ResponseTooLarge));
+            let span_field = |name, value| {
+                capture.records().iter().any(|record| {
+                    matches!(
+                        record,
+                        Record::Span {
+                            name: "http.request",
+                            ..
+                        }
+                    ) && record.field(name) == Some(value)
+                })
+            };
+            assert!(span_field(
+                "dekopon.http.byte_limit.key",
+                "maxResponseBytes"
+            ));
+            assert!(span_field("dekopon.http.byte_limit.bytes", "55"));
+            assert_eq!(
+                capture
+                    .events_where(
+                        "dekopon_http_host::audit",
+                        &[
+                            ("audit.event", "accounting.http.request"),
+                            ("dekopon.http.byte_limit.key", "maxResponseBytes"),
+                            ("dekopon.http.byte_limit.bytes", "55"),
+                        ],
+                    )
+                    .len(),
+                1
             );
         }
     }
