@@ -48,6 +48,39 @@ Driving an agent is its own statement: action `Dekopon::Action::"agent.prompt"` 
 never allowed is refused before the gateway calls a model. Capabilities imply no session, and a
 session no capabilities.
 
+## Conversation attributes
+
+Policy sees where a message arrived as `context.conversation`
+([schema](../crates/dekopon-policy/src/lib.rs)): `kind`, `container`, `id` and `thread`. `container`
+and `thread` are optional, so a policy that reads either guards with `has` or fails to load. Each
+transport fills them:
+
+| Transport | `container` | `id` | `thread` |
+|---|---|---|---|
+| [Slack](../crates/dekopon-gatewayd/src/transport/slack.rs) | team | channel | thread root timestamp (a top-level message is its own root); none in classic DMs |
+| [Discord](../crates/dekopon-gatewayd/src/transport/discord.rs) | guild; none in a DM | channel or thread parent | the thread's channel id |
+| [Telegram](../crates/dekopon-gatewayd/src/transport/telegram.rs) | none | chat | topic |
+| [WhatsApp](../crates/dekopon-gatewayd/src/transport/whatsapp.rs) | `waba_id:phone_number_id` | sender | none |
+| [GitHub](../crates/dekopon-gatewayd/src/transport/github.rs) | owner | `owner.repo` | issue, pull request or discussion number, else [`repository`](../crates/dekopon-core/src/github.rs) |
+| [Fauxlack](../crates/dekopon-gatewayd/src/transport/fauxlack.rs) | server | channel | thread |
+| [local](../crates/dekopon-gatewayd/src/transport/local.rs) | the caller's; default none | the caller's; default `dev` | none ([validated](../crates/dekopon-broker-protocol/src/conversation.rs)) |
+
+This `forbid` limits pull-request comments to one Slack thread:
+
+```cedar
+@id("comments-stay-in-one-thread")
+forbid(principal, action == Dekopon::Action::"gh.pull-request.comment", resource)
+unless { context has transportKind && context.transportKind == "slack"
+      && context has conversation && context.conversation has container
+      && context.conversation has thread
+      && context.conversation.container == "t0123abcd"
+      && context.conversation.id == "c0123abcd"
+      && context.conversation.thread == "1761900000.000100" };
+```
+
+A timestamp is unique only within a channel, so the fence pins the channel too. It
+fences that capability only, not the agent's Slack replies.
+
 ## `secret.use` and public DRNs
 
 A DRN (`drn:…`) publicly names a secret; knowing one grants nothing. The model passes it on a
