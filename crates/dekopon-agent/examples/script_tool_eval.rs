@@ -52,6 +52,7 @@ const MAX_CAPABILITY_CALLS: u32 = 16;
 const ORCHARD_MAX_STEPS: u32 = 20;
 const ORCHARD_MAX_CAPABILITY_CALLS: u32 = 100;
 const MODEL_TIMEOUT: Duration = Duration::from_secs(120);
+const FRESHNESS_MODEL_TIMEOUT: Duration = Duration::from_secs(900);
 const OUTPUT_HEAD_CHARS: usize = 2048;
 const SYSTEM: &str = "You are answering one chat message. Use the bash tool for any data or \
                       action the answer needs, then reply in plain text.";
@@ -231,6 +232,13 @@ impl World {
         }
     }
 
+    const fn model_timeout(self) -> Duration {
+        match self {
+            Self::Basic | Self::Orchard => MODEL_TIMEOUT,
+            Self::Freshness => FRESHNESS_MODEL_TIMEOUT,
+        }
+    }
+
     const fn limits(self) -> PromptLimits {
         match self {
             Self::Basic => PromptLimits {
@@ -300,6 +308,14 @@ fn load_tasks(directory: &Path) -> Result<Vec<Task>, EvalError> {
         return Err(EvalError::NoTasks);
     }
     directories.iter().map(|path| Task::load(path)).collect()
+}
+
+fn model_timeout(tasks: &[Task]) -> Duration {
+    tasks
+        .iter()
+        .map(|task| task.world.model_timeout())
+        .max()
+        .unwrap_or(MODEL_TIMEOUT)
 }
 
 struct Renames(Vec<(String, String)>);
@@ -912,9 +928,14 @@ fn run_trial<'a>(
     let research_calls = research_calls.lock().clone();
     if let Some(expected) = &trial.task.expected.research {
         problems.extend(
-            freshness::judge(expected, &research_calls, answer.as_deref())
-                .into_iter()
-                .map(|reason| Problem::Research { reason }),
+            freshness::judge(
+                expected,
+                freshness::supplied_reference(&trial.task.instruction),
+                &research_calls,
+                answer.as_deref(),
+            )
+            .into_iter()
+            .map(|reason| Problem::Research { reason }),
         );
     }
     Ok(Row {
@@ -950,10 +971,10 @@ fn codex_client(
     CodexClient::with_credential(model, Arc::new(credential), timeout, &[])
 }
 
-fn build_client(arguments: &Arguments) -> Result<ModelClient, EvalError> {
+fn build_client(arguments: &Arguments, timeout: Duration) -> Result<ModelClient, EvalError> {
     Ok(match (arguments.client, arguments.auth_file.as_deref()) {
         (ClientKind::Codex, Some(auth_file)) => ModelClient::Codex(
-            codex_client(&arguments.model, auth_file, MODEL_TIMEOUT)?.with_name(&arguments.label),
+            codex_client(&arguments.model, auth_file, timeout)?.with_name(&arguments.label),
         ),
         (ClientKind::Codex, None) => return Err(EvalError::AuthFile),
         (ClientKind::OpenRouter, _) => {
@@ -970,7 +991,7 @@ fn build_client(arguments: &Arguments) -> Result<ModelClient, EvalError> {
                 ..Settings::default()
             };
             ModelClient::OpenRouter(
-                OpenRouterClient::new(&arguments.model, token, MODEL_TIMEOUT, settings, &[])?
+                OpenRouterClient::new(&arguments.model, token, timeout, settings, &[])?
                     .with_name(&arguments.label),
             )
         }
@@ -1029,7 +1050,8 @@ fn run() -> Result<u32, EvalError> {
     if let Some(path) = &arguments.trace {
         install_trace(path)?;
     }
-    let client = Arc::new(build_client(&arguments)?);
+    let timeout = model_timeout(&tasks);
+    let client = Arc::new(build_client(&arguments, timeout)?);
     #[expect(
         clippy::disallowed_methods,
         reason = "owner: this evaluation run, which drops it on return; bound: the example's one runtime"
@@ -1057,7 +1079,7 @@ fn run() -> Result<u32, EvalError> {
                         label: &arguments.label,
                         model: &arguments.model,
                         client: arguments.client,
-                        timeout: MODEL_TIMEOUT,
+                        timeout: task.world.model_timeout(),
                     },
                 )?;
                 serde_json::to_writer(&mut rows, &row)
@@ -1426,9 +1448,13 @@ mod tests {
         for task in tasks {
             for amended in [false, true] {
                 let mut task = Task::load(&root.join(&task.name)).unwrap();
-                if amended {
-                    task.instruction = format!("{}\n[gateway: Dekopon runtime time reference, sampled for this task: {} (UTC). This is a fixed sample, not a continuously advancing clock.]", task.instruction, freshness::NOW).into();
+                let supplied_reference = amended.then_some(freshness::NOW);
+                if let Some(reference) = supplied_reference {
+                    task.instruction = format!("{}\n{}{reference} (UTC). This is a fixed sample, not a continuously advancing clock.]", task.instruction, freshness::REFERENCE_PREFIX).into();
                 }
+                let timeout = model_timeout(std::slice::from_ref(&task));
+                assert_eq!(timeout, Duration::from_secs(900));
+                assert_eq!(task.world.model_timeout(), timeout);
                 let expected = task.expected.research.as_ref().unwrap();
                 let valid = amended || expected.historical;
                 let input = if valid {
@@ -1446,7 +1472,7 @@ mod tests {
                 } else {
                     "model-new"
                 };
-                let answer = json!({"referenceUtc":if expected.historical && !amended {None} else {Some(freshness::NOW)},"claims":[{"source":source,"fact":fact,"basis":"publication"}]}).to_string();
+                let answer = json!({"referenceUtc":supplied_reference,"claims":[{"source":source,"fact":fact,"basis":"publication"}]}).to_string();
                 let command = format!("exa search --input-json '{}'", input);
                 let arguments = json!({"command":command}).to_string();
                 let tool = json!({"type":"response.output_item.done","item":{"type":"function_call","id":"fc_search","call_id":"search","name":"bash","arguments":arguments}});
@@ -1462,12 +1488,24 @@ mod tests {
                 let directory = tempfile::tempdir().unwrap();
                 let auth = directory.path().join("synthetic-auth.json");
                 std::fs::write(&auth, json!({"version":1,"access":"synthetic-access","refresh":"synthetic-refresh","expiresAt":4_000_000_000_u64,"accountId":"synthetic-account"}).to_string()).unwrap();
-                let timeout = Duration::from_secs(900);
+                let arguments = parse(&[
+                    "--client",
+                    "codex",
+                    "--model",
+                    "gpt-6-luna",
+                    "--auth-file",
+                    auth.to_str().unwrap(),
+                    "--tasks",
+                    root.to_str().unwrap(),
+                    "--out",
+                    "unused.jsonl",
+                ])
+                .unwrap();
+                let ModelClient::Codex(client) = build_client(&arguments, timeout).unwrap() else {
+                    panic!("the Codex selection constructs the Responses client")
+                };
                 let client = Arc::new(ModelClient::Codex(
-                    codex_client("gpt-6-luna", &auth, timeout)
-                        .unwrap()
-                        .with_loopback_endpoint(&server.url())
-                        .unwrap(),
+                    client.with_loopback_endpoint(&server.url()).unwrap(),
                 ));
                 let system: Arc<str> = SYSTEM.into();
                 let history: Arc<[ModelMessage]> = if task.name == "fresh-correction" {
@@ -1498,6 +1536,9 @@ mod tests {
                 assert_eq!(row.fatal, None);
                 assert_eq!(row.model_turns, 2);
                 assert_eq!(row.research_calls, [input]);
+                assert!(!row.problems.contains(&Problem::Research {
+                    reason: freshness::Problem::Reference
+                }));
                 assert_eq!(
                     row.reward,
                     u8::from(valid),

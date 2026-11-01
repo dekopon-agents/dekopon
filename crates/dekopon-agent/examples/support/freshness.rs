@@ -6,7 +6,18 @@ use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const HELP: &str = "Usage: exa search [QUERY] [--input-json JSON] [--start-published-date TIMESTAMP] [--end-published-date TIMESTAMP] [--max-age-hours HOURS] [--text]";
+#[cfg(test)]
 pub const NOW: &str = "2026-10-31T18:40:00Z";
+pub const REFERENCE_PREFIX: &str =
+    "[gateway: Dekopon runtime time reference, sampled for this task: ";
+
+pub fn supplied_reference(instruction: &str) -> Option<&str> {
+    instruction
+        .rsplit_once(REFERENCE_PREFIX)?
+        .1
+        .split_once(" (UTC).")
+        .map(|(reference, _)| reference)
+}
 
 pub fn sources() -> Vec<Value> {
     serde_json::from_str(include_str!("../eval/freshness/sources.json"))
@@ -59,7 +70,12 @@ enum Basis {
     UndatedSnapshot,
 }
 
-pub fn judge(expected: &Expected, calls: &[Value], answer: Option<&str>) -> Vec<Problem> {
+pub fn judge(
+    expected: &Expected,
+    supplied_reference: Option<&str>,
+    calls: &[Value],
+    answer: Option<&str>,
+) -> Vec<Problem> {
     let mut problems = Vec::new();
     if calls.is_empty() {
         problems.push(Problem::NoSearch);
@@ -81,12 +97,7 @@ pub fn judge(expected: &Expected, calls: &[Value], answer: Option<&str>) -> Vec<
         problems.push(Problem::AnswerFormat);
         return problems;
     };
-    if answer
-        .reference_utc
-        .as_deref()
-        .is_some_and(|now| now != NOW)
-        || (!expected.historical && answer.reference_utc.is_none())
-    {
+    if answer.reference_utc.as_deref() != supplied_reference {
         problems.push(Problem::Reference);
     }
     let sources = sources();
@@ -234,9 +245,21 @@ impl Research {
                         .get(key)
                         .is_some_and(|v| v.as_str().and_then(timestamp).is_none())
                 })
-            || input["contents"]["maxAgeHours"]
-                .as_i64()
-                .is_some_and(|hours| !(-1..=720).contains(&hours))
+            || input.get("contents").is_some_and(|contents| {
+                !contents.is_null()
+                    && !contents.as_object().is_some_and(|options| {
+                        options.iter().all(|(name, value)| match name.as_str() {
+                            "maxAgeHours" => {
+                                value.is_null()
+                                    || value
+                                        .as_i64()
+                                        .is_some_and(|hours| (-1..=720).contains(&hours))
+                            }
+                            "text" => value.is_null() || value.is_boolean(),
+                            _ => false,
+                        })
+                    })
+            })
         {
             return Err(usage());
         }
@@ -281,6 +304,7 @@ mod tests {
         let answer = ledger(json!([{"source":"june","fact":"june-release","basis":"publication"}]));
         let problems = judge(
             &window(),
+            Some(NOW),
             &[json!({"query":"announcements", "contents":{"maxAgeHours":72}})],
             Some(&answer),
         );
@@ -295,9 +319,12 @@ mod tests {
             {"source":"event","fact":"upcoming-event","basis":"publication"},
             {"source":"plans","fact":"plan-current","basis":"undated-snapshot"}
         ]));
-        assert_eq!(judge(&window(), &[call()], Some(&answer)), []);
+        assert_eq!(judge(&window(), Some(NOW), &[call()], Some(&answer)), []);
         let wrong = ledger(json!([{"source":"plans","fact":"plan-current","basis":"publication"}]));
-        assert!(judge(&window(), &[call()], Some(&wrong)).contains(&Problem::UnsupportedClaim));
+        assert!(
+            judge(&window(), Some(NOW), &[call()], Some(&wrong))
+                .contains(&Problem::UnsupportedClaim)
+        );
     }
 
     #[test]
@@ -306,9 +333,36 @@ mod tests {
         input["query"] = json!("AI developer announcements June 2026");
         let answer = ledger(json!([{"source":"october","fact":"model-new","basis":"publication"}]));
         assert_eq!(
-            judge(&window(), &[input], Some(&answer)),
+            judge(&window(), Some(NOW), &[input], Some(&answer)),
             [Problem::StaleQuery]
         );
+    }
+
+    #[test]
+    fn a_supported_baseline_with_no_supplied_clock_accepts_a_null_reference() {
+        let answer = json!({"referenceUtc":null,"claims":[
+            {"source":"october","fact":"model-new","basis":"publication"}
+        ]})
+        .to_string();
+        assert_eq!(judge(&window(), None, &[call()], Some(&answer)), []);
+    }
+
+    #[test]
+    fn a_supplied_reference_is_required_and_is_not_replaced_by_the_fixture_clock() {
+        let reference = "2026-11-01T00:00:00Z";
+        let claims = json!([{"source":"october","fact":"model-new","basis":"publication"}]);
+        let answer = json!({"referenceUtc":reference,"claims":claims}).to_string();
+        assert_eq!(
+            judge(&window(), Some(reference), &[call()], Some(&answer)),
+            []
+        );
+        for reported in [None, Some(NOW)] {
+            let answer = json!({"referenceUtc":reported,"claims":claims}).to_string();
+            assert_eq!(
+                judge(&window(), Some(reference), &[call()], Some(&answer)),
+                [Problem::Reference]
+            );
+        }
     }
 
     #[test]
@@ -324,7 +378,43 @@ mod tests {
             {"source":"june","fact":"june-release","basis":"publication"}
         ]})
         .to_string();
-        assert_eq!(judge(&expected, &[call], Some(&answer)), []);
+        assert_eq!(judge(&expected, None, &[call], Some(&answer)), []);
+    }
+
+    #[test]
+    fn the_canned_service_rejects_malformed_and_unknown_contents_options() {
+        let research = Research {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        for contents in [
+            json!({"maxAgeHours":"72"}),
+            json!({"maxAgeHours":72.0}),
+            json!({"maxAgeHours":true}),
+            json!({"maxAgeHours":72,"unknown":true}),
+            json!({"text":"true"}),
+            json!("contents"),
+            json!([]),
+        ] {
+            let input = json!({"query":"announcements","contents":contents}).to_string();
+            assert!(
+                matches!(
+                    research.parse(&["search", "--input-json", &input]),
+                    Err(CommandRun::Rendered { status: 2, .. })
+                ),
+                "{input}"
+            );
+        }
+        for contents in [
+            json!({"maxAgeHours":72,"text":true}),
+            json!({"maxAgeHours":null,"text":null}),
+            json!(null),
+        ] {
+            let input = json!({"query":"announcements","contents":contents});
+            let proposal = research
+                .parse(&["search", "--input-json", &input.to_string()])
+                .unwrap();
+            assert_eq!(proposal.input, input);
+        }
     }
 
     #[test]
