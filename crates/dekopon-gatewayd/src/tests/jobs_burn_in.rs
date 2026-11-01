@@ -485,7 +485,14 @@ async fn job_words_on_a_route_without_jobs_report_off_while_foreign_job_words_ar
     let (capture, dispatch) = capture_job_records();
     async {
         let directory = temporary();
-        let (broker, _) = stub_broker(directory.path(), listings(4, &["cli-probe.upper"])).await;
+        let mut replies = listings(4, &["cli-probe.upper"]);
+        replies.push(ResponseEnvelope {
+            api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2,
+            response: dekopon_broker_protocol::BrokerResponse::Ran {
+                outcome: dekopon_broker_protocol::RunOutcome::NotFound,
+            },
+        });
+        let (broker, _) = stub_broker(directory.path(), replies).await;
         let models = ModelScript::new([
             script_call("sleep 1 &\njobs\nwait\nkill %1"),
             answer("off"),

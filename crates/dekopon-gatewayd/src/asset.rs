@@ -32,7 +32,10 @@ use tokio::{
 
 pub(crate) const MAX_SENDS_PER_TURN: u8 = 4;
 
-use crate::{conversation::ConversationKey, transport::AssetFetcher};
+use crate::{
+    conversation::ConversationKey,
+    transport::{AssetFetcher, MediaRefusal},
+};
 
 pub(crate) const MAX_ASSETS_PER_MESSAGE: usize = 32;
 
@@ -1300,6 +1303,25 @@ impl Attempt {
                 .await
                 .map_err(|_elapsed| AssetFailure::TimedOut)?
                 .map_err(|error| {
+                    if let crate::transport::TransportError::AssetTooLarge { size } = error {
+                        return AssetFailure::TooLarge { size };
+                    }
+                    if let crate::transport::TransportError::AssetRefused {
+                        cause: MediaRefusal::Gone,
+                    } = error
+                    {
+                        return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
+                    }
+                    if let Retry::Refetch = self.ticket.retry
+                        && let crate::transport::TransportError::AssetRefused {
+                            cause: MediaRefusal::Download { status: 401 | 403 },
+                        } = error
+                    {
+                        return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
+                    }
+                    if let crate::transport::TransportError::AssetRefused { cause } = error {
+                        return AssetFailure::Media(cause);
+                    }
                     if let Retry::Refetch = self.ticket.retry
                         && let crate::transport::TransportError::Service { code } = &error
                         && matches!(
@@ -1584,6 +1606,7 @@ enum AssetFailure {
     Unknown,
     Unreadable { reason: &'static str },
     TooLarge { size: u64 },
+    Media(crate::transport::MediaRefusal),
     Unavailable,
     TimedOut,
     Transport { category: &'static str },
@@ -1611,6 +1634,15 @@ impl AssetFailure {
                 kibibytes(size),
                 kibibytes(MAX_ASSET_BYTES)
             ),
+            Self::Media(MediaRefusal::Gone) => {
+                Self::Refused(ChatAssetRefusal::PlatformGone).for_model(id)
+            }
+            Self::Media(MediaRefusal::Signature) => format!(
+                "chat-asset:{id} cannot be opened: the downloaded file is not the type it was sent as."
+            ),
+            Self::Media(MediaRefusal::Download { status }) => {
+                format!("chat-asset:{id} could not be downloaded: WhatsApp answered HTTP {status}.")
+            }
             Self::Unavailable => format!("chat-asset:{id} cannot be opened."),
             Self::TimedOut => format!("chat-asset:{id} could not be read (fetch-timeout)."),
             Self::Transport { category } => {
@@ -1623,11 +1655,15 @@ impl AssetFailure {
         match self {
             Self::Refused(reason) => reason,
             Self::Unknown | Self::Storage(BlobError::Unknown) => ChatAssetRefusal::UnknownAsset,
-            Self::Unreadable { .. } => ChatAssetRefusal::UnsupportedMedia,
+            Self::Unreadable { .. } | Self::Media(MediaRefusal::Signature) => {
+                ChatAssetRefusal::UnsupportedMedia
+            }
+            Self::Media(MediaRefusal::Gone) => ChatAssetRefusal::PlatformGone,
             Self::Storage(BlobError::Reclaimed) => ChatAssetRefusal::Evicted,
             Self::Storage(BlobError::Unauthorized) => ChatAssetRefusal::Revoked,
             Self::Storage(_)
             | Self::TooLarge { .. }
+            | Self::Media(MediaRefusal::Download { .. })
             | Self::Transport { .. }
             | Self::TimedOut
             | Self::Unavailable => ChatAssetRefusal::Unavailable,
@@ -2138,8 +2174,11 @@ fn sniff(blob: &DiskBlob, encoding: AssetEncoding) -> Result<Option<&'static str
             result?
         }
     };
-    let prefix = &decoded[..count];
-    Ok(if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
+    Ok(signature_mime(&decoded[..count]))
+}
+
+pub(crate) fn signature_mime(prefix: &[u8]) -> Option<&'static str> {
+    if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if prefix.starts_with(b"\xff\xd8\xff") {
         Some("image/jpeg")
@@ -2151,7 +2190,7 @@ fn sniff(blob: &DiskBlob, encoding: AssetEncoding) -> Result<Option<&'static str
         Some("application/pdf")
     } else {
         None
-    })
+    }
 }
 
 #[cfg(test)]

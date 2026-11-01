@@ -696,6 +696,7 @@ impl DiscordTransport {
             asset_overflow: message["attachments"]
                 .as_array()
                 .is_some_and(|files| files.len() > MAX_ATTACHMENTS),
+            input_refusal: None,
         }))
     }
 

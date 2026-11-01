@@ -99,6 +99,10 @@ impl LocalTransport {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one connection task owns the read loop, stop presses and the outbound writer"
+    )]
     fn serve(&self, stream: UnixStream) -> impl Future<Output = ()> + Send + 'static {
         let connection = self.connections.fetch_add(1, Ordering::Relaxed);
         let (outbound_send, mut outbound_receive) = mpsc::channel::<LocalWrite>(OUTBOUND_BUFFER);
@@ -241,9 +245,13 @@ impl LocalTransport {
                     constituents: Vec::new(),
                     folded: Vec::new(),
                     asset_overflow: false,
+                    input_refusal: None,
                 };
-                let sent = inbound.send(TransportEvent::Message(Box::new(message)));
-                if sent.await.is_err() {
+                if inbound
+                    .send(TransportEvent::Message(Box::new(message)))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }

@@ -2,7 +2,7 @@ use std::{net::IpAddr, time::Instant};
 
 use tracing::Instrument as _;
 
-use crate::transport::{asset_buffer, hydration::HydratedImage, reserve_for_chunk};
+use crate::transport::{asset_buffer, floor_boundary, hydration::HydratedImage, reserve_for_chunk};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
@@ -10,6 +10,8 @@ use super::*;
 
 pub(crate) const MAX_IMAGE_BYTES: usize = 5_000_000;
 pub(super) const MAX_CAPTION_CHARS: usize = 1024;
+const MAX_DOCUMENT_NAME_BYTES: usize = 128;
+const PDF: &str = "application/pdf";
 const DOWNLOAD_HOST: &str = "lookaside.fbsbx.com";
 const DOWNLOAD_PATH: &str = "/whatsapp_business/attachments/";
 
@@ -17,7 +19,7 @@ fn media_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-pub(super) fn inbound_image(image: &Value) -> Option<PendingAsset> {
+fn photo(image: &Value) -> Option<PendingAsset> {
     let id = image.get("id")?.as_str()?;
     let mime = image.get("mime_type")?.as_str()?;
     let extension = match mime {
@@ -39,12 +41,144 @@ pub(super) fn inbound_image(image: &Value) -> Option<PendingAsset> {
     })
 }
 
-pub(super) fn failure(reason: &str) -> TransportError {
+pub(super) fn inbound_image(image: &Value) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+    captioned(image, photo(image))
+}
+
+pub(super) fn inbound_document(
+    document: &Value,
+) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+    captioned(document, pdf(document))
+}
+
+fn captioned(
+    media: &Value,
+    asset: Option<PendingAsset>,
+) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+    let caption = match media.get("caption") {
+        None => Some(""),
+        Some(Value::String(caption)) => Some(caption.as_str()),
+        Some(_) => None,
+    };
+    match (caption, asset) {
+        (Some(caption), Some(asset)) => (caption, vec![asset], None),
+        (caption, _) => (
+            caption.unwrap_or_default(),
+            Vec::new(),
+            Some(InputRefusal::Unsupported),
+        ),
+    }
+}
+
+fn pdf(document: &Value) -> Option<PendingAsset> {
+    let id = document.get("id")?.as_str()?;
+    if document.get("mime_type")?.as_str()? != PDF || !media_id(id) {
+        return None;
+    }
+    Some(PendingAsset {
+        name: document_name(document.get("filename").and_then(Value::as_str)),
+        mime: PDF.to_owned(),
+        size: None,
+        source: Some(AssetSourceRef::WhatsApp {
+            media_id: id.to_owned(),
+            mime: PDF.to_owned(),
+        }),
+    })
+}
+
+fn document_name(filename: Option<&str>) -> String {
+    let base = filename
+        .unwrap_or_default()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    let name: String = base
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let name = name.trim();
+    let name = &name[..floor_boundary(name, MAX_DOCUMENT_NAME_BYTES)];
+    if name.is_empty() || name.chars().all(|character| character == '.') {
+        "document.pdf".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Media {
+    Png,
+    Jpeg,
+    Pdf,
+}
+
+impl Media {
+    fn of(mime: &str) -> Option<Self> {
+        match mime {
+            "image/png" => Some(Self::Png),
+            "image/jpeg" => Some(Self::Jpeg),
+            PDF => Some(Self::Pdf),
+            _ => None,
+        }
+    }
+
+    fn limit(self, max_bytes: u64) -> u64 {
+        match self {
+            Self::Png | Self::Jpeg => max_bytes.min(MAX_IMAGE_BYTES as u64),
+            Self::Pdf => max_bytes,
+        }
+    }
+
+    fn oversized(self, size: u64) -> TransportError {
+        match self {
+            Self::Png | Self::Jpeg => failure("image-too-large"),
+            Self::Pdf if size == 0 => failure("media-size"),
+            Self::Pdf => {
+                refused("document-too-large");
+                TransportError::AssetTooLarge { size }
+            }
+        }
+    }
+
+    fn body_failure(self, failure: BodyFailure) -> TransportError {
+        match (self, failure) {
+            (Self::Pdf, BodyFailure::TooLarge { observed }) => self.oversized(observed),
+            (Self::Pdf, BodyFailure::Status(status)) => {
+                refused(&format!("http-{status}"));
+                TransportError::AssetRefused {
+                    cause: match status {
+                        404 | 410 => MediaRefusal::Gone,
+                        _ => MediaRefusal::Download { status },
+                    },
+                }
+            }
+            (Self::Png | Self::Jpeg | Self::Pdf, failure) => failure.into_service(),
+        }
+    }
+
+    fn signature_failure(self) -> TransportError {
+        match self {
+            Self::Png | Self::Jpeg => failure("image-signature"),
+            Self::Pdf => {
+                refused("document-signature");
+                TransportError::AssetRefused {
+                    cause: MediaRefusal::Signature,
+                }
+            }
+        }
+    }
+}
+
+fn refused(reason: &str) {
     tracing::warn!(
         event = "gateway_whatsapp_media_refused",
         reason,
         "gateway.whatsapp.media.refused"
     );
+}
+
+pub(super) fn failure(reason: &str) -> TransportError {
+    refused(reason);
     TransportError::Service {
         code: reason.to_owned(),
     }
@@ -68,28 +202,57 @@ fn request_failed(error: reqwest::Error) -> TransportError {
     TransportError::Request(Box::new(error.without_url()))
 }
 
-async fn read_body(
+enum BodyFailure {
+    Status(u16),
+    TooLarge { observed: u64 },
+    Transport(TransportError),
+}
+
+impl BodyFailure {
+    fn into_service(self) -> TransportError {
+        match self {
+            Self::Status(status) => failure(&format!("http-{status}")),
+            Self::TooLarge { .. } => failure("response-too-large"),
+            Self::Transport(error) => error,
+        }
+    }
+}
+
+async fn bounded_body(
     mut response: reqwest::Response,
     limit: usize,
-) -> Result<Vec<u8>, TransportError> {
+) -> Result<Vec<u8>, BodyFailure> {
     if !response.status().is_success() {
-        return Err(failure(&format!("http-{}", response.status().as_u16())));
+        return Err(BodyFailure::Status(response.status().as_u16()));
     }
-    if response
+    if let Some(length) = response
         .content_length()
-        .is_some_and(|length| length > limit as u64)
+        .filter(|length| *length > limit as u64)
     {
-        return Err(failure("response-too-large"));
+        return Err(BodyFailure::TooLarge { observed: length });
     }
     let mut bytes = asset_buffer(response.content_length(), limit);
-    while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
-        if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err(failure("response-too-large"));
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| BodyFailure::Transport(request_failed(error)))?
+    {
+        let observed = bytes.len().saturating_add(chunk.len());
+        if observed > limit {
+            return Err(BodyFailure::TooLarge {
+                observed: observed as u64,
+            });
         }
         reserve_for_chunk(&mut bytes, chunk.len(), limit);
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+async fn read_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, TransportError> {
+    bounded_body(response, limit)
+        .await
+        .map_err(BodyFailure::into_service)
 }
 
 async fn json_response(response: reqwest::Response) -> Result<Value, TransportError> {
@@ -262,10 +425,10 @@ impl AssetFetcher for WhatsappDriver {
         };
         let (id, mime) = (id.clone(), mime.clone());
         Box::pin(async move {
-            if !media_id(&id) || !matches!(mime.as_str(), "image/png" | "image/jpeg") {
+            let Some(kind) = Media::of(&mime).filter(|_| media_id(&id)) else {
                 return Err(failure("asset-metadata"));
-            }
-            let limit = max_bytes.min(MAX_IMAGE_BYTES as u64) as usize;
+            };
+            let limit = usize::try_from(kind.limit(max_bytes)).unwrap_or(usize::MAX);
             let response = self
                 .http
                 .get(format!("{}/{}/{}", self.endpoint, self.version, id))
@@ -274,6 +437,10 @@ impl AssetFetcher for WhatsappDriver {
                 .send()
                 .await
                 .map_err(request_failed)?;
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                return Err(kind.body_failure(BodyFailure::Status(status)));
+            }
             let metadata = json_response(response).await?;
             if metadata.get("id").and_then(Value::as_str) != Some(&id)
                 || metadata.get("mime_type").and_then(Value::as_str) != Some(&mime)
@@ -285,7 +452,7 @@ impl AssetFetcher for WhatsappDriver {
                 .and_then(|size| size.as_u64().or_else(|| size.as_str()?.parse::<u64>().ok()))
                 .ok_or_else(|| failure("media-size"))?;
             if size == 0 || size > limit as u64 {
-                return Err(failure("image-too-large"));
+                return Err(kind.oversized(size));
             }
             let url = self.download_url(
                 metadata
@@ -300,17 +467,14 @@ impl AssetFetcher for WhatsappDriver {
                 .send()
                 .await
                 .map_err(request_failed)?;
-            let bytes = read_body(response, limit).await?;
+            let bytes = bounded_body(response, limit)
+                .await
+                .map_err(|failure| kind.body_failure(failure))?;
             if bytes.len() as u64 != size {
                 return Err(failure("media-size-mismatch"));
             }
-            let valid = match mime.as_str() {
-                "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-                "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-                _ => false,
-            };
-            if !valid {
-                return Err(failure("image-signature"));
+            if crate::asset::signature_mime(&bytes) != Some(mime.as_str()) {
+                return Err(kind.signature_failure());
             }
             Ok(bytes)
         })

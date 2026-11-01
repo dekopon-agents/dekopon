@@ -136,6 +136,7 @@ impl ChatTransport for FauxlackTransport {
                         })
                         .collect(),
                     asset_overflow: false,
+                    input_refusal: None,
                     addressed,
                     thread_continuation: None,
                     reply: ReplyTarget::Fauxlack {

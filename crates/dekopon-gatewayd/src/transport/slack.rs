@@ -490,7 +490,6 @@ impl SlackTransport {
             return Ok(None);
         };
         let kind = posted_in.conversation_kind(thread_ts.is_some());
-        let is_shared = kind != ConversationKind::DirectMessage;
         let follow_conversation = Conversation {
             kind,
             container: Some(team.to_ascii_lowercase()),
@@ -537,7 +536,7 @@ impl SlackTransport {
         if follow_route.is_some() && !explicitly_addressed && !followed && !ambient {
             return Ok(None);
         }
-        let thread_continuation = match (is_shared, self.experience) {
+        let thread_continuation = match (kind != ConversationKind::DirectMessage, self.experience) {
             (true, SlackExperience::Agent) => {
                 let claim = ThreadClaim::Slack {
                     team_id: team.to_owned(),
@@ -604,6 +603,7 @@ impl SlackTransport {
             constituents: Vec::new(),
             folded: Vec::new(),
             asset_overflow: projection.asset_overflow,
+            input_refusal: None,
         }))
     }
 
@@ -1741,6 +1741,8 @@ impl PermanentReactionError {
                 _ => None,
             },
             TransportError::AssetType { .. }
+            | TransportError::AssetTooLarge { .. }
+            | TransportError::AssetRefused { .. }
             | TransportError::Attachment(_)
             | TransportError::AttachmentTask { .. }
             | TransportError::MissingCredential { .. }

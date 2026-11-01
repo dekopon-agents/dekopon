@@ -20,7 +20,13 @@ pub(super) fn configure_broker(config: &mut Value, policies: &mut String, server
         config["principals"]["galice"] = json!({"subjects": ["fauxlack.globex.ualice"]});
         config["principals"]["gteam"] = json!({"subjects": ["fauxlack.globex.cteam"]});
     }
-    config["providers"] = json!([provider("cli-probe"), provider("http-probe")]);
+    config["providers"] = json!([
+        provider("cli-probe"),
+        provider("http-probe"),
+        provider("clock-raw-probe")
+    ]);
+    config["capabilities"]["clock-probe"] =
+        json!({"constraints": {"timeoutMs": 30_000}, "capabilities": {"clock.now": {}}});
     config["capabilities"]["cli-probe"]["capabilities"]["cli-probe.reverse"] = json!({});
     config["capabilities"]["http-probe"] = json!({"constraints": {"timeoutMs": 30_000, "asset": {"attach": false, "send": true, "remove": false}}, "capabilities": {"http-probe.purge": {}}});
     *policies = String::new();
@@ -555,5 +561,61 @@ async fn shutting_down_a_fixture_joins_a_model_with_unconsumed_responses() {
     let _audit = Audit::exclusive().await;
     let fixture = boot(vec![final_answer("never requested")]).await;
     assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 0);
+    let _directory = fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ungranted_provider_word_is_refused_in_a_fauxlack_turn() {
+    let _audit = Audit::exclusive().await;
+    let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
+    let commands = [
+        "httpprobe --help",
+        "date --clock-in-run-command",
+        "httpprobe fetch --not-valid",
+        "date --help",
+        "certainly-uninstalled",
+        "probe upper --text granted | jq -r .text",
+    ];
+    let script = commands
+        .map(|command| format!("{command}; printf 'status=%s\\n' \"$?\""))
+        .join("\n");
+    let fixture = boot_fauxlack(
+        &chat,
+        vec![
+            bash_tool_call("refusals", &script),
+            final_answer("Checked."),
+        ],
+        &["acme"],
+    )
+    .await;
+    let root = chat
+        .server("acme")
+        .user("ubob")
+        .post("cteam", "<@udekopon> check the command refusals")
+        .await
+        .unwrap();
+    assert_eq!(
+        root.thread().next_from("udekopon", WAIT).await.text,
+        "Checked."
+    );
+    let result = fixture.tool_result("refusals");
+    let expected = [
+        "dekopon-shell: httpprobe: not granted in this conversation",
+        "status=127",
+        "dekopon-shell: date: not granted in this conversation",
+        "status=127",
+        "dekopon-shell: httpprobe: not granted in this conversation",
+        "status=127",
+        "dekopon-shell: date: not granted in this conversation",
+        "status=127",
+        "dekopon-shell: certainly-uninstalled: command not found",
+        "status=127",
+        "GRANTED",
+        "status=0",
+        "[exit code: 0]",
+    ]
+    .join("\n");
+    assert_eq!(result.trim(), expected);
+    println!("fauxlack shell output:\n{result}");
     let _directory = fixture.shutdown().await;
 }

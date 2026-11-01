@@ -353,6 +353,7 @@ impl Anchor {
             text,
             assets: Vec::new(),
             asset_overflow: false,
+            input_refusal: None,
             addressed: Some(true),
             thread_continuation: None,
             reply: self.reply.clone(),
