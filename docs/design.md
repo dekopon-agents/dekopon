@@ -27,10 +27,10 @@ An argument to keep or add code on any of these grounds is rejected.
 
 - **Idempotency, exactly-once, duplicate-effect defense, automatic retries.** A failed call goes
   back to the model, which decides whether to try again.
-- **Guaranteed support through every layer.** Accepting an attachment does not promise every tool
-  or model can consume it. Each operation enforces its actual service and resource limits and
-  exposes failures so the agent can adapt or explain them. Do not narrow intake or transit merely
-  to guarantee downstream success. Process safety remains the host's responsibility, not the model's.
+- **Limits borrowed from another layer.** Each operation works or returns a typed error the model,
+  or the trace when none waits, can act on. It bounds what it spends before spending it, so it never
+  crashes; only the broker decides authority. It never inherits another layer's limit or refuses
+  input that a later tool or model can't use.
 - **Crash durability, reconciliation, quarantine, tamper detection.** A failure fails fast, leaves
   one trace record and has a reset path. Detection that can't fix anything isn't built.
 - **An authorized endpoint that transforms what it received.** The broker refuses a response that
