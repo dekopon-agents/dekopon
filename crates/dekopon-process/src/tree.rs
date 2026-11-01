@@ -134,15 +134,16 @@ impl TreeContext {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancel.iter().any(CancelSignal::is_cancelled)
-            || self
-                .cancel_deadline
-                .as_ref()
-                .is_some_and(|timer| timer.is_elapsed())
     }
 
     pub fn charge_step(&self) -> Result<(), LimitExceeded> {
         if self.is_cancelled() {
             return Err(LimitExceeded::Cancelled);
+        }
+        if self.script_timer_elapsed() {
+            return Err(LimitExceeded::Deadline {
+                timeout_ms: self.limits.timeout.as_millis(),
+            });
         }
         self.steps
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
@@ -180,13 +181,19 @@ impl TreeContext {
     }
 
     pub fn check_deadline(&self) -> Result<(), LimitExceeded> {
-        if Instant::now() >= self.deadline {
+        if Instant::now() >= self.deadline || self.script_timer_elapsed() {
             Err(LimitExceeded::Deadline {
                 timeout_ms: self.limits.timeout.as_millis(),
             })
         } else {
             Ok(())
         }
+    }
+
+    fn script_timer_elapsed(&self) -> bool {
+        self.cancel_deadline
+            .as_ref()
+            .is_some_and(|timer| timer.is_elapsed())
     }
 
     #[must_use]
