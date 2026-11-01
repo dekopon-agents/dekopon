@@ -33,8 +33,20 @@ fn timestamp(text: &str) -> Option<OffsetDateTime> {
 pub struct Expected {
     pub start: String,
     pub end: String,
-    pub end_latest: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_end_latest")]
+    pub end_latest: Option<OffsetDateTime>,
     pub historical: bool,
+}
+
+fn deserialize_end_latest<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<OffsetDateTime>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+        .map(|text| {
+            OffsetDateTime::parse(&text, &Rfc3339)
+                .map_err(|source| serde::de::Error::custom(format_args!("end_latest: {source}")))
+        })
+        .transpose()
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -83,9 +95,7 @@ pub fn judge(
     }
     let start = timestamp(&expected.start).expect("fixture start timestamp");
     let end = timestamp(&expected.end).expect("fixture end timestamp");
-    let end_latest = expected.end_latest.as_deref().map_or(end, |text| {
-        timestamp(text).expect("fixture latest end timestamp")
-    });
+    let end_latest = expected.end_latest.unwrap_or(end);
     for call in calls {
         let query = call["query"].as_str().unwrap_or_default().to_lowercase();
         if !expected.historical && (query.contains("june") || query.contains("2026-06")) {

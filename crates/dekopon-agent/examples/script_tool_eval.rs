@@ -1477,6 +1477,54 @@ mod tests {
     }
 
     #[test]
+    fn freshness_rejects_a_malformed_latest_bound_before_constructing_a_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let instruction = include_str!("eval/freshness/fresh-news/instruction.md");
+        let mut expected: Value =
+            serde_json::from_str(include_str!("eval/freshness/fresh-news/expected.json")).unwrap();
+        std::fs::write(directory.path().join("instruction.md"), instruction).unwrap();
+        let expected_path = directory.path().join("expected.json");
+        expected["research"]["end_latest"] = json!("2026-11-01");
+        std::fs::write(&expected_path, expected.to_string()).unwrap();
+        assert!(
+            matches!(Task::load(directory.path()), Err(EvalError::Expected { source, .. })
+            if source.classify() == serde_json::error::Category::Data)
+        );
+        let out = directory.path().join("rows.jsonl");
+        let arguments = parse(&[
+            "--model",
+            "synthetic-model",
+            "--tasks",
+            directory.path().to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .unwrap();
+        let constructed = std::cell::Cell::new(false);
+        let result = run(&arguments, |_, _| {
+            constructed.set(true);
+            Err(EvalError::Credential)
+        });
+        assert!(matches!(result, Err(EvalError::Expected { source, .. })
+            if source.classify() == serde_json::error::Category::Data));
+        assert!(!constructed.get());
+        assert!(!out.exists());
+        expected["research"]["end_latest"] = json!("2026-11-01T00:00:00Z");
+        std::fs::write(&expected_path, expected.to_string()).unwrap();
+        let task = Task::load(directory.path()).unwrap();
+        assert_eq!(
+            task.expected.research.unwrap().end_latest,
+            Some(
+                time::OffsetDateTime::parse(
+                    "2026-11-01T00:00:00Z",
+                    &time::format_description::well_known::Rfc3339
+                )
+                .unwrap()
+            )
+        );
+    }
+
+    #[test]
     fn freshness_run_scores_eight_canned_trajectories_with_history_only_for_the_correction() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/eval/freshness");
         let context = root.join("time-reference.txt");
