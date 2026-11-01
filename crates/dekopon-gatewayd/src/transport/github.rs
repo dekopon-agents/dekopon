@@ -301,7 +301,11 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     let Some(entry) = parse(&root, event_kind, &delivery) else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
     };
-    let Some((owner, repo, subject)) = repository_subject(&entry.repository) else {
+    let Some((owner, repo)) = entry.repository.full_name.as_str().split_once('/') else {
+        return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
+    };
+    let id = u64::from(entry.repository.id);
+    let Ok(subject) = AttestedSubject::github_repository(owner, repo, id) else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
     };
     let conversation = Conversation {
@@ -377,14 +381,6 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
             refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE)
         }
     }
-}
-
-fn repository_subject(
-    repository: &dekopon_core::github::RepositoryFacts,
-) -> Option<(&str, &str, AttestedSubject)> {
-    let (owner, repo) = repository.full_name.as_str().split_once('/')?;
-    let subject = AttestedSubject::github_repository(owner, repo, u64::from(repository.id)).ok()?;
-    Some((owner, repo, subject))
 }
 
 fn repository_ignore_reason(root: &Value) -> Option<&'static str> {
