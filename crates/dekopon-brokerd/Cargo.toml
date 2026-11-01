@@ -27,7 +27,7 @@ dekopon-broker-protocol.workspace = true
 dekopon-capability.workspace = true
 dekopon-core = { workspace = true, features = ["cli"] }
 dekopon-storage-host.workspace = true
-dekopon-telemetry = { workspace = true, features = ["exporter"] }
+dekopon-telemetry = { workspace = true, features = ["cli", "exporter"] }
 tracing-opentelemetry.workspace = true
 futures-util.workspace = true
 hmac.workspace = true

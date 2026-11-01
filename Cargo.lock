@@ -1422,6 +1422,9 @@ name = "dekopon-telemetry"
 version = "0.80.0"
 dependencies = [
  "async-trait",
+ "clap",
+ "dekopon-core",
+ "libc",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-http",
@@ -1429,6 +1432,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",
