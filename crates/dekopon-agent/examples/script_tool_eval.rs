@@ -82,6 +82,7 @@ struct Arguments {
     label: String,
     system: Option<PathBuf>,
     history: Option<PathBuf>,
+    task_context: Option<PathBuf>,
     rename: Option<PathBuf>,
     trace: Option<PathBuf>,
     auth_file: Option<PathBuf>,
@@ -92,7 +93,7 @@ enum EvalError {
     #[error(
         "usage: --model <id> --tasks <dir> --out <rows.jsonl> [--repeat N] [--label <experiment>] \
          [--client openrouter|codex] [--auth-file <path>] [--system <file>] [--rename <file>] \
-         [--history <file>] [--trace <file>]"
+         [--history <file>] [--task-context <file>] [--trace <file>]"
     )]
     Arguments,
     #[error("--client codex requires --auth-file")]
@@ -121,6 +122,8 @@ enum EvalError {
     RenameFile(#[source] std::io::Error),
     #[error("rename map line {line} is not from=to with a nonempty from")]
     Rename { line: usize },
+    #[error("could not read the task context")]
+    TaskContext(#[source] std::io::Error),
     #[error("could not read the history")]
     HistoryFile(#[source] std::io::Error),
     #[error("history line {line} is not a {{\"user\", \"answer\"}} object")]
@@ -157,6 +160,7 @@ impl Arguments {
             (None, None, None, None, None);
         let (mut label, mut system, mut history, mut rename, mut trace, mut auth_file) =
             (None, None, None, None, None, None);
+        let mut task_context = None;
         while let Some(flag) = arguments.next() {
             let value = arguments.next().ok_or(EvalError::Arguments)?;
             match flag.as_str() {
@@ -180,6 +184,9 @@ impl Arguments {
                 "--label" if label.is_none() => label = Some(value),
                 "--system" if system.is_none() => system = Some(PathBuf::from(value)),
                 "--history" if history.is_none() => history = Some(PathBuf::from(value)),
+                "--task-context" if task_context.is_none() => {
+                    task_context = Some(PathBuf::from(value));
+                }
                 "--rename" if rename.is_none() => rename = Some(PathBuf::from(value)),
                 "--trace" if trace.is_none() => trace = Some(PathBuf::from(value)),
                 "--auth-file" if auth_file.is_none() => auth_file = Some(PathBuf::from(value)),
@@ -199,6 +206,7 @@ impl Arguments {
             label: label.unwrap_or_else(|| "script-tool-eval".into()),
             system,
             history,
+            task_context,
             rename,
             trace,
             auth_file,
@@ -260,6 +268,7 @@ impl World {
 struct Task {
     name: String,
     instruction: Arc<str>,
+    history: Option<Arc<[ModelMessage]>>,
     expected_text: String,
     expected: Expected,
     world: World,
@@ -283,7 +292,13 @@ impl Task {
                 task: name.clone(),
                 source,
             })?;
+        let history = match std::fs::read_to_string(directory.join("history.jsonl")) {
+            Ok(text) => Some(parse_history(&text)?.into()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => return Err(EvalError::Task { task: name, source }),
+        };
         Ok(Self {
+            history,
             world: World::of_task(&name),
             name,
             instruction: instruction.into(),
@@ -293,21 +308,32 @@ impl Task {
     }
 }
 
-fn load_tasks(directory: &Path) -> Result<Vec<Task>, EvalError> {
-    if directory.join("instruction.md").is_file() {
-        return Ok(vec![Task::load(directory)?]);
+fn load_tasks(directory: &Path, context: Option<&Path>) -> Result<Vec<Task>, EvalError> {
+    let mut tasks = if directory.join("instruction.md").is_file() {
+        vec![Task::load(directory)?]
+    } else {
+        let mut directories = std::fs::read_dir(directory)
+            .map_err(EvalError::Tasks)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(EvalError::Tasks)?;
+        directories.retain(|path| path.join("instruction.md").is_file());
+        directories.sort();
+        if directories.is_empty() {
+            return Err(EvalError::NoTasks);
+        }
+        directories
+            .iter()
+            .map(|path| Task::load(path))
+            .collect::<Result<_, _>>()?
+    };
+    if let Some(path) = context {
+        let context = std::fs::read_to_string(path).map_err(EvalError::TaskContext)?;
+        for task in &mut tasks {
+            task.instruction = format!("{}\n\n{}", task.instruction, context.trim_end()).into();
+        }
     }
-    let mut directories = std::fs::read_dir(directory)
-        .map_err(EvalError::Tasks)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(EvalError::Tasks)?;
-    directories.retain(|path| path.join("instruction.md").is_file());
-    directories.sort();
-    if directories.is_empty() {
-        return Err(EvalError::NoTasks);
-    }
-    directories.iter().map(|path| Task::load(path)).collect()
+    Ok(tasks)
 }
 
 fn model_timeout(tasks: &[Task]) -> Duration {
@@ -847,7 +873,7 @@ fn session<I: CapabilityInvoker + Send + 'static>(
     };
     let instruction = Arc::clone(&trial.task.instruction);
     let system = Arc::clone(trial.system);
-    let history = Arc::clone(trial.history);
+    let history = Arc::clone(trial.task.history.as_ref().unwrap_or(trial.history));
     let (result, model, shell) = runtime.block_on(runtime.spawn_blocking(move || {
         let inputs = SessionInputs::new(&instruction, limits).with_system(Some(&system));
         let (result, _captured) = run_prompt_session(&model, &shell, inputs, &history);
@@ -1013,7 +1039,14 @@ fn main() -> ProcessExit {
     if let Some(code) = dekopon_shell::run_jq_worker_if_requested() {
         return code;
     }
-    match run() {
+    let result = (|| {
+        let arguments = Arguments::parse()?;
+        let executable = std::env::current_exe().map_err(EvalError::Executable)?;
+        dekopon_shell::set_jq_worker_executable(executable)
+            .map_err(|_already_set| EvalError::JqWorker)?;
+        run(&arguments, build_client)
+    })();
+    match result {
         Ok(0) => ProcessExit::SUCCESS,
         Ok(failed) => {
             eprintln!("script_tool_eval: {failed} trial(s) failed");
@@ -1031,12 +1064,11 @@ fn main() -> ProcessExit {
     }
 }
 
-fn run() -> Result<u32, EvalError> {
-    let arguments = Arguments::parse()?;
-    let executable = std::env::current_exe().map_err(EvalError::Executable)?;
-    dekopon_shell::set_jq_worker_executable(executable)
-        .map_err(|_already_set| EvalError::JqWorker)?;
-    let tasks = load_tasks(&arguments.tasks)?;
+fn run(
+    arguments: &Arguments,
+    construct_client: impl FnOnce(&Arguments, Duration) -> Result<ModelClient, EvalError>,
+) -> Result<u32, EvalError> {
+    let tasks = load_tasks(&arguments.tasks, arguments.task_context.as_deref())?;
     let system = load_system(arguments.system.as_deref(), arguments.rename.as_deref())?;
     let basic_system: Arc<str> = system.as_str().into();
     let orchard_system: Arc<str> = format!("{system}\n\n{}", orchard::GATEWAY_ASSETS_NOTE).into();
@@ -1051,7 +1083,7 @@ fn run() -> Result<u32, EvalError> {
         install_trace(path)?;
     }
     let timeout = model_timeout(&tasks);
-    let client = Arc::new(build_client(&arguments, timeout)?);
+    let client = Arc::new(construct_client(arguments, timeout)?);
     #[expect(
         clippy::disallowed_methods,
         reason = "owner: this evaluation run, which drops it on return; bound: the example's one runtime"
@@ -1123,13 +1155,18 @@ mod tests {
     }
 
     fn tasks() -> Vec<Task> {
-        load_tasks(&Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/eval")).unwrap()
+        load_tasks(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/eval"),
+            None,
+        )
+        .unwrap()
     }
 
     fn task(name: &str, expected: &str) -> Task {
         Task {
             name: name.to_owned(),
             instruction: "Run the synthetic tool once.".into(),
+            history: None,
             expected_text: expected.to_owned(),
             expected: serde_json::from_str(expected).unwrap(),
             world: World::of_task(name),
@@ -1440,21 +1477,15 @@ mod tests {
     }
 
     #[test]
-    fn freshness_matrix_scores_eight_canned_trajectories_without_upstream_calls() {
+    fn freshness_run_scores_eight_canned_trajectories_with_history_only_for_the_correction() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/eval/freshness");
-        let tasks = load_tasks(&root).unwrap();
-        assert_eq!(tasks.len(), 4);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        for task in tasks {
-            for amended in [false, true] {
-                let mut task = Task::load(&root.join(&task.name)).unwrap();
-                let supplied_reference = amended.then_some(freshness::NOW);
-                if let Some(reference) = supplied_reference {
-                    task.instruction = format!("{}\n{}{reference} (UTC). This is a fixed sample, not a continuously advancing clock.]", task.instruction, freshness::REFERENCE_PREFIX).into();
-                }
-                let timeout = model_timeout(std::slice::from_ref(&task));
-                assert_eq!(timeout, Duration::from_secs(900));
-                assert_eq!(task.world.model_timeout(), timeout);
+        let context = root.join("time-reference.txt");
+        for amended in [false, true] {
+            let tasks = load_tasks(&root, amended.then_some(context.as_path())).unwrap();
+            assert_eq!(tasks.len(), 4);
+            let mut inputs = Vec::new();
+            let mut responses = Vec::new();
+            for task in &tasks {
                 let expected = task.expected.research.as_ref().unwrap();
                 let valid = amended || expected.historical;
                 let input = if valid {
@@ -1462,114 +1493,202 @@ mod tests {
                 } else {
                     json!({"query":"AI developer announcements June 2026", "contents":{"maxAgeHours":72}})
                 };
-                let source = if expected.historical || !valid {
-                    "june"
+                let (source, fact) = if expected.historical || !valid {
+                    ("june", "june-release")
                 } else {
-                    "october"
+                    ("october", "model-new")
                 };
-                let fact = if source == "june" {
-                    "june-release"
-                } else {
-                    "model-new"
-                };
-                let answer = json!({"referenceUtc":supplied_reference,"claims":[{"source":source,"fact":fact,"basis":"publication"}]}).to_string();
+                let answer = json!({"referenceUtc":amended.then_some(freshness::NOW),"claims":[{"source":source,"fact":fact,"basis":"publication"}]}).to_string();
                 let command = format!("exa search --input-json '{}'", input);
                 let arguments = json!({"command":command}).to_string();
                 let tool = json!({"type":"response.output_item.done","item":{"type":"function_call","id":"fc_search","call_id":"search","name":"bash","arguments":arguments}});
                 let complete =
                     json!({"type":"response.completed","response":{"id":"r","status":"completed"}});
-                let server = LoopbackServer::sequence([
+                responses.extend([
                     sse(&format!("data: {tool}\n\ndata: {complete}\n\n")),
                     sse(&format!(
                         "data: {}\n\ndata: {complete}\n\n",
                         json!({"type":"response.output_text.delta","delta":answer})
                     )),
                 ]);
-                let directory = tempfile::tempdir().unwrap();
-                let auth = directory.path().join("synthetic-auth.json");
-                std::fs::write(&auth, json!({"version":1,"access":"synthetic-access","refresh":"synthetic-refresh","expiresAt":4_000_000_000_u64,"accountId":"synthetic-account"}).to_string()).unwrap();
-                let arguments = parse(&[
-                    "--client",
-                    "codex",
-                    "--model",
-                    "gpt-6-luna",
-                    "--auth-file",
-                    auth.to_str().unwrap(),
-                    "--tasks",
-                    root.to_str().unwrap(),
-                    "--out",
-                    "unused.jsonl",
-                ])
-                .unwrap();
-                let ModelClient::Codex(client) = build_client(&arguments, timeout).unwrap() else {
+                inputs.push(input);
+            }
+            let server = LoopbackServer::sequence(responses);
+            let directory = tempfile::tempdir().unwrap();
+            let auth = directory.path().join("synthetic-auth.json");
+            let out = directory.path().join("rows.jsonl");
+            std::fs::write(&auth, json!({"version":1,"access":"synthetic-access","refresh":"synthetic-refresh","expiresAt":4_000_000_000_u64,"accountId":"synthetic-account"}).to_string()).unwrap();
+            let mut argv = vec![
+                "--client",
+                "codex",
+                "--model",
+                "gpt-6-luna",
+                "--auth-file",
+                auth.to_str().unwrap(),
+                "--tasks",
+                root.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--label",
+                if amended { "amended" } else { "baseline" },
+            ];
+            if amended {
+                argv.extend(["--task-context", context.to_str().unwrap()]);
+            }
+            let arguments = parse(&argv).unwrap();
+            let failed = run(&arguments, |arguments, timeout| {
+                assert_eq!(timeout, Duration::from_secs(900));
+                let ModelClient::Codex(client) = build_client(arguments, timeout)? else {
                     panic!("the Codex selection constructs the Responses client")
                 };
-                let client = Arc::new(ModelClient::Codex(
-                    client.with_loopback_endpoint(&server.url()).unwrap(),
-                ));
-                let system: Arc<str> = SYSTEM.into();
-                let history: Arc<[ModelMessage]> = if task.name == "fresh-correction" {
-                    parse_history(
-                        &std::fs::read_to_string(root.join(&task.name).join("history.jsonl"))
-                            .unwrap(),
-                    )
-                    .unwrap()
-                    .into()
-                } else {
-                    Vec::new().into()
-                };
-                let row = run_trial(
-                    &runtime,
-                    &client,
-                    &Trial {
-                        task: &task,
-                        index: 0,
-                        system: &system,
-                        history: &history,
-                        label: if amended { "amended" } else { "baseline" },
-                        model: "gpt-6-luna",
-                        client: ClientKind::Codex,
-                        timeout,
-                    },
-                )
-                .unwrap();
-                assert_eq!(row.fatal, None);
-                assert_eq!(row.model_turns, 2);
-                assert_eq!(row.research_calls, [input]);
-                assert!(!row.problems.contains(&Problem::Research {
-                    reason: freshness::Problem::Reference
-                }));
-                assert_eq!(
-                    row.reward,
-                    u8::from(valid),
-                    "{} {}: {:?}",
-                    task.name,
-                    row.label,
-                    row.problems
+                Ok(ModelClient::Codex(
+                    client.with_loopback_endpoint(&server.url())?,
+                ))
+            })
+            .unwrap();
+            assert_eq!(failed, if amended { 0 } else { 3 });
+            let rows = std::fs::read_to_string(out)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 4);
+            let requests = server.recorded();
+            assert_eq!(requests.len(), 8);
+            for (index, ((task, row), input)) in tasks.iter().zip(rows).zip(inputs).enumerate() {
+                assert_eq!(row["task"], task.name);
+                assert_eq!(row["fatal"], Value::Null);
+                assert_eq!(row["model_turns"], 2);
+                assert_eq!(row["research_calls"], json!([input]));
+                assert!(
+                    !row["problems"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|problem| problem["reason"]["kind"] == "reference")
                 );
-                println!("{}", serde_json::to_string(&row).unwrap());
-                let requests = server.recorded();
-                assert_eq!(requests.len(), 2);
+                let valid = amended || task.expected.research.as_ref().unwrap().historical;
+                assert_eq!(row["reward"], u8::from(valid), "{row}");
+                println!("{row}");
+                let request = &requests[index * 2];
                 let first: Value = serde_json::from_slice(
-                    &requests[0][requests[0]
+                    &request[request
                         .windows(4)
                         .position(|bytes| bytes == b"\r\n\r\n")
                         .unwrap()
                         + 4..],
                 )
                 .unwrap();
-                let current =
-                    first["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
-                        .as_str()
-                        .unwrap();
-                assert_eq!(current.contains("Dekopon runtime time reference"), amended);
-                if task.name == "fresh-correction" {
-                    assert_eq!(first["input"].as_array().unwrap().len(), 3);
+                let input = first["input"].as_array().unwrap();
+                let current = input.last().unwrap()["content"][0]["text"]
+                    .as_str()
+                    .unwrap();
+                let expected_context = std::fs::read_to_string(&context).unwrap();
+                assert_eq!(current.ends_with(expected_context.trim_end()), amended);
+                assert_eq!(current, task.instruction.as_ref());
+                if row["task"] == "fresh-correction" {
+                    assert_eq!(input.len(), 3);
+                    assert_eq!(input[0]["role"], "user");
+                    assert_eq!(
+                        input[0]["content"][0]["text"],
+                        "What's new for AI developers?"
+                    );
+                    assert_eq!(input[1]["role"], "assistant");
+                    assert_eq!(
+                        input[1]["content"][0]["text"],
+                        "Here is a June 9, 2026 snapshot based on June searches."
+                    );
+                } else {
+                    assert_eq!(input.len(), 1, "{} has no June history", task.name);
                 }
-                std::fs::remove_file(auth).unwrap();
-                server.join();
+            }
+            std::fs::remove_file(auth).unwrap();
+            server.join();
+        }
+    }
+
+    #[test]
+    fn freshness_task_history_overrides_global_history_including_an_empty_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = directory.path().join("global.jsonl");
+        std::fs::write(
+            &global,
+            r#"{"user":"global fallback","answer":"global answer"}"#,
+        )
+        .unwrap();
+        for (name, history) in [
+            ("empty", Some("")),
+            ("fallback", None),
+            (
+                "local",
+                Some(r#"{"user":"local history","answer":"local answer"}"#),
+            ),
+        ] {
+            let task = directory.path().join(name);
+            std::fs::create_dir(&task).unwrap();
+            std::fs::write(task.join("instruction.md"), "current task").unwrap();
+            std::fs::write(
+                task.join("expected.json"),
+                r#"{"all_of":["done"],"require_clean":false}"#,
+            )
+            .unwrap();
+            if let Some(history) = history {
+                std::fs::write(task.join("history.jsonl"), history).unwrap();
             }
         }
+        let server = LoopbackServer::serving(
+            &sse(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ),
+            3,
+        );
+        let out = directory.path().join("rows.jsonl");
+        let arguments = parse(&[
+            "--model",
+            "synthetic-model",
+            "--tasks",
+            directory.path().to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--history",
+            global.to_str().unwrap(),
+        ])
+        .unwrap();
+        let failed = run(&arguments, |arguments, timeout| {
+            Ok(ModelClient::OpenRouter(
+                OpenRouterClient::new(
+                    &arguments.model,
+                    "synthetic-key".into(),
+                    timeout,
+                    Settings::default(),
+                    &[],
+                )?
+                .with_loopback_endpoint(&server.url())?,
+            ))
+        })
+        .unwrap();
+        assert_eq!(failed, 0);
+        let requests = server.recorded();
+        assert_eq!(requests.len(), 3);
+        for (request, expected) in requests.iter().zip([
+            vec!["current task"],
+            vec!["global fallback", "global answer", "current task"],
+            vec!["local history", "local answer", "current task"],
+        ]) {
+            let (_, body) = std::str::from_utf8(request)
+                .unwrap()
+                .split_once("\r\n\r\n")
+                .unwrap();
+            let body: Value = serde_json::from_str(body).unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            let text = messages
+                .iter()
+                .skip(1)
+                .map(|message| message["content"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(text, expected);
+        }
+        server.join();
     }
 
     #[test]

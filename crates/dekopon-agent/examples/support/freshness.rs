@@ -33,6 +33,7 @@ fn timestamp(text: &str) -> Option<OffsetDateTime> {
 pub struct Expected {
     pub start: String,
     pub end: String,
+    pub end_latest: Option<String>,
     pub historical: bool,
 }
 
@@ -82,13 +83,19 @@ pub fn judge(
     }
     let start = timestamp(&expected.start).expect("fixture start timestamp");
     let end = timestamp(&expected.end).expect("fixture end timestamp");
+    let end_latest = expected.end_latest.as_deref().map_or(end, |text| {
+        timestamp(text).expect("fixture latest end timestamp")
+    });
     for call in calls {
         let query = call["query"].as_str().unwrap_or_default().to_lowercase();
         if !expected.historical && (query.contains("june") || query.contains("2026-06")) {
             problems.push(Problem::StaleQuery);
         }
         if call["startPublishedDate"].as_str().and_then(timestamp) != Some(start)
-            || call["endPublishedDate"].as_str().and_then(timestamp) != Some(end)
+            || !call["endPublishedDate"]
+                .as_str()
+                .and_then(timestamp)
+                .is_some_and(|at| at >= end && at <= end_latest)
         {
             problems.push(Problem::PublicationWindow);
         }
@@ -287,6 +294,7 @@ mod tests {
         Expected {
             start: "2026-10-28T18:40:00Z".into(),
             end: NOW.into(),
+            end_latest: None,
             historical: false,
         }
     }
@@ -339,6 +347,55 @@ mod tests {
     }
 
     #[test]
+    fn today_probes_from_the_reference_through_utc_midnight_score_the_same() {
+        let answer = ledger(json!([{"source":"october","fact":"model-new","basis":"publication"}]));
+        for expected_text in [
+            include_str!("../eval/freshness/fresh-news/expected.json"),
+            include_str!("../eval/freshness/fresh-correction/expected.json"),
+        ] {
+            let fixture: Value = serde_json::from_str(expected_text).unwrap();
+            let expected: Expected = serde_json::from_value(fixture["research"].clone()).unwrap();
+            let call = |end: &str| {
+                json!({"query":"AI developer announcements",
+                "startPublishedDate":expected.start,"endPublishedDate":end})
+            };
+            let reference_score = judge(&expected, Some(NOW), &[call(NOW)], Some(&answer));
+            assert_eq!(reference_score, []);
+            for end in [
+                NOW,
+                "2026-10-31T18:40:00.123456789Z",
+                "2026-10-31T19:23:47Z",
+                "2026-10-31T23:59:59Z",
+                "2026-10-31T23:59:59.999999999Z",
+                "2026-11-01T00:00:00Z",
+            ] {
+                assert_eq!(
+                    judge(&expected, Some(NOW), &[call(end)], Some(&answer)),
+                    reference_score,
+                    "{end}"
+                );
+            }
+            for end in [
+                "2026-10-30T23:59:59Z",
+                "2026-10-31T18:00:00Z",
+                "2026-11-01T12:00:00Z",
+            ] {
+                assert!(
+                    judge(&expected, Some(NOW), &[call(end)], Some(&answer))
+                        .contains(&Problem::PublicationWindow),
+                    "{end}"
+                );
+            }
+        }
+        let mut too_wide = call();
+        too_wide["endPublishedDate"] = json!("2026-11-01T00:00:00Z");
+        assert_eq!(
+            judge(&window(), Some(NOW), &[too_wide], Some(&answer)),
+            [Problem::PublicationWindow]
+        );
+    }
+
+    #[test]
     fn a_supported_baseline_with_no_supplied_clock_accepts_a_null_reference() {
         let answer = json!({"referenceUtc":null,"claims":[
             {"source":"october","fact":"model-new","basis":"publication"}
@@ -370,6 +427,7 @@ mod tests {
         let expected = Expected {
             start: "2026-06-01T00:00:00Z".into(),
             end: "2026-06-30T23:59:59Z".into(),
+            end_latest: None,
             historical: true,
         };
         let call = json!({"query":"AI developer announcements June 2026",
