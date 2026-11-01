@@ -153,3 +153,17 @@ fn capture_reduction_is_bounded_by_the_tree_value_limit() {
     assert_eq!(tree.value_bytes(), 217);
     assert_eq!(budget.max_value_bytes(), 1024);
 }
+
+#[test]
+fn an_unknown_word_with_no_thread_permit_still_runs_its_fallback() {
+    let result = crate::Interpreter::new(Limits::default(), crate::test_threads_up_to(0)).run(
+        "nosuchword || { echo status=$?; echo fallback; }; echo after",
+        &NoCalls,
+    );
+    assert_eq!(result.exit_code, dekopon_process::ExitCode::SUCCESS);
+    assert_eq!(
+        result.output,
+        "dekopon-shell: nosuchword: command not found\nstatus=127\nfallback\nafter"
+    );
+    assert_eq!(result.capability_calls, 0);
+}

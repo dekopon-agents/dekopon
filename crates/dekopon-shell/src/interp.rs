@@ -92,6 +92,45 @@ enum BuiltinMode {
     Run,
 }
 
+#[derive(Clone, Copy)]
+enum CallCharge {
+    BeforeDispatch,
+    OnInvocation,
+}
+
+impl CallCharge {
+    fn finish(
+        self,
+        budget: &mut Budget,
+        capability: &mut String,
+        outcome: crate::RunResult,
+    ) -> Result<CapabilityCallResult, LimitExceeded> {
+        let result = match outcome {
+            crate::RunResult::Invoked {
+                capability: reported,
+                result,
+                ..
+            } => {
+                *capability = reported;
+                match self {
+                    Self::BeforeDispatch => {}
+                    Self::OnInvocation => budget.charge_capability_call()?,
+                }
+                result
+            }
+            crate::RunResult::Uncertain(result) => result,
+            crate::RunResult::Returned(result) => {
+                match self {
+                    Self::BeforeDispatch => budget.refund_capability_call(),
+                    Self::OnInvocation => {}
+                }
+                result
+            }
+        };
+        Ok(result)
+    }
+}
+
 enum ParsedStream<'a> {
     Cat(&'a [String]),
     Base64(&'a [String]),
@@ -2606,7 +2645,8 @@ impl<'a> Evaluator<'a> {
                     word: command.to_owned(),
                     argv: typed_arguments.to_vec(),
                 };
-                let outcome = self.run_provider(call, input, stdout_sink);
+                let outcome =
+                    self.run_provider(call, input, stdout_sink, CallCharge::BeforeDispatch);
                 self.completed(outcome)
             }
             Resolution::NotFound => {
@@ -2614,7 +2654,7 @@ impl<'a> Evaluator<'a> {
                     word: command.to_owned(),
                     argv: typed_arguments.to_vec(),
                 };
-                let outcome = self.run_provider(call, input, stdout_sink);
+                let outcome = self.run_provider(call, input, stdout_sink, CallCharge::OnInvocation);
                 self.completed(outcome)
             }
         }
@@ -2625,9 +2665,25 @@ impl<'a> Evaluator<'a> {
         call: crate::RunCall,
         input: StageInput,
         sink: &Sink,
+        charge: CallCharge,
     ) -> Result<CommandResult, CommandFailure> {
         self.budget.check_deadline()?;
         let mut capability = call.word.clone();
+        let needs_feeder = match &input {
+            StageInput::Inherited => self.provider_reads_script_stdin(),
+            StageInput::Piped(_) => true,
+        };
+        let (call_permit, feeder_permit) = match self.call_permits(needs_feeder.then_some(())) {
+            Ok((call, feeder)) => (call, feeder.map(|((), permit)| permit)),
+            Err(error) => match charge {
+                CallCharge::BeforeDispatch => return Err(error.into()),
+                CallCharge::OnInvocation => {
+                    tracing::debug!(?error, "shell.command.unresolved.thread_limit");
+                    self.write_line(&format!("dekopon-shell: {capability}: command not found"));
+                    return Ok(CommandResult::status(ExitCode::NOT_FOUND));
+                }
+            },
+        };
         let unopened = |_error: std::io::Error| {
             CommandFailure::failed(format!(
                 "{capability}: failed: its standard streams could not be opened"
@@ -2665,8 +2721,11 @@ impl<'a> Evaluator<'a> {
             stdin: provider_stdin,
             stdout: OwnedFd::from(provider_stdout),
         };
-        let (call_permit, feed) = self.call_permits(feed)?;
-        self.budget.charge_capability_call()?;
+        let feed = feed.zip(feeder_permit);
+        match charge {
+            CallCharge::BeforeDispatch => self.budget.charge_capability_call()?,
+            CallCharge::OnInvocation => {}
+        }
         let invoker = self.invoker;
         let tree = self.budget.tree().clone();
         let feeder_budget = self.budget.fork();
@@ -2706,27 +2765,16 @@ impl<'a> Evaluator<'a> {
         let (result, copied, fed) = match joined {
             Ok(joined) => joined,
             Err(error) => {
-                self.budget.refund_capability_call();
+                match charge {
+                    CallCharge::BeforeDispatch => self.budget.refund_capability_call(),
+                    CallCharge::OnInvocation => {}
+                }
                 return Err(CommandFailure::failed(format!(
                     "{capability}: failed: its call thread could not start: {error}"
                 )));
             }
         };
-        let result = match result {
-            crate::RunResult::Invoked {
-                capability: reported,
-                result,
-                ..
-            } => {
-                capability = reported;
-                result
-            }
-            crate::RunResult::Uncertain(result) => result,
-            crate::RunResult::Returned(result) => {
-                self.budget.refund_capability_call();
-                result
-            }
-        };
+        let result = charge.finish(&mut self.budget, &mut capability, result)?;
         if let (Some(slot), Some(reader)) = (self.stdin.last_mut(), fed.settle(&capability)?) {
             *slot = reader;
         }

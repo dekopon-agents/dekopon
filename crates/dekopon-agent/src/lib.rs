@@ -1440,6 +1440,34 @@ mod tests {
     }
 
     #[test]
+    fn a_word_without_a_broker_still_runs_its_fallback_when_the_call_budget_is_spent() {
+        use crate::prompt::ScriptRuntime as _;
+
+        let runtime = crate::ShellRuntime {
+            invoker: SessionInvoker {
+                direct: FakeLeg::new("cli-probe.upper", "direct"),
+                broker: None,
+            },
+            limits: dekopon_process::Limits {
+                max_capability_calls: 0,
+                ..dekopon_process::Limits::default()
+            },
+            calls: dekopon_process::CallBudget::new(0),
+            threads: dekopon_test_support::shell_threads(),
+        };
+        let result = runtime.run_script(
+            "nosuchword || { echo status=$?; echo fallback; }; echo after",
+            None,
+        );
+        assert_eq!(result.exit_code, dekopon_process::ExitCode::SUCCESS);
+        assert_eq!(
+            result.output,
+            "dekopon-shell: nosuchword: command not found\nstatus=127\nfallback\nafter"
+        );
+        assert_eq!(runtime.calls.used(), 0);
+    }
+
+    #[test]
     fn a_session_without_a_broker_is_exactly_as_capable_as_direct_mode() {
         let invoker = SessionInvoker {
             direct: FakeLeg::new("cli-probe.upper", "direct"),
@@ -1798,6 +1826,73 @@ mod tests {
                 drop(stream);
             });
             (leg_for(&socket), receiver, release)
+        }
+
+        async fn assert_exhausted_word_refusal(
+            outcome: dekopon_broker_protocol::RunOutcome,
+            word: &'static str,
+            expected: &str,
+        ) {
+            let directory = private_broker_directory();
+            let response = ResponseEnvelope {
+                api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2,
+                response: dekopon_broker_protocol::BrokerResponse::Ran { outcome },
+            };
+            let (leg, mut observed) =
+                stub_leg_observing(directory.path(), vec![response], None).await;
+            let calls = dekopon_process::CallBudget::new(0);
+            let runtime = ShellRuntime {
+                invoker: leg,
+                limits: Limits {
+                    max_capability_calls: 0,
+                    ..Limits::default()
+                },
+                calls: calls.clone(),
+                threads: dekopon_test_support::shell_threads(),
+            };
+            let script = format!("{word} || {{ echo status=$?; echo fallback; }}; echo after");
+            let result = tokio::task::spawn_blocking(move || runtime.run_script(&script, None))
+                .await
+                .expect("the script completes");
+            assert_eq!(result.exit_code, ExitCode::SUCCESS);
+            assert_eq!(
+                result.output,
+                format!("{expected}\nstatus=127\nfallback\nafter")
+            );
+            assert_eq!(calls.used(), 0);
+            let BrokerRequest::Run { word: received, .. } = observed
+                .try_recv()
+                .expect("the unresolved word reaches the broker")
+                .request
+            else {
+                panic!("the existing run request carries the unresolved word");
+            };
+            assert_eq!(received, word);
+            assert!(observed.try_recv().is_err());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_unknown_word_still_runs_its_fallback_when_the_call_budget_is_spent() {
+            assert_exhausted_word_refusal(
+                dekopon_broker_protocol::RunOutcome::NotFound,
+                "nosuchword",
+                "dekopon-shell: nosuchword: command not found",
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_ungranted_word_still_runs_its_fallback_when_the_call_budget_is_spent() {
+            assert_exhausted_word_refusal(
+                dekopon_broker_protocol::RunOutcome::Rendered {
+                    stdout: String::new(),
+                    stderr: "dekopon-shell: ssh: not granted in this conversation\n".to_owned(),
+                    status: 127,
+                },
+                "ssh",
+                "dekopon-shell: ssh: not granted in this conversation",
+            )
+            .await;
         }
 
         #[tokio::test(flavor = "multi_thread")]

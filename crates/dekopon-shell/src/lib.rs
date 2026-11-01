@@ -663,6 +663,19 @@ mod tests {
     }
 
     #[test]
+    fn a_capability_invoked_from_an_unresolved_word_still_spends_a_call() {
+        let invoker = RecordingInvoker::default();
+        let limits = Limits {
+            max_capability_calls: 1,
+            ..Limits::default()
+        };
+        let outcome = Interpreter::new(limits, crate::test_threads()).run("gh.pr-view", &invoker);
+        assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+        assert_eq!(outcome.capability_calls, 1);
+        assert_eq!(invoker.secret_uses.lock().len(), 1);
+    }
+
+    #[test]
     fn a_cancelled_loop_stops_before_exhausting_steps() {
         let (handle, cancelled) = dekopon_process::CancelSignal::pair();
         handle.cancel();
