@@ -10046,6 +10046,154 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
     );
 }
 
+async fn dispatch_notice(inbound: InboundMessage) -> (dekopon_test_support::CaptureLayer, usize) {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["conversation"] = json!({"kind": ["channel"], "ids": ["c0123abc"]});
+    let config = resolved(directory.path(), &document).await;
+    let routes = Arc::new(
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
+    );
+    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let runner = runner(broker, ModelScript::forbidden(), 4);
+    let identities = BTreeMap::from([(
+        "dev".to_owned(),
+        TransportIdentity {
+            user_id: Some("U0BOTBOT".to_owned()),
+            handle: None,
+        },
+    )]);
+    let drivers = BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )]);
+    let mut sessions = tokio::task::JoinSet::new();
+    let capture = {
+        let (capture, _guard) = capture_spans();
+        crate::dispatch(
+            &runner,
+            &routes,
+            &identities,
+            &drivers,
+            NO_STOP_WORDS,
+            &mut sessions,
+            &mut crate::collection::Collector::new(&[], 4),
+            &mut crate::follow::Debounce::default(),
+            inbound,
+        );
+        capture
+    };
+    let session_count = sessions.len();
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+    (capture, session_count)
+}
+
+fn unrouted_channel(text: &str) -> InboundMessage {
+    InboundMessage {
+        conversation: Conversation {
+            kind: ConversationKind::Channel,
+            container: Some("T0123ABC".to_owned()),
+            id: "c9999zzz".to_owned(),
+            thread: None,
+        },
+        ..message(text)
+    }
+}
+
+fn unrouted_info(capture: &dekopon_test_support::CaptureLayer) -> dekopon_test_support::Record {
+    let mut records =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_message_ignored")]);
+    assert_eq!(records.len(), 1, "one ignored-message record");
+    let record = records.pop().expect("ignored-message record");
+    assert!(matches!(
+        record,
+        dekopon_test_support::Record::Event { level: "INFO", .. }
+    ));
+    for (name, value) in [
+        ("reason", "unrouted"),
+        ("transport", "dev"),
+        ("message", "gateway.message.ignored"),
+    ] {
+        assert_eq!(record.field(name), Some(value), "{name}");
+    }
+    for name in [
+        "text",
+        "sender.display_name",
+        "subject",
+        "mention",
+        "direct_message",
+    ] {
+        assert_eq!(record.field(name), None, "{name}");
+    }
+    record
+}
+
+#[tokio::test]
+async fn an_unrouted_mention_emits_one_info_record_without_text() {
+    for (text, addressed) in [
+        ("<@U0BOTBOT> private message text", None),
+        ("private message text", Some(true)),
+    ] {
+        let mut inbound = unrouted_channel(text);
+        inbound.addressed = addressed;
+        let (capture, sessions) = dispatch_notice(inbound).await;
+        assert_eq!(sessions, 0);
+        let record = unrouted_info(&capture);
+        assert_eq!(record.field("conversation.kind"), Some("channel"));
+        assert_eq!(record.field("conversation.container"), Some("T0123ABC"));
+        assert_eq!(record.field("addressing_cause"), Some("mention"));
+    }
+}
+
+#[tokio::test]
+async fn an_unrouted_direct_message_emits_one_info_record_without_text() {
+    for addressed in [None, Some(true)] {
+        let mut inbound = message("private message text");
+        inbound.addressed = addressed;
+        let (capture, sessions) = dispatch_notice(inbound).await;
+        assert_eq!(sessions, 0);
+        let record = unrouted_info(&capture);
+        assert_eq!(record.field("conversation.kind"), Some("directMessage"));
+        assert_eq!(record.field("conversation.container"), Some(""));
+        assert_eq!(record.field("addressing_cause"), Some("direct_message"));
+    }
+}
+
+#[tokio::test]
+async fn an_unaddressed_unrouted_channel_message_stays_at_debug() {
+    for (text, addressed) in [
+        ("private message text", None),
+        ("<@U0BOTBOT> private message text", Some(false)),
+    ] {
+        let mut inbound = unrouted_channel(text);
+        inbound.addressed = addressed;
+        let (capture, sessions) = dispatch_notice(inbound).await;
+        assert_eq!(sessions, 0);
+        let records =
+            capture.events_where("dekopon_gatewayd", &[("event", "gateway_message_ignored")]);
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0],
+            dekopon_test_support::Record::Event { level: "DEBUG", .. }
+        ));
+        assert_eq!(records[0].field("reason"), Some("unrouted"));
+    }
+}
+
+#[tokio::test]
+async fn a_routed_mention_still_starts_a_session_without_an_ignored_record() {
+    let mut inbound = unrouted_channel("<@U0BOTBOT> private message text");
+    inbound.conversation.id = "c0123abc".to_owned();
+    let (capture, sessions) = dispatch_notice(inbound).await;
+    assert_eq!(sessions, 1);
+    assert!(
+        capture
+            .events_where("dekopon_gatewayd", &[("event", "gateway_message_ignored")])
+            .is_empty()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     let directory = temporary();
