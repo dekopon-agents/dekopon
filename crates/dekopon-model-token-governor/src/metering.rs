@@ -30,7 +30,7 @@ pub struct Metering {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Via {
     Agent,
-    Proxy,
+    Proxy { session: Option<VmSession> },
     Summary,
 }
 
@@ -38,9 +38,41 @@ impl Via {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Agent => "agent",
-            Self::Proxy => "proxy",
+            Self::Proxy { .. } => "proxy",
             Self::Summary => "summary",
         }
+    }
+
+    const fn session(&self) -> Option<&VmSession> {
+        match self {
+            Self::Proxy { session } => session.as_ref(),
+            Self::Agent | Self::Summary => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmSession([u8; 36]);
+
+impl VmSession {
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let bytes: [u8; 36] = text.trim().as_bytes().try_into().ok()?;
+        bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => *byte == b'-',
+                14 => *byte == b'7',
+                19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+                _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+            })
+            .then_some(Self(bytes))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or_default()
     }
 }
 
@@ -425,6 +457,7 @@ fn record(call: &Call, estimate: Estimate, charge: &Charge, error_kind: Option<&
         model.name = call.model.as_str(),
         model.backend = call.backend,
         meter.via = call.via.as_str(),
+        vm.session = call.via.session().map(VmSession::as_str),
         usage.input_tokens = int(charge.input),
         usage.output_tokens = int(charge.output),
         usage.cached_input_tokens = int(charge.usage.cached_input_tokens.unwrap_or(0)),

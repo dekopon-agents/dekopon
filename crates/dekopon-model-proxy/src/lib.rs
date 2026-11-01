@@ -36,7 +36,7 @@ use dekopon_model::{
     wire::{Field, PeekError, RequestPeek},
 };
 use dekopon_model_token_governor::{
-    Call, Estimate, Metering, ModelUsage, Outcome, Sizes, Tokens, Via,
+    Call, Estimate, Metering, ModelUsage, Outcome, Sizes, Tokens, Via, VmSession,
 };
 use tracing::{Instrument as _, Span, field::Empty};
 
@@ -255,24 +255,30 @@ impl ModelProxy {
 
 struct CallSpan {
     inner: Span,
+    session: Option<VmSession>,
     usage: ModelUsage,
     settled: bool,
 }
 
 impl CallSpan {
     fn open(headers: &HeaderMap) -> Self {
+        let session = headers
+            .get(SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(VmSession::parse);
         Self {
             inner: tracing::info_span!(
                 target: "model",
                 "model.proxy.call",
                 vm.subject = label(headers, SUBJECT_HEADER),
-                vm.session = label(headers, SESSION_HEADER),
+                vm.session = session.as_ref().map_or("", VmSession::as_str),
                 agent = Empty,
                 model.name = Empty,
                 usage.input_tokens = Empty,
                 usage.output_tokens = Empty,
                 outcome = Empty,
             ),
+            session,
             usage: ModelUsage::default(),
             settled: false,
         }
@@ -456,7 +462,9 @@ async fn call(
             agent: grant.agent.clone(),
             model: model.name.clone(),
             backend: model.backend,
-            via: Via::Proxy,
+            via: Via::Proxy {
+                session: span.session,
+            },
         };
         let estimate = Estimate::from_sizes(
             Sizes {
