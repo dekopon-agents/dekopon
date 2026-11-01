@@ -502,7 +502,8 @@ impl<I: CapabilityInvoker> CapabilityInvoker for FollowInvoker<I> {
         tree: &TreeContext,
     ) -> dekopon_shell::RunResult {
         use dekopon_shell::RunResult;
-        if call.word == "follow" && self.ticket.is_none() {
+        if call.word == "follow" && self.ticket.is_none() && self.inner.has_command_word(&call.word)
+        {
             return RunResult::Returned(CapabilityCallResult::Failed {
                 error: "follow is not enabled on this route".to_owned(),
                 detail: None,
@@ -763,6 +764,9 @@ mod tests {
         fn granted(&self) -> Vec<String> {
             Vec::new()
         }
+        fn command_words(&self) -> Vec<String> {
+            vec!["follow".to_owned()]
+        }
         fn run(
             &self,
             _: dekopon_shell::RunCall,
@@ -818,6 +822,86 @@ mod tests {
             dekopon_shell::RunResult::Returned(CapabilityCallResult::Failed { .. })
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    async fn assert_unresolved_follow_refusal(
+        outcome: dekopon_broker_protocol::RunOutcome,
+        expected: &str,
+    ) {
+        use dekopon_broker_protocol::{
+            Arg, BrokerClient, BrokerRequest, BrokerResponse, FrameLimits, ProtocolVersion,
+            ResponseEnvelope,
+        };
+
+        let directory = crate::tests::temporary();
+        let response = ResponseEnvelope {
+            api_version: ProtocolVersion::V1Alpha2,
+            response: BrokerResponse::Ran { outcome },
+        };
+        let mut broker = dekopon_test_support::BrokerFixture::answering(
+            directory.path(),
+            [
+                ResponseEnvelope::capabilities(Vec::new(), Vec::new(), Default::default()),
+                response.clone(),
+                response,
+            ],
+        );
+        let client = BrokerClient::new(
+            broker.socket(),
+            crate::current_uid(),
+            FrameLimits::default(),
+        )
+        .unwrap();
+        let inner = dekopon_agent::BrokerLeg::connect(client, None)
+            .await
+            .unwrap();
+        let invoker = Arc::new(FollowInvoker::new(inner, None));
+        drop(broker.request().await);
+        for (script, arguments) in [
+            ("follow", Vec::new()),
+            ("follow --help", vec![Arg::Text("--help".to_owned())]),
+        ] {
+            let invoker = Arc::clone(&invoker);
+            let result = tokio::task::spawn_blocking(move || {
+                dekopon_shell::Interpreter::new(
+                    dekopon_process::Limits::default(),
+                    dekopon_test_support::shell_threads(),
+                )
+                .run(script, invoker.as_ref())
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.exit_code, dekopon_process::ExitCode::NOT_FOUND);
+            assert_eq!(result.output, expected);
+            let BrokerRequest::Run { word, argv, .. } = broker.request().await.request else {
+                panic!("the unresolved follow word reaches the existing run request");
+            };
+            assert_eq!(word, "follow");
+            assert_eq!(argv, arguments);
+        }
+        assert!(broker.recorded().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_absent_follow_word_and_its_help_keep_command_not_found_without_a_ticket() {
+        assert_unresolved_follow_refusal(
+            dekopon_broker_protocol::RunOutcome::NotFound,
+            "dekopon-shell: follow: command not found",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ungranted_follow_word_and_its_help_keep_the_broker_refusal_without_a_ticket() {
+        assert_unresolved_follow_refusal(
+            dekopon_broker_protocol::RunOutcome::Rendered {
+                stdout: String::new(),
+                stderr: "dekopon-shell: follow: not granted in this conversation\n".to_owned(),
+                status: 127,
+            },
+            "dekopon-shell: follow: not granted in this conversation",
+        )
+        .await;
     }
 
     #[test]

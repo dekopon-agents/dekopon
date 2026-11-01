@@ -3842,6 +3842,51 @@ async fn command_words_are_filtered_by_policy_and_unknown_words_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_installed_but_ungranted_word_renders_only_its_word_at_exit_127() {
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let (broker, _) = Broker::start(
+        probe_registry(BrokerHostLimits::default()).await,
+        principal("broker-test"),
+        probe_engine(
+            &probe_policy("caller", "provider-test", "cli-probe.upper"),
+            ["caller", "stranger"],
+        ),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
+        CredentialStore::empty(),
+        callers(["caller"]),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+        Leniency::Strict,
+    )
+    .expect("broker starts");
+    let stranger = session("stranger", "provider-test");
+    for argv in [
+        vec!["--help".to_owned()],
+        vec!["--not-valid".to_owned()],
+        Vec::new(),
+    ] {
+        let outcome = broker
+            .run_command(&stranger, None, None, "probe", &argv, false)
+            .await
+            .expect("an installed ungranted word is rendered before parsing");
+        assert_eq!(
+            outcome,
+            CommandRunOutcome::Rendered {
+                stdout: String::new(),
+                stderr: "dekopon-shell: probe: not granted in this conversation\n".to_owned(),
+                status: 127,
+            }
+        );
+    }
+    assert!(broker.command_words(&stranger).is_empty());
+    assert!(broker.command_word_help(&stranger).is_empty());
+    assert!(audit.records().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_command_word_is_refused_without_running_anything() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let (broker, _) = Broker::start(
@@ -3874,10 +3919,10 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
         )
         .await
         .expect_err("no loaded provider declares this word");
-    assert!(
-        format!("{error}").contains("gh"),
-        "the refusal names the word: {error}"
-    );
+    let dekopon_broker_host::BrokerHostError::UnknownCommandWord { word } = error else {
+        panic!("the unknown word has a typed refusal");
+    };
+    assert_eq!(word, "gh");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3897,7 +3942,10 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
     let (broker, _) = Broker::start(
         registry,
         principal("broker-test"),
-        engine("", ["caller"], [("cli-probe.upper", "cli-probe")]),
+        probe_engine(
+            &probe_policy("caller", "provider-test", "cli-probe.upper"),
+            ["caller"],
+        ),
         catalog([(
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),

@@ -352,6 +352,9 @@ async fn run_step(
     if let Some(refusal) = refusal {
         return Err(grant(refusal));
     }
+    let decision = broker
+        .authorize_invocation(&context, &step.capability)
+        .map_err(grant)?;
     let Argv { word, arguments } = &step.argv;
     let parse = |failure| {
         Refused::Parse(Box::new(ParseRefusal {
@@ -389,9 +392,6 @@ async fn run_step(
         Err(error) => Err(ParseFailure::Host(error)),
     };
     proposed.map_err(parse)?;
-    let decision = broker
-        .authorize_invocation(&context, &step.capability)
-        .map_err(grant)?;
     match step.requests {
         Some(declared) => {
             let maximum = max_requests(&decision.set);
