@@ -3780,7 +3780,7 @@ impl ModelScript {
         let messages = prompts
             .get(index)
             .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1));
-        messages.iter().map(message_text).collect()
+        messages.iter().map(task_time::payload_message).collect()
     }
 }
 
@@ -4932,7 +4932,7 @@ impl InterruptibleModel {
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
         self.prompts.lock()[index]
             .iter()
-            .map(message_text)
+            .map(task_time::payload_message)
             .collect()
     }
 
@@ -18744,6 +18744,8 @@ mod steering;
 #[path = "tests/steering_e2e.rs"]
 mod steering_e2e;
 mod subscriptions;
+#[path = "tests/task_time.rs"]
+mod task_time;
 mod wake_reason;
 #[path = "tests/wakes.rs"]
 mod wakes;

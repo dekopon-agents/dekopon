@@ -1,0 +1,32 @@
+[
+  {
+    "id": "october",
+    "url": "https://research.invalid/october",
+    "fact": "model-new",
+    "publishedDate": "2026-10-31T16:00:00Z",
+    "retrievedAt": "2026-10-31T18:40:00Z"
+  },
+  {
+    "id": "june",
+    "url": "https://research.invalid/june",
+    "fact": "june-release",
+    "publishedDate": "2026-06-09T10:00:00Z",
+    "updatedAt": "2026-10-31T17:00:00Z",
+    "retrievedAt": "2026-10-31T18:40:00Z"
+  },
+  {
+    "id": "plans",
+    "url": "https://research.invalid/plans",
+    "fact": "plan-current",
+    "publishedDate": null,
+    "retrievedAt": "2026-10-31T18:40:00Z"
+  },
+  {
+    "id": "event",
+    "url": "https://research.invalid/event",
+    "fact": "upcoming-event",
+    "publishedDate": "2026-10-30T11:00:00Z",
+    "effectiveAt": "2026-11-15T00:00:00Z",
+    "retrievedAt": "2026-10-31T18:40:00Z"
+  }
+]

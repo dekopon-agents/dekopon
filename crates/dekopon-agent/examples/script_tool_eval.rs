@@ -1,5 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+#[path = "support/freshness.rs"]
+mod freshness;
 #[path = "support/orchard.rs"]
 mod orchard;
 #[path = "support/score.rs"]
@@ -207,11 +209,14 @@ impl Arguments {
 enum World {
     Basic,
     Orchard,
+    Freshness,
 }
 
 impl World {
     fn of_task(name: &str) -> Self {
-        if name.starts_with("sci-") {
+        if name.starts_with("fresh-") {
+            Self::Freshness
+        } else if name.starts_with("sci-") {
             Self::Orchard
         } else {
             Self::Basic
@@ -222,6 +227,7 @@ impl World {
         match self {
             Self::Basic => Rules::Basic,
             Self::Orchard => Rules::Orchard,
+            Self::Freshness => Rules::Freshness,
         }
     }
 
@@ -230,6 +236,10 @@ impl World {
             Self::Basic => PromptLimits {
                 max_steps: MAX_STEPS,
                 max_capability_calls: MAX_CAPABILITY_CALLS,
+            },
+            Self::Freshness => PromptLimits {
+                max_steps: 200,
+                max_capability_calls: 1000,
             },
             Self::Orchard => PromptLimits {
                 max_steps: ORCHARD_MAX_STEPS,
@@ -781,6 +791,7 @@ struct Row<'a> {
     usage: UsageRecord,
     turns: Vec<TurnRecord>,
     scripts: Vec<ScriptRecord>,
+    research_calls: Vec<Value>,
 }
 
 struct Trial<'a> {
@@ -851,9 +862,16 @@ fn run_trial<'a>(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
     let started = Instant::now();
+    let research_calls = Arc::new(Mutex::new(Vec::new()));
     let session = match trial.task.world {
         World::Basic => self::session(runtime, model, EvalInvoker, trial)?,
         World::Orchard => self::session(runtime, model, orchard::Orchard::new(), trial)?,
+        World::Freshness => self::session(
+            runtime,
+            model,
+            orchard::Orchard::research(Arc::clone(&research_calls)),
+            trial,
+        )?,
     };
     let seconds = started.elapsed().as_secs_f64();
     let count = |length: usize| u32::try_from(length).unwrap_or(u32::MAX);
@@ -882,7 +900,7 @@ fn run_trial<'a>(
             output_head: &script.output_head,
         })
         .collect::<Vec<_>>();
-    let problems = score::judge(
+    let mut problems = score::judge(
         trial.task.world.rules(),
         &trial.task.expected,
         &Attempt {
@@ -891,10 +909,19 @@ fn run_trial<'a>(
             scripts: &views,
         },
     );
+    let research_calls = research_calls.lock().clone();
+    if let Some(expected) = &trial.task.expected.research {
+        problems.extend(
+            freshness::judge(expected, &research_calls, answer.as_deref())
+                .into_iter()
+                .map(|reason| Problem::Research { reason }),
+        );
+    }
     Ok(Row {
         label: trial.label,
         client: trial.client.name(),
         model: trial.model,
+        research_calls,
         core_version: env!("CARGO_PKG_VERSION"),
         offered_sha256: offered_sha256(&session.offered, trial.system, trial.task),
         task: &trial.task.name,
@@ -1015,7 +1042,7 @@ fn run() -> Result<u32, EvalError> {
         let mut failed = 0_u32;
         for task in &tasks {
             let system = match task.world {
-                World::Basic => &basic_system,
+                World::Basic | World::Freshness => &basic_system,
                 World::Orchard => &orchard_system,
             };
             for index in 0..arguments.repeat.get() {
@@ -1344,7 +1371,7 @@ mod tests {
         let orchard = orchard::Orchard::new();
         let invoker: &dyn CapabilityInvoker = match task.world {
             World::Basic => &EvalInvoker,
-            World::Orchard => &orchard,
+            World::Orchard | World::Freshness => &orchard,
         };
         let records = canned
             .scripts
@@ -1387,6 +1414,120 @@ mod tests {
             assert_eq!(passed, [], "{} reference", task.name);
             let failed = score_canned(task, &broken);
             assert_ne!(failed, [], "{} broken", task.name);
+        }
+    }
+
+    #[test]
+    fn freshness_matrix_scores_eight_canned_trajectories_without_upstream_calls() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/eval/freshness");
+        let tasks = load_tasks(&root).unwrap();
+        assert_eq!(tasks.len(), 4);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for task in tasks {
+            for amended in [false, true] {
+                let mut task = Task::load(&root.join(&task.name)).unwrap();
+                if amended {
+                    task.instruction = format!("{}\n[gateway: Dekopon runtime time reference, sampled for this task: {} (UTC). This is a fixed sample, not a continuously advancing clock.]", task.instruction, freshness::NOW).into();
+                }
+                let expected = task.expected.research.as_ref().unwrap();
+                let valid = amended || expected.historical;
+                let input = if valid {
+                    json!({"query":"AI developer announcements", "startPublishedDate":expected.start,"endPublishedDate":expected.end})
+                } else {
+                    json!({"query":"AI developer announcements June 2026", "contents":{"maxAgeHours":72}})
+                };
+                let source = if expected.historical || !valid {
+                    "june"
+                } else {
+                    "october"
+                };
+                let fact = if source == "june" {
+                    "june-release"
+                } else {
+                    "model-new"
+                };
+                let answer = json!({"referenceUtc":freshness::NOW,"claims":[{"source":source,"fact":fact,"basis":"publication"}]}).to_string();
+                let command = format!("exa search --input-json '{}'", input);
+                let arguments = json!({"command":command}).to_string();
+                let tool = json!({"type":"response.output_item.done","item":{"type":"function_call","id":"fc_search","call_id":"search","name":"bash","arguments":arguments}});
+                let complete =
+                    json!({"type":"response.completed","response":{"id":"r","status":"completed"}});
+                let server = LoopbackServer::sequence([
+                    sse(&format!("data: {tool}\n\ndata: {complete}\n\n")),
+                    sse(&format!(
+                        "data: {}\n\ndata: {complete}\n\n",
+                        json!({"type":"response.output_text.delta","delta":answer})
+                    )),
+                ]);
+                let directory = tempfile::tempdir().unwrap();
+                let auth = directory.path().join("synthetic-auth.json");
+                std::fs::write(&auth, json!({"version":1,"access":"synthetic-access","refresh":"synthetic-refresh","expiresAt":4_000_000_000_u64,"accountId":"synthetic-account"}).to_string()).unwrap();
+                let timeout = Duration::from_secs(900);
+                let client = Arc::new(ModelClient::Codex(
+                    codex_client("gpt-6-luna", &auth, timeout)
+                        .unwrap()
+                        .with_loopback_endpoint(&server.url())
+                        .unwrap(),
+                ));
+                let system: Arc<str> = SYSTEM.into();
+                let history: Arc<[ModelMessage]> = if task.name == "fresh-correction" {
+                    parse_history(
+                        &std::fs::read_to_string(root.join(&task.name).join("history.jsonl"))
+                            .unwrap(),
+                    )
+                    .unwrap()
+                    .into()
+                } else {
+                    Vec::new().into()
+                };
+                let row = run_trial(
+                    &runtime,
+                    &client,
+                    &Trial {
+                        task: &task,
+                        index: 0,
+                        system: &system,
+                        history: &history,
+                        label: if amended { "amended" } else { "baseline" },
+                        model: "gpt-6-luna",
+                        client: ClientKind::Codex,
+                        timeout,
+                    },
+                )
+                .unwrap();
+                assert_eq!(row.fatal, None);
+                assert_eq!(row.model_turns, 2);
+                assert_eq!(row.research_calls, [input]);
+                assert_eq!(
+                    row.reward,
+                    u8::from(valid),
+                    "{} {}: {:?}",
+                    task.name,
+                    row.label,
+                    row.problems
+                );
+                println!("{}", serde_json::to_string(&row).unwrap());
+                let requests = server.recorded();
+                assert_eq!(requests.len(), 2);
+                let first: Value = serde_json::from_slice(
+                    &requests[0][requests[0]
+                        .windows(4)
+                        .position(|bytes| bytes == b"\r\n\r\n")
+                        .unwrap()
+                        + 4..],
+                )
+                .unwrap();
+                let current =
+                    first["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+                        .as_str()
+                        .unwrap();
+                assert_eq!(current.contains("Dekopon runtime time reference"), amended);
+                if task.name == "fresh-correction" {
+                    assert_eq!(first["input"].as_array().unwrap().len(), 3);
+                }
+                std::fs::remove_file(auth).unwrap();
+                server.join();
+            }
         }
     }
 

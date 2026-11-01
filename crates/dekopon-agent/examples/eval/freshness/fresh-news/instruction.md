@@ -1,0 +1,1 @@
+What's new for AI developers today? Use the synthetic research sources. Return only a JSON evidence ledger with referenceUtc (your UTC reference), and claims: objects with source (result id), fact (result fact), and basis (publication or undated-snapshot). Include only conclusions the returned evidence supports.

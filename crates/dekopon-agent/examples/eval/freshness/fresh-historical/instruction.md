@@ -1,0 +1,1 @@
+Research AI developer announcements from June 2026 using the synthetic sources. Keep that historical scope. Return only a JSON evidence ledger with referenceUtc (your UTC reference), and claims: objects with source (result id), fact (result fact), and basis (publication or undated-snapshot). Include only conclusions the returned evidence supports.
