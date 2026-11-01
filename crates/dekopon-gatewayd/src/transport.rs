@@ -50,6 +50,7 @@ pub(crate) struct InboundMessage {
     pub conversation: Conversation,
     pub message_id: MessageId,
     pub text: String,
+    pub control_text: Option<String>,
     pub pull_request_links: Option<crate::pull_request_links::PullRequestLinkContext>,
     pub assets: Vec<PendingAsset>,
     pub asset_overflow: bool,
@@ -63,6 +64,12 @@ pub(crate) struct InboundMessage {
     pub native_group: Option<String>,
     pub constituents: Vec<tracing::Span>,
     pub folded: Vec<String>,
+}
+
+impl InboundMessage {
+    pub(crate) fn control_text(&self) -> &str {
+        self.control_text.as_deref().unwrap_or(&self.text)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

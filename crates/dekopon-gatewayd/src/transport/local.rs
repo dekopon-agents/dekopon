@@ -226,6 +226,7 @@ impl LocalTransport {
                 received.record("message.id", message_id.as_str());
                 record_conversation(&received, &request.conversation);
                 let message = InboundMessage {
+                    control_text: None,
                     pull_request_links: None,
                     transport: name.clone(),
                     transport_kind: ChatTransportKind::Local,
