@@ -300,9 +300,15 @@ pub(super) fn refusal<I: DeserializeOwned + JsonSchema>(input: &str) -> InvalidI
     }
     let schema = super::input_schema::<I>();
     let (path, at_schema, at_value) = location(&schema, &value, error.path());
-    recover(&schema, at_schema, at_value, failure, &path).unwrap_or(InvalidInput {
-        path,
-        kind: failure.kind,
+    recover(&schema, at_schema, at_value, failure, &path).unwrap_or_else(|| {
+        if failure.kind == Kind::MissingField {
+            fallback
+        } else {
+            InvalidInput {
+                path,
+                kind: failure.kind,
+            }
+        }
     })
 }
 
@@ -454,6 +460,60 @@ mod tests {
             failure.to_string(),
             "invalid input: operation.extra: unknown field"
         );
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    struct Leaf {
+        name: String,
+        size: u64,
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    #[serde(tag = "kind")]
+    enum Tag {
+        A(Leaf),
+        B { path: String },
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    struct MissingTagInput {
+        t: Tag,
+    }
+
+    #[test]
+    fn a_missing_enum_tag_does_not_blame_its_present_enclosing_field() {
+        let failure = refusal::<MissingTagInput>(r#"{"t":{"name":"a","size":1}}"#);
+        assert_eq!(failure.kind, Kind::Unlocated);
+        assert_eq!(failure.to_string(), SdkFailure::InvalidInput.to_string());
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    enum External {
+        Read { path: String },
+        Put(Leaf),
+        Stop,
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    struct ExternalInput {
+        op: External,
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+    struct ExternalItems {
+        ops: Vec<External>,
+    }
+
+    #[test]
+    fn a_missing_field_in_an_external_variant_does_not_blame_its_enclosing_field() {
+        for failure in [
+            refusal::<ExternalInput>(r#"{"op":{"Read":{}}}"#),
+            refusal::<ExternalInput>(r#"{"op":{"Put":{"name":"a"}}}"#),
+            refusal::<ExternalItems>(r#"{"ops":["Stop",{"Read":{}}]}"#),
+        ] {
+            assert_eq!(failure.kind, Kind::Unlocated);
+            assert_eq!(failure.to_string(), SdkFailure::InvalidInput.to_string());
+        }
     }
 
     #[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
