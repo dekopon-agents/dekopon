@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     fn a_declared_length_sizes_the_buffer_and_is_clamped_to_the_ceiling() {
-        let limit = 8 * 1024 * 1024;
+        let limit = dekopon_model::asset::MAX_ATTACHMENT_BYTES;
 
         assert_eq!(asset_buffer(Some(1_000), limit).capacity(), 1_000);
         assert_eq!(asset_buffer(None, limit).capacity(), 0);

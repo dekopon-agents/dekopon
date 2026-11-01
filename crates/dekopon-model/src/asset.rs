@@ -12,7 +12,7 @@ use std::{
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 
-pub const MAX_ATTACHMENT_BYTES: usize = dekopon_core::asset::MAX_DECODED_ASSET_BYTES;
+pub const MAX_ATTACHMENT_BYTES: usize = dekopon_core::asset::MAX_DECODED_DOCUMENT_BYTES;
 pub const MAX_STORED_ATTACHMENT_BYTES: usize = MAX_ATTACHMENT_BYTES.div_ceil(3) * 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -418,7 +418,7 @@ mod tests {
     fn decoded_limit_matches_the_shared_contract() {
         assert_eq!(
             MAX_ATTACHMENT_BYTES,
-            dekopon_core::asset::MAX_DECODED_ASSET_BYTES
+            dekopon_core::asset::MAX_DECODED_DOCUMENT_BYTES
         );
     }
 
