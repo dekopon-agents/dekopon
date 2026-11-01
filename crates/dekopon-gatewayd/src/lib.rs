@@ -334,7 +334,8 @@ where
         shell_threads: ShellThreads::new(shell_threads, tokio::runtime::Handle::current()),
         thread_owner: Arc::clone(&thread_owner),
     });
-    let (mut owned_tasks, boot_proxy) = start_metering_tasks(config, &configured, &metering)?;
+    let (mut owned_tasks, boot_proxy) =
+        start_metering_tasks(config, &candidate.routes, &configured, &metering)?;
 
     tracing::info!(
         event = "gateway_started",
@@ -526,14 +527,22 @@ async fn load_follow_table(
 
 fn start_metering_tasks(
     config: &ResolvedConfig,
+    routes: &RoutingTable,
     configured: &ConfiguredModels,
     metering: &Arc<dekopon_model_token_governor::Metering>,
 ) -> Result<(JoinSet<()>, Option<Arc<dekopon_model_proxy::ModelProxy>>), GatewaydError> {
     let mut owned_tasks = JoinSet::new();
+    for subject in proxy::listed_guests(config.proxy.as_ref()) {
+        tracing::warn!(
+            event = "gateway_proxy_guest_models_deprecated",
+            vm.subject = subject,
+            "gateway.proxy.guest_models_deprecated"
+        );
+    }
     let boot_proxy = config
         .proxy
         .as_ref()
-        .map(|resolved| proxy::build(resolved, &config.models, configured, metering))
+        .map(|_| proxy::build(routes.guests(), &config.models, configured, metering))
         .transpose()
         .map_err(GatewaydError::Proxy)?;
     meter_restore::spawn(
@@ -546,6 +555,12 @@ fn start_metering_tasks(
         &mut owned_tasks,
     );
     Ok((owned_tasks, boot_proxy))
+}
+
+fn guest_model_warnings(config: &ResolvedConfig) -> impl Iterator<Item = CheckWarning> + '_ {
+    proxy::listed_guests(config.proxy.as_ref()).map(|subject| CheckWarning::GuestModels {
+        subject: subject.to_owned(),
+    })
 }
 
 #[derive(Debug, Default)]
@@ -568,6 +583,10 @@ pub enum CheckWarning {
     ModelCredential { model: String, variable: String },
     #[error("persistent memory has no journal: window-only, memory tools unavailable")]
     MemoryWithoutJournal,
+    #[error(
+        "proxy guest {subject:?} lists models, which is deprecated: drop the key to run it on its agent's model"
+    )]
+    GuestModels { subject: String },
     #[error("{stage} not checked: a stage it needs failed")]
     Skipped { stage: Stage },
     #[error("model {model} not probed: {reason}")]
@@ -711,6 +730,9 @@ async fn load_candidate_with_service(
                 && routes.has_persistent_memory()
             {
                 report.warnings.push(CheckWarning::MemoryWithoutJournal);
+            }
+            if mode == config::LoadMode::Check {
+                report.warnings.extend(guest_model_warnings(config));
             }
             if active.is_none() {
                 credentials(config, routes, mode, &mut report)

@@ -2610,8 +2610,20 @@ impl<'a> Evaluator<'a> {
                 self.completed(outcome)
             }
             Resolution::NotFound => {
-                self.write_line(&format!("dekopon-shell: {command}: command not found"));
-                Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)))
+                let call = crate::RunCall {
+                    word: command.to_owned(),
+                    argv: typed_arguments.to_vec(),
+                };
+                match self.run_provider(call, input, stdout_sink) {
+                    Err(CommandFailure::Fatal(FatalError::Limit(
+                        error @ LimitExceeded::ShellThreads { .. },
+                    ))) => {
+                        tracing::debug!(?error, "shell.command.unresolved.thread_limit");
+                        self.write_line(&format!("dekopon-shell: {command}: command not found"));
+                        Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)))
+                    }
+                    outcome => self.completed(outcome),
+                }
             }
         }
     }
@@ -2624,6 +2636,11 @@ impl<'a> Evaluator<'a> {
     ) -> Result<CommandResult, CommandFailure> {
         self.budget.check_deadline()?;
         let mut capability = call.word.clone();
+        let needs_feeder = match &input {
+            StageInput::Inherited => self.provider_reads_script_stdin(),
+            StageInput::Piped(_) => true,
+        };
+        let (call_permit, feeder_permit) = self.call_permits(needs_feeder.then_some(()))?;
         let unopened = |_error: std::io::Error| {
             CommandFailure::failed(format!(
                 "{capability}: failed: its standard streams could not be opened"
@@ -2661,7 +2678,7 @@ impl<'a> Evaluator<'a> {
             stdin: provider_stdin,
             stdout: OwnedFd::from(provider_stdout),
         };
-        let (call_permit, feed) = self.call_permits(feed)?;
+        let feed = feed.zip(feeder_permit.map(|((), permit)| permit));
         self.budget.charge_capability_call()?;
         let invoker = self.invoker;
         let tree = self.budget.tree().clone();

@@ -114,6 +114,7 @@ impl ChatTransport for FauxlackTransport {
                     }
                 };
                 return Ok(TransportEvent::Message(Box::new(InboundMessage {
+                    control_text: None,
                     pull_request_links: None,
                     transport: self.name.clone(),
                     transport_kind: ChatTransportKind::Fauxlack,
@@ -136,6 +137,7 @@ impl ChatTransport for FauxlackTransport {
                         })
                         .collect(),
                     asset_overflow: false,
+                    input_refusal: None,
                     addressed,
                     thread_continuation: None,
                     reply: ReplyTarget::Fauxlack {

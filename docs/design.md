@@ -100,9 +100,9 @@ The model's prompt lands in `agent.model.prompt` records and its reply in
 Coding agents in Firecracker VMs, such as `claude`, `pi` and `codex`, need a model. A key inside the
 VM is a key whatever runs there can print. So the gateway serves the model APIs on its own mTLS
 listener, reachable only through the VM jail's egress gateway. The jail names the VM. The proxy maps
-it to an agent and the models that agent may use, rewrites the requested model to the upstream id,
-injects the key, and admits the call against the agent's token budget before sending it. Whatever
-token the VM's client sends is ignored.
+it to an agent, replaces whatever model the VM names with that agent's own model and generation
+settings, injects the key, and admits the call against the agent's token budget before sending it.
+Whatever token the VM's client sends is ignored.
 
 The proxy lives in the gateway because the gateway's model client already holds the model keys and
 the broker takes on no model orchestration. Nothing points a VM's client at the proxy: the script

@@ -152,6 +152,11 @@ pub enum Field {
     Store,
     Models,
     Route,
+    MaxTokens,
+    Temperature,
+    TopP,
+    Reasoning,
+    Provider,
 }
 
 impl Field {
@@ -163,6 +168,11 @@ impl Field {
             Self::Store => "store",
             Self::Models => "models",
             Self::Route => "route",
+            Self::MaxTokens => "max_tokens",
+            Self::Temperature => "temperature",
+            Self::TopP => "top_p",
+            Self::Reasoning => "reasoning",
+            Self::Provider => "provider",
         }
     }
 }
@@ -174,26 +184,46 @@ impl std::fmt::Display for Field {
 }
 
 #[derive(Deserialize)]
-#[serde(field_identifier, rename_all = "lowercase")]
+#[serde(field_identifier, rename_all = "snake_case")]
 enum TopKey {
     Model,
     Stream,
     Store,
     Models,
     Route,
+    MaxTokens,
+    Temperature,
+    TopP,
+    Reasoning,
+    Provider,
     #[serde(other)]
     Other,
 }
 
+#[derive(Clone, Copy)]
+enum Keys {
+    Routing,
+    Settings,
+}
+
 impl TopKey {
-    const fn field(self) -> Option<Field> {
-        match self {
-            Self::Model => Some(Field::Model),
-            Self::Stream => Some(Field::Stream),
-            Self::Store => Some(Field::Store),
-            Self::Models => Some(Field::Models),
-            Self::Route => Some(Field::Route),
-            Self::Other => None,
+    const fn field(self, keys: Keys) -> Option<Field> {
+        match (self, keys) {
+            (Self::Model, _) => Some(Field::Model),
+            (Self::Stream, _) => Some(Field::Stream),
+            (Self::Store, _) => Some(Field::Store),
+            (Self::Models, _) => Some(Field::Models),
+            (Self::Route, _) => Some(Field::Route),
+            (Self::MaxTokens, Keys::Settings) => Some(Field::MaxTokens),
+            (Self::Temperature, Keys::Settings) => Some(Field::Temperature),
+            (Self::TopP, Keys::Settings) => Some(Field::TopP),
+            (Self::Reasoning, Keys::Settings) => Some(Field::Reasoning),
+            (Self::Provider, Keys::Settings) => Some(Field::Provider),
+            (
+                Self::MaxTokens | Self::Temperature | Self::TopP | Self::Reasoning | Self::Provider,
+                Keys::Routing,
+            )
+            | (Self::Other, _) => None,
         }
     }
 }
@@ -208,10 +238,20 @@ pub struct RequestPeek {
 
 impl RequestPeek {
     pub fn of(body: &[u8]) -> Result<Self, PeekError> {
+        Self::peek(body, Keys::Routing)
+    }
+
+    // Only a caller that replaces generation settings may refuse their duplicates; elsewhere a
+    // repeated settings key is the guest's own business and is forwarded untouched.
+    pub fn with_settings(body: &[u8]) -> Result<Self, PeekError> {
+        Self::peek(body, Keys::Settings)
+    }
+
+    fn peek(body: &[u8], keys: Keys) -> Result<Self, PeekError> {
         let images = serde_json::from_slice::<Scan>(body)
             .map_err(|_invalid| PeekError::NotJson)?
             .images;
-        let fields = top_level_fields(body)?;
+        let fields = top_level_fields(body, keys)?;
         let raw = |wanted: Field| {
             fields
                 .iter()
@@ -351,7 +391,10 @@ impl<'de> serde::de::Visitor<'de> for ScanVisitor {
     }
 }
 
-fn top_level_fields(body: &[u8]) -> Result<Vec<(Field, std::ops::Range<usize>)>, PeekError> {
+fn top_level_fields(
+    body: &[u8],
+    keys: Keys,
+) -> Result<Vec<(Field, std::ops::Range<usize>)>, PeekError> {
     let mut fields = Vec::new();
     let mut at = skip_space(body, 0);
     if body.get(at) != Some(&b'{') {
@@ -367,7 +410,7 @@ fn top_level_fields(body: &[u8]) -> Result<Vec<(Field, std::ops::Range<usize>)>,
         at = skip_space(body, key_end);
         at = skip_space(body, at + 1);
         let value_end = value_end(body, at).ok_or(PeekError::NotObject)?;
-        if let Some(field) = key.field() {
+        if let Some(field) = key.field(keys) {
             if fields.iter().any(|(seen, _)| *seen == field) {
                 return Err(PeekError::Duplicate(field));
             }
@@ -554,6 +597,16 @@ mod tests {
         }
         let peek = RequestPeek::of(br#"{"model":"astra","x":1,"x":2}"#).unwrap();
         assert_eq!(peek.fields.len(), 1);
+    }
+
+    #[test]
+    fn only_a_settings_peek_refuses_a_repeated_settings_key() {
+        let body = br#"{"model":"astra","temperature":0.1,"temperature":0.2}"#;
+        assert_eq!(RequestPeek::of(body).unwrap().fields.len(), 1);
+        assert_eq!(
+            RequestPeek::with_settings(body).unwrap_err(),
+            PeekError::Duplicate(Field::Temperature)
+        );
     }
 
     #[test]

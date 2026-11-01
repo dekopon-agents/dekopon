@@ -943,10 +943,14 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
                     false,
                 )
                 .await
-                .expect_err("a reserved word never reaches its guest");
-            assert!(
-                matches!(&refused, BrokerHostError::UnknownCommandWord { word } if word == "recall"),
-                "{refused:?}"
+                .expect("a reserved word is refused before it reaches its guest");
+            assert_eq!(
+                refused,
+                dekopon_broker_host::CommandRunOutcome::Rendered {
+                    stdout: String::new(),
+                    stderr: "dekopon-shell: recall: not granted in this conversation\n".to_owned(),
+                    status: 127,
+                }
             );
             continue;
         }
@@ -965,18 +969,25 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
             .capability_surface(&gateway, Some(&grant), Some(&claim))
             .expect("ordinary chat remains available");
         assert!(listed.is_empty() && words.is_empty() && help.is_empty() && memory.is_none());
-        assert!(
-            broker
-                .run_command(
-                    &gateway,
-                    Some(&grant),
-                    Some(&claim),
-                    "storageprobe",
-                    &[],
-                    false
-                )
-                .await
-                .is_err()
+        let refused = broker
+            .run_command(
+                &gateway,
+                Some(&grant),
+                Some(&claim),
+                "storageprobe",
+                &[],
+                false,
+            )
+            .await
+            .expect("the installed reserved word is refused before parsing");
+        assert_eq!(
+            refused,
+            dekopon_broker_host::CommandRunOutcome::Rendered {
+                stdout: String::new(),
+                stderr: "dekopon-shell: storageprobe: not granted in this conversation\n"
+                    .to_owned(),
+                status: 127,
+            }
         );
 
         let chat_id = "renamed-chat".parse::<InvocationId>().expect("invocation");

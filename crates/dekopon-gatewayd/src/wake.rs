@@ -343,6 +343,7 @@ impl Anchor {
             );
         }
         InboundMessage {
+            control_text: None,
             pull_request_links: None,
             transport: self.transport.to_string(),
             transport_kind: self.kind,
@@ -352,6 +353,7 @@ impl Anchor {
             text,
             assets: Vec::new(),
             asset_overflow: false,
+            input_refusal: None,
             addressed: Some(true),
             thread_continuation: None,
             reply: self.reply.clone(),

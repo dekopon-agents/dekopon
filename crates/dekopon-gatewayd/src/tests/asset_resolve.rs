@@ -636,13 +636,13 @@ async fn a_retired_refetch_refuses_revoked_without_downloading() {
 }
 
 struct ServiceFailure {
-    code: &'static str,
+    error: fn() -> TransportError,
     calls: AtomicUsize,
 }
 impl ServiceFailure {
-    fn new(code: &'static str) -> Self {
+    fn new(error: fn() -> TransportError) -> Self {
         Self {
-            code,
+            error,
             calls: AtomicUsize::new(0),
         }
     }
@@ -650,19 +650,42 @@ impl ServiceFailure {
 impl AssetFetcher for ServiceFailure {
     fn fetch(&self, _: &AssetSourceRef, _: u64) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async {
-            Err(TransportError::Service {
-                code: self.code.into(),
-            })
-        })
+        let error = (self.error)();
+        Box::pin(async { Err(error) })
     }
 }
 
 #[tokio::test]
 async fn platform_refusal_codes_name_platform_gone_and_other_codes_stay_retryable() {
-    for code in [
-        "404", "410", "401", "403", "http-404", "http-410", "http-401", "http-403", "500",
-    ] {
+    use crate::transport::MediaRefusal;
+    fn service(code: &'static str) -> TransportError {
+        TransportError::Service { code: code.into() }
+    }
+    fn typed(status: u16) -> TransportError {
+        TransportError::AssetRefused {
+            cause: match status {
+                404 => MediaRefusal::Gone,
+                status => MediaRefusal::Download { status },
+            },
+        }
+    }
+    type Failure = fn() -> TransportError;
+    let failures: [(&str, Failure); 13] = [
+        ("404", || service("404")),
+        ("410", || service("410")),
+        ("401", || service("401")),
+        ("403", || service("403")),
+        ("http-404", || service("http-404")),
+        ("http-410", || service("http-410")),
+        ("http-401", || service("http-401")),
+        ("http-403", || service("http-403")),
+        ("500", || service("500")),
+        ("typed-gone", || typed(404)),
+        ("typed-401", || typed(401)),
+        ("typed-403", || typed(403)),
+        ("typed-500", || typed(500)),
+    ];
+    for (code, error) in failures {
         let store = store(3);
         let access = access(code);
         let id = register(&store, &access, Some(3));
@@ -670,11 +693,11 @@ async fn platform_refusal_codes_name_platform_gone_and_other_codes_stay_retryabl
         let session = SessionAssets::new(
             Arc::clone(&store),
             access.clone(),
-            Some(Arc::new(ServiceFailure::new(code))),
+            Some(Arc::new(ServiceFailure::new(error))),
             Handle::current(),
             true,
         );
-        let expected = if code == "500" {
+        let expected = if code.ends_with("500") {
             ChatAssetRefusal::Unavailable
         } else {
             ChatAssetRefusal::PlatformGone
@@ -695,7 +718,7 @@ async fn platform_refusal_codes_name_platform_gone_and_other_codes_stay_retryabl
         let retry = self::session(&store, &access, &gate)
             .resolve_input(id)
             .await;
-        if code == "500" {
+        if code.ends_with("500") {
             assert_eq!(retry.unwrap().blob.read().unwrap(), b"aaa");
             assert_eq!(gate.fetches(), 1);
         } else {
@@ -849,7 +872,9 @@ async fn encoding_a_history_image_refills_bytes_or_reports_platform_gone() {
         drop(store.admit(&access, id, b"aaa").unwrap());
         let gate = Gate::open(b"aaa");
         let mut session = session(&store, &access, &gate);
-        let service = Arc::new(ServiceFailure::new("404"));
+        let service = Arc::new(ServiceFailure::new(|| TransportError::Service {
+            code: "404".into(),
+        }));
         if gone {
             session.fetcher = Some(Arc::clone(&service) as Arc<dyn AssetFetcher>);
         }
@@ -1351,7 +1376,9 @@ async fn platform_gone_is_cached_across_later_history_requests() {
     let access = access("gone-history");
     let id = register(&store, &access, Some(3));
     drop(store.admit(&access, id, b"aaa").unwrap());
-    let service = Arc::new(ServiceFailure::new("404"));
+    let service = Arc::new(ServiceFailure::new(|| TransportError::Service {
+        code: "404".into(),
+    }));
     let session = SessionAssets::new(
         Arc::clone(&store),
         access.clone(),

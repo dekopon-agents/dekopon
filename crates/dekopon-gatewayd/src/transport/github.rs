@@ -328,6 +328,7 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     }
     let receipt = received.in_scope(|| receive_span(ChatTransportKind::Github));
     let message = InboundMessage {
+        control_text: None,
         pull_request_links: None,
         transport: state.name.clone(),
         transport_kind: ChatTransportKind::Github,
@@ -337,6 +338,7 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         text: String::new(),
         assets: Vec::new(),
         asset_overflow: false,
+        input_refusal: None,
         addressed: Some(true),
         thread_continuation: None,
         reply: ReplyTarget::GithubTrace,

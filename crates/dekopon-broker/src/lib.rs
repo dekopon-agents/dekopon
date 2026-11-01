@@ -2421,13 +2421,26 @@ where
             None => None,
         };
         let memory_word = self.is_chat_memory_word(word);
-        if memory_word
-            && !attested.is_some_and(|(context, claim)| {
-                self.memory_surface(&context, &claim.agent).is_some()
+        let context = attested.as_ref().map_or(peer, |(context, _)| context);
+        let installed = self
+            .registry
+            .command_words_by_provider()
+            .into_iter()
+            .any(|(_, words)| words.iter().any(|candidate| candidate == word));
+        let reachable = if memory_word {
+            attested.as_ref().is_some_and(|(context, claim)| {
+                self.memory_surface(context, &claim.agent).is_some()
             })
-        {
-            return Err(BrokerHostError::UnknownCommandWord {
-                word: word.to_owned(),
+        } else {
+            self.command_words(context)
+                .iter()
+                .any(|candidate| candidate == word)
+        };
+        if installed && !reachable {
+            return Ok(CommandRunOutcome::Rendered {
+                stdout: String::new(),
+                stderr: format!("dekopon-shell: {word}: not granted in this conversation\n"),
+                status: 127,
             });
         }
         let outcome = self.registry.run_command(word, argv, stdin_piped).await?;
