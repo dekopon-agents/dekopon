@@ -5072,6 +5072,10 @@ fn emit_audit_event_record(event: &AuditEvent) {
                 error.code = error_detail.as_ref().map(|detail| detail.code.as_str()),
                 error.message = error_detail.as_ref().map(|detail| detail.message.as_str()),
                 http.calls = rendered(http_calls),
+                vm.session = http_calls
+                    .iter()
+                    .find_map(|call| call.vm_session.as_ref())
+                    .map(dekopon_core::VmSession::as_str),
                 storage.scope_commitment = storage_scope_commitment
                     .as_ref()
                     .map(StorageScopeCommitment::as_str),

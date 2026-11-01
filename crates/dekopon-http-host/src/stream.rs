@@ -637,6 +637,14 @@ impl BufferedHttpClient {
                         .map(str::to_owned)
                 }),
         };
+        self.evidence[index].vm_session = match metadata {
+            super::ResponseMetadata::SignedDownload => None,
+            super::ResponseMetadata::Ordinary => response
+                .headers()
+                .get(dekopon_core::VM_SESSION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(dekopon_core::VmSession::parse),
+        };
         Ok(Head {
             status,
             headers: head.headers,

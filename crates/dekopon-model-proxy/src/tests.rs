@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use dekopon_core::Redacted;
+use dekopon_core::{Redacted, VM_SESSION_HEADER};
 use dekopon_model::wire::Field;
 use dekopon_model_token_governor::{Budget, MeterSpec, Metering, Tokens, UnixMillis};
 use dekopon_test_support::{CODEX_RESPONSES_TWO_DELTAS, OPENAI_CHAT_COMPLETIONS_TWO_DELTAS};
@@ -15,8 +15,7 @@ use tokio::{
 };
 
 use crate::{
-    CurrentProxy, Grant, Granted, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER,
-    SUBJECT_HEADER, Upstream,
+    CurrentProxy, Grant, Granted, MAX_BODY_BYTES, ModelProxy, ProxyModel, SUBJECT_HEADER, Upstream,
 };
 
 const SUBJECT: &str = "dekopon:gylmar-vm";
@@ -409,7 +408,7 @@ async fn a_proxied_call_records_subject_session_model_and_outcome() {
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
         .post("/v1/chat/completions", CHAT_CALL)
-        .header(SESSION_HEADER, format!(" {SESSION} "))
+        .header(VM_SESSION_HEADER, format!(" {SESSION} "))
         .send()
         .await
         .unwrap();
@@ -465,7 +464,7 @@ async fn a_vm_calls_meter_record_names_its_launch_session_after_the_telemetry_br
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
         .post("/v1/chat/completions", CHAT_CALL)
-        .header(SESSION_HEADER, SESSION)
+        .header(VM_SESSION_HEADER, SESSION)
         .send()
         .await
         .unwrap();
@@ -524,7 +523,7 @@ async fn a_missing_or_malformed_session_header_records_no_session() {
         let running = proxy(&upstream.url, 100_000).await;
         let mut request = running.post("/v1/chat/completions", CHAT_CALL);
         if let Some(session) = session {
-            request = request.header(SESSION_HEADER, session);
+            request = request.header(VM_SESSION_HEADER, session);
             assert!(!upstream_saw(&upstream, request).await.contains(session));
         } else {
             upstream_saw(&upstream, request).await;
@@ -556,7 +555,7 @@ async fn a_refused_call_records_its_outcome_on_the_span() {
     let running = proxy("http://127.0.0.1:9", 100_000).await;
     let response = running
         .post("/v1/chat/completions", r#"{"model":"glm-ungranted"}"#)
-        .header(SESSION_HEADER, SESSION)
+        .header(VM_SESSION_HEADER, SESSION)
         .send()
         .await
         .unwrap();
