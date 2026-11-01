@@ -144,7 +144,7 @@ async fn a_job_leg_authorization_records_its_trigger() {
             principal: principal("caller"),
         },
         principal("gateway"),
-        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
         scope,
     )
     .expect("job context");

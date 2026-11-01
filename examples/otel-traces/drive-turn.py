@@ -140,8 +140,8 @@ permit(principal == Dekopon::Principal::"smoke-user",
             "providers": [str(root / "examples/providers/cli-probe-provider.wasm")],
             "identities": [{"uid": os.geteuid(), "principal": "dekopon-gatewayd",
                 "actor": {"type": "service", "principal": "dekopon-gatewayd"},
-                "attestor": {"namespaces": ["tel"]}}],
-            "principals": {"smoke-user": {"subjects": ["tel.16034700182"]}},
+                "attestor": {"namespaces": ["drn:tel:*:*:*"]}}],
+            "principals": {"smoke-user": {"subjects": ["drn:tel:number::16034700182"]}},
             "capabilities": {"cli-probe": {
                 "constraints": {"timeoutMs": 30000},
                 "capabilities": {"cli-probe.upper": {}}}},
@@ -169,7 +169,7 @@ permit(principal == Dekopon::Principal::"smoke-user",
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(60)
             client.connect(str(path))
-            client.sendall((json.dumps({"subject": "tel.16034700182",
+            client.sendall((json.dumps({"subject": "drn:tel:number::16034700182",
                 "conversation": {"kind": "directMessage", "id": "dev"},
                 "text": PAYLOAD}) + "\n").encode())
             with client.makefile("rb") as reader:

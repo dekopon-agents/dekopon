@@ -18,7 +18,7 @@ use std::{
 
 use clap::{CommandFactory as _, Parser, error::ErrorKind};
 use dekopon_config::load_discovered;
-use dekopon_core::{AgentId, ExternalSubject};
+use dekopon_core::{AgentId, Subject};
 use dekopon_process::ShellThreads;
 use dekopon_tui::OperatorProfile;
 use dekopon_tui::{
@@ -79,7 +79,7 @@ struct Cli {
     #[arg(long, value_name = "UID", env = "DEKOPON_BROKER_UID")]
     server_uid: Option<u32>,
 
-    /// Canonical external subject sessions propose on behalf of.
+    /// Subject DRN sessions propose on behalf of, such as `drn:slack:user:T0123ABC:U9XYZ`.
     ///
     /// The broker still has to hold an attestor grant covering its namespace and a mapping
     /// resolving it to a principal; declaring one here grants nothing at all.
@@ -88,7 +88,7 @@ struct Cli {
     /// console guessed would be an identity nobody chose, and the broker would refuse it anyway one
     /// step later having told you nothing useful.
     #[arg(long, value_name = "SUBJECT", env = "DEKOPON_CONSOLE_SUBJECT")]
-    subject: Option<ExternalSubject>,
+    subject: Option<Subject>,
 
     /// Exact catalog agent to enter directly; otherwise use the picker.
     #[arg(long, value_name = "AGENT")]

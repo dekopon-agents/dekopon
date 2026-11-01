@@ -12,7 +12,7 @@ use dekopon_capability::{
     EffectKind, ExecutionConstraints, InvocationOutcome, StorageAccess, StorageConstraints,
     StorageInterface, StorageRetention, StorageScope,
 };
-use dekopon_core::{Actor, ExternalSubject, PrincipalId};
+use dekopon_core::{Actor, PrincipalId, Subject};
 use dekopon_storage_host::{StorageHost, StorageLimits};
 use dekopon_test_support::provider_fixture;
 use serde_json::json;
@@ -44,8 +44,8 @@ async fn build_scoped_broker(
     .unwrap();
     let capability: dekopon_core::CapabilityId = "storage-probe.run".parse().unwrap();
     let provider: dekopon_core::ProviderId = "storage-probe".parse().unwrap();
-    let alice: ExternalSubject = "slack.t0123abc.u9xyz".parse().unwrap();
-    let bob: ExternalSubject = "slack.t0123abc.u8xyz".parse().unwrap();
+    let alice: Subject = "drn:slack:user:t0123abc:u9xyz".parse().unwrap();
+    let bob: Subject = "drn:slack:user:t0123abc:u8xyz".parse().unwrap();
     let world = PolicyWorld::new(
         [
             "alice".parse::<PrincipalId>().unwrap(),
@@ -109,15 +109,21 @@ when { context.via == "gateway" && context.agent == "reviewer" };
         CredentialStore::empty(),
         IdentityDirectory::new([
             (alice.clone(), "alice".parse().unwrap()),
-            ("discord.123".parse().unwrap(), "alice".parse().unwrap()),
-            ("discord.456.789".parse().unwrap(), "space".parse().unwrap()),
+            (
+                "drn:discord:user::123".parse().unwrap(),
+                "alice".parse().unwrap(),
+            ),
+            (
+                "drn:discord:channel:456:789".parse().unwrap(),
+                "space".parse().unwrap(),
+            ),
             (bob.clone(), "bob".parse().unwrap()),
             (
-                "slack.t0123abc.cspace".parse().unwrap(),
+                "drn:slack:channel:t0123abc:cspace".parse().unwrap(),
                 "space".parse().unwrap(),
             ),
             (
-                "slack.t0123abc.cspace2".parse().unwrap(),
+                "drn:slack:channel:t0123abc:cspace2".parse().unwrap(),
                 "space".parse().unwrap(),
             ),
         ])
@@ -139,7 +145,7 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
     )
     .unwrap();
     let grant = AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+        namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
     };
     for scope in [StorageScope::Agent, StorageScope::Space] {
         let temporary = tempfile::tempdir().unwrap();
@@ -165,7 +171,10 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
                 secret_use: None,
             };
             let claim = Attestation::for_chat(
-                "slack.t0123abc.u9xyz".parse().unwrap(),
+                dekopon_core::AttestedSubject::one(
+                    "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+                )
+                .unwrap(),
                 "reviewer".parse().unwrap(),
                 ChatScopeClaim {
                     participant: None,
@@ -210,7 +219,10 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
             });
             if mapped && scope == StorageScope::Space {
                 let mut other = claim.clone();
-                other.subject = "slack.t0123abc.u8xyz".parse().unwrap();
+                other.subjects = dekopon_core::AttestedSubject::one(
+                    "drn:slack:user:t0123abc:u8xyz".parse().unwrap(),
+                )
+                .unwrap();
                 assert!(
                     broker
                         .session_surface(&gateway, Some(&grant), Some(&other))
@@ -273,8 +285,8 @@ async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().canonicalize().unwrap().join("storage");
     let (first_broker, first_storage) = build_broker(&root, true).await;
-    let alice: ExternalSubject = "slack.t0123abc.u9xyz".parse().unwrap();
-    let bob: ExternalSubject = "slack.t0123abc.u8xyz".parse().unwrap();
+    let alice: Subject = "drn:slack:user:t0123abc:u9xyz".parse().unwrap();
+    let bob: Subject = "drn:slack:user:t0123abc:u8xyz".parse().unwrap();
     let gateway = AuthenticatedContext::new(
         "gateway".parse().unwrap(),
         Actor::Service {
@@ -314,9 +326,12 @@ async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
         (request, claim)
     };
     let grant = AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+        namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
     };
-    let (request, claim) = invoke(0, bob.clone());
+    let (request, claim) = invoke(
+        0,
+        dekopon_core::AttestedSubject::one(bob.clone()).expect("one-form subject"),
+    );
     let formerly_allowed = first_broker
         .invoke(
             &gateway,
@@ -335,7 +350,10 @@ async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
     drop(first_broker);
     drop(first_storage);
     let (broker, storage) = build_broker(&root, false).await;
-    let (request, claim) = invoke(1, alice);
+    let (request, claim) = invoke(
+        1,
+        dekopon_core::AttestedSubject::one(alice).expect("one-form subject"),
+    );
     let admitted = broker
         .invoke(
             &gateway,
@@ -365,7 +383,10 @@ async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
         .set_times(FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(60)))
         .unwrap();
     let aged = fs::metadata(&path).unwrap().modified().unwrap();
-    let (request, claim) = invoke(2, bob);
+    let (request, claim) = invoke(
+        2,
+        dekopon_core::AttestedSubject::one(bob).expect("one-form subject"),
+    );
     let denied = broker
         .invoke(
             &gateway,
@@ -378,7 +399,13 @@ async fn revoked_agent_storage_caller_does_not_refresh_the_shared_resource() {
         .unwrap();
     assert_eq!(denied.result.outcome, InvocationOutcome::Denied);
     assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), aged);
-    let (request, claim) = invoke(3, "slack.t0123abc.u9xyz".parse().unwrap());
+    let (request, claim) = invoke(
+        3,
+        dekopon_core::AttestedSubject::one(
+            "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+        )
+        .unwrap(),
+    );
     let admitted = broker
         .invoke(
             &gateway,
@@ -434,7 +461,10 @@ async fn an_allowed_job_write_joins_its_job_authorization_by_invocation_id() {
             secret_use: None,
         };
         let claim = Attestation::for_chat(
-            "slack.t0123abc.u9xyz".parse().unwrap(),
+            dekopon_core::AttestedSubject::one(
+                "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+            )
+            .unwrap(),
             "reviewer".parse().unwrap(),
             ChatScopeClaim {
                 participant: None,
@@ -453,7 +483,7 @@ async fn an_allowed_job_write_joins_its_job_authorization_by_invocation_id() {
         )
         .bound_to(request.id.clone());
         let grant = AttestorGrant {
-            namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+            namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
         };
         let result = broker
             .invoke(
@@ -535,11 +565,12 @@ async fn a_discord_thread_claim_derives_its_parent_channels_space_key() {
     )
     .unwrap();
     let grant = AttestorGrant {
-        namespaces: Some(vec!["discord".to_owned()]),
+        namespaces: Some(vec!["drn:discord:*:*:*".parse().unwrap()]),
     };
     let claim = |kind, thread| {
         Attestation::for_chat(
-            "discord.123".parse().unwrap(),
+            dekopon_core::AttestedSubject::one("drn:discord:user::123".parse().expect("subject"))
+                .unwrap(),
             "reviewer".parse().unwrap(),
             ChatScopeClaim {
                 participant: None,

@@ -3,7 +3,7 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use dekopon_agent::CancelVia;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
-use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_core::{AttestedSubject, Redacted, Subject};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use tracing::{Instrument as _, Span};
@@ -225,7 +225,8 @@ impl TelegramTransport {
             pull_request_links: None,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Telegram,
-            subject: ExternalSubject::telegram(&user.to_string())
+            subject: Subject::telegram_user(&user.to_string())
+                .and_then(AttestedSubject::one)
                 .map_err(TransportError::Subject)?,
             conversation,
             message_id: MessageId::Native(message_id.to_string()),
@@ -302,7 +303,7 @@ impl TelegramTransport {
         if claimed != conversation_id {
             return ignored("conversation-mismatch");
         }
-        let Ok(subject) = ExternalSubject::telegram(&user.to_string()) else {
+        let Ok(subject) = Subject::telegram_user(&user.to_string()) else {
             return ignored("subject");
         };
         received.record("message.id", message_id.to_string().as_str());
@@ -1814,7 +1815,7 @@ mod tests {
         assert_eq!(request.transport, "family");
         assert_eq!(request.conversation_id, "42");
         assert_eq!(
-            request.subject, "telegram.16034700182",
+            request.subject, "drn:telegram:user::16034700182",
             "the presser comes from the authenticated envelope, never from the payload"
         );
         assert_eq!(request.via, CancelVia::Button);

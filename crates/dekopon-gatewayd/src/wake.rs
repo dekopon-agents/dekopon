@@ -11,7 +11,7 @@ use dekopon_agent::{
 use dekopon_broker_protocol::{
     Attestation, ChatScopeClaim, ChatTransportKind, Conversation, TraceParent, Trigger,
 };
-use dekopon_core::{AgentId, ExternalSubject, TransportId};
+use dekopon_core::{AgentId, AttestedSubject, Subject, SubjectKind, TransportId};
 use dekopon_process::ExitCode;
 use dekopon_process::Limits as ShellLimits;
 use dekopon_shell::{CapabilityInvoker, Interpreter, ScriptOutcome};
@@ -32,7 +32,7 @@ const MAX_PROBE_OUTPUT_BYTES: usize = 8 * 1024;
 const WHATSAPP_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(crate) fn space_wake(message: &InboundMessage) -> bool {
-    message.subject.kind() == dekopon_core::PrincipalKind::Space
+    message.subject.name().principal_kind() == dekopon_core::PrincipalKind::Space
         && match message.message_id {
             MessageId::Wake { .. } => true,
             MessageId::Native(_)
@@ -199,7 +199,7 @@ impl ReviewSubscriptions {
 pub(crate) struct Anchor {
     transport: TransportId,
     kind: ChatTransportKind,
-    subject: ExternalSubject,
+    subject: AttestedSubject,
     conversation: Conversation,
     reply: ReplyTarget,
     agent: AgentId,
@@ -213,24 +213,24 @@ impl Anchor {
             ConversationKind::Channel | ConversationKind::Thread => {}
             ConversationKind::DirectMessage | ConversationKind::GroupDirectMessage => return None,
         }
-        let service = match self.kind {
-            ChatTransportKind::Slack => "slack",
-            ChatTransportKind::Fauxlack => "fauxlack",
-            ChatTransportKind::Discord => "discord",
+        let kind = match self.kind {
+            ChatTransportKind::Slack => SubjectKind::SlackChannel,
+            ChatTransportKind::Fauxlack => SubjectKind::FauxlackChannel,
+            ChatTransportKind::Discord => SubjectKind::DiscordChannel,
             ChatTransportKind::Telegram
             | ChatTransportKind::Whatsapp
             | ChatTransportKind::Github
             | ChatTransportKind::Local => return None,
         };
-        let mut anchor = self.clone();
-        anchor.subject = format!(
-            "{service}.{}.{}",
+        let space = Subject::new(
+            kind,
             self.conversation.container.as_deref()?,
-            self.conversation.id
+            &self.conversation.id,
         )
-        .parse()
         .ok()?;
-        (anchor.subject.kind() == dekopon_core::PrincipalKind::Space).then_some(anchor)
+        let mut anchor = self.clone();
+        anchor.subject = AttestedSubject::one(space).ok()?;
+        Some(anchor)
     }
 
     pub(crate) fn same_channel(&self, other: &Self) -> bool {
@@ -263,8 +263,8 @@ impl Anchor {
         })
     }
 
-    pub(crate) const fn subject(&self) -> &ExternalSubject {
-        &self.subject
+    pub(crate) const fn subject(&self) -> &Subject {
+        self.subject.name()
     }
 
     pub(crate) const fn agent(&self) -> &AgentId {
@@ -594,7 +594,8 @@ impl WakeRegistrar for SessionWakes {
         self.store.cancel_subscription(&self.space_anchor()?, id)
     }
     fn schedule(&self, request: WakeRequest) -> Result<WakeSummary, WakeRefusal> {
-        if !self.space_access && self.anchor.subject().kind() == dekopon_core::PrincipalKind::Space
+        if !self.space_access
+            && self.anchor.subject().principal_kind() == dekopon_core::PrincipalKind::Space
         {
             return Err(WakeRefusal::MappedChannelRequired);
         }

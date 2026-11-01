@@ -11,15 +11,15 @@ use dekopon_broker::{
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, PrincipalId, ProviderId, RiskLevel, TransportId,
+    Actor, AgentId, CapabilityId, PrincipalId, ProviderId, RiskLevel, Subject, TransportId,
 };
 use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tracing_subscriber::layer::SubscriberExt as _;
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
-const MAPPED_SUBJECT: &str = "slack.t0123abc.u9xyz";
-const UNMAPPED_SUBJECT: &str = "slack.t0123abc.unobody";
+const MAPPED_SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
+const UNMAPPED_SUBJECT: &str = "drn:slack:user:t0123abc:unobody";
 
 const POLICIES: &str = r#"
 @id("attested-reverse")
@@ -55,7 +55,7 @@ fn agent(name: &str) -> AgentId {
     name.parse().expect("valid agent fixture")
 }
 
-fn subject(canonical: &str) -> ExternalSubject {
+fn subject(canonical: &str) -> Subject {
     canonical.parse().expect("canonical subject fixture")
 }
 
@@ -123,7 +123,7 @@ fn gateway() -> AuthenticatedContext {
 
 fn grant() -> AttestorGrant {
     AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+        namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
     }
 }
 
@@ -141,7 +141,7 @@ fn proposal(id: &str) -> InvocationRequest {
 
 fn chat_claim(canonical: &str, agent_id: &str) -> Attestation {
     Attestation::for_chat(
-        subject(canonical),
+        dekopon_core::AttestedSubject::one(subject(canonical)).expect("one-form subject"),
         agent(agent_id),
         ChatScopeClaim {
             participant: None,
@@ -175,7 +175,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
     let (broker, audit) = broker().await;
 
     let narrow = AttestorGrant {
-        namespaces: Some(vec!["slack.tother".to_owned()]),
+        namespaces: Some(vec!["drn:slack:*:tother:*".parse().unwrap()]),
     };
     assert!(
         broker
@@ -183,7 +183,8 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
                 &gateway(),
                 Some(&narrow),
                 Some(&Attestation::for_subject(
-                    subject(MAPPED_SUBJECT),
+                    dekopon_core::AttestedSubject::one(subject(MAPPED_SUBJECT))
+                        .expect("one-form subject"),
                     agent("some-agent")
                 )),
             )
@@ -197,8 +198,12 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             &gateway(),
             Some(&grant()),
             Some(
-                &Attestation::for_subject(subject(MAPPED_SUBJECT), agent("broken-agent"))
-                    .bound_to(denied.id.clone()),
+                &Attestation::for_subject(
+                    dekopon_core::AttestedSubject::one(subject(MAPPED_SUBJECT))
+                        .expect("one-form subject"),
+                    agent("broken-agent"),
+                )
+                .bound_to(denied.id.clone()),
             ),
             denied,
             Default::default(),
@@ -287,7 +292,8 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
                 &gateway(),
                 attestor.as_ref(),
                 Some(&Attestation::for_subject(
-                    subject(canonical),
+                    dekopon_core::AttestedSubject::one(subject(canonical))
+                        .expect("one-form subject"),
                     agent(agent_id),
                 )),
             )
@@ -367,7 +373,8 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
                 &gateway(),
                 Some(&grant()),
                 Some(&Attestation::for_subject(
-                    subject(MAPPED_SUBJECT),
+                    dekopon_core::AttestedSubject::one(subject(MAPPED_SUBJECT))
+                        .expect("one-form subject"),
                     agent("some-agent")
                 )),
             )
@@ -384,7 +391,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
 async fn out_of_namespace_subjects_keep_the_same_opaque_refusal_whether_mapped_or_not() {
     let (broker, _) = broker().await;
     let outside = AttestorGrant {
-        namespaces: Some(vec!["slack.tother".to_owned()]),
+        namespaces: Some(vec!["drn:slack:*:tother:*".parse().unwrap()]),
     };
     for canonical in [MAPPED_SUBJECT, UNMAPPED_SUBJECT] {
         let refusal = broker
@@ -392,7 +399,8 @@ async fn out_of_namespace_subjects_keep_the_same_opaque_refusal_whether_mapped_o
                 &gateway(),
                 Some(&outside),
                 Some(&Attestation::for_subject(
-                    subject(canonical),
+                    dekopon_core::AttestedSubject::one(subject(canonical))
+                        .expect("one-form subject"),
                     agent("some-agent"),
                 )),
             )
@@ -422,7 +430,8 @@ async fn omitted_namespaces_allow_the_unmapped_refusal_cause() {
             &gateway(),
             Some(&grant),
             Some(&Attestation::for_subject(
-                subject(UNMAPPED_SUBJECT),
+                dekopon_core::AttestedSubject::one(subject(UNMAPPED_SUBJECT))
+                    .expect("one-form subject"),
                 agent("some-agent"),
             )),
         )

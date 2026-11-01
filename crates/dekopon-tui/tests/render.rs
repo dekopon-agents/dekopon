@@ -29,7 +29,7 @@ fn agent(name: &str, description: &str) -> Agent {
 fn console(agents: Vec<Agent>) -> App {
     App::new(
         agents,
-        "slack.t0123abc.u9xyz".to_owned(),
+        "drn:slack:user:t0123abc:u9xyz".to_owned(),
         "/run/dekopon/broker.sock".to_owned(),
         "/config/dekopon/chatgpt-auth.console.json".to_owned(),
     )
@@ -69,7 +69,7 @@ fn the_status_line_shows_the_subject_and_the_credential_file() {
     // spends. An operator must never have to guess either.
     let drawn = frame(&console(Vec::new()));
     assert!(
-        drawn.contains("slack.t0123abc.u9xyz"),
+        drawn.contains("drn:slack:user:t0123abc:u9xyz"),
         "the subject is missing"
     );
     assert!(

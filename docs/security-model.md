@@ -113,6 +113,8 @@ API offers on a granted model. The budget bounds the spend.
 - Dekopon isn't production-hardened and has no multi-tenant transport. Per-agent credentials don't
   give each organization its own OS identity.
 - A compromised gateway speaks for every subject inside its attestor namespaces.
+- A GitHub name mapping follows the name to any later repository under it; only `repo-id` is
+  stable.
 - The provider lock pins bytes by digest. A digest proves identity, not publisher, and there's no
   provenance check or revocation.
 - Wasmtime bounds memory, fuel and time per invocation; it isn't claimed as a production sandbox.

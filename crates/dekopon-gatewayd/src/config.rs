@@ -16,7 +16,7 @@ use dekopon_broker_protocol::{
 };
 use dekopon_config::{Projection, ProjectionError};
 use dekopon_core::{
-    AgentId, ExternalSubject, FileHygieneError, FileTier,
+    AgentId, FileHygieneError, FileTier, Subject,
     fragments::{self, FragmentError, MergeRules},
     read_trusted_file,
 };
@@ -811,7 +811,7 @@ pub struct RouteConfig {
     #[serde(default, deserialize_with = "github_events_present")]
     pub github_events: Option<Vec<GithubEvent>>,
     #[serde(default)]
-    pub subjects: Option<Vec<ExternalSubject>>,
+    pub subjects: Option<Vec<Subject>>,
     pub agent: AgentId,
     #[serde(default)]
     pub model: Option<String>,
@@ -890,7 +890,7 @@ pub struct ResolvedRoute {
     pub transport: String,
     pub github_events: Option<Vec<GithubEvent>>,
     pub conversation: ConversationMatch,
-    pub subjects: Option<Vec<ExternalSubject>>,
+    pub subjects: Option<Vec<Subject>>,
     pub agent: AgentId,
     pub model: Option<String>,
     pub inspect_agent_config: bool,
@@ -2531,6 +2531,14 @@ fn resolve_with_service(
         {
             problems.push(ConfigProblem::EmptyRouteSubjects { route: index });
         }
+        if route
+            .subjects
+            .iter()
+            .flatten()
+            .any(|subject| subject.kind().is_id_form())
+        {
+            problems.push(ConfigProblem::IdFormRouteSubject { route: index });
+        }
         if direct_message_only
             && matches!(
                 &route.memory,
@@ -3474,6 +3482,10 @@ pub enum ConfigProblem {
         "routes[{route}]: `subjects:` is empty, which answers nobody; omit it to answer every subject"
     )]
     EmptyRouteSubjects { route: usize },
+    #[error(
+        "routes[{route}]: `subjects:` names an id-form subject; a route matches the name form, so name the repository or login"
+    )]
+    IdFormRouteSubject { route: usize },
     #[error(
         "routes[{route}]: `memory.scope: sharedConversation` on a `kind: [directMessage]` route shares nothing; the direct message already is the subject"
     )]

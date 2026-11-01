@@ -29,7 +29,7 @@ const MAX_WAIT: Duration = Duration::from_secs(120);
 
 struct Pending {
     message: InboundMessage,
-    speakers: Vec<dekopon_core::ExternalSubject>,
+    speakers: Vec<dekopon_core::Subject>,
     text: String,
     first: tokio::time::Instant,
     latest: tokio::time::Instant,
@@ -51,11 +51,11 @@ impl Debounce {
             let speaker = pending
                 .speakers
                 .iter()
-                .position(|subject| subject == &message.subject);
+                .position(|subject| subject == message.subject.name());
             let label = speaker.unwrap_or(pending.speakers.len()) + 1;
             if pending.text.len() < MAX_INBOUND_TEXT_BYTES {
                 if speaker.is_none() {
-                    pending.speakers.push(message.subject.clone());
+                    pending.speakers.push(message.subject.name().clone());
                 }
                 pending
                     .text
@@ -76,7 +76,7 @@ impl Debounce {
         self.pending.insert(
             key,
             Pending {
-                speakers: vec![message.subject.clone()],
+                speakers: vec![message.subject.name().clone()],
                 text: crate::transport::bound_inbound(&format!(
                     "[follow speaker 1]\n{}",
                     message.text
@@ -89,11 +89,11 @@ impl Debounce {
         true
     }
 
-    pub(crate) fn cancel(&mut self, key: &str, subject: &dekopon_core::ExternalSubject) {
+    pub(crate) fn cancel(&mut self, key: &str, subject: &dekopon_core::Subject) {
         if self
             .pending
             .get(key)
-            .is_some_and(|pending| &pending.message.subject == subject)
+            .is_some_and(|pending| pending.message.subject.name() == subject)
         {
             self.pending.remove(key);
         }

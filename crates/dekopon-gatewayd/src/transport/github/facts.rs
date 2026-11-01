@@ -1,8 +1,5 @@
 use super::GithubEvent as E;
-use dekopon_core::{
-    ExternalSubject,
-    github::{self, *},
-};
+use dekopon_core::github::{self, *};
 use serde_json::Value;
 
 fn text<T>(
@@ -161,15 +158,17 @@ fn run_author(root: &Value, a: &mut AuthorSetFacts) -> Option<()> {
     reason = "one exhaustive match owns the frozen family-to-facts table"
 )]
 pub(super) fn parse(root: &Value, event: E, delivery: &str) -> Option<github::GithubEvent> {
-    let subject = ExternalSubject::github(
-        root.pointer("/repository/owner/login")?.as_str()?,
-        root.pointer("/repository/name")?.as_str()?,
-    )
-    .ok()?;
     let repository = RepositoryFacts {
         id: id(root, "/repository/id")?,
-        full_name: RepoFullName::new(&format!("{}/{}", subject.tenant()?, subject.subject()))
-            .ok()?,
+        full_name: RepoFullName::new(
+            &format!(
+                "{}/{}",
+                root.pointer("/repository/owner/login")?.as_str()?,
+                root.pointer("/repository/name")?.as_str()?
+            )
+            .to_ascii_lowercase(),
+        )
+        .ok()?,
     };
     let actor_kind = match root.pointer("/sender/type").and_then(Value::as_str) {
         Some("User") => Some(ActorKind::User),

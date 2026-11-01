@@ -62,7 +62,7 @@ impl World {
             &"reviewer".parse().unwrap(),
             "dev",
             channel,
-            &"tel.15550000001".parse().unwrap(),
+            &"drn:tel:number::15550000001".parse().unwrap(),
         );
         let stem = key.journal_stem();
         let fence = Arc::new(AssetFence::new().with_grant(fixture().grant.hex()));
@@ -94,7 +94,7 @@ impl World {
             &"reviewer".parse().unwrap(),
             "slack",
             "direct",
-            &"tel.15550000001".parse().unwrap(),
+            &"drn:tel:number::15550000001".parse().unwrap(),
         );
         world.stem = key.journal_stem();
         world.access = AssetAccess::persistent(key, 1, Arc::clone(&world.fence));

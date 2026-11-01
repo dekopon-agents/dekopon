@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
-use dekopon_core::{ExternalSubject, PrincipalKind, SubjectError};
+use dekopon_core::{Subject, SubjectError, SubjectKind};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -24,13 +24,6 @@ pub enum ManifestProblem {
         id: String,
         #[source]
         source: SubjectError,
-    },
-    #[error("{server}/{id}: expected {expected:?}, got {actual:?}")]
-    Kind {
-        server: String,
-        id: String,
-        expected: PrincipalKind,
-        actual: PrincipalKind,
     },
     #[error("{server}/{id}: noncanonical conversation")]
     Conversation { server: String, id: String },
@@ -125,30 +118,18 @@ struct Image {
 fn subject(
     server: &str,
     id: &str,
-    expected: PrincipalKind,
+    kind: SubjectKind,
     problems: &mut Vec<ManifestProblem>,
-) -> Option<ExternalSubject> {
-    match ExternalSubject::fauxlack(server, id) {
-        Ok(subject) => {
-            if subject.kind() != expected {
-                problems.push(ManifestProblem::Kind {
-                    server: server.into(),
-                    id: id.into(),
-                    expected,
-                    actual: subject.kind(),
-                });
-            }
-            Some(subject)
-        }
-        Err(source) => {
+) -> Option<Subject> {
+    Subject::new(kind, server, id)
+        .map_err(|source| {
             problems.push(ManifestProblem::Subject {
                 server: server.into(),
                 id: id.into(),
                 source,
             });
-            None
-        }
-    }
+        })
+        .ok()
 }
 
 fn container(
@@ -158,7 +139,7 @@ fn container(
     kind: ConversationKind,
     problems: &mut Vec<ManifestProblem>,
 ) {
-    let sender = subject(&server.id, "u0", PrincipalKind::Person, problems);
+    let sender = subject(&server.id, "u0", SubjectKind::FauxlackUser, problems);
     let conversation = Conversation {
         kind,
         container: Some(server.id.clone()),
@@ -193,7 +174,7 @@ impl Fauxlack {
         let mut problems = Vec::new();
         let mut servers = BTreeMap::new();
         for server in manifest.servers {
-            subject(&server.id, "u0", PrincipalKind::Person, &mut problems);
+            subject(&server.id, "u0", SubjectKind::FauxlackUser, &mut problems);
             if servers.contains_key(&server.id) {
                 problems.push(ManifestProblem::DuplicateServer {
                     id: server.id.clone(),
@@ -216,9 +197,12 @@ impl Fauxlack {
             }
             let mut users = BTreeMap::new();
             for user in &server.users {
-                if let Some(subject) =
-                    subject(&server.id, &user.id, PrincipalKind::Person, &mut problems)
-                {
+                if let Some(subject) = subject(
+                    &server.id,
+                    &user.id,
+                    SubjectKind::FauxlackUser,
+                    &mut problems,
+                ) {
                     users.insert(
                         user.id.clone(),
                         Person {
@@ -231,7 +215,12 @@ impl Fauxlack {
             }
             let mut containers = BTreeMap::new();
             for channel in &server.channels {
-                subject(&server.id, &channel.id, PrincipalKind::Space, &mut problems);
+                subject(
+                    &server.id,
+                    &channel.id,
+                    SubjectKind::FauxlackChannel,
+                    &mut problems,
+                );
                 container(
                     &server,
                     &channel.id,

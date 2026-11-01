@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use dekopon_agent::CancelVia;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
-use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_core::{AttestedSubject, Redacted, Subject};
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{
@@ -525,7 +525,7 @@ impl DiscordTransport {
         let why = reason.as_str();
         received.record("drop.reason", why);
         received.record("mention.roles", mention_roles);
-        let sender = origin.and_then(|(user, _)| ExternalSubject::discord(user).ok());
+        let sender = origin.and_then(|(user, _)| Subject::discord_user(user).ok());
         let subject = sender.as_ref().map(tracing::field::display);
         let channel = origin.map(|(_, channel)| channel);
         let transport = self.name.as_str();
@@ -672,7 +672,9 @@ impl DiscordTransport {
             pull_request_links: None,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Discord,
-            subject: ExternalSubject::discord(user_id).map_err(TransportError::Subject)?,
+            subject: Subject::discord_user(user_id)
+                .and_then(AttestedSubject::one)
+                .map_err(TransportError::Subject)?,
             conversation,
             message_id: MessageId::Native(message_id.to_owned()),
             text,
@@ -894,7 +896,7 @@ impl DiscordTransport {
             return Ok(None);
         }
         received.record("message.id", message_id);
-        let subject = ExternalSubject::discord(user_id).map_err(TransportError::Subject)?;
+        let subject = Subject::discord_user(user_id).map_err(TransportError::Subject)?;
         let press = CancelPress {
             target: LivenessTarget::Discord {
                 channel_id: channel_id.to_owned(),
@@ -1298,7 +1300,7 @@ impl DiscordDriver {
             id: message_id.to_owned(),
             from_bot: author == bot,
             author: author.to_owned(),
-            subject: ExternalSubject::discord(author).ok()?,
+            subject: Subject::discord_user(author).ok()?,
             text,
             assets,
             at: snowflake_instant(message_id)?,
@@ -2713,7 +2715,7 @@ mod unit_tests {
             .expect("Discord has a stop button")
             .ack(&CancelPress {
                 target: target(),
-                subject: "discord.42".to_owned(),
+                subject: "drn:discord:user::42".to_owned(),
                 ack: AckToken::Discord {
                     interaction_id: "300".to_owned(),
                     interaction_token: "interaction-token-1".to_owned(),
@@ -2762,7 +2764,7 @@ mod unit_tests {
             let refused = button
                 .ack(&CancelPress {
                     target: target(),
-                    subject: "discord.42".to_owned(),
+                    subject: "drn:discord:user::42".to_owned(),
                     ack,
                 })
                 .await
@@ -2806,7 +2808,7 @@ mod unit_tests {
             .expect("this gateway's own button");
         assert_eq!(request.transport, "elote");
         assert_eq!(request.conversation_id, "100");
-        assert_eq!(request.subject, "discord.42");
+        assert_eq!(request.subject, "drn:discord:user::42");
         assert_eq!(request.via, CancelVia::Button);
         assert_eq!(pressed.subject, request.subject);
         assert_eq!(
@@ -3209,8 +3211,11 @@ mod unit_tests {
         assert_eq!(
             seen,
             [
-                ("1100000008388608000", "discord.43".to_owned()),
-                ("1100000012582912000", format!("discord.{BOT_USER}")),
+                ("1100000008388608000", "drn:discord:user::43".to_owned()),
+                (
+                    "1100000012582912000",
+                    format!("drn:discord:user::{BOT_USER}")
+                ),
             ]
         );
     }

@@ -10,7 +10,7 @@ fn github_message(owner: &str, repo: &str, guid: &str, number: u64) -> InboundMe
     );
     inbound.transport = "github".into();
     inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Github;
-    inbound.subject = ExternalSubject::github(owner, repo).unwrap();
+    inbound.subject = dekopon_core::AttestedSubject::github_repository(owner, repo, 1).unwrap();
     inbound.conversation = Conversation {
         kind: ConversationKind::Thread,
         container: Some(owner.into()),
@@ -102,7 +102,7 @@ async fn github_report_claim_requires_a_fresh_prompt_grant_and_never_posts() {
     let models = ModelScript::new([answer("Report only.")]);
     let driver = github_driver();
     let route = github_route();
-    let subject = ExternalSubject::github("owner", "repo").unwrap();
+    let subject = Subject::github_repo("owner", "repo").unwrap();
     let capture = CaptureLayer::default();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
     let _guard = tracing::subscriber::set_default(subscriber);
@@ -136,7 +136,7 @@ async fn github_report_claim_requires_a_fresh_prompt_grant_and_never_posts() {
         else {
             panic!("fresh attested capabilities required")
         };
-        assert_eq!(claim.subject, subject);
+        assert_eq!(claim.subjects.name(), &subject);
         let scope = claim.scope.as_ref().unwrap();
         assert_eq!(scope.conversation.thread.as_deref(), Some("7"));
         assert_eq!(scope.trigger, Trigger::Message);

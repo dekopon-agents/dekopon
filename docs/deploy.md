@@ -97,8 +97,8 @@ Keep the Mac awake, and bound the logs yourself; launchd doesn't.
 3. Put both in the gateway's environment under the names `appTokenEnv` and `botTokenEnv` give: its
    `--env-file` on a Mac, `gateway.env` Secret references on Kubernetes.
 4. A member's ID (`U…`) is under **Copy member ID** in their profile; the web client's URL,
-   `app.slack.com/client/T…/C…`, shows the team ID, then the channel's. The broker's `principals`
-   and the gateway identity's `attestor.namespaces` take them lowercased.
+   `app.slack.com/client/T…/C…`, shows the team ID, then the channel's. Principals and attestor
+   scopes take them as `drn:slack:user:T…:U…` and `drn:slack:*:T…:*`.
 
 ## Upgrades
 

@@ -18,9 +18,7 @@ use dekopon_capability::{
     EffectKind, HttpConstraints, InvocationOutcome, StorageAccess, StorageConstraints,
     StorageInterface, StorageScope,
 };
-use dekopon_core::{
-    Actor, AgentId, ExternalSubject, InvocationId, PrincipalId, RiskLevel, TransportId,
-};
+use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, RiskLevel, Subject, TransportId};
 use dekopon_storage_host::{ContinuityPolicy, StorageHost, StorageLimits};
 use dekopon_test_support::provider_fixture;
 use serde_json::json;
@@ -181,9 +179,12 @@ fn slack_conversation(key: &str) -> Conversation {
 
 fn claim_for(conversation: &str) -> Attestation {
     Attestation::for_chat(
-        "slack.t0123abc.u9xyz"
-            .parse::<ExternalSubject>()
-            .expect("subject"),
+        dekopon_core::AttestedSubject::one(
+            "drn:slack:user:t0123abc:u9xyz"
+                .parse::<Subject>()
+                .expect("subject"),
+        )
+        .expect("one-form subject"),
         "reviewer".parse::<AgentId>().expect("agent"),
         ChatScopeClaim {
             participant: None,
@@ -199,13 +200,16 @@ fn claim_for(conversation: &str) -> Attestation {
 
 fn attestor_grant() -> AttestorGrant {
     AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+        namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
     }
 }
 
 fn local_claim(transport: &str, conversation: &str) -> Attestation {
     Attestation::for_chat(
-        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        dekopon_core::AttestedSubject::one(
+            "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+        )
+        .expect("subject"),
         "reviewer".parse().expect("agent"),
         ChatScopeClaim {
             participant: None,
@@ -302,7 +306,7 @@ async fn smoke_memory_broker(root: &std::path::Path) -> Broker<InMemoryAuditLog>
         constraints,
         CredentialStore::empty(),
         IdentityDirectory::new([(
-            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
             "maintainer".parse().expect("principal"),
         )])
         .expect("directory"),
@@ -579,7 +583,7 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
         constraints,
         CredentialStore::empty(),
         IdentityDirectory::new([(
-            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
             "maintainer".parse().expect("principal"),
         )])
         .expect("identities"),
@@ -681,7 +685,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         constraints,
         CredentialStore::empty(),
         IdentityDirectory::new([(
-            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
             "maintainer".parse().expect("principal"),
         )])
         .expect("identities"),
@@ -691,7 +695,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     .expect("broker");
     let gateway = gateway();
     let grant = AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+        namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
     };
     let claim = claim();
     let (listed, _, _, _) = broker
@@ -699,7 +703,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
             &gateway,
             Some(&grant),
             Some(&Attestation::for_subject(
-                claim.subject.clone(),
+                claim.subjects.clone(),
                 claim.agent.clone(),
             )),
         )
@@ -758,7 +762,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                 &gateway,
                 Some(&grant),
                 Some(
-                    &Attestation::for_subject(claim.subject.clone(), claim.agent.clone())
+                    &Attestation::for_subject(claim.subjects.clone(), claim.agent.clone())
                         .bound_to(id.clone()),
                 ),
                 InvocationRequest {
@@ -912,7 +916,7 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
             constraints,
             CredentialStore::empty(),
             IdentityDirectory::new([(
-                "slack.t0123abc.u9xyz".parse().expect("subject"),
+                "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
                 "maintainer".parse().expect("principal"),
             )])
             .expect("identities"),
@@ -924,7 +928,7 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
         let grant = attestor_grant();
         let claim = claim();
         if route == CapabilityRoute::ChatMemoryRecent {
-            let attestation = Attestation::for_subject(claim.subject, claim.agent);
+            let attestation = Attestation::for_subject(claim.subjects, claim.agent);
             let (_, words, _, _) = broker
                 .capability_surface(&gateway, Some(&grant), Some(&attestation))
                 .expect("the attestation is honored");
@@ -955,7 +959,7 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
                 &gateway,
                 Some(&grant),
                 Some(&Attestation::for_subject(
-                    claim.subject.clone(),
+                    claim.subjects.clone(),
                     claim.agent.clone(),
                 )),
             )
@@ -1020,7 +1024,7 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
             .invoke(
                 &gateway,
                 Some(&grant),
-                Some(&Attestation::for_subject(claim.subject, claim.agent).bound_to(id.clone())),
+                Some(&Attestation::for_subject(claim.subjects, claim.agent).bound_to(id.clone())),
                 InvocationRequest {
                     id,
                     capability: "storage-probe.run".parse().expect("capability"),

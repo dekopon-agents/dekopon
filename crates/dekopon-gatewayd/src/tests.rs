@@ -77,7 +77,7 @@ use dekopon_broker_protocol::{
     FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope,
 };
 use dekopon_config::LocalCatalog;
-use dekopon_core::{AgentId, ExternalSubject};
+use dekopon_core::{AgentId, Subject};
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
     TurnEvent,
@@ -124,9 +124,9 @@ use crate::{
     },
 };
 
-const SUBJECT: &str = "tel.16034700182";
+const SUBJECT: &str = "drn:tel:number::16034700182";
 
-fn subject() -> ExternalSubject {
+fn subject() -> Subject {
     SUBJECT.parse().expect("canonical subject fixture")
 }
 
@@ -1797,7 +1797,7 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
         |p| matches!(p, ConfigProblem::GithubRequiresOneShot { .. })
     ));
     let mut bad = doc.clone();
-    bad["routes"][0]["conversation"]["ids"] = json!(["owner.dotted.repo"]);
+    bad["routes"][0]["conversation"]["ids"] = json!(["owner"]);
     assert!(reports(
         &load(directory.path(), &bad).await.unwrap_err(),
         |p| matches!(p, ConfigProblem::InvalidRouteConversation { .. })
@@ -1835,7 +1835,7 @@ async fn github_first_selector_wins_before_event_filter() {
         id: "owner.repo".into(),
         thread: Some("guid".into()),
     };
-    let subject = dekopon_core::ExternalSubject::github("owner", "repo").unwrap();
+    let subject = dekopon_core::Subject::github_repo("owner", "repo").unwrap();
     assert!(
         routes
             .github_route("github", &conversation, &subject, GithubEvent::WorkflowRun)
@@ -1997,7 +1997,10 @@ async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
         send("control-before", "pull_request", "CONTROL"),
     )
     .await;
-    assert_eq!(control_before.subject.canonical(), "github.owner.control");
+    assert_eq!(
+        control_before.subject.name().canonical(),
+        "drn:github:repo:owner:control"
+    );
     config["routes"][0]["githubEvents"] = json!(["pull_request", "workflow_run"]);
     write_config(root.path(), &config);
     gateway.reconcile().await;
@@ -2007,7 +2010,10 @@ async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
     ));
     let added =
         take_github_delivery(&mut transport, send("run-added", "workflow_run", "REPO")).await;
-    assert_eq!(added.subject.canonical(), "github.owner.repo");
+    assert_eq!(
+        added.subject.name().canonical(),
+        "drn:github:repo:owner:repo"
+    );
     assert_eq!(added.message_id.to_string(), "run-added");
     let before_remove = take_github_delivery(
         &mut transport,
@@ -2037,7 +2043,10 @@ async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
         send("control-after", "pull_request", "CONTROL"),
     )
     .await;
-    assert_eq!(control_after.subject.canonical(), "github.owner.control");
+    assert_eq!(
+        control_after.subject.name().canonical(),
+        "drn:github:repo:owner:control"
+    );
     assert_eq!(control_after.message_id.to_string(), "control-after");
 }
 
@@ -2145,7 +2154,10 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         signed_github_request(&client, address, &body, &signature, "first").await,
         reqwest::StatusCode::OK
     );
-    assert_eq!(message.subject.canonical(), "github.owner.repo");
+    assert_eq!(
+        message.subject.name().canonical(),
+        "drn:github:repo:owner:repo"
+    );
     assert_eq!(message.conversation.key(), "owner.repo:7");
     let mut broker = dekopon_test_support::BrokerFixture::answering(
         directory.path(),
@@ -2368,7 +2380,10 @@ async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
     let TransportEvent::Message(message) = combined.next().await.unwrap() else {
         panic!("WhatsApp still queues")
     };
-    assert_eq!(message.subject.canonical(), "whatsapp.1603");
+    assert_eq!(
+        message.subject.name().canonical(),
+        "drn:whatsapp:number::1603"
+    );
 }
 
 #[tokio::test]
@@ -2532,8 +2547,13 @@ async fn invalid_configurations_fail_closed_at_startup() {
         }),
         (
             json!({"/routes/0/conversation": {"kind": ["channel"]},
-            "/routes/0/subjects": ["tel.16034700182"]}),
+            "/routes/0/subjects": ["drn:tel:number::16034700182"]}),
             |problem| matches!(problem, ConfigProblem::SubjectsOnNonDmRoute { .. }),
+        ),
+        (
+            json!({"/routes/0/conversation": {"kind": ["directMessage"]},
+            "/routes/0/subjects": ["drn:github:user-id::583231"]}),
+            |problem| matches!(problem, ConfigProblem::IdFormRouteSubject { .. }),
         ),
         (
             json!({"/routes/0/memory": {"mode": "persistent", "scope": "sharedConversation"}}),
@@ -4649,7 +4669,7 @@ fn message(text: &str) -> InboundMessage {
         pull_request_links: None,
         transport: "dev".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Local,
-        subject: subject(),
+        subject: dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
         conversation: Conversation {
             kind: ConversationKind::DirectMessage,
             container: None,
@@ -4678,7 +4698,10 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
     let mut inbound = message("hello");
     inbound.transport = "support-whatsapp".to_owned();
     inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Whatsapp;
-    inbound.subject = ExternalSubject::whatsapp("16034700182").expect("subject");
+    inbound.subject = dekopon_core::AttestedSubject::one(
+        Subject::whatsapp_number("16034700182").expect("subject"),
+    )
+    .expect("one-form subject");
     inbound.conversation = Conversation {
         kind: ConversationKind::DirectMessage,
         container: Some("123:456".to_owned()),
@@ -4733,9 +4756,12 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         pull_request_links: None,
         transport: "scientist-slack".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Slack,
-        subject: "slack.t0123abc.u9xyz"
-            .parse()
-            .expect("Slack subject fixture"),
+        subject: dekopon_core::AttestedSubject::one(
+            "drn:slack:user:t0123abc:u9xyz"
+                .parse()
+                .expect("Slack subject fixture"),
+        )
+        .expect("one-form subject"),
         conversation: Conversation {
             kind: ConversationKind::Thread,
             container: Some("t0123abc".to_owned()),
@@ -5123,7 +5149,7 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     else {
         panic!("a session must open a chat-scoped attested leg: {request:?}");
     };
-    assert_eq!(claim.subject.canonical(), SUBJECT);
+    assert_eq!(claim.subjects.name().canonical(), SUBJECT);
     assert_eq!(claim.agent.as_str(), "reviewer");
     assert_eq!(claim.scope.expect("chat scope").transport.as_str(), "dev");
 }
@@ -5428,7 +5454,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         &route.agent,
         &route.transport,
         &message.conversation,
-        Some(&message.subject),
+        Some(message.subject.name()),
     );
 
     let session = tokio::spawn(run_session(
@@ -6448,7 +6474,7 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
     assert_eq!(
         runner
             .gate
-            .cancel(&cancel("tel.999", CancelVia::Button))
+            .cancel(&cancel("drn:tel:number::999", CancelVia::Button))
             .running,
         CancelOutcome::OtherSubject,
         "another chat user cannot stop the initiator's work"
@@ -6994,12 +7020,15 @@ async fn every_unmapped_refusal_notifies_the_owner_even_when_replies_are_limited
     let models = ModelScript::forbidden();
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
-    let other_subject: ExternalSubject = "tel.16034700183".parse().expect("valid other subject");
+    let other_subject: Subject = "drn:tel:number::16034700183"
+        .parse()
+        .expect("valid other subject");
     for attempt in 0..3 {
         let mut inbound = message("private stranger message");
         if attempt == 2 {
             tokio::time::advance(Duration::from_millis(500)).await;
-            inbound.subject = other_subject.clone();
+            inbound.subject = dekopon_core::AttestedSubject::one(other_subject.clone())
+                .expect("one-form subject");
         }
         run_session(
             Arc::clone(&runner),
@@ -7365,7 +7394,9 @@ fn a_follow_batch_keeps_every_speakers_text_and_runs_as_the_newest_with_both_tim
     let mut pending = crate::follow::Debounce::default();
     let first = tokio::time::Instant::now();
     let mut earlier = message("first");
-    earlier.subject = ExternalSubject::discord("123456789012345678").unwrap();
+    earlier.subject =
+        dekopon_core::AttestedSubject::one(Subject::discord_user("123456789012345678").unwrap())
+            .expect("one-form subject");
     let later = message("newest");
     assert!(pending.offer("key".into(), earlier, first));
     assert!(pending.offer("key".into(), later.clone(), first + Duration::from_secs(20)));
@@ -7390,7 +7421,7 @@ fn a_follow_batch_keeps_every_speakers_text_and_runs_as_the_newest_with_both_tim
     assert_eq!(pending.due(first + Duration::from_secs(119)).len(), 0);
     assert_eq!(pending.due(first + Duration::from_secs(120)).len(), 1);
     assert!(pending.offer("key".into(), later.clone(), first));
-    pending.cancel("key", &later.subject);
+    pending.cancel("key", later.subject.name());
     assert!(pending.deadline().is_none());
     for index in 0..1024 {
         assert!(pending.offer(index.to_string(), later.clone(), first));
@@ -7588,7 +7619,8 @@ async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
 
 fn message_from(subject: &str, text: &str) -> InboundMessage {
     InboundMessage {
-        subject: subject.parse().expect("canonical subject fixture"),
+        subject: dekopon_core::AttestedSubject::one(subject.parse().expect("subject"))
+            .expect("canonical subject fixture"),
         ..message(text)
     }
 }
@@ -7943,7 +7975,7 @@ async fn two_configured_models_never_share_one_client() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_senders_in_one_conversation_never_see_each_others_history() {
-    const OTHER_SUBJECT: &str = "tel.16035550100";
+    const OTHER_SUBJECT: &str = "drn:tel:number::16035550100";
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
@@ -7997,7 +8029,7 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_scope_replays_attributed_turns_across_authenticated_participants() {
-    const OTHER_SUBJECT: &str = "tel.16035550100";
+    const OTHER_SUBJECT: &str = "drn:tel:number::16035550100";
     let directory = temporary();
     let (broker, mut observed) =
         stub_broker(directory.path(), principal_listings(&["xavier", "simon"])).await;
@@ -8052,7 +8084,7 @@ async fn shared_scope_replays_attributed_turns_across_authenticated_participants
 
 #[tokio::test(flavor = "multi_thread")]
 async fn user_authored_attribution_lookalikes_remain_below_the_gateway_line() {
-    const OTHER_SUBJECT: &str = "tel.16035550100";
+    const OTHER_SUBJECT: &str = "drn:tel:number::16035550100";
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), principal_listings(&["simon", "xavier"])).await;
@@ -8127,7 +8159,7 @@ async fn a_shared_turn_from_a_subject_no_principal_names_is_labelled_unmapped_wi
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_history_keeps_the_participant_label_and_drops_the_inventory_note() {
-    const OTHER_SUBJECT: &str = "tel.16035550100";
+    const OTHER_SUBJECT: &str = "drn:tel:number::16035550100";
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), principal_listings(&["simon", "xavier"])).await;
@@ -8735,8 +8767,8 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
 fn state_keys_cover_agent_transport_conversation_and_private_subject_boundaries() {
     let reviewer = "reviewer".parse().expect("valid agent fixture");
     let auditor = "auditor".parse().expect("valid agent fixture");
-    let first_subject: ExternalSubject = SUBJECT.parse().expect("canonical subject fixture");
-    let second_subject: ExternalSubject = "tel.16035550100"
+    let first_subject: Subject = SUBJECT.parse().expect("canonical subject fixture");
+    let second_subject: Subject = "drn:tel:number::16035550100"
         .parse()
         .expect("canonical subject fixture");
     let private = ConversationKey::private(&reviewer, "slack", "channel:thread", &first_subject);
@@ -9156,7 +9188,7 @@ fn a_cache_key_is_the_same_for_the_same_secret_and_conversation() {
 fn a_different_secret_conversation_agent_transport_or_audience_names_a_different_cache_key() {
     let agent: AgentId = "reviewer".parse().expect("valid agent fixture");
     let other_agent: AgentId = "helper".parse().expect("valid agent fixture");
-    let subject: ExternalSubject = SUBJECT.parse().expect("canonical subject fixture");
+    let subject: Subject = SUBJECT.parse().expect("canonical subject fixture");
     let base = ConversationKey::private(&agent, "dev", "c0123abc", &subject);
     let mut keys = [
         ConversationKey::private(&agent, "dev", "c0123abd", &subject),
@@ -9166,7 +9198,7 @@ fn a_different_secret_conversation_agent_transport_or_audience_names_a_different
             &agent,
             "dev",
             "c0123abc",
-            &"tel.16035550100"
+            &"drn:tel:number::16035550100"
                 .parse()
                 .expect("canonical subject fixture"),
         ),
@@ -9194,7 +9226,7 @@ fn a_different_secret_conversation_agent_transport_or_audience_names_a_different
 
 #[test]
 fn a_cache_key_never_contains_the_raw_subject_or_conversation_id() {
-    const DISTINCTIVE: &str = "tel.15558675309";
+    const DISTINCTIVE: &str = "drn:tel:number::15558675309";
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "c0123abc", DISTINCTIVE);
     let seed = store.begin(
@@ -9484,7 +9516,7 @@ async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
-    const OTHER_SUBJECT: &str = "tel.16035550100";
+    const OTHER_SUBJECT: &str = "drn:tel:number::16035550100";
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
@@ -9820,7 +9852,9 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         "follow waits for the debounce deadline"
     );
     let mut other = incoming.clone();
-    other.subject = ExternalSubject::discord("123456789012345678").unwrap();
+    other.subject =
+        dekopon_core::AttestedSubject::one(Subject::discord_user("123456789012345678").unwrap())
+            .expect("one-form subject");
     other.text = "newest".into();
     crate::dispatch(
         &runner,
@@ -9877,7 +9911,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
     let own_stop = crate::transport::CancelRequest {
         transport: "discord".into(),
         conversation_id: incoming.conversation.key(),
-        subject: incoming.subject.canonical(),
+        subject: incoming.subject.name().canonical(),
         via: dekopon_agent::CancelVia::StopReply,
     };
     assert!(matches!(
@@ -10993,7 +11027,10 @@ async fn slack_messages_the_bot_itself_posted_are_never_routed() {
             .expect("a routable message"),
     );
     assert_eq!(message.text, "a real question");
-    assert_eq!(message.subject.canonical(), "slack.t0123abc.u9xyz");
+    assert_eq!(
+        message.subject.name().canonical(),
+        "drn:slack:user:t0123abc:u9xyz"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -11136,7 +11173,10 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
     follow_up.text = "Please inspect the earlier image".into();
     follow_up.assets.clear();
     let mut other_speaker = follow_up.clone();
-    other_speaker.subject = "slack.t0123abc.u8xyz".parse().expect("other Slack user");
+    other_speaker.subject = dekopon_core::AttestedSubject::one(
+        "drn:slack:user:t0123abc:u8xyz".parse().expect("subject"),
+    )
+    .expect("other Slack user");
     other_speaker.message_id = MessageId::Native("1700000000.000003".into());
     let shared_second = other_speaker.clone();
     for (inbound, label) in [
@@ -11347,7 +11387,7 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
         &route.agent,
         &route.transport,
         &sealed_forward.conversation,
-        Some(&sealed_forward.subject),
+        Some(sealed_forward.subject.name()),
     );
     let directory = temporary();
     let broker = ResolvedBroker {
@@ -12154,7 +12194,7 @@ async fn slack_agent_stop_events_are_acknowledged_and_decoded_as_control_not_pro
         crate::transport::CancelRequest {
             transport: "scientist-slack".to_owned(),
             conversation_id: "d0123abc:1700000000.000001".to_owned(),
-            subject: "slack.t0123abc.u9xyz".to_owned(),
+            subject: "drn:slack:user:t0123abc:u9xyz".to_owned(),
             via: CancelVia::NativeStop,
         }
     );
@@ -12170,7 +12210,7 @@ async fn slack_agent_stop_events_are_acknowledged_and_decoded_as_control_not_pro
         crate::transport::CancelRequest {
             transport: "scientist-slack".to_owned(),
             conversation_id: "d0123abc:1700000000.000003".to_owned(),
-            subject: "slack.t0123abc.u9xyz".to_owned(),
+            subject: "drn:slack:user:t0123abc:u9xyz".to_owned(),
             via: CancelVia::NativeStop,
         }
     );
@@ -12538,7 +12578,7 @@ fn one_shot_asset_ids_are_monotonic_and_still_resolve_only_in_their_scope() {
 
 #[test]
 fn attachment_inventory_obeys_the_same_private_and_shared_audience_keys_as_history() {
-    const OTHER_SUBJECT: &str = "tel.16035550100";
+    const OTHER_SUBJECT: &str = "drn:tel:number::16035550100";
     let store = asset_store();
     let now = Instant::now();
     let first_private = private_conversation_key("dev", "c1", SUBJECT);
@@ -13077,7 +13117,7 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
 
 #[test]
 fn the_asset_store_debug_view_exposes_only_counts() {
-    const DISTINCTIVE: &str = "tel.15558675309";
+    const DISTINCTIVE: &str = "drn:tel:number::15558675309";
     let store = asset_store();
     store.assets_for(
         &private_conversation_key("dev", "private-channel-8675309", DISTINCTIVE),
@@ -13698,8 +13738,8 @@ async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
 
     let message = next_message(&mut transport).await;
     assert_eq!(
-        message.subject.canonical(),
-        format!("discord.{DISCORD_USER}")
+        message.subject.name().canonical(),
+        format!("drn:discord:user::{DISCORD_USER}")
     );
     assert_eq!(
         message.addressed,
@@ -14472,7 +14512,10 @@ async fn telegram_acknowledges_by_advancing_its_offset() {
             .expect("a routable message"),
     );
     assert_eq!(message.text, "a person asked this");
-    assert_eq!(message.subject.canonical(), "telegram.16034700182");
+    assert_eq!(
+        message.subject.name().canonical(),
+        "drn:telegram:user::16034700182"
+    );
 
     assert!(
         tokio::time::timeout(Duration::from_millis(400), transport.next())
@@ -15469,7 +15512,7 @@ async fn a_queued_message_links_the_message_that_held_it() {
     run_session(
         runner,
         route(model_config()),
-        message_from("tel.999", "second"),
+        message_from("drn:tel:number::999", "second"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
@@ -16918,7 +16961,7 @@ async fn a_follow_up_after_a_wall_clock_stop_gets_its_full_budget() {
     run_session(
         Arc::clone(&runner),
         timed_route(model_config(), budget),
-        message_from("tel.16035550100", "my turn next"),
+        message_from("drn:tel:number::16035550100", "my turn next"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
@@ -17030,7 +17073,7 @@ async fn another_subjects_press_is_acknowledged_and_ignored() {
 
     let press = CancelPress {
         target: LivenessTarget::Local { connection: 1 },
-        subject: "tel.16035550100".to_owned(),
+        subject: "drn:tel:number::16035550100".to_owned(),
         ack: crate::transport::AckToken::Local,
     };
     driver
@@ -17042,7 +17085,7 @@ async fn another_subjects_press_is_acknowledged_and_ignored() {
     assert_eq!(
         runner
             .gate
-            .cancel(&cancel("tel.16035550100", CancelVia::Button))
+            .cancel(&cancel("drn:tel:number::16035550100", CancelVia::Button))
             .running,
         CancelOutcome::OtherSubject,
         "a bystander cannot stop this session"
@@ -17060,7 +17103,7 @@ async fn another_subjects_press_is_acknowledged_and_ignored() {
     assert!(
         driver
             .rendered()
-            .contains(&"cancel.ack:tel.16035550100".to_owned()),
+            .contains(&"cancel.ack:drn:tel:number::16035550100".to_owned()),
         "the press was acknowledged inside the service deadline: {:?}",
         driver.rendered()
     );
@@ -17165,7 +17208,10 @@ async fn the_route_table_matches_on_kind_container_id_and_subjects_in_declaratio
             .is_some()
     );
     let stranger = InboundMessage {
-        subject: "tel.15558675309".parse().expect("subject"),
+        subject: dekopon_core::AttestedSubject::one(
+            "drn:tel:number::15558675309".parse().expect("subject"),
+        )
+        .expect("subject"),
         ..routed("dev", ConversationKind::DirectMessage, "dev")
     };
     assert!(
@@ -17354,7 +17400,10 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
                 observed.recv().await.expect("send run").request,
                 BrokerRequest::Run { .. }
             ));
-            assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
+            assert_eq!(
+                claim.subjects.name().canonical(),
+                "drn:whatsapp:number::15550000001"
+            );
             assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
         }
         {
@@ -17779,7 +17828,7 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
     let (transport, inbound) = admitted_photo(&peer.origin, "image/png", None).await;
     let store = Arc::new(asset_store());
     let conversations = ConversationStore::new(8);
-    let key = private_conversation_key("wa", "one", "whatsapp.15550000001");
+    let key = private_conversation_key("wa", "one", "drn:whatsapp:number::15550000001");
     let seed = conversations.begin(
         &key,
         &granted(&["gpt-image.edit"]),
@@ -17793,7 +17842,7 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
         AssetAccess::one_shot(private_conversation_key(
             "wa",
             "other",
-            "whatsapp.15550000001",
+            "drn:whatsapp:number::15550000001",
         )),
         seed.assets.clone(),
     ];
@@ -18297,7 +18346,8 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
     let mut sessions = tokio::task::JoinSet::new();
     let mut member = burst_photo("");
     member.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
-    member.subject = ExternalSubject::telegram("123456").unwrap();
+    member.subject = dekopon_core::AttestedSubject::one(Subject::telegram_user("123456").unwrap())
+        .expect("one-form subject");
     member.conversation = Conversation {
         kind: ConversationKind::Thread,
         container: None,
@@ -18351,7 +18401,11 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
     for axis in 0..3 {
         let mut outsider = member.clone();
         match axis {
-            0 => outsider.subject = ExternalSubject::telegram("654321").unwrap(),
+            0 => {
+                outsider.subject =
+                    dekopon_core::AttestedSubject::one(Subject::telegram_user("654321").unwrap())
+                        .expect("one-form subject")
+            }
             1 => outsider.native_group = Some("other-group".into()),
             _ => outsider.conversation.thread = Some("43".into()),
         }
@@ -18614,7 +18668,7 @@ async fn queued_mp4_delivers_on_empty_text_but_not_when_the_model_fails_before_r
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_once() {
     const NOTICE: &str = "[gateway: a previous asset send did not complete. Sent flags remain set; no automatic retry was made.]";
-    const OTHER_SUBJECT: &str = "tel.16035550100";
+    const OTHER_SUBJECT: &str = "drn:tel:number::16035550100";
     for memory in [window(), shared_window()] {
         let directory = temporary();
         let (broker, _observed) = stub_broker_assets(
@@ -18904,7 +18958,7 @@ async fn a_slack_mention_resumes_with_authorized_stay_and_survives_restart() {
         panic!("broker did not receive an invocation")
     };
     let actual = attestation.expect("invocation carries its chat attestation");
-    assert_eq!(actual.subject, claim.subject);
+    assert_eq!(actual.subjects.name(), claim.subjects.name());
     assert_eq!(actual.agent, claim.agent);
     assert_eq!(actual.scope, claim.scope);
     assert!(actual.binds(&invocation.id));
@@ -18983,7 +19037,7 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
     let mut route = route(model_config());
     route.follow = true;
-    let mut inbound = message_from("tel.16034700183", "check hello");
+    let mut inbound = message_from("drn:tel:number::16034700183", "check hello");
     inbound.message_id = MessageId::Follow("native-id".into());
     let key = crate::follow::follow_key(
         &route.transport,
@@ -18995,7 +19049,10 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     runner.follow = Some(table);
     let driver = Arc::new(RecordingDriver::default());
     let runner = Arc::new(runner);
-    let mut owner = message_from("tel.16034700182", "owner invites another speaker");
+    let mut owner = message_from(
+        "drn:tel:number::16034700182",
+        "owner invites another speaker",
+    );
     owner.message_id = MessageId::Follow("owner-id".into());
     for speaker in [owner.clone(), inbound.clone()] {
         tokio::time::timeout(
@@ -19022,7 +19079,7 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     else {
         panic!("owner turn must open its own leg: {previous:?}");
     };
-    assert_eq!(owner_claim.subject, owner.subject);
+    assert_eq!(owner_claim.subjects, owner.subject);
     assert_eq!(
         owner_claim.scope.as_ref().unwrap().trigger,
         dekopon_broker_protocol::Trigger::Message
@@ -19034,7 +19091,7 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     else {
         panic!("first request must open the speaker's leg: {capabilities:?}");
     };
-    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(claim.subjects, inbound.subject);
     assert_eq!(
         claim.scope.as_ref().unwrap().trigger,
         dekopon_broker_protocol::Trigger::Message
@@ -19049,7 +19106,7 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     else {
         panic!("unlisted command is resolved without invocation: {unlisted:?}");
     };
-    assert_eq!(unlisted_claim.subject, inbound.subject);
+    assert_eq!(unlisted_claim.subjects, inbound.subject);
     assert_eq!(
         unlisted_claim.scope.as_ref().unwrap().trigger,
         dekopon_broker_protocol::Trigger::Message
@@ -19071,7 +19128,7 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     else {
         panic!("second request must resolve the named command: {command:?}");
     };
-    assert_eq!(claim.subject, inbound.subject);
+    assert_eq!(claim.subjects, inbound.subject);
     assert_eq!(
         claim.scope.as_ref().unwrap().trigger,
         dekopon_broker_protocol::Trigger::Message
@@ -19127,7 +19184,7 @@ async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts(
         let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
         let mut route = route(model_config());
         route.follow = true;
-        let mut inbound = message_from("tel.16034700183", "ambient sentinel");
+        let mut inbound = message_from("drn:tel:number::16034700183", "ambient sentinel");
         inbound.message_id = MessageId::Follow("native-id".into());
         let key = crate::follow::follow_key(
             &route.transport,
@@ -19154,7 +19211,7 @@ async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts(
         let request = broker.request().await;
         assert!(
             matches!(request.request, BrokerRequest::Capabilities { attestation: Some(ref claim) }
-                if claim.subject == inbound.subject
+                if claim.subjects == inbound.subject
                     && claim.scope.as_ref().is_some_and(|scope| scope.trigger == dekopon_broker_protocol::Trigger::Message)),
             "{label}"
         );
@@ -19189,7 +19246,7 @@ async fn an_inactive_follow_turn_records_only_category_metadata() {
     runner.follow = Some(Arc::new(crate::follow::FollowTable::load(journal).unwrap()));
     let mut route = route(model_config());
     route.follow = true;
-    let mut inbound = message_from("tel.16034700183", "private payload sentinel");
+    let mut inbound = message_from("drn:tel:number::16034700183", "private payload sentinel");
     inbound.message_id = MessageId::Follow("native-id".into());
     let driver = Arc::new(RecordingDriver::default());
     run_session(
@@ -19475,7 +19532,9 @@ async fn sealing_one_private_speaker_ends_the_shared_follow_marker() {
     route.follow = true;
     let first = message("hello");
     let mut second = message("hello from another speaker");
-    second.subject = "tel.16034700183".parse().unwrap();
+    second.subject =
+        dekopon_core::AttestedSubject::one("drn:tel:number::16034700183".parse().expect("subject"))
+            .unwrap();
     let key = crate::follow::follow_key(
         &route.transport,
         route.agent.as_str(),
@@ -19491,7 +19550,7 @@ async fn sealing_one_private_speaker_ends_the_shared_follow_marker() {
         &route.agent,
         &route.transport,
         &second.conversation,
-        Some(&second.subject),
+        Some(second.subject.name()),
     );
     assert!(crate::session::seal_conversation(&runner, &route, &second, &private_key).await);
     assert_eq!(
@@ -19681,7 +19740,7 @@ fn past(id: &str, author: &str, subject: &str, text: &str) -> crate::transport::
 fn bot_past(id: &str, text: &str) -> crate::transport::PastMessage {
     crate::transport::PastMessage {
         from_bot: true,
-        ..past(id, "B1", "tel.16035550000", text)
+        ..past(id, "B1", "drn:tel:number::16035550000", text)
     }
 }
 
@@ -19717,7 +19776,7 @@ async fn naming_broker(
             else {
                 continue;
             };
-            let subject = claim.subject.canonical();
+            let subject = claim.subjects.name().canonical();
             observed.lock().push(subject.clone());
             let response = match names.get(&subject) {
                 Some(principal) => ResponseEnvelope::chat_capabilities(
@@ -19752,10 +19811,20 @@ async fn a_fresh_thread_session_sees_the_thread_it_was_asked_in() {
     let directory = temporary();
     let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
     let models = ModelScript::new([answer("It is about the outage.")]);
-    let mut screenshot = past("0000000003", "U2", "tel.16035550102", "look at this");
+    let mut screenshot = past(
+        "0000000003",
+        "U2",
+        "drn:tel:number::16035550102",
+        "look at this",
+    );
     screenshot.assets = vec![pending("graph.png", "image/png", 12)];
     let driver = HistoryDriver::new(Ok(vec![
-        past("0000000001", "U1", "tel.16035550101", "the site is down"),
+        past(
+            "0000000001",
+            "U1",
+            "drn:tel:number::16035550101",
+            "the site is down",
+        ),
         bot_past("0000000002", "Checking."),
         screenshot,
     ]));
@@ -19861,7 +19930,7 @@ async fn an_unaddressed_message_between_mentions_reaches_the_next_turn_once() {
 
     run(mention("t1", "first question")).await;
     driver.post(bot_past("t2", "first answer"));
-    let mut photo = past("t3", "U2", "tel.16035550102", "a photo");
+    let mut photo = past("t3", "U2", "drn:tel:number::16035550102", "a photo");
     photo.assets = vec![pending("cat.png", "image/png", 12)];
     driver.post(photo);
     run(mention("t4", "what did they post?")).await;
@@ -19918,7 +19987,7 @@ async fn a_message_steered_into_a_turn_is_not_replayed_by_the_next_mention() {
     let models = ModelScript::new([answer("ok")]);
     let driver = HistoryDriver::new(Ok(vec![
         past("t2", "U1", SUBJECT, "steered in"),
-        past("t3", "U2", "tel.16035550102", "unaddressed"),
+        past("t3", "U2", "drn:tel:number::16035550102", "unaddressed"),
     ]));
     let runner = runner(broker, Arc::clone(&models), 4);
     let window = recall_window(RecallSource::Platform);
@@ -19967,14 +20036,17 @@ async fn recalled_labels(scope: MemoryScope) -> (String, Vec<String>) {
     let directory = temporary();
     let (broker, asked) = naming_broker(
         directory.path(),
-        &[(SUBJECT, "xavier"), ("tel.16035550100", "simon")],
+        &[
+            (SUBJECT, "xavier"),
+            ("drn:tel:number::16035550100", "simon"),
+        ],
     )
     .await;
     let models = ModelScript::new([answer("ok")]);
     let driver = HistoryDriver::new(Ok(vec![
-        past("t1", "U7", "tel.16035550100", "hi"),
-        past("t2", "U9", "tel.16035550199", "yo"),
-        past("t3", "U7", "tel.16035550100", "again"),
+        past("t1", "U7", "drn:tel:number::16035550100", "hi"),
+        past("t2", "U9", "drn:tel:number::16035550199", "yo"),
+        past("t3", "U7", "drn:tel:number::16035550100", "again"),
         past("t4", "U1", SUBJECT, "mine"),
     ]));
     let route = persistent_route(
@@ -20009,7 +20081,11 @@ async fn recalled_history_names_mapped_authors_and_keeps_unmapped_ids_on_a_priva
     );
     assert_eq!(
         asked,
-        [SUBJECT, "tel.16035550100", "tel.16035550199"],
+        [
+            SUBJECT,
+            "drn:tel:number::16035550100",
+            "drn:tel:number::16035550199"
+        ],
         "one exchange for the sender and one per distinct other author"
     );
 }
@@ -20214,7 +20290,12 @@ async fn an_unaddressed_continuation_catches_up_on_what_others_posted() {
     };
 
     run(mention("t1", "first question")).await;
-    driver.post(past("t2", "U2", "tel.16035550102", "posted meanwhile"));
+    driver.post(past(
+        "t2",
+        "U2",
+        "drn:tel:number::16035550102",
+        "posted meanwhile",
+    ));
     run(InboundMessage {
         addressed: Some(false),
         ..mention("t3", "and another thing")
@@ -20242,7 +20323,7 @@ async fn a_folded_steer_is_not_replayed_by_the_next_mention() {
     let driver = HistoryDriver::new(Ok(vec![
         past("t2", "U1", SUBJECT, "lead"),
         past("t3", "U1", SUBJECT, "folded in"),
-        past("t4", "U2", "tel.16035550102", "unaddressed"),
+        past("t4", "U2", "drn:tel:number::16035550102", "unaddressed"),
     ]));
     let runner = runner(broker, Arc::clone(&models), 4);
     resident_since(&runner, "t1");
@@ -20278,7 +20359,10 @@ async fn a_late_mention_on_a_shared_route_keeps_others_history_out_of_the_sender
     let directory = temporary();
     let (broker, _asked) = naming_broker(
         directory.path(),
-        &[(SUBJECT, "xavier"), ("tel.16035550102", "simon")],
+        &[
+            (SUBJECT, "xavier"),
+            ("drn:tel:number::16035550102", "simon"),
+        ],
     )
     .await;
     let models = ModelScript::new([
@@ -20305,7 +20389,7 @@ async fn a_late_mention_on_a_shared_route_keeps_others_history_out_of_the_sender
     };
 
     run(mention("t1", "first question")).await;
-    driver.post(past("t2", "U2", "tel.16035550102", "hi all"));
+    driver.post(past("t2", "U2", "drn:tel:number::16035550102", "hi all"));
     run(mention("t3", "what did simon say?")).await;
     run(mention("t4", "thanks")).await;
 
@@ -20332,13 +20416,13 @@ async fn a_late_mention_reads_nothing_older_than_forget_after() {
     let directory = temporary();
     let (broker, _asked) = naming_broker(directory.path(), &[(SUBJECT, "xavier")]).await;
     let models = ModelScript::new([answer("ok")]);
-    let mut stale = past("t2", "U2", "tel.16035550102", "long ago");
+    let mut stale = past("t2", "U2", "drn:tel:number::16035550102", "long ago");
     stale.at = std::time::SystemTime::now()
         .checked_sub(DEFAULT_FORGET_AFTER + Duration::from_secs(60))
         .expect("a time before the horizon");
     let driver = HistoryDriver::new(Ok(vec![
         stale,
-        past("t3", "U2", "tel.16035550102", "just now"),
+        past("t3", "U2", "drn:tel:number::16035550102", "just now"),
     ]));
     let runner = runner(broker, Arc::clone(&models), 4);
     resident_since(&runner, "t1");
@@ -20989,7 +21073,7 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         move |_, _queued| Some(((*selected.load_full()).clone(), String::new())),
     ));
     model.wait_until_entered().await;
-    let queued = message_from("tel.999", "next");
+    let queued = message_from("drn:tel:number::999", "next");
     let second = crate::session::run_session_resolving(
         runner,
         old.clone(),
@@ -21533,7 +21617,9 @@ async fn collected_media_never_crosses_a_removed_or_replaced_route() {
         for (index, text) in ["first", "second"].into_iter().enumerate() {
             let mut inbound = message(text);
             inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
-            inbound.subject = ExternalSubject::telegram("123").unwrap();
+            inbound.subject =
+                dekopon_core::AttestedSubject::one(Subject::telegram_user("123").unwrap())
+                    .expect("one-form subject");
             inbound.conversation.id = "123".into();
             inbound.message_id = MessageId::Native((index + 1).to_string());
             inbound.native_group = Some("group".into());
@@ -22632,7 +22718,10 @@ async fn a_wall_clock_stop_seals_the_thread() {
     let directory = temporary();
     let (broker, _asked) = naming_broker(
         directory.path(),
-        &[(SUBJECT, "xavier"), ("tel.16035550100", "other")],
+        &[
+            (SUBJECT, "xavier"),
+            ("drn:tel:number::16035550100", "other"),
+        ],
     )
     .await;
     let mut runner = runner(broker, ModelScript::forbidden(), 4);
@@ -22655,7 +22744,9 @@ async fn a_wall_clock_stop_seals_the_thread() {
     )
     .await;
     let mut queued = inbound.clone();
-    queued.subject = "tel.16035550100".parse().unwrap();
+    queued.subject =
+        dekopon_core::AttestedSubject::one("drn:tel:number::16035550100".parse().expect("subject"))
+            .unwrap();
     queued.text = "queued question".to_owned();
     run_session(
         Arc::clone(&runner),
@@ -23058,7 +23149,7 @@ async fn append_failure_preserves_the_delivered_reply_without_a_journal_record()
         &route.agent,
         &route.transport,
         &inbound.conversation,
-        Some(&inbound.subject),
+        Some(inbound.subject.name()),
     )
     .journal_stem();
     fs::write(
@@ -23150,7 +23241,7 @@ async fn a_journal_backed_platform_route_captures_exchanges_without_journaling_c
         &route.agent,
         &route.transport,
         &inbound.conversation,
-        Some(&inbound.subject),
+        Some(inbound.subject.name()),
     );
     let driver = HistoryDriver::new(Ok(Vec::new()));
     run_session(
@@ -23644,7 +23735,10 @@ async fn space_shared_replay_keeps_the_window_when_speakers_grants_differ() {
         let (capture, _guard) = capture_spans();
         let first = owned_slack_message("first question", false);
         let mut second = owned_slack_message("second question", false);
-        second.subject = "slack.t0123abc.u8xyz".parse().expect("second speaker");
+        second.subject = dekopon_core::AttestedSubject::one(
+            "drn:slack:user:t0123abc:u8xyz".parse().expect("subject"),
+        )
+        .expect("second speaker");
         second.thread_continuation = None;
         for inbound in [first, second] {
             run_session(
@@ -23881,7 +23975,8 @@ async fn a_slack_follow_batch_keeps_both_speakers_and_authorizes_only_the_newest
         let second = next_message(&mut transport).await;
         assert_eq!(
             second.subject,
-            ExternalSubject::slack(TEAM, "u8other").unwrap()
+            dekopon_core::AttestedSubject::one(Subject::slack_user(TEAM, "u8other").unwrap())
+                .expect("one-form subject")
         );
         let (broker, mut observed) = stub_broker(
             fixture.directory.path(),
@@ -23931,7 +24026,7 @@ async fn a_slack_follow_batch_keeps_both_speakers_and_authorizes_only_the_newest
         assert_eq!(models.requests(), 1);
         let request = observed.recv().await.unwrap();
         assert!(
-            matches!(request.request, BrokerRequest::Capabilities { attestation: Some(Attestation { subject, .. }) } if subject == second.subject)
+            matches!(request.request, BrokerRequest::Capabilities { attestation: Some(Attestation { subjects, .. }) } if subjects == second.subject)
         );
     }
 }
@@ -24121,7 +24216,8 @@ async fn slack_follow_human_thumbs_down_leaves_once_ignoring_bots_and_other_auth
     assert_eq!(mention.addressed, Some(true));
     assert_eq!(
         mention.subject,
-        ExternalSubject::slack(TEAM, "u8other").unwrap()
+        dekopon_core::AttestedSubject::one(Subject::slack_user(TEAM, "u8other").unwrap())
+            .expect("one-form subject")
     );
 }
 

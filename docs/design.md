@@ -40,8 +40,8 @@ An argument to keep or add code on any of these grounds is rejected.
 ## Authority flow
 
 1. A chat service authenticates the sender. `dekopon-gatewayd` picks the route's agent and opens a
-   session with the broker, naming the sender's canonical subject (`slack.t0123abc.u9xyz`), never a
-   principal.
+   session with the broker, naming the sender's subject (`drn:slack:user:t0123abc:u9xyz`), never
+   a principal.
 2. `dekopon-brokerd` authenticates the gateway by its Unix peer UID, checks that the subject lies
    inside the gateway's attestor grant, maps the subject to a principal and asks Cedar whether that
    principal may prompt that agent. A refusal ends the turn before any model call.

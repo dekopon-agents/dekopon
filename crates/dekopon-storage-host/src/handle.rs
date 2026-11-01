@@ -730,7 +730,7 @@ mod tests {
                 StorageAccess::ReadWrite,
                 StorageScope::PrivateConversation,
                 "reviewer".parse().expect("agent"),
-                "slack.t0123abc.u9xyz".parse().expect("subject"),
+                "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
                 "slack",
                 "scientist-slack",
                 "c0123abc",

@@ -16,8 +16,8 @@ use std::{
 use async_trait::async_trait;
 use dekopon_agent::CancelVia;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
-use dekopon_core::ExternalSubject;
 use dekopon_core::base64::{Base64Display, STANDARD};
+use dekopon_core::{AttestedSubject, Subject};
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -50,12 +50,19 @@ const TRUNCATION_MARKER: char = '…';
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalRequest {
-    subject: ExternalSubject,
+    #[serde(deserialize_with = "one_form")]
+    subject: AttestedSubject,
     #[serde(default = "default_conversation")]
     conversation: Conversation,
     text: Option<String>,
     #[serde(default)]
     stop: bool,
+}
+
+fn one_form<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AttestedSubject, D::Error> {
+    AttestedSubject::one(Subject::deserialize(deserializer)?).map_err(serde::de::Error::custom)
 }
 
 fn default_conversation() -> Conversation {
@@ -183,7 +190,7 @@ impl LocalTransport {
                         });
                         continue;
                     }
-                    let subject = request.subject.canonical();
+                    let subject = request.subject.name().canonical();
                     let press = CancelPress {
                         target: LivenessTarget::Local { connection },
                         subject: subject.clone(),
@@ -797,7 +804,7 @@ mod unit_tests {
         },
     };
 
-    const SUBJECT: &str = "tel.16034700182";
+    const SUBJECT: &str = "drn:tel:number::16034700182";
 
     fn private_directory() -> tempfile::TempDir {
         let directory = tempfile::tempdir().expect("a temporary directory");

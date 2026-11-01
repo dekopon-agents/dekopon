@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use dekopon_agent::CancelVia;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
-use dekopon_core::{ExternalSubject, Redacted};
+use dekopon_core::{AttestedSubject, Redacted, Subject};
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{
@@ -271,7 +271,7 @@ impl SlackTransport {
         let thread_ts = payload["message"]["thread_ts"]
             .as_str()
             .unwrap_or(message_ts);
-        let subject = ExternalSubject::slack(team, user)
+        let subject = Subject::slack_user(team, user)
             .map_err(TransportError::Subject)?
             .to_string();
         Ok(Some((
@@ -500,7 +500,7 @@ impl SlackTransport {
             .generation
             .as_ref()
             .map(crate::gateway::CurrentGeneration::load);
-        let subject = ExternalSubject::slack(team, user).map_err(TransportError::Subject)?;
+        let subject = Subject::slack_user(team, user).map_err(TransportError::Subject)?;
         let pull_request_links = (!explicitly_addressed && kind == ConversationKind::Channel)
             .then(|| {
                 generation
@@ -509,7 +509,6 @@ impl SlackTransport {
                     .find(&self.name, &follow_conversation, &subject)
                     .filter(|(_, route)| route.ambient.pull_request_links)?;
                 crate::pull_request_links::PullRequestLinkContext::parse(top_text)
-                    .unwrap_or_else(refused_pr_repository)
             })
             .flatten();
         let ambient = pull_request_links.is_some();
@@ -578,7 +577,7 @@ impl SlackTransport {
             pull_request_links,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Slack,
-            subject,
+            subject: AttestedSubject::one(subject).map_err(TransportError::Subject)?,
             conversation,
             message_id: MessageId::Native(ts.to_owned()),
             text: projection.text,
@@ -710,7 +709,7 @@ impl SlackTransport {
         Ok(Some(CancelRequest {
             transport: self.name.clone(),
             conversation_id: conversation.key(),
-            subject: ExternalSubject::slack(team, user)
+            subject: Subject::slack_user(team, user)
                 .map_err(TransportError::Subject)?
                 .to_string(),
             via: CancelVia::NativeStop,
@@ -2222,7 +2221,7 @@ fn past_message(message: &Value, team: &str, bot: &str) -> Option<PastMessage> {
         id: ts.to_owned(),
         from_bot: user == bot,
         author: user.to_owned(),
-        subject: ExternalSubject::slack(team, user).ok()?,
+        subject: Subject::slack_user(team, user).ok()?,
         text: projection.text,
         assets: projection.assets,
         at,
@@ -2311,7 +2310,7 @@ mod driver_tests {
     const GROUP_CHANNEL: &str = "G0123ABC";
     const USER: &str = "U9XYZ";
     const BOT_USER: &str = "UBOT123";
-    const SUBJECT: &str = "slack.t0123abc.u9xyz";
+    const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
     const CONVERSATION: &str = "c0123abc:1700000000.000001";
     const INBOUND_TS: &str = "1700000000.000001";
     const POSTED_TS: &str = "1700000000.000100";
@@ -3506,7 +3505,10 @@ mod driver_tests {
                     assert!(assets.is_empty());
                 }
             }
-            assert_eq!(ingress.subject, history.subject);
+            assert_eq!(
+                ingress.subject,
+                dekopon_core::AttestedSubject::one(history.subject).expect("one-form subject")
+            );
             assert_eq!(history.author, USER);
             assert!(ingress.text.contains("author: \"UORIGINAL\""));
             assert!(!ingress.asset_overflow);
@@ -3518,7 +3520,7 @@ mod driver_tests {
                     &"reviewer".parse().expect("agent id"),
                     &ingress.transport,
                     &ingress.conversation,
-                    Some(&ingress.subject),
+                    Some(ingress.subject.name()),
                 );
                 let registered =
                     store.assets_for(&key, ingress.assets.clone(), std::time::Instant::now());
@@ -3949,7 +3951,7 @@ mod driver_tests {
             [(
                 "1700000000.000003",
                 format!(
-                    "slack.{}.{}",
+                    "drn:slack:user:{}:{}",
                     TEAM.to_ascii_lowercase(),
                     USER.to_ascii_lowercase()
                 ),
@@ -4143,11 +4145,4 @@ mod markdown_tests {
             "```\n7.\n```\n~~~~\n8)\n~~~\n~~~~\n9\\."
         );
     }
-}
-
-fn refused_pr_repository(
-    error: dekopon_core::SubjectError,
-) -> Option<crate::pull_request_links::PullRequestLinkContext> {
-    tracing::info!(event = "gateway_message_ignored", reason = "invalid-repository", error = %error, "gateway.message.ignored");
-    None
 }

@@ -14,16 +14,15 @@ use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId,
-    ProviderFailureDetail, ProviderId, Redacted, RiskLevel, SecretDrn, SecretSinkKind,
-    SecretUseProposal,
+    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderFailureDetail, ProviderId,
+    Redacted, RiskLevel, SecretDrn, SecretSinkKind, SecretUseProposal, Subject,
 };
 use dekopon_test_support::{LoopbackServer, provider_fixture};
 use serde_json::json;
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
-const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
+const SLACK_SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
 
 const GATEWAY: &str = "gateway";
 
@@ -36,14 +35,17 @@ fn agent(name: &str) -> AgentId {
     name.parse::<AgentId>().expect("valid agent fixture")
 }
 
-fn subject(canonical: &str) -> ExternalSubject {
+fn subject(canonical: &str) -> Subject {
     canonical
-        .parse::<ExternalSubject>()
+        .parse::<Subject>()
         .expect("canonical subject fixture")
 }
 
-fn caller_subject(name: &str) -> ExternalSubject {
-    subject(&format!("slack.t0123abc.u{}", name.replace('-', "")))
+fn caller_subject(name: &str) -> Subject {
+    subject(&format!(
+        "drn:slack:user:t0123abc:u{}",
+        name.replace('-', "")
+    ))
 }
 
 fn callers<'a>(names: impl IntoIterator<Item = &'a str>) -> IdentityDirectory {
@@ -83,8 +85,11 @@ async fn invoke_as(
     agent_name: &str,
     request: InvocationRequest,
 ) -> Result<AssetInvocationResult, BrokerError> {
-    let attestation = Attestation::for_subject(caller_subject(name), agent(agent_name))
-        .bound_to(request.id.clone());
+    let attestation = Attestation::for_subject(
+        dekopon_core::AttestedSubject::one(caller_subject(name)).expect("one-form subject"),
+        agent(agent_name),
+    )
+    .bound_to(request.id.clone());
     let (host, mut stdout) = std::os::unix::net::UnixStream::pair().expect("test stdout pipe");
     let capture = std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -318,12 +323,21 @@ fn attested_policy(name: &str, agent_name: &str, via: &str, capability: &str) ->
 
 fn attestor_grant<'a>(namespaces: impl IntoIterator<Item = &'a str>) -> AttestorGrant {
     AttestorGrant {
-        namespaces: Some(namespaces.into_iter().map(str::to_owned).collect()),
+        namespaces: Some(
+            namespaces
+                .into_iter()
+                .map(|scope| scope.parse().expect("valid scope"))
+                .collect(),
+        ),
     }
 }
 
-fn attestation(subject: &ExternalSubject, agent_name: &str, invocation: &str) -> Attestation {
-    Attestation::for_subject(subject.clone(), agent(agent_name)).bound_to(
+fn attestation(subject: &Subject, agent_name: &str, invocation: &str) -> Attestation {
+    Attestation::for_subject(
+        dekopon_core::AttestedSubject::one(subject.clone()).expect("one-form subject"),
+        agent(agent_name),
+    )
+    .bound_to(
         invocation
             .parse::<InvocationId>()
             .expect("valid invocation fixture"),
@@ -1432,7 +1446,7 @@ async fn a_request_template_pins_the_attested_conversation_and_needs_a_chat_scop
 
     let request = fetch("invoke-scoped");
     let attestation = Attestation::for_chat(
-        caller_subject("caller"),
+        dekopon_core::AttestedSubject::one(caller_subject("caller")).expect("one-form subject"),
         agent("provider-test"),
         dekopon_broker::ChatScopeClaim {
             participant: None,
@@ -2797,7 +2811,7 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
     .expect("an unconditional grant and an attested grant coexist in one policy set");
 
     let gateway = service_context(GATEWAY);
-    let grant = attestor_grant(["slack.t0123abc"]);
+    let grant = attestor_grant(["drn:slack:*:t0123abc:*"]);
     let subject = subject(SLACK_SUBJECT);
 
     let (attested_stdout, mut attested_reader) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2860,7 +2874,7 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
             &gateway,
             Some(&grant),
             Some(&Attestation::for_subject(
-                subject.clone(),
+                dekopon_core::AttestedSubject::one(subject.clone()).expect("one-form subject"),
                 agent("some-agent"),
             )),
         )
@@ -2936,7 +2950,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         ("invoke-no-grant", None),
         (
             "invoke-out-of-scope",
-            Some(attestor_grant(["slack.t0999zzz"])),
+            Some(attestor_grant(["drn:slack:*:t0999zzz:*"])),
         ),
     ] {
         let result = broker
@@ -2983,7 +2997,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
             "a refusal derived no attested context, so there is no `via` to record"
         );
         assert_eq!(
-            attested_subject.as_ref().map(ExternalSubject::canonical),
+            attested_subject.as_ref().map(Subject::canonical),
             Some(SLACK_SUBJECT.to_owned())
         );
         assert!(!allowed);
@@ -2995,7 +3009,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
     let unmapped = broker
         .invoke(
             &gateway,
-            Some(&attestor_grant(["slack.t0123abc"])),
+            Some(&attestor_grant(["drn:slack:*:t0123abc:*"])),
             Some(&attestation(&subject, "some-agent", "invoke-unmapped")),
             request(
                 "invoke-unmapped",
@@ -3024,7 +3038,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
     };
     assert_eq!(principal.as_ref().map(PrincipalId::as_str), Some("gateway"));
     assert_eq!(
-        attested_subject.as_ref().map(ExternalSubject::canonical),
+        attested_subject.as_ref().map(Subject::canonical),
         Some(SLACK_SUBJECT.to_owned())
     );
     assert_eq!(reason.as_deref(), Some("unmapped-subject"));
@@ -3047,7 +3061,7 @@ async fn attested_success_audits_via_and_subject() {
     let result = broker
         .invoke(
             &service_context("gateway"),
-            Some(&attestor_grant(["slack.t0123abc"])),
+            Some(&attestor_grant(["drn:slack:*:t0123abc:*"])),
             Some(&attestation(
                 &subject(SLACK_SUBJECT),
                 "some-agent",
@@ -3103,7 +3117,7 @@ async fn attested_success_audits_via_and_subject() {
 
 fn smoke_claim() -> Attestation {
     Attestation::for_chat(
-        subject(SLACK_SUBJECT),
+        dekopon_core::AttestedSubject::one(subject(SLACK_SUBJECT)).expect("one-form subject"),
         agent("some-agent"),
         dekopon_broker::ChatScopeClaim {
             participant: None,
@@ -3131,7 +3145,7 @@ async fn only_the_literal_smoke_claim_passes_every_ordinary_attestation_entry() 
     )
     .await;
     let peer = service_context("gateway");
-    let grant = attestor_grant(["slack.t0123abc"]);
+    let grant = attestor_grant(["drn:slack:*:t0123abc:*"]);
     let literal = smoke_claim();
     assert_eq!(
         broker
@@ -3252,7 +3266,7 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
     .await;
     let console = service_context("dekopon-console");
     let gateway = service_context("gateway");
-    let grant = attestor_grant(["slack.t0123abc"]);
+    let grant = attestor_grant(["drn:slack:*:t0123abc:*"]);
     let mut real = smoke_claim();
     let scope = real.scope.as_mut().expect("chat scope");
     scope.transport = "scientist-slack".parse().expect("transport");
@@ -3280,7 +3294,8 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
                 &console,
                 Some(&grant),
                 Some(&Attestation::for_subject(
-                    subject(SLACK_SUBJECT),
+                    dekopon_core::AttestedSubject::one(subject(SLACK_SUBJECT))
+                        .expect("one-form subject"),
                     agent("some-agent")
                 ))
             )
@@ -3307,7 +3322,8 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
     };
     let refused_run_command = status == 2 && stderr.starts_with("dekopon sandbox:");
     let unknown = Attestation::for_chat(
-        subject("slack.t0123abc.unmapped"),
+        dekopon_core::AttestedSubject::one(subject("drn:slack:user:t0123abc:unmapped"))
+            .expect("one-form subject"),
         agent("some-agent"),
         real.scope.clone().expect("scope"),
     );
@@ -3424,12 +3440,15 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
 async fn attested_capabilities_distinguishes_refusal_from_empty() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = attested_broker(
-        directory([(SLACK_SUBJECT, "cpetersen"), ("tel.16034700182", "oncall")]),
+        directory([
+            (SLACK_SUBJECT, "cpetersen"),
+            ("drn:tel:number::16034700182", "oncall"),
+        ]),
         audit,
     )
     .await;
     let gateway = service_context("gateway");
-    let grant = attestor_grant(["slack.t0123abc", "tel"]);
+    let grant = attestor_grant(["drn:slack:*:t0123abc:*", "drn:tel:*:*:*"]);
     let mapped = subject(SLACK_SUBJECT);
 
     assert!(
@@ -3438,7 +3457,7 @@ async fn attested_capabilities_distinguishes_refusal_from_empty() {
                 &gateway,
                 None,
                 Some(&Attestation::for_subject(
-                    mapped.clone(),
+                    dekopon_core::AttestedSubject::one(mapped.clone()).expect("one-form subject"),
                     agent("some-agent"),
                 )),
             )
@@ -3451,7 +3470,7 @@ async fn attested_capabilities_distinguishes_refusal_from_empty() {
             &gateway,
             Some(&grant),
             Some(&Attestation::for_subject(
-                mapped.clone(),
+                dekopon_core::AttestedSubject::one(mapped.clone()).expect("one-form subject"),
                 agent("some-agent"),
             )),
         )
@@ -3465,7 +3484,8 @@ async fn attested_capabilities_distinguishes_refusal_from_empty() {
             &gateway,
             Some(&grant),
             Some(&Attestation::for_subject(
-                subject("tel.16034700182"),
+                dekopon_core::AttestedSubject::one(subject("drn:tel:number::16034700182"))
+                    .expect("one-form subject"),
                 agent("some-agent"),
             )),
         )
@@ -3475,58 +3495,76 @@ async fn attested_capabilities_distinguishes_refusal_from_empty() {
 }
 
 #[test]
-fn attestor_scopes_match_on_segment_boundaries() {
-    let grant = attestor_grant(["slack.t0123abc"]);
-    grant
+fn an_attestation_is_refused_unless_the_grant_covers_every_form() {
+    let website = dekopon_core::AttestedSubject::github_repository(
+        "dekopon-agents",
+        "dekopon-agents.github.io",
+        42,
+    )
+    .expect("webhook facts");
+    assert!(!attestor_grant(["drn:github:repo:dekopon-agents:*"]).permits(&website));
+    assert!(
+        !attestor_grant([
+            "drn:github:repo:dekopon-agents:dekopon-agents",
+            "drn:github:repo-id::*"
+        ])
+        .permits(&website)
+    );
+    assert!(
+        attestor_grant(["drn:github:repo:dekopon-agents:*", "drn:github:repo-id::*"])
+            .permits(&website)
+    );
+    assert!(
+        AttestorGrant {
+            namespaces: Some(Vec::new())
+        }
         .validate()
-        .expect("a service plus one canonical segment is a valid scope");
-    assert!(grant.permits(&ExternalSubject::slack("T0123ABC", "U9XYZ").expect("slack subject")));
-    assert!(!grant.permits(&ExternalSubject::slack("T0123ABCX", "U9").expect("slack subject")));
-
-    for invalid in [
-        vec![],
-        vec!["sms".to_owned()],
-        vec!["slack.T0123ABC".to_owned()],
-        vec!["slack..u9xyz".to_owned()],
-        vec!["slack.t0123abc.u9xyz.extra".to_owned()],
-    ] {
-        let grant = AttestorGrant {
-            namespaces: Some(invalid.clone()),
-        };
-        assert!(
-            grant.validate().is_err(),
-            "accepted attestor namespaces {invalid:?}"
-        );
-    }
+        .is_err()
+    );
 }
 
-#[test]
-fn github_attestor_scopes_accept_canonical_owner_and_repo_namespaces() {
-    let owner = attestor_grant(["github.dekopon-agents"]);
-    owner.validate().expect("canonical GitHub owner scope");
-    let repo = attestor_grant(["github.dekopon-agents.my_repo"]);
-    repo.validate().expect("canonical GitHub repo scope");
-    let matched = ExternalSubject::github("dekopon-agents", "my_repo").unwrap();
-    assert!(owner.permits(&matched));
-    assert!(repo.permits(&matched));
-    assert!(!repo.permits(&ExternalSubject::github("dekopon-agents", "my_repo-extra").unwrap()));
-    for scope in [
-        "github.Owner".to_owned(),
-        format!("github.{}", "o".repeat(40)),
-    ] {
-        let error = attestor_grant([scope.as_str()])
-            .validate()
-            .expect_err("noncanonical owner scope");
-        assert!(
-            matches!(error, BrokerBuildError::InvalidAttestorScope { scope: rejected } if rejected == scope)
-        );
-    }
+#[tokio::test]
+async fn a_twin_whose_forms_map_to_different_principals_is_refused_as_split() {
+    const WEBSITE: &str = "drn:github:repo:dekopon-agents:dekopon-agents.github.io";
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let broker = attested_broker(
+        directory([(WEBSITE, "cpetersen"), ("drn:github:repo-id::42", "oncall")]),
+        audit,
+    )
+    .await;
+    let grant = attestor_grant(["drn:github:repo:dekopon-agents:*", "drn:github:repo-id::*"]);
+    let claim = Attestation::for_subject(
+        dekopon_core::AttestedSubject::github_repository(
+            "dekopon-agents",
+            "dekopon-agents.github.io",
+            42,
+        )
+        .expect("webhook facts"),
+        agent("some-agent"),
+    );
+    let (_, refusal) = broker.resolve_context(&service_context("gateway"), Some(&grant), &claim);
+    assert_eq!(
+        refusal.expect("a split subject is refused").reason,
+        "split-subject"
+    );
+
+    let one_principal = attested_broker(
+        directory([
+            (WEBSITE, "cpetersen"),
+            ("drn:github:repo-id::42", "cpetersen"),
+        ]),
+        Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
+    )
+    .await;
+    let (context, _) =
+        one_principal.resolve_context(&service_context("gateway"), Some(&grant), &claim);
+    assert_eq!(context.principal(), &principal("cpetersen"));
 }
 
 #[test]
 fn identity_directory_rejects_duplicates_and_resolves_exactly() {
     let slack = subject(SLACK_SUBJECT);
-    let telephone = subject("tel.16034700182");
+    let telephone = subject("drn:tel:number::16034700182");
     let resolved = IdentityDirectory::new([
         (slack.clone(), principal("cpetersen")),
         (telephone.clone(), principal("oncall")),
@@ -3535,7 +3573,9 @@ fn identity_directory_rejects_duplicates_and_resolves_exactly() {
     assert_eq!(resolved.resolve(&slack), Some(&principal("cpetersen")));
     assert_eq!(resolved.resolve(&telephone), Some(&principal("oncall")));
     assert!(
-        resolved.resolve(&subject("slack.t0123abc.u0000")).is_none(),
+        resolved
+            .resolve(&subject("drn:slack:user:t0123abc:u0000"))
+            .is_none(),
         "an unmapped subject in a mapped workspace resolves to nothing"
     );
     assert!(IdentityDirectory::empty().resolve(&slack).is_none());
@@ -4030,7 +4070,10 @@ async fn a_spaces_request_forbid_stops_http_before_the_network() {
         LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     let mappings = [
         (subject(SLACK_SUBJECT), principal("caller")),
-        (subject("slack.t0123abc.c0123abc"), principal("space")),
+        (
+            subject("drn:slack:channel:t0123abc:c0123abc"),
+            principal("space"),
+        ),
     ];
     let world = PolicyWorld::new(
         [principal("caller"), principal("space")],
@@ -4059,7 +4102,7 @@ async fn a_spaces_request_forbid_stops_http_before_the_network() {
     )
     .expect("broker");
     let claim = Attestation::for_chat(
-        subject(SLACK_SUBJECT),
+        dekopon_core::AttestedSubject::one(subject(SLACK_SUBJECT)).expect("one-form subject"),
         agent("provider-test"),
         dekopon_broker::ChatScopeClaim {
             participant: None,
@@ -4118,7 +4161,10 @@ async fn a_space_only_policy_error_records_its_id() {
         LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     let mappings = [
         (subject(SLACK_SUBJECT), principal("caller")),
-        (subject("slack.t0123abc.c0123abc"), principal("space")),
+        (
+            subject("drn:slack:channel:t0123abc:c0123abc"),
+            principal("space"),
+        ),
     ];
     let world = PolicyWorld::new(
         [principal("caller"), principal("space")],
@@ -4147,7 +4193,7 @@ async fn a_space_only_policy_error_records_its_id() {
     )
     .expect("broker");
     let claim = Attestation::for_chat(
-        subject(SLACK_SUBJECT),
+        dekopon_core::AttestedSubject::one(subject(SLACK_SUBJECT)).expect("one-form subject"),
         agent("provider-test"),
         dekopon_broker::ChatScopeClaim {
             participant: None,
