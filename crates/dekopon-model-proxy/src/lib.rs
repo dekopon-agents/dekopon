@@ -30,13 +30,13 @@ use axum::{
     routing::post,
 };
 use bytes::Bytes;
-use dekopon_core::{AgentId, Redacted};
+use dekopon_core::{AgentId, Redacted, VM_SESSION_HEADER, VmSession};
 use dekopon_model::{
     chatgpt::{CredentialFile, RefreshClient},
     wire::{Field, PeekError, RequestPeek},
 };
 use dekopon_model_token_governor::{
-    Call, Estimate, Metering, ModelUsage, Outcome, Sizes, Tokens, Via, VmSession,
+    Call, Estimate, Metering, ModelUsage, Outcome, Sizes, Tokens, Via,
 };
 use tracing::{Instrument as _, Span, field::Empty};
 
@@ -46,7 +46,6 @@ use tee::{Shape, Timing};
 
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const SUBJECT_HEADER: &str = "x-dekopon-vm-subject";
-pub const SESSION_HEADER: &str = "x-dekopon-vm-session";
 const MAX_LABEL_BYTES: usize = 128;
 pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -263,7 +262,7 @@ struct CallSpan {
 impl CallSpan {
     fn open(headers: &HeaderMap) -> Self {
         let session = headers
-            .get(SESSION_HEADER)
+            .get(VM_SESSION_HEADER)
             .and_then(|value| value.to_str().ok())
             .and_then(VmSession::parse);
         Self {

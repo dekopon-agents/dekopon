@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use dekopon_core::AgentId;
+use dekopon_core::{AgentId, VmSession};
 use parking_lot::Mutex;
 
 use crate::{
@@ -48,31 +48,6 @@ impl Via {
             Self::Proxy { session } => session.as_ref(),
             Self::Agent | Self::Summary => None,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VmSession([u8; 36]);
-
-impl VmSession {
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Self> {
-        let bytes: [u8; 36] = text.trim().as_bytes().try_into().ok()?;
-        bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| match index {
-                8 | 13 | 18 | 23 => *byte == b'-',
-                14 => *byte == b'7',
-                19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
-                _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
-            })
-            .then_some(Self(bytes))
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.0).unwrap_or_default()
     }
 }
 
