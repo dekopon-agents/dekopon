@@ -1164,6 +1164,42 @@ async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_real_component_names_a_null_input_field() {
+    let component = provider_fixture("cli-probe-provider.wasm");
+    std::fs::metadata(&component).expect("build the real cli-probe component before this test");
+    let registry = BrokerProviderRegistry::load([component], BrokerHostLimits::default())
+        .await
+        .expect("the real cli-probe component loads");
+    let (streams, stdout) = fixture::piped_stdout();
+    let failure = registry
+        .invoke(
+            authorized_for(
+                "cli-probe",
+                "cli-probe.count".parse().expect("valid capability"),
+                json!({"text": null}),
+                ExecutionConstraints {
+                    asset: None,
+                    timeout_ms: 5_000,
+                    http: None,
+                    storage: None,
+                    secret_use: None,
+                },
+            ),
+            None,
+            streams,
+        )
+        .await
+        .expect_err("a null string field is refused by the component SDK");
+    let BrokerHostError::ProviderFailure { status, stderr, .. } = failure.error.as_ref() else {
+        panic!("expected a typed provider failure, got {failure:?}");
+    };
+    assert_eq!(*status, 2);
+    assert_eq!(stderr, "invalid input: text: wrong type\n");
+    assert!(stdout.bytes().is_empty());
+    println!("cli-probe.count {{\"text\":null}}: status {status}, stderr {stderr:?}, stdout empty");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],

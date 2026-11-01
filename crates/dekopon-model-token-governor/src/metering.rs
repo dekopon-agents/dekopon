@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use dekopon_core::AgentId;
+use dekopon_core::{AgentId, VmSession};
 use parking_lot::Mutex;
 
 use crate::{
@@ -30,7 +30,7 @@ pub struct Metering {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Via {
     Agent,
-    Proxy,
+    Proxy { session: Option<VmSession> },
     Summary,
 }
 
@@ -38,8 +38,15 @@ impl Via {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Agent => "agent",
-            Self::Proxy => "proxy",
+            Self::Proxy { .. } => "proxy",
             Self::Summary => "summary",
+        }
+    }
+
+    const fn session(&self) -> Option<&VmSession> {
+        match self {
+            Self::Proxy { session } => session.as_ref(),
+            Self::Agent | Self::Summary => None,
         }
     }
 }
@@ -425,6 +432,7 @@ fn record(call: &Call, estimate: Estimate, charge: &Charge, error_kind: Option<&
         model.name = call.model.as_str(),
         model.backend = call.backend,
         meter.via = call.via.as_str(),
+        vm.session = call.via.session().map(VmSession::as_str),
         usage.input_tokens = int(charge.input),
         usage.output_tokens = int(charge.output),
         usage.cached_input_tokens = int(charge.usage.cached_input_tokens.unwrap_or(0)),

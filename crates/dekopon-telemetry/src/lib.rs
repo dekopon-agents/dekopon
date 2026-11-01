@@ -20,11 +20,15 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 #[cfg(feature = "exporter")]
 pub use exporter::{CA_CERTIFICATE_ENV, ExporterSettings, TelemetryError, Transport};
+#[cfg(all(unix, feature = "cli"))]
+pub use install::LogFileArgs;
 #[cfg(feature = "exporter")]
 pub use install::{
     Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install, InstallError, ShutdownError,
     TelemetryGuard, optional_logger_provider, optional_tracer_provider,
 };
+#[cfg(all(unix, feature = "exporter"))]
+pub use install::{LogFile, LogFileError, LogFileOperation};
 
 #[derive(Clone, Debug)]
 pub struct EventStringArray<V = String> {

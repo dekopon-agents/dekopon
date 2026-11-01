@@ -3217,6 +3217,7 @@ async fn telegram_call_failures_never_render_bot_tokens() {
                     .reply(
                         &answering,
                         OutboundReply {
+                            footer: None,
                             text: "a caption".to_owned(),
                             images: generated_images(1),
                         },
@@ -3780,7 +3781,7 @@ impl ModelScript {
         let messages = prompts
             .get(index)
             .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1));
-        messages.iter().map(message_text).collect()
+        messages.iter().map(task_time::payload_message).collect()
     }
 }
 
@@ -4020,6 +4021,14 @@ impl ChatDriver for RecordingDriver {
         _target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        match _target {
+            ReplyTarget::GithubTrace | ReplyTarget::Local { .. } => assert!(reply.footer.is_none()),
+            ReplyTarget::Slack { .. }
+            | ReplyTarget::Fauxlack { .. }
+            | ReplyTarget::Discord { .. }
+            | ReplyTarget::Telegram { .. }
+            | ReplyTarget::WhatsApp { .. } => {}
+        }
         if let Some(kind) = self.charge_reply() {
             return Err(injected(kind));
         }
@@ -4645,6 +4654,7 @@ fn model_config() -> ModelConfig {
 
 fn message(text: &str) -> InboundMessage {
     InboundMessage {
+        control_text: None,
         pull_request_links: None,
         transport: "dev".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Local,
@@ -4668,6 +4678,7 @@ fn message(text: &str) -> InboundMessage {
         constituents: Vec::new(),
         folded: Vec::new(),
         asset_overflow: false,
+        input_refusal: None,
     }
 }
 
@@ -4727,6 +4738,7 @@ fn slack_thread_continuation(inherited: bool) -> ThreadContinuation {
 
 fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
     InboundMessage {
+        control_text: None,
         pull_request_links: None,
         transport: "scientist-slack".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Slack,
@@ -4755,6 +4767,7 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         constituents: Vec::new(),
         folded: Vec::new(),
         asset_overflow: false,
+        input_refusal: None,
     }
 }
 
@@ -4928,7 +4941,7 @@ impl InterruptibleModel {
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
         self.prompts.lock()[index]
             .iter()
-            .map(message_text)
+            .map(task_time::payload_message)
             .collect()
     }
 
@@ -9565,7 +9578,11 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     .await;
 
     assert_eq!(
-        driver.replies(),
+        driver
+            .replies()
+            .iter()
+            .map(|reply| task_time::payload_message(&ModelMessage::user(reply)).1)
+            .collect::<Vec<_>>(),
         vec!["[gateway: unmapped participant]\nwhat broke?".to_owned()]
     );
     assert_eq!(
@@ -15595,7 +15612,22 @@ async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
     assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
     provider.force_flush().unwrap();
 
-    let spans = exported.0.lock().clone();
+    let spans = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            {
+                let spans = exported.0.lock();
+                if ["gateway.message", "gateway.session"]
+                    .into_iter()
+                    .all(|name| spans.iter().filter(|span| span.name == name).count() >= 2)
+                {
+                    break spans.clone();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two gateway.message and two gateway.session spans are exported");
     let statuses = spans
         .iter()
         .filter(|span| span.name == "gateway.message")
@@ -17365,7 +17397,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             assert_eq!(
                 requests.len(),
                 8,
-                "one inbound fetch reused by model and provider, then three uploads/sends"
+                "one inbound fetch reused by model and provider, then three uploads and captioned image sends"
             );
             for edit in 0..3 {
                 assert!(
@@ -17376,7 +17408,18 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
                 );
                 let sent: Value =
                     serde_json::from_slice(&requests[edit * 2 + 3].body).expect("image send");
-                assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
+                let text = sent["image"]["caption"].as_str().unwrap();
+                let seconds = text
+                    .strip_prefix("Edited image.\n\n_portable · 4 steps · ")
+                    .unwrap()
+                    .strip_suffix(" s_")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                assert_eq!(
+                    sent["image"],
+                    json!({"id":"987","caption":format!("Edited image.\n\n_portable · 4 steps · {seconds} s_")})
+                );
             }
         }
         peer.finish().await;
@@ -17439,6 +17482,316 @@ async fn unauthorized_and_unrouted_whatsapp_photos_fetch_nothing() {
         assert_eq!(models.requests(), 0);
         assert!(peer.requests.lock().is_empty());
         peer.finish().await;
+    }
+}
+
+fn fetch_asset_call(id: u64) -> AssistantTurn {
+    AssistantTurn::new(
+        Some(String::new()),
+        vec![ModelToolCall {
+            id: "asset-call".into(),
+            kind: "function".to_owned(),
+            function: ModelFunctionCall {
+                name: "fetch_chat_asset".to_owned(),
+                arguments: json!({ "id": id }).to_string(),
+            },
+        }],
+        None,
+    )
+}
+
+fn model_files(models: &ModelScript, index: usize) -> Vec<(String, String, Vec<u8>)> {
+    models.prompts.lock()[index]
+        .iter()
+        .filter_map(ModelMessage::parts)
+        .flatten()
+        .filter_map(|part| match part {
+            dekopon_model::model::ContentPart::File { name, mime, data } => Some((
+                name.clone(),
+                mime.clone(),
+                data.read().expect("file lease reads"),
+            )),
+            dekopon_model::model::ContentPart::Text(_)
+            | dekopon_model::model::ContentPart::Image { .. } => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_pdf_reaches_the_model_as_a_file_part_with_its_bytes_name_and_mime() {
+    use crate::transport::whatsapp::tests_media::{
+        MediaPeer, PDF, admitted, bytes_reply, document_webhook, metadata,
+    };
+    for captioned in [true, false] {
+        let peer = MediaPeer::new(|origin, index| match index {
+            0 => metadata(origin, "application/pdf", PDF),
+            1 => bytes_reply(PDF),
+            _ => panic!("one metadata and one download request"),
+        })
+        .await;
+        let mut document =
+            json!({"id":"789", "mime_type":"application/pdf", "filename":"invoice.pdf"});
+        if captioned {
+            document["caption"] = json!("What is the total?");
+        }
+        let (transport, upload) = admitted(&peer.origin, &document_webhook(document)).await;
+        let directory = temporary();
+        let capabilities = || {
+            ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+        };
+        let (broker, _observed) =
+            stub_broker(directory.path(), vec![capabilities(), capabilities()]).await;
+        let models = ModelScript::new(if captioned {
+            vec![fetch_asset_call(1), answer("The total is 4,217.50.")]
+        } else {
+            vec![
+                answer("Received invoice.pdf."),
+                fetch_asset_call(1),
+                answer("The total is 4,217.50."),
+            ]
+        });
+        let mut runner = runner(broker, Arc::clone(&models), 4);
+        Arc::get_mut(&mut runner)
+            .expect("unique runner")
+            .asset_fetchers
+            .insert("wa".to_owned(), transport.asset_fetcher().expect("fetcher"));
+        let mut route = persistent_route(model_config(), window());
+        route.transport = "wa".to_owned();
+        let driver = Arc::new(RecordingDriver::default());
+        let mut turns = vec![upload.clone()];
+        if !captioned {
+            let mut question = upload.clone();
+            question.assets.clear();
+            question.text = "What is the total?".to_owned();
+            question.message_id = MessageId::Native("wamid.question".to_owned());
+            turns.push(question);
+        }
+        for message in turns {
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                message,
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            )
+            .await;
+        }
+        let read = models.requests() - 1;
+        assert_eq!(
+            model_files(&models, read),
+            [(
+                "invoice.pdf".to_owned(),
+                "application/pdf".to_owned(),
+                PDF.to_vec()
+            )]
+        );
+        assert!(tool_message(&models, read).contains("follows in the next message"));
+        assert_eq!(
+            driver.replies().last().map(String::as_str),
+            Some("The total is 4,217.50.")
+        );
+        assert_eq!(peer.requests.lock().len(), 2);
+        peer.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_pdf_fetch_refusal_tells_the_model_its_cause_and_sends_no_file() {
+    use crate::transport::whatsapp::tests_media::{
+        MediaPeer, PDF, admitted, bytes_reply, document_webhook, json_reply, metadata,
+    };
+    use axum::{http::StatusCode, response::IntoResponse as _};
+    const LIMIT: usize = 8 * 1024 * 1024;
+    for (case, requests, expected) in [
+        (
+            "advertised",
+            1,
+            "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read.",
+        ),
+        (
+            "streamed",
+            2,
+            "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read.",
+        ),
+        (
+            "signature",
+            2,
+            "chat-asset:1 cannot be opened: the downloaded file is not the type it was sent as.",
+        ),
+        (
+            "not-found",
+            1,
+            "chat-asset:1 is unavailable: platform-gone: the platform no longer allows this attachment to be downloaded.",
+        ),
+        (
+            "download-refused",
+            2,
+            "chat-asset:1 could not be downloaded: WhatsApp answered HTTP 403.",
+        ),
+    ] {
+        let peer = MediaPeer::new(move |origin, index| match (case, index) {
+            ("advertised", 0) => json_reply(json!({"id":"789", "mime_type":"application/pdf",
+                "file_size": LIMIT + 1,
+                "url": format!("{origin}/whatsapp_business/attachments/?signed=URL_SENTINEL")})),
+            ("not-found", 0) => (StatusCode::NOT_FOUND, "raw body").into_response(),
+            (_, 0) => metadata(origin, "application/pdf", PDF),
+            ("streamed", 1) => bytes_reply(&vec![b'%'; LIMIT + 1]),
+            ("signature", 1) => bytes_reply(&vec![b'X'; PDF.len()]),
+            ("download-refused", 1) => (StatusCode::FORBIDDEN, "raw body").into_response(),
+            _ => panic!("no request after a refusal"),
+        })
+        .await;
+        let document = json!({"id":"789", "mime_type":"application/pdf", "caption":"Total?"});
+        let (transport, upload) = admitted(&peer.origin, &document_webhook(document)).await;
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+                BTreeMap::new(),
+            )],
+        )
+        .await;
+        let models = ModelScript::new([fetch_asset_call(1), answer("I could not read it.")]);
+        let mut runner = runner(broker, Arc::clone(&models), 4);
+        Arc::get_mut(&mut runner)
+            .expect("unique runner")
+            .asset_fetchers
+            .insert("wa".to_owned(), transport.asset_fetcher().expect("fetcher"));
+        let mut route = route(model_config());
+        route.transport = "wa".to_owned();
+        run_session(runner, route, upload, Arc::new(RecordingDriver::default())).await;
+        assert_eq!(tool_message(&models, 1), expected, "{case}");
+        assert!(model_files(&models, 1).is_empty(), "{case}");
+        assert_eq!(peer.requests.lock().len(), requests, "{case}");
+        peer.finish().await;
+    }
+}
+
+async fn refused_once_when_routed_and_silent_when_unrouted(kind: &str, body: Value) {
+    use crate::transport::whatsapp::tests_media::{MediaPeer, admitted, message_webhook};
+    for routed in [true, false] {
+        let peer = MediaPeer::new(|_, _| panic!("a refused message is never fetched")).await;
+        let (_transport, message) =
+            admitted(&peer.origin, &message_webhook(kind, body.clone())).await;
+        let directory = temporary();
+        let mut doc = document(directory.path());
+        doc["transports"][0] = json!({
+            "name": "wa", "kind": "whatsappCloudApi", "appSecretEnv": "APP",
+            "verifyTokenEnv": "VERIFY", "accessTokenEnv": "ACCESS", "bind": "127.0.0.1:9080",
+            "callbackPath": "/wa", "wabaId": "123", "phoneNumberId": "456",
+            "graphApiVersion": "v25.0"
+        });
+        doc["routes"][0]["transport"] = json!("wa");
+        let routes = if routed {
+            let config = resolved(directory.path(), &doc).await;
+            Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap())
+        } else {
+            Arc::new(RoutingTable::default())
+        };
+        let (broker, mut observed) = stub_broker(directory.path(), Vec::new()).await;
+        let models = ModelScript::forbidden();
+        let runner = runner(broker, Arc::clone(&models), 4);
+        let driver = Arc::new(RecordingDriver::default());
+        let drivers =
+            BTreeMap::from([("wa".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+        let mut sessions = tokio::task::JoinSet::new();
+        crate::dispatch(
+            &runner,
+            &routes,
+            &BTreeMap::new(),
+            &drivers,
+            &[],
+            &mut sessions,
+            &mut crate::collection::Collector::new(&[], 4),
+            &mut crate::follow::Debounce::default(),
+            message,
+        );
+        while sessions.join_next().await.is_some() {}
+        assert_eq!(
+            driver.replies(),
+            if routed {
+                vec![
+                    "I can only read text, PDF documents, and PNG or JPEG images. Please send your message in one of those forms."
+                        .to_owned(),
+                ]
+            } else {
+                Vec::new()
+            },
+            "{kind} routed={routed}"
+        );
+        assert_eq!(models.requests(), 0);
+        assert!(observed.try_recv().is_err());
+        peer.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsupported_whatsapp_document_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "document",
+        json!({"id":"789", "mime_type":"application/msword", "caption":"read"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_voice_note_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "audio",
+        json!({"id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_video_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "video",
+        json!({"id":"789", "mime_type":"video/mp4", "caption":"watch"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_sticker_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "sticker",
+        json!({"id":"789", "mime_type":"image/webp", "animated":false}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_location_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "location",
+        json!({"latitude":1.5, "longitude":2.5, "name":"somewhere"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_contact_card_gets_one_refusal_only_when_routed() {
+    refused_once_when_routed_and_silent_when_unrouted(
+        "contacts",
+        json!([{"name":{"formatted_name":"A Person"}, "phones":[{"phone":"+15550000002"}]}]),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whatsapp_webp_or_gif_image_gets_one_refusal_only_when_routed() {
+    for mime in ["image/webp", "image/gif"] {
+        refused_once_when_routed_and_silent_when_unrouted(
+            "image",
+            json!({"id":"789", "mime_type":mime, "caption":"edit"}),
+        )
+        .await;
     }
 }
 
@@ -18415,6 +18768,8 @@ mod steering;
 #[path = "tests/steering_e2e.rs"]
 mod steering_e2e;
 mod subscriptions;
+#[path = "tests/task_time.rs"]
+mod task_time;
 mod wake_reason;
 #[path = "tests/wakes.rs"]
 mod wakes;
@@ -23609,7 +23964,14 @@ async fn a_slack_follow_batch_keeps_both_speakers_and_authorizes_only_the_newest
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slack_follow_mute_and_lapse_close_the_ticket_without_a_model_call() {
-    for (text, age, cause) in [("mute", 0, "mute"), ("later", 86400, "lapse")] {
+    let mentioned = format!("<@{BOT_USER}> mute");
+    let escaped = format!("&lt;@{BOT_USER}&gt; mute");
+    for (text, age, cause) in [
+        ("mute", 0, Some("mute")),
+        (mentioned.as_str(), 0, Some("mute")),
+        (escaped.as_str(), 0, None),
+        ("later", 86400, Some("lapse")),
+    ] {
         let fixture = SlackFollowFixture::new().await;
         fixture
             .table
@@ -23649,6 +24011,18 @@ async fn slack_follow_mute_and_lapse_close_the_ticket_without_a_model_call() {
         while let Some(result) = sessions.join_next().await {
             result.unwrap();
         }
+        let Some(cause) = cause else {
+            assert!(matches!(
+                fixture.table.ticket(&fixture.key, SystemTime::now()),
+                crate::follow::FollowTicket::Active { .. }
+            ));
+            assert!(
+                capture
+                    .events_where("dekopon_gatewayd", &[("audit.event", "gateway.follow")])
+                    .is_empty()
+            );
+            continue;
+        };
         assert_eq!(
             fixture.table.ticket(&fixture.key, SystemTime::now()),
             crate::follow::FollowTicket::Absent
@@ -24084,3 +24458,6 @@ pub(super) async fn native_join<F: std::future::Future>(join: F) -> F::Output {
 
 #[path = "tests/digests.rs"]
 mod digests;
+
+#[path = "tests/footer.rs"]
+mod footer;

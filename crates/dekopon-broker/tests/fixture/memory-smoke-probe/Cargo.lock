@@ -60,7 +60,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "dekopon-capability"
-version = "0.75.0"
+version = "0.80.0"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.75.0"
+version = "0.80.0"
 dependencies = [
  "libc",
  "serde",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.75.0"
+version = "0.80.0"
 dependencies = [
  "clap",
  "dekopon-capability",
@@ -100,6 +100,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "wit-bindgen",
 ]
 
@@ -321,6 +322,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

@@ -99,6 +99,10 @@ impl LocalTransport {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one connection task owns the read loop, stop presses and the outbound writer"
+    )]
     fn serve(&self, stream: UnixStream) -> impl Future<Output = ()> + Send + 'static {
         let connection = self.connections.fetch_add(1, Ordering::Relaxed);
         let (outbound_send, mut outbound_receive) = mpsc::channel::<LocalWrite>(OUTBOUND_BUFFER);
@@ -222,6 +226,7 @@ impl LocalTransport {
                 received.record("message.id", message_id.as_str());
                 record_conversation(&received, &request.conversation);
                 let message = InboundMessage {
+                    control_text: None,
                     pull_request_links: None,
                     transport: name.clone(),
                     transport_kind: ChatTransportKind::Local,
@@ -240,6 +245,7 @@ impl LocalTransport {
                     constituents: Vec::new(),
                     folded: Vec::new(),
                     asset_overflow: false,
+                    input_refusal: None,
                 };
                 if inbound
                     .send(TransportEvent::Message(Box::new(message)))
@@ -473,7 +479,11 @@ impl ChatDriver for LocalDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, images } = reply;
+        let OutboundReply {
+            text,
+            images,
+            footer: _,
+        } = reply;
         super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
         let images = super::hydration::hydrate_images(images).await?;
         let &ReplyTarget::Local { connection } = target else {

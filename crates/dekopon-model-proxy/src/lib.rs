@@ -30,7 +30,7 @@ use axum::{
     routing::post,
 };
 use bytes::Bytes;
-use dekopon_core::{AgentId, Redacted};
+use dekopon_core::{AgentId, Redacted, VM_SESSION_HEADER, VmSession};
 use dekopon_model::{
     chatgpt::{CredentialFile, RefreshClient},
     wire::{Field, PeekError, RequestPeek},
@@ -46,7 +46,6 @@ use tee::{Shape, Timing};
 
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const SUBJECT_HEADER: &str = "x-dekopon-vm-subject";
-pub const SESSION_HEADER: &str = "x-dekopon-vm-session";
 const MAX_LABEL_BYTES: usize = 128;
 pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -74,6 +73,7 @@ pub enum Upstream {
     OpenRouter {
         endpoint: String,
         api_key: Redacted<String>,
+        settings: Vec<(Field, String)>,
     },
     Anthropic {
         endpoint: String,
@@ -127,7 +127,22 @@ pub struct ProxyModel {
 
 pub struct Grant {
     pub agent: AgentId,
-    pub models: BTreeSet<String>,
+    pub models: Granted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Granted {
+    Listed(BTreeSet<String>),
+    Inherited(String),
+}
+
+impl Granted {
+    fn names(&self) -> Vec<&str> {
+        match self {
+            Self::Listed(models) => models.iter().map(String::as_str).collect(),
+            Self::Inherited(model) => vec![model.as_str()],
+        }
+    }
 }
 
 pub struct ModelProxy {
@@ -176,7 +191,13 @@ impl ModelProxy {
     }
 
     fn model_rule(&self, grant: &Grant, dialect: Dialect) -> String {
-        let granted = || grant.models.iter().filter_map(|name| self.models.get(name));
+        let granted = || {
+            grant
+                .models
+                .names()
+                .into_iter()
+                .filter_map(|name| self.models.get(name))
+        };
         let served = granted()
             .filter(|model| model.upstream.serves(dialect))
             .map(|model| format!("`{}`", model.name))
@@ -233,24 +254,30 @@ impl ModelProxy {
 
 struct CallSpan {
     inner: Span,
+    session: Option<VmSession>,
     usage: ModelUsage,
     settled: bool,
 }
 
 impl CallSpan {
     fn open(headers: &HeaderMap) -> Self {
+        let session = headers
+            .get(VM_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(VmSession::parse);
         Self {
             inner: tracing::info_span!(
                 target: "model",
                 "model.proxy.call",
                 vm.subject = label(headers, SUBJECT_HEADER),
-                vm.session = label(headers, SESSION_HEADER),
+                vm.session = session.as_ref().map_or("", VmSession::as_str),
                 agent = Empty,
                 model.name = Empty,
                 usage.input_tokens = Empty,
                 usage.output_tokens = Empty,
                 outcome = Empty,
             ),
+            session,
             usage: ModelUsage::default(),
             settled: false,
         }
@@ -364,40 +391,65 @@ async fn call(
             ));
         }
     };
-    let peek = match RequestPeek::of(&body) {
+    let peeked = match &grant.models {
+        Granted::Listed(_) => RequestPeek::of(&body),
+        Granted::Inherited(_) => RequestPeek::with_settings(&body),
+    };
+    let peek = match peeked {
         Ok(peek) => peek,
         Err(error) => {
             return span.refused(dialect.sandbox(Problem::Invalid, &peek_rule(&error, grant)));
         }
     };
-    let Some(model) = proxy
-        .models
-        .get(&peek.model)
-        .filter(|model| grant.models.contains(&model.name) && model.upstream.serves(dialect))
-    else {
+    let model = match &grant.models {
+        Granted::Listed(models) => proxy
+            .models
+            .get(&peek.model)
+            .filter(|model| models.contains(&model.name) && model.upstream.serves(dialect)),
+        Granted::Inherited(name) => match proxy.models.get(name) {
+            Some(model) if !model.upstream.serves(dialect) => {
+                return span.refused(dialect.sandbox(
+                    Problem::Forbidden,
+                    &format!(
+                        "this VM runs on its agent's model `{}`, which is served on `{}`, not `{}`. Call it on its own path.",
+                        model.name,
+                        model.upstream.path(),
+                        dialect.path()
+                    ),
+                ));
+            }
+            served => served,
+        },
+    };
+    let Some(model) = model else {
         return span
             .refused(dialect.sandbox(Problem::Forbidden, &proxy.model_rule(grant, dialect)));
     };
     span.inner.record("model.name", model.name.as_str());
     let wire_model = serde_json::Value::from(model.wire_model.as_str()).to_string();
-    let rewritten = match &model.upstream {
-        Upstream::Codex { .. } if peek.stream != Some(true) => {
+    let rewritten = match (&model.upstream, &grant.models) {
+        (Upstream::Codex { .. }, _) if peek.stream != Some(true) => {
             return span.refused(dialect.sandbox(
                 Problem::Invalid,
                 "this model is served only as a stream. Set `stream` to true.",
             ));
         }
-        Upstream::Codex { .. } => peek.rewrite(
+        (Upstream::Codex { .. }, _) => peek.rewrite(
             &body,
             &[(Field::Model, &wire_model), (Field::Store, "false")],
         ),
-        Upstream::OpenRouter { .. } if peek.has(Field::Models) || peek.has(Field::Route) => {
+        (Upstream::OpenRouter { .. }, _) if peek.has(Field::Models) || peek.has(Field::Route) => {
             return span.refused(dialect.sandbox(
                 Problem::Invalid,
                 "OpenRouter fallback routing (`models` / `route`) is not allowed; the sandbox pins each call to one configured model. Remove the field.",
             ));
         }
-        Upstream::Anthropic { .. } | Upstream::OpenRouter { .. } => {
+        (Upstream::OpenRouter { settings, .. }, Granted::Inherited(_)) => {
+            let mut replacements = vec![(Field::Model, wire_model.as_str())];
+            replacements.extend(settings.iter().map(|(field, raw)| (*field, raw.as_str())));
+            peek.rewrite(&body, &replacements)
+        }
+        (Upstream::Anthropic { .. }, _) | (Upstream::OpenRouter { .. }, Granted::Listed(_)) => {
             peek.rewrite(&body, &[(Field::Model, &wire_model)])
         }
     };
@@ -409,7 +461,9 @@ async fn call(
             agent: grant.agent.clone(),
             model: model.name.clone(),
             backend: model.backend,
-            via: Via::Proxy,
+            via: Via::Proxy {
+                session: span.session,
+            },
         };
         let estimate = Estimate::from_sizes(
             Sizes {
@@ -589,7 +643,8 @@ fn peek_rule(error: &PeekError, grant: &Grant) -> String {
             "the request must name a model. Set `model` to one of this agent's configured models: {}.",
             grant
                 .models
-                .iter()
+                .names()
+                .into_iter()
                 .map(|name| format!("`{name}`"))
                 .collect::<Vec<_>>()
                 .join(", ")

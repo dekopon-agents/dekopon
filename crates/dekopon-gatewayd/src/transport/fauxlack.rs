@@ -114,6 +114,7 @@ impl ChatTransport for FauxlackTransport {
                     }
                 };
                 return Ok(TransportEvent::Message(Box::new(InboundMessage {
+                    control_text: None,
                     pull_request_links: None,
                     transport: self.name.clone(),
                     transport_kind: ChatTransportKind::Fauxlack,
@@ -135,6 +136,7 @@ impl ChatTransport for FauxlackTransport {
                         })
                         .collect(),
                     asset_overflow: false,
+                    input_refusal: None,
                     addressed,
                     thread_continuation: None,
                     reply: ReplyTarget::Fauxlack {
@@ -213,6 +215,7 @@ impl ChatDriver for Driver {
         if server != self.server.id() {
             return Err(TransportError::Response);
         }
+        let context = reply.footer.as_ref().map(|footer| footer.line().to_owned());
         let (text, files) = self.images(reply).await?;
         self.server
             .publish(Draft {
@@ -220,6 +223,7 @@ impl ChatDriver for Driver {
                 container,
                 thread: thread.as_deref(),
                 text: &text,
+                context: context.as_deref(),
                 files,
                 publication: Publication::Final,
             })
@@ -253,6 +257,7 @@ impl ProgressMessage for Driver {
                 container,
                 thread,
                 text: text.as_str(),
+                context: None,
                 files: Vec::new(),
                 publication: Publication::Progress,
             })
@@ -298,10 +303,14 @@ impl ProgressMessage for Driver {
                 code: "answer-has-attachments".into(),
             });
         }
-        if self
-            .server
-            .progress(&message.id, &reply.text, Progress::Finalize(Vec::new()))
-        {
+        if self.server.progress(
+            &message.id,
+            &reply.text,
+            Progress::Finalize {
+                files: Vec::new(),
+                context: reply.footer.as_ref().map(|footer| footer.line().to_owned()),
+            },
+        ) {
             Ok(())
         } else {
             Err(TransportError::Response)

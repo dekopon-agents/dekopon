@@ -594,25 +594,29 @@ impl CapabilityInvoker for BrokerLeg {
         streams: dekopon_shell::Streams,
         tree: &TreeContext,
     ) -> dekopon_shell::RunResult {
-        let word = CommandWord::new(&call.word);
-        self.emit(ProgressEvent::ToolStarted {
-            word: word.clone(),
-            argument_count: bounded_count(call.argv.len()),
-            calls_used: self.calls.used(),
-            calls_max: self.calls.maximum(),
+        let reported = self.command_words.contains(&call.word).then(|| {
+            let word = CommandWord::new(&call.word);
+            self.emit(ProgressEvent::ToolStarted {
+                word: word.clone(),
+                argument_count: bounded_count(call.argv.len()),
+                calls_used: self.calls.used(),
+                calls_max: self.calls.maximum(),
+            });
+            (word, Instant::now())
         });
-        let started = Instant::now();
         let outcome = self.run_call(call, streams, tree);
         let result = match &outcome {
             dekopon_shell::RunResult::Invoked { result, .. }
             | dekopon_shell::RunResult::Returned(result)
             | dekopon_shell::RunResult::Uncertain(result) => result,
         };
-        self.emit(ProgressEvent::ToolFinished {
-            word,
-            outcome: call_outcome(result),
-            duration: started.elapsed(),
-        });
+        if let Some((word, started)) = reported {
+            self.emit(ProgressEvent::ToolFinished {
+                word,
+                outcome: call_outcome(result),
+                duration: started.elapsed(),
+            });
+        }
         outcome
     }
 
@@ -1436,6 +1440,34 @@ mod tests {
     }
 
     #[test]
+    fn a_word_without_a_broker_stays_behind_admission_when_the_budget_is_spent() {
+        use crate::prompt::ScriptRuntime as _;
+
+        let runtime = crate::ShellRuntime {
+            invoker: SessionInvoker {
+                direct: FakeLeg::new("cli-probe.upper", "direct"),
+                broker: None,
+            },
+            limits: dekopon_process::Limits {
+                max_capability_calls: 0,
+                ..dekopon_process::Limits::default()
+            },
+            calls: dekopon_process::CallBudget::new(0),
+            threads: dekopon_test_support::shell_threads(),
+        };
+        let result = runtime.run_script(
+            "nosuchword || { echo status=$?; echo fallback; }; echo after",
+            None,
+        );
+        assert_eq!(result.exit_code, dekopon_process::ExitCode::SYNTAX);
+        assert_eq!(
+            result.output,
+            "dekopon-shell: the turn's capability-call budget of 0 is spent"
+        );
+        assert_eq!(runtime.calls.used(), 0);
+    }
+
+    #[test]
     fn a_session_without_a_broker_is_exactly_as_capable_as_direct_mode() {
         let invoker = SessionInvoker {
             direct: FakeLeg::new("cli-probe.upper", "direct"),
@@ -1794,6 +1826,62 @@ mod tests {
                 drop(stream);
             });
             (leg_for(&socket), receiver, release)
+        }
+
+        async fn assert_exhausted_word_admission(
+            outcome: dekopon_broker_protocol::RunOutcome,
+            word: &'static str,
+        ) {
+            let directory = private_broker_directory();
+            let response = ResponseEnvelope {
+                api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2,
+                response: dekopon_broker_protocol::BrokerResponse::Ran { outcome },
+            };
+            let (leg, mut observed) =
+                stub_leg_observing(directory.path(), vec![response], None).await;
+            let calls = dekopon_process::CallBudget::new(0);
+            let runtime = ShellRuntime {
+                invoker: leg,
+                limits: Limits {
+                    max_capability_calls: 0,
+                    ..Limits::default()
+                },
+                calls: calls.clone(),
+                threads: dekopon_test_support::shell_threads(),
+            };
+            let script = format!("{word} || {{ echo status=$?; echo fallback; }}; echo after");
+            let result = tokio::task::spawn_blocking(move || runtime.run_script(&script, None))
+                .await
+                .expect("the script completes");
+            assert_eq!(result.exit_code, ExitCode::SYNTAX);
+            assert_eq!(
+                result.output,
+                "dekopon-shell: the turn's capability-call budget of 0 is spent"
+            );
+            assert_eq!(calls.used(), 0);
+            assert!(observed.try_recv().is_err());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_unknown_word_stays_behind_admission_when_the_budget_is_spent() {
+            assert_exhausted_word_admission(
+                dekopon_broker_protocol::RunOutcome::NotFound,
+                "nosuchword",
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_ungranted_word_stays_behind_admission_when_the_budget_is_spent() {
+            assert_exhausted_word_admission(
+                dekopon_broker_protocol::RunOutcome::Rendered {
+                    stdout: String::new(),
+                    stderr: "dekopon-shell: ssh: not granted in this conversation\n".to_owned(),
+                    status: 127,
+                },
+                "ssh",
+            )
+            .await;
         }
 
         #[tokio::test(flavor = "multi_thread")]

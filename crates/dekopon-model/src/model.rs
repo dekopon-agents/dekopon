@@ -428,6 +428,10 @@ impl ModelKey {
         self
     }
 
+    pub fn upstream(&self) -> &str {
+        &self.upstream.0
+    }
+
     pub fn reported(&self) -> Option<&str> {
         self.reported.as_ref().map(|model| model.0.as_str())
     }

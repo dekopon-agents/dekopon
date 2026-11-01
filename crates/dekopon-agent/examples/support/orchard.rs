@@ -722,13 +722,22 @@ fn wiki(capability: &str, input: &Value) -> Result<Value, CapabilityCallResult> 
 pub struct Orchard {
     next_asset: AtomicU64,
     attached: parking_lot::Mutex<Vec<u64>>,
+    research: Option<super::freshness::Research>,
 }
 
 impl Orchard {
     pub fn new() -> Self {
         Self {
+            research: None,
             next_asset: AtomicU64::new(1),
             attached: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn research(calls: std::sync::Arc<parking_lot::Mutex<Vec<Value>>>) -> Self {
+        Self {
+            research: Some(super::freshness::Research { calls }),
+            ..Self::new()
         }
     }
 
@@ -843,6 +852,9 @@ impl Orchard {
         _stdin_piped: bool,
     ) -> Option<Result<dekopon_shell::CommandProposal, CommandRun>> {
         let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+        if let Some(research) = &self.research {
+            return (word == "exa").then(|| research.parse(&argv));
+        }
         Some(match word {
             "gh" => gh(&argv),
             "wikipedia" => wikipedia(&argv),
@@ -855,16 +867,25 @@ impl Orchard {
 
 impl CapabilityInvoker for Orchard {
     fn granted(&self) -> Vec<String> {
+        if self.research.is_some() {
+            return vec!["exa.search".into()];
+        }
         GRANTED.iter().map(|id| (*id).to_owned()).collect()
     }
 
     fn command_words(&self) -> Vec<String> {
+        if self.research.is_some() {
+            return vec!["exa".into()];
+        }
         ["asset", "gh", "image", "wikipedia"]
             .map(str::to_owned)
             .to_vec()
     }
 
     fn command_word_help(&self) -> BTreeMap<String, String> {
+        if self.research.is_some() {
+            return BTreeMap::from([("exa".into(), super::freshness::HELP.into())]);
+        }
         BTreeMap::from([
             ("asset".to_owned(), ASSET_HELP.to_owned()),
             ("gh".to_owned(), GH_HELP.to_owned()),
@@ -920,7 +941,9 @@ impl CapabilityInvoker for Orchard {
         _tree: &TreeContext,
     ) -> CapabilityCallResult {
         let capability = proposal.capability.as_str();
-        let answer = if capability.starts_with("mediawiki.") {
+        let answer = if let Some(research) = &self.research {
+            research.answer(&proposal.input)
+        } else if capability.starts_with("mediawiki.") {
             wiki(capability, &proposal.input)
         } else {
             self.answer(capability, &proposal.input)

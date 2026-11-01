@@ -54,6 +54,8 @@ struct Cli {
     /// Private KEY=VALUE file loaded before serving; options and inherited variables win.
     #[arg(long, value_name = "PATH")]
     env_file: Option<PathBuf>,
+    #[command(flatten)]
+    log: dekopon_telemetry::LogFileArgs,
     /// Maintenance or health-check mode. Omit to serve the broker.
     #[command(subcommand)]
     command: Option<Command>,
@@ -262,6 +264,15 @@ fn main() -> ExitCode {
     if let Err(error) = validate_cli(&cli) {
         return dekopon_core::render_cli_error(error, Cli::command());
     }
+    if cli.log.log_file.is_some() {
+        match &cli.command {
+            None => {}
+            Some(Command::Probe { .. } | Command::Provider(_) | Command::Check(_)) => {
+                eprintln!("dekopon-brokerd: --log-file is accepted only when serving");
+                return ExitCode::from(2);
+            }
+        }
+    }
     if let Some(env_file) = &cli.env_file {
         match &cli.command {
             None => {}
@@ -274,6 +285,13 @@ fn main() -> ExitCode {
         eprintln!("dekopon-brokerd: {}", error_chain(&error));
         return ExitCode::FAILURE;
     }
+    let log = match cli.log.open(dekopon_brokerd::current_uid()).transpose() {
+        Ok(log) => log,
+        Err(error) => {
+            eprintln!("dekopon-brokerd: {}", error_chain(&error));
+            return ExitCode::FAILURE;
+        }
+    };
     let mut builder = match runtime_builder(&cli) {
         Ok(builder) => builder,
         Err(error) => return dekopon_core::render_cli_error(error, Cli::command()),
@@ -293,7 +311,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    observed::finish(runtime, execute(cli))
+    observed::finish(runtime, execute(cli, log))
 }
 
 #[cfg(unix)]
@@ -332,7 +350,7 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
 }
 
 #[cfg(unix)]
-async fn execute(cli: Cli) -> ExitCode {
+async fn execute(cli: Cli, log: Option<dekopon_telemetry::LogFile>) -> ExitCode {
     match cli.command {
         Some(Command::Probe { socket }) => match probe(&socket).await {
             Ok(()) => ExitCode::SUCCESS,
@@ -384,7 +402,13 @@ async fn execute(cli: Cli) -> ExitCode {
                 dekopon_telemetry::optional_logger_provider(exporter, "dekopon-brokerd");
             let mut install = Install::new(Console {
                 format: ConsoleFormat::Json,
-                writer: ConsoleWriter::Stdout("bk-stdout"),
+                writer: match log {
+                    Some(log) => ConsoleWriter::File {
+                        thread: "bk-log",
+                        log,
+                    },
+                    None => ConsoleWriter::Stdout("bk-stdout"),
+                },
                 filter: ConsoleFilter::Environment("info".to_owned()),
             });
             if let Some(provider) = tracer_provider {

@@ -31,10 +31,10 @@ use crate::{
     asset::{AssetSourceRef, PendingAsset},
     config::{LivenessMode, LivenessSettings},
     transport::{
-        AssetFetcher, ChatDriver, ChatTransport, InboundMessage, LivenessTarget, MessageId,
-        OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError, TransportEvent,
-        TransportIdentity, TypingLease, bound_inbound, credential_client, receive_span,
-        record_conversation, split_message,
+        AssetFetcher, ChatDriver, ChatTransport, InboundMessage, InputRefusal, LivenessTarget,
+        MediaRefusal, MessageId, OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError,
+        TransportEvent, TransportIdentity, TypingLease, bound_inbound, credential_client,
+        receive_span, record_conversation,
         webhook::{
             self, MAX_WEBHOOK_CONCURRENCY, VerifyFailure, WEBHOOK_REQUEST_TIMEOUT, content_free,
             text_response,
@@ -432,7 +432,7 @@ fn parse_delivery(
                 ) else {
                     continue;
                 };
-                let (text, assets) = match message.get("type").and_then(Value::as_str) {
+                let (text, assets, refusal) = match message.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         let Some(text) = message.pointer("/text/body").and_then(Value::as_str)
                         else {
@@ -441,25 +441,12 @@ fn parse_delivery(
                         if text.trim().is_empty() {
                             continue;
                         }
-                        (text, Vec::new())
+                        (text, Vec::new(), None)
                     }
-                    Some("image") => {
-                        let Some(asset) = media::inbound_image(&message["image"]) else {
-                            tracing::debug!(
-                                event = "gateway_message_ignored",
-                                reason = "image-metadata",
-                                "gateway.message.ignored"
-                            );
-                            continue;
-                        };
-                        let caption = match message["image"].get("caption") {
-                            None => "",
-                            Some(Value::String(caption)) => caption,
-                            Some(_) => continue,
-                        };
-                        (caption, vec![asset])
-                    }
-                    _ => continue,
+                    Some("image") => media::inbound_image(&message["image"]),
+                    Some("document") => media::inbound_document(&message["document"]),
+                    None | Some("reaction" | "system") => continue,
+                    Some(_) => ("", Vec::new(), Some(InputRefusal::Unsupported)),
                 };
                 let individual = contacts.is_some_and(|contacts| {
                     contacts
@@ -504,6 +491,7 @@ fn parse_delivery(
                 receipt.record("message.id", id);
                 record_conversation(&receipt, &conversation);
                 accepted.push(InboundMessage {
+                    control_text: None,
                     pull_request_links: None,
                     transport: state.name.clone(),
                     transport_kind: ChatTransportKind::Whatsapp,
@@ -527,6 +515,7 @@ fn parse_delivery(
                     constituents: Vec::new(),
                     folded: Vec::new(),
                     asset_overflow: false,
+                    input_refusal: refusal,
                 });
             }
         }
@@ -721,7 +710,12 @@ impl ChatDriver for WhatsappDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, images } = reply;
+        let OutboundReply {
+            text,
+            images,
+            footer,
+        } = reply;
+        let suffix = footer.as_ref().map(|footer| format!("_{}_", footer.line()));
         super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Photos)?;
         let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::WhatsApp { recipient } = target else {
@@ -736,22 +730,37 @@ impl ChatDriver for WhatsappDriver {
             return Err(media::failure("image-too-large"));
         }
         let caption_fits = !images.is_empty() && text.chars().count() <= media::MAX_CAPTION_CHARS;
+        let caption = suffix.as_deref().and_then(|suffix| {
+            crate::progress::Footer::caption(
+                &text,
+                suffix,
+                media::MAX_CAPTION_CHARS,
+                TextUnit::Scalar,
+            )
+        });
+        let caption_text = caption.as_deref().unwrap_or(&text);
         let mut accepted = 0_usize;
         while let Some(read) = images.next().await {
             let (index, image) = match read {
                 Ok(read) => read,
                 Err(error) => return Err(self.reply_failure(error, accepted)),
             };
-            let caption = (caption_fits && index == 0 && !text.is_empty()).then_some(text.as_str());
+            let caption =
+                (caption_fits && index == 0 && !caption_text.is_empty()).then_some(caption_text);
             if let Err(error) = self.send_image(recipient, caption, image).await {
                 return Err(self.reply_failure(error, accepted));
             }
             accepted += 1;
         }
-        if caption_fits {
+        if caption_fits && (footer.is_none() || caption.is_some()) {
             return Ok(());
         }
-        for chunk in split_message(&text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar) {
+        for chunk in crate::progress::Footer::chunks(
+            if caption_fits { "" } else { &text },
+            suffix.as_deref(),
+            MAX_WHATSAPP_TEXT_CHARS,
+            TextUnit::Scalar,
+        ) {
             match self.send_text(recipient, &chunk).await {
                 Ok(()) => accepted += 1,
                 Err(error) => return Err(self.reply_failure(error, accepted)),
@@ -1028,9 +1037,13 @@ mod tests {
                 ]}
             ]
         });
-        let messages = parse_delivery(&state(), &payload, &received()).expect("delivery");
-        assert_eq!(messages.len(), 1);
+        let delivered = parse_delivery(&state(), &payload, &received()).expect("delivery");
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].message_id.to_string(), "one");
+        assert_eq!(delivered[0].input_refusal, Some(InputRefusal::Unsupported));
+        let messages = &delivered[1..];
         assert_eq!(messages[0].message_id.to_string(), "two");
+        assert_eq!(messages[0].input_refusal, None);
         assert_eq!(messages[0].subject.canonical(), "whatsapp.1603");
         assert_eq!(
             messages[0].conversation.container.as_deref(),
@@ -1386,7 +1399,7 @@ mod tests {
     }
 
     fn split(text: &str) -> Vec<String> {
-        split_message(text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar)
+        super::super::split_message(text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar)
     }
 
     #[test]

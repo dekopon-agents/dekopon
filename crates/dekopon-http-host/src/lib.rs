@@ -707,6 +707,8 @@ pub struct HttpCallEvidence {
     pub response_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_session: Option<dekopon_core::VmSession>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub credential_injected: bool,
 }
@@ -1111,6 +1113,7 @@ impl BufferedHttpClient {
             request_bytes: prepared.request_bytes,
             response_bytes: 0,
             upstream_request_id: None,
+            vm_session: None,
             credential_injected: false,
         });
         if let Some(header) = credential_header {
@@ -2721,6 +2724,57 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].authority, authority);
         server.join();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vm_session_response_header_reaches_evidence_only_in_canonical_form() {
+        const SESSION: &str = "019a3c2e-7b4d-7c1a-9e2f-0123456789ab";
+        let cases = [
+            (Some(SESSION), Some(SESSION)),
+            (Some("019A3C2E-7B4D-7C1A-9E2F-0123456789AB"), None),
+            (Some("019a3c2e-7b4d-4c1a-9e2f-0123456789ab"), None),
+            (None, None),
+        ];
+        for (header, recorded) in cases {
+            let session = header
+                .map(|value| format!("x-dekopon-vm-session: {value}\r\n"))
+                .unwrap_or_default();
+            let server = LoopbackServer::once(
+                format!("HTTP/1.1 201 Created\r\n{session}Content-Length: 2\r\nConnection: close\r\n\r\n{{}}")
+                    .as_bytes(),
+            );
+            let authority = server.authority().to_owned();
+            let mut client = BufferedHttpClient::authorized(
+                grant(authority.clone(), "POST"),
+                HttpHostCeilings::default(),
+                Duration::from_secs(5),
+            )
+            .expect("valid fixture authorization");
+            let response = client
+                .send(Request {
+                    method: "POST".to_owned(),
+                    uri: format!("http://{authority}/v1/sessions"),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+                .await
+                .expect("bounded request succeeds");
+            let returned = response
+                .headers
+                .iter()
+                .find(|header| header.name == "x-dekopon-vm-session")
+                .map(|header| header.value.as_slice());
+            assert_eq!(returned, header.map(str::as_bytes));
+            let evidence = client.into_evidence();
+            assert_eq!(
+                evidence[0]
+                    .vm_session
+                    .as_ref()
+                    .map(dekopon_core::VmSession::as_str),
+                recorded
+            );
+            server.join();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

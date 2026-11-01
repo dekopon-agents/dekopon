@@ -569,6 +569,7 @@ impl BufferedHttpClient {
                 request_bytes,
                 response_bytes: 0,
                 upstream_request_id: None,
+                vm_session: None,
                 credential_injected: false,
             });
             #[cfg(feature = "native-test")]

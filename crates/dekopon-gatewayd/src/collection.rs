@@ -108,6 +108,10 @@ impl Collector {
         reason = "reshaped by the unit that next rewrites this"
     )]
     pub(crate) fn offer(&mut self, route: RouteIdentity, message: InboundMessage) -> Offered {
+        if let Some(refusal) = message.input_refusal {
+            message.receive_span.in_scope(|| record_received(&message));
+            return Offered::Refused(message, refusal.reason());
+        }
         if message.asset_overflow || message.assets.len() > MAX_ASSETS_PER_MESSAGE {
             message.receive_span.in_scope(|| record_received(&message));
             return Offered::Refused(message, "input-limit");
@@ -355,6 +359,7 @@ pub(crate) mod tests {
 
     fn message(photos: usize, text: &str) -> InboundMessage {
         InboundMessage {
+            control_text: None,
             pull_request_links: None,
             transport: "wa".into(),
             transport_kind: ChatTransportKind::Whatsapp,
@@ -376,6 +381,7 @@ pub(crate) mod tests {
                 })
                 .collect(),
             asset_overflow: false,
+            input_refusal: None,
             addressed: None,
             thread_continuation: None,
             reply: ReplyTarget::WhatsApp {

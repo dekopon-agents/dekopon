@@ -33,6 +33,7 @@ mod subject;
 mod trace;
 #[cfg(unix)]
 mod trusted_file;
+mod vm;
 
 use std::{fmt, str::FromStr};
 
@@ -59,6 +60,7 @@ pub use trusted_file::{
     AncestorOwners, AncestorPolicy, FileHygieneError, FileTier, check_trusted_ancestors,
     check_trusted_metadata, read_trusted_file,
 };
+pub use vm::{VM_SESSION_HEADER, VmSession};
 
 pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 253;
 pub const MAX_SECRET_DRN_LENGTH: usize = 512;

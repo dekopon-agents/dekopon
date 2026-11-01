@@ -4,6 +4,7 @@ use crate::{
     model::{CompletionOptions, ModelTool, assistant_message},
 };
 use serde_json::json;
+use std::num::NonZeroU32;
 use tracing::instrument::WithSubscriber as _;
 
 const TOOL: &str = include_str!("../fixtures/openrouter-tool.sse");

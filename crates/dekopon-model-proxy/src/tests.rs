@@ -4,7 +4,8 @@ use std::{
     time::Duration,
 };
 
-use dekopon_core::Redacted;
+use dekopon_core::{Redacted, VM_SESSION_HEADER};
+use dekopon_model::wire::Field;
 use dekopon_model_token_governor::{Budget, MeterSpec, Metering, Tokens, UnixMillis};
 use dekopon_test_support::{CODEX_RESPONSES_TWO_DELTAS, OPENAI_CHAT_COMPLETIONS_TWO_DELTAS};
 use parking_lot::Mutex;
@@ -14,11 +15,11 @@ use tokio::{
 };
 
 use crate::{
-    CurrentProxy, Grant, MAX_BODY_BYTES, ModelProxy, ProxyModel, SESSION_HEADER, SUBJECT_HEADER,
-    Upstream,
+    CurrentProxy, Grant, Granted, MAX_BODY_BYTES, ModelProxy, ProxyModel, SUBJECT_HEADER, Upstream,
 };
 
 const SUBJECT: &str = "dekopon:gylmar-vm";
+const SESSION: &str = "019a3c2e-7b4d-7c1a-9e2f-0123456789ab";
 
 enum Step {
     Write(Vec<u8>),
@@ -158,6 +159,7 @@ fn models(
             upstream: Upstream::OpenRouter {
                 endpoint: endpoint.to_owned(),
                 api_key: Redacted::new("sk-or-proxy".to_owned()),
+                settings: Vec::new(),
             },
         },
         ProxyModel {
@@ -168,6 +170,7 @@ fn models(
             upstream: Upstream::OpenRouter {
                 endpoint: endpoint.to_owned(),
                 api_key: Redacted::new("sk-or-proxy".to_owned()),
+                settings: Vec::new(),
             },
         },
     ];
@@ -201,20 +204,25 @@ async fn proxy_with(
     codex: Option<Arc<dekopon_model::chatgpt::CredentialFile>>,
     ping: Duration,
 ) -> Running {
+    let granted = Granted::Listed(BTreeSet::from([
+        "claude-opus".to_owned(),
+        "glm-flash".to_owned(),
+        "astra".to_owned(),
+    ]));
+    serve(models(endpoint, codex), granted, limit, ping).await
+}
+
+async fn serve(models: Vec<ProxyModel>, granted: Granted, limit: u64, ping: Duration) -> Running {
     let metering = metering(limit);
     let guests = HashMap::from([(
         SUBJECT.to_owned(),
         Grant {
             agent: "gylmar".parse().unwrap(),
-            models: BTreeSet::from([
-                "claude-opus".to_owned(),
-                "glm-flash".to_owned(),
-                "astra".to_owned(),
-            ]),
+            models: granted,
         },
     )]);
     let proxy = Arc::new(
-        ModelProxy::new(models(endpoint, codex), guests, Arc::clone(&metering))
+        ModelProxy::new(models, guests, Arc::clone(&metering))
             .unwrap()
             .with_timing(ping, Duration::from_secs(30)),
     );
@@ -245,26 +253,20 @@ impl Running {
 }
 
 #[derive(Clone, Default)]
-struct MeterRecords(Arc<Mutex<Vec<String>>>);
+struct MeterRecords(Arc<Mutex<Vec<Fields>>>);
 
 impl<S> tracing_subscriber::Layer<S> for MeterRecords
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
-        struct EventFields(String);
-        impl tracing::field::Visit for EventFields {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push_str(&format!("{}={value:?} ", field.name()));
-            }
-        }
         if event.metadata().target() == "meter" {
-            let mut fields = EventFields(String::new());
-            event.record(&mut fields);
+            let mut fields = Fields::new();
+            event.record(&mut SpanFields(&mut fields));
             if let Some(parent) = ctx.event_span(event) {
-                fields.0.push_str(&format!("parent={:?} ", parent.id()));
+                fields.insert("parent".to_owned(), format!("{:?}", parent.id()));
             }
-            self.0.lock().push(fields.0);
+            self.0.lock().push(fields);
         }
     }
 }
@@ -358,7 +360,7 @@ async fn resident_router_resolves_each_request_against_the_current_model() {
             SUBJECT.to_owned(),
             Grant {
                 agent: "gylmar".parse().unwrap(),
-                models: BTreeSet::from(["glm-flash".to_owned()]),
+                models: Granted::Listed(BTreeSet::from(["glm-flash".to_owned()])),
             },
         )])
     };
@@ -406,15 +408,15 @@ async fn a_proxied_call_records_subject_session_model_and_outcome() {
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
         .post("/v1/chat/completions", CHAT_CALL)
-        .header(SESSION_HEADER, " vm-session-7 ")
+        .header(VM_SESSION_HEADER, format!(" {SESSION} "))
         .send()
         .await
         .unwrap();
     assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
-    assert!(!upstream.request().contains("vm-session-7"));
+    assert!(!upstream.request().contains(SESSION));
     let expected = [
         ("vm.subject", SUBJECT),
-        ("vm.session", "vm-session-7"),
+        ("vm.session", SESSION),
         ("agent", "gylmar"),
         ("model.name", "glm-flash"),
         ("usage.input_tokens", "5"),
@@ -426,50 +428,125 @@ async fn a_proxied_call_records_subject_session_model_and_outcome() {
 }
 
 #[tokio::test]
-async fn a_call_without_a_session_header_still_records_its_subject() {
-    let (_, spans, _guard) = capture();
-    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
-    let running = proxy(&upstream.url, 100_000).await;
-    let response = running.post("/v1/chat/completions", CHAT_CALL).send().await;
-    assert_eq!(response.unwrap().text().await.unwrap(), USAGE_ANSWER);
-    let span = spans.only();
-    assert_eq!(span["vm.subject"], SUBJECT);
-    assert_eq!(span["vm.session"], "");
-}
-
-#[tokio::test]
-async fn an_oversized_session_header_is_recorded_empty() {
-    let (_, spans, _guard) = capture();
+async fn a_vm_calls_meter_record_names_its_launch_session_after_the_telemetry_bridge() {
+    if std::env::var_os("DEKOPON_TEST_PROXY_METER_SUBSCRIBER").is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_vm_calls_meter_record_names_its_launch_session_after_the_telemetry_bridge",
+            ])
+            .env("DEKOPON_TEST_PROXY_METER_SUBSCRIBER", "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "subscriber test: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        return;
+    }
+    let exported = ExportedLogs::default();
+    let telemetry = dekopon_telemetry::Install::new(dekopon_telemetry::Console {
+        format: dekopon_telemetry::ConsoleFormat::Json,
+        writer: dekopon_telemetry::ConsoleWriter::Stderr,
+        filter: dekopon_telemetry::ConsoleFilter::Directive("off".into()),
+    })
+    .with_logs(
+        opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build(),
+        "job=debug,meter=info",
+    )
+    .install()
+    .unwrap();
     let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
         .post("/v1/chat/completions", CHAT_CALL)
-        .header(SESSION_HEADER, "s".repeat(129))
+        .header(VM_SESSION_HEADER, SESSION)
         .send()
-        .await;
-    assert_eq!(response.unwrap().status(), 200);
-    let span = spans.only();
-    assert_eq!(span["vm.session"], "");
-    assert_eq!(span["outcome"], "succeeded");
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
+    drop(running);
+    telemetry.shutdown().unwrap();
+
+    assert!(!upstream.request().contains(SESSION));
+    let records = exported.0.lock();
+    let [record] = &records[..] else {
+        panic!("one exported meter record: {records:?}");
+    };
+    assert_eq!(record["vm.session"], SESSION);
+    assert_eq!(record["meter.via"], "proxy");
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExportedLogs(Arc<Mutex<Vec<Fields>>>);
+
+impl opentelemetry_sdk::logs::LogExporter for ExportedLogs {
+    async fn export(
+        &self,
+        batch: opentelemetry_sdk::logs::LogBatch<'_>,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        for (record, _) in batch.iter() {
+            let fields = record
+                .attributes_iter()
+                .filter_map(|(key, value)| {
+                    let opentelemetry::logs::AnyValue::String(text) = value else {
+                        return None;
+                    };
+                    Some((key.as_str().to_owned(), text.as_str().to_owned()))
+                })
+                .collect();
+            self.0.lock().push(fields);
+        }
+        Ok(())
+    }
 }
 
 #[tokio::test]
-async fn a_nonprintable_session_header_is_recorded_empty() {
-    let (_, spans, _guard) = capture();
-    let running = proxy("http://127.0.0.1:9", 100_000).await;
-    for session in ["session\tlabel", "séance"] {
-        let response = running
-            .post("/v1/chat/completions", r#"{"model":"glm-ungranted"}"#)
-            .header(SESSION_HEADER, session)
-            .send()
-            .await;
-        assert_eq!(response.unwrap().status(), 403);
+async fn a_missing_or_malformed_session_header_records_no_session() {
+    let (records, spans, _guard) = capture();
+    let overlong = format!("{SESSION}0");
+    let cases = [
+        None,
+        Some("019a3c2e-7b4d-4c1a-9e2f-0123456789ab"),
+        Some("019A3C2E-7B4D-7C1A-9E2F-0123456789AB"),
+        Some(overlong.as_str()),
+        Some("vm-session-7"),
+        Some("session\tlabel"),
+        Some("séance"),
+    ];
+    for session in cases {
+        let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+        let running = proxy(&upstream.url, 100_000).await;
+        let mut request = running.post("/v1/chat/completions", CHAT_CALL);
+        if let Some(session) = session {
+            request = request.header(VM_SESSION_HEADER, session);
+            assert!(!upstream_saw(&upstream, request).await.contains(session));
+        } else {
+            upstream_saw(&upstream, request).await;
+        }
+    }
+    let meters = records.0.lock();
+    assert_eq!(meters.len(), cases.len(), "{meters:?}");
+    for meter in meters.iter() {
+        assert!(!meter.contains_key("vm.session"), "{meter:?}");
+        assert_eq!(meter["meter.via"], "proxy");
     }
     let spans = spans.0.lock();
-    assert_eq!(spans.len(), 2, "{spans:?}");
+    assert_eq!(spans.len(), cases.len(), "{spans:?}");
     for span in spans.values() {
+        assert_eq!(span["vm.subject"], SUBJECT);
         assert_eq!(span["vm.session"], "");
     }
+}
+
+async fn upstream_saw(upstream: &FakeUpstream, request: reqwest::RequestBuilder) -> String {
+    let response = request.send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
+    upstream.request()
 }
 
 #[tokio::test]
@@ -478,14 +555,14 @@ async fn a_refused_call_records_its_outcome_on_the_span() {
     let running = proxy("http://127.0.0.1:9", 100_000).await;
     let response = running
         .post("/v1/chat/completions", r#"{"model":"glm-ungranted"}"#)
-        .header(SESSION_HEADER, "vm-session-7")
+        .header(VM_SESSION_HEADER, SESSION)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 403);
     let expected = [
         ("vm.subject", SUBJECT),
-        ("vm.session", "vm-session-7"),
+        ("vm.session", SESSION),
         ("agent", "gylmar"),
         ("usage.input_tokens", "0"),
         ("usage.output_tokens", "0"),
@@ -875,12 +952,12 @@ async fn an_upstream_error_status_is_charged_nothing() {
     assert_eq!(span["usage.output_tokens"], "0");
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
-    for field in [
-        "outcome=\"failed\"",
-        "usage.input_tokens=0 ",
-        "usage.output_tokens=0 ",
+    for (field, value) in [
+        ("outcome", "failed"),
+        ("usage.input_tokens", "0"),
+        ("usage.output_tokens", "0"),
     ] {
-        assert!(records[0].contains(field), "{field}: {records:?}");
+        assert_eq!(records[0][field], value, "{field}: {records:?}");
     }
 }
 
@@ -992,8 +1069,8 @@ async fn a_client_disconnect_mid_stream_charges_what_was_observed_once() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
-    assert!(records[0].contains("outcome=\"cancelled\""), "{records:?}");
-    assert!(records[0].contains("meter.via=\"proxy\""), "{records:?}");
+    assert_eq!(records[0]["outcome"], "cancelled", "{records:?}");
+    assert_eq!(records[0]["meter.via"], "proxy", "{records:?}");
     let input = Tokens::from_bytes(body.replace("glm-flash", "z-ai/glm-4.5-air").len()).0;
     assert_eq!(
         used(&running.metering),
@@ -1035,10 +1112,141 @@ async fn a_client_that_drops_the_stream_records_cancelled_under_the_call_span() 
     assert_eq!(span["outcome"], "cancelled");
     let records = records.0.lock().clone();
     assert_eq!(records.len(), 1, "{records:?}");
-    assert!(records[0].contains("outcome=\"cancelled\""), "{records:?}");
-    assert!(
-        records[0].contains(&format!("parent={id:?} ")),
-        "{id:?}: {records:?}"
+    assert_eq!(records[0]["outcome"], "cancelled", "{records:?}");
+    assert_eq!(records[0]["parent"], format!("{id:?}"), "{records:?}");
+}
+
+const AGENT_SETTINGS: [(Field, &str); 3] = [
+    (Field::Temperature, "0.3"),
+    (Field::MaxTokens, "512"),
+    (Field::Provider, r#"{"allow_fallbacks":false}"#),
+];
+
+async fn inheriting(endpoint: &str) -> Running {
+    let mut models = models(endpoint, None);
+    for model in &mut models {
+        if let Upstream::OpenRouter { settings, .. } = &mut model.upstream {
+            *settings = AGENT_SETTINGS
+                .iter()
+                .map(|(field, raw)| (*field, (*raw).to_owned()))
+                .collect();
+        }
+    }
+    serve(
+        models,
+        Granted::Inherited("glm-flash".to_owned()),
+        100_000,
+        Duration::from_secs(20),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_inheriting_guest_reaches_one_upstream_call_on_its_agents_model_and_settings() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    let body = r#"{"model":"anything","messages":[],"stream":false,"temperature":1.5,"top_p":0.9}"#;
+    let response = running
+        .post("/v1/chat/completions", body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
+    assert_eq!(upstream.requests.lock().len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&upstream.body()).unwrap(),
+        serde_json::json!({
+            "model": "z-ai/glm-4.5-air",
+            "messages": [],
+            "stream": false,
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "max_tokens": 512,
+            "provider": {"allow_fallbacks": false},
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_inheriting_guests_meter_record_names_the_agents_model_and_draws_on_its_budget() {
+    let (records, _, _guard) = capture();
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    let response = running
+        .post(
+            "/v1/chat/completions",
+            r#"{"model":"claude-opus","messages":[]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let records = records.0.lock().clone();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["agent"], "gylmar");
+    assert_eq!(records[0]["model.name"], "glm-flash");
+    assert_eq!(records[0]["meter.via"], "proxy");
+    assert_eq!(used(&running.metering), 7);
+}
+
+#[tokio::test]
+async fn a_guest_named_model_is_overwritten_never_forwarded() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    let response = running
+        .post(
+            "/v1/chat/completions",
+            r#"{"model":"glm-ungranted","messages":[]}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let forwarded = upstream.body();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&forwarded).unwrap()["model"],
+        "z-ai/glm-4.5-air"
+    );
+    assert!(!forwarded.contains("glm-ungranted"), "{forwarded}");
+    assert!(!forwarded.contains("z-ai/glm-4.6"), "{forwarded}");
+}
+
+#[tokio::test]
+async fn a_dialect_the_inherited_model_cannot_serve_is_refused_before_any_upstream_call() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    let response = running
+        .post("/v1/messages", r#"{"model":"claude-opus","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    let message = sandbox_refusal(response, "/v1/messages", 403, "permission_error").await;
+    assert_eq!(
+        message,
+        "dekopon sandbox: this VM runs on its agent's model `glm-flash`, which is served on `/v1/chat/completions`, not `/v1/messages`. Call it on its own path."
+    );
+    assert!(upstream.requests.lock().is_empty());
+    assert_eq!(used(&running.metering), 0);
+}
+
+#[tokio::test]
+async fn a_listed_guest_forwards_duplicate_settings_keys_untouched() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = proxy(&upstream.url, 100_000).await;
+    let response = running
+        .post(
+            "/v1/chat/completions",
+            r#"{"model":"glm-flash","messages":[],"temperature":0.1,"temperature":0.2}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        upstream.body(),
+        r#"{"model":"z-ai/glm-4.5-air","messages":[],"temperature":0.1,"temperature":0.2}"#
     );
 }
 
