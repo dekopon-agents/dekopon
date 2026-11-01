@@ -37,7 +37,7 @@ tokio.workspace = true
 wasmtime = { workspace = true, features = ["async"] }
 
 [dev-dependencies]
-wasm-encoder = "=0.262.0"
+wasm-encoder = "=0.259.0"
 # Inline adversarial components exercise post-return traps and fuel cancellation, not guest builds.
 wasmtime = { workspace = true, features = ["wat"] }
 dekopon-test-support = { path = "../dekopon-test-support" }
