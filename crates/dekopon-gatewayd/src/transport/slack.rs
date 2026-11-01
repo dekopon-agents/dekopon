@@ -603,6 +603,7 @@ impl SlackTransport {
             constituents: Vec::new(),
             folded: Vec::new(),
             asset_overflow: projection.asset_overflow,
+            input_refusal: None,
         }))
     }
 
@@ -1740,6 +1741,8 @@ impl PermanentReactionError {
                 _ => None,
             },
             TransportError::AssetType { .. }
+            | TransportError::AssetTooLarge { .. }
+            | TransportError::AssetRefused { .. }
             | TransportError::Attachment(_)
             | TransportError::AttachmentTask { .. }
             | TransportError::MissingCredential { .. }

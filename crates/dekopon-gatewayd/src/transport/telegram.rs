@@ -251,6 +251,7 @@ impl TelegramTransport {
             constituents: Vec::new(),
             folded: Vec::new(),
             asset_overflow: false,
+            input_refusal: None,
         }))
     }
 

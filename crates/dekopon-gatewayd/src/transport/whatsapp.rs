@@ -31,10 +31,10 @@ use crate::{
     asset::{AssetSourceRef, PendingAsset},
     config::{LivenessMode, LivenessSettings},
     transport::{
-        AssetFetcher, ChatDriver, ChatTransport, InboundMessage, LivenessTarget, MessageId,
-        OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError, TransportEvent,
-        TransportIdentity, TypingLease, bound_inbound, credential_client, receive_span,
-        record_conversation, split_message,
+        AssetFetcher, ChatDriver, ChatTransport, InboundMessage, InputRefusal, LivenessTarget,
+        MediaRefusal, MessageId, OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError,
+        TransportEvent, TransportIdentity, TypingLease, bound_inbound, credential_client,
+        receive_span, record_conversation, split_message,
         webhook::{
             self, MAX_WEBHOOK_CONCURRENCY, VerifyFailure, WEBHOOK_REQUEST_TIMEOUT, content_free,
             text_response,
@@ -432,7 +432,7 @@ fn parse_delivery(
                 ) else {
                     continue;
                 };
-                let (text, assets) = match message.get("type").and_then(Value::as_str) {
+                let (text, assets, refusal) = match message.get("type").and_then(Value::as_str) {
                     Some("text") => {
                         let Some(text) = message.pointer("/text/body").and_then(Value::as_str)
                         else {
@@ -441,25 +441,12 @@ fn parse_delivery(
                         if text.trim().is_empty() {
                             continue;
                         }
-                        (text, Vec::new())
+                        (text, Vec::new(), None)
                     }
-                    Some("image") => {
-                        let Some(asset) = media::inbound_image(&message["image"]) else {
-                            tracing::debug!(
-                                event = "gateway_message_ignored",
-                                reason = "image-metadata",
-                                "gateway.message.ignored"
-                            );
-                            continue;
-                        };
-                        let caption = match message["image"].get("caption") {
-                            None => "",
-                            Some(Value::String(caption)) => caption,
-                            Some(_) => continue,
-                        };
-                        (caption, vec![asset])
-                    }
-                    _ => continue,
+                    Some("image") => media::inbound_image(&message["image"]),
+                    Some("document") => media::inbound_document(&message["document"]),
+                    None | Some("reaction" | "system") => continue,
+                    Some(_) => ("", Vec::new(), Some(InputRefusal::Unsupported)),
                 };
                 let individual = contacts.is_some_and(|contacts| {
                     contacts
@@ -527,6 +514,7 @@ fn parse_delivery(
                     constituents: Vec::new(),
                     folded: Vec::new(),
                     asset_overflow: false,
+                    input_refusal: refusal,
                 });
             }
         }
@@ -1028,9 +1016,13 @@ mod tests {
                 ]}
             ]
         });
-        let messages = parse_delivery(&state(), &payload, &received()).expect("delivery");
-        assert_eq!(messages.len(), 1);
+        let delivered = parse_delivery(&state(), &payload, &received()).expect("delivery");
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].message_id.to_string(), "one");
+        assert_eq!(delivered[0].input_refusal, Some(InputRefusal::Unsupported));
+        let messages = &delivered[1..];
         assert_eq!(messages[0].message_id.to_string(), "two");
+        assert_eq!(messages[0].input_refusal, None);
         assert_eq!(messages[0].subject.canonical(), "whatsapp.1603");
         assert_eq!(
             messages[0].conversation.container.as_deref(),

@@ -335,6 +335,7 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         text: String::new(),
         assets: Vec::new(),
         asset_overflow: false,
+        input_refusal: None,
         addressed: Some(true),
         thread_continuation: None,
         reply: ReplyTarget::GithubTrace,
