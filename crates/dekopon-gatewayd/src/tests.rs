@@ -9578,7 +9578,11 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     .await;
 
     assert_eq!(
-        driver.replies(),
+        driver
+            .replies()
+            .iter()
+            .map(|reply| task_time::payload_message(&ModelMessage::user(reply)).1)
+            .collect::<Vec<_>>(),
         vec!["[gateway: unmapped participant]\nwhat broke?".to_owned()]
     );
     assert_eq!(
