@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.77.0] - 2026-11-01
+
+### Fixed
+
+- PDF documents sent over WhatsApp reach the agent instead of being silently dropped, and unreadable uploads get a reply.
+
+## [dekopon-chart-0.64.0] - 2026-11-01
+
+### Changed
+
+- Chart 0.64.0 targets core v0.77.0 and renders the `v0.77.0` image tag.
+
 ## [0.76.0] - 2026-10-31
 
 ### Added
