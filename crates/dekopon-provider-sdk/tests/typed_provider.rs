@@ -734,16 +734,69 @@ fn an_unknown_capability_fails_with_the_sdk_status_and_static_message() {
 }
 
 #[test]
-fn invalid_input_never_echoes_parser_text() {
-    for input in [
-        r#"{"text":5}"#,
-        r#"{"text":"x","extra":"secret-looking"}"#,
-        r#"{"limit":1}"#,
-        "{",
+fn a_null_for_a_string_field_names_the_field() {
+    let exit = call::<Fixture>("fixture.count", r#"{"text":null}"#);
+    assert_eq!(
+        (exit.status, exit.stdout.as_str(), exit.stderr.as_str()),
+        (2, "", "invalid input: text: wrong type\n")
+    );
+}
+
+#[test]
+fn an_unknown_input_field_names_the_field() {
+    let exit = call::<Fixture>("fixture.count", r#"{"text":"x","extra":null}"#);
+    assert_eq!(
+        (exit.status, exit.stdout.as_str(), exit.stderr.as_str()),
+        (2, "", "invalid input: extra: unknown field\n")
+    );
+}
+
+#[test]
+fn a_missing_input_field_names_the_field() {
+    let exit = call::<Fixture>("fixture.count", r#"{"limit":1}"#);
+    assert_eq!(
+        (exit.status, exit.stdout.as_str(), exit.stderr.as_str()),
+        (2, "", "invalid input: text: missing field\n")
+    );
+}
+
+#[test]
+fn a_nested_input_field_names_its_path() {
+    let exit = call::<Faulty<Tree>>(
+        "faulty.take",
+        r#"{"children":[{"children":[]},{"children":[]},{"children":null}]}"#,
+    );
+    assert_eq!(
+        (exit.status, exit.stdout.as_str(), exit.stderr.as_str()),
+        (2, "", "invalid input: children[2].children: wrong type\n")
+    );
+}
+
+#[test]
+fn an_input_refusal_never_echoes_a_sentinel_value() {
+    for (input, expected) in [
+        (
+            r#"{"text":"x","limit":"SENTINEL-INPUT-VALUE"}"#,
+            "invalid input: limit: wrong type\n",
+        ),
+        (
+            r#"{"text":"x","extra":"SENTINEL-INPUT-VALUE"}"#,
+            "invalid input: extra: unknown field\n",
+        ),
+        (
+            "{SENTINEL-INPUT-VALUE",
+            "the input does not match the capability's input schema\n",
+        ),
+        (
+            r#"{"text":"x","text":"SENTINEL-INPUT-VALUE","limit":100}"#,
+            "the input does not match the capability's input schema\n",
+        ),
     ] {
         let exit = call::<Fixture>("fixture.count", input);
-        assert_eq!(exit.status, 2);
-        assert_eq!(exit.stderr, format!("{}\n", SdkFailure::InvalidInput));
+        assert_eq!(
+            (exit.status, exit.stdout.as_str(), exit.stderr.as_str()),
+            (2, "", expected)
+        );
     }
 }
 
