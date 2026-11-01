@@ -39,11 +39,11 @@ homepage = "https://github.com/dekopon-agents/dekopon"
 authors = ["Dekopon contributors"]
 
 [workspace.dependencies]
-arbitrary = "1.4.2"
-aho-corasick = "1.1.4"
+arbitrary = "1.5.0"
+aho-corasick = "1.1.5"
 dekopon-tui = { version = "*", path = "crates/dekopon-tui" }
 prost = "0.14.3"
-opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "logs"] }
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 async-trait = "0.1.89"
@@ -65,9 +65,9 @@ hmac = "0.13.0"
 http-auth = { version = "0.1.10", default-features = false }
 hyper = { version = "1.11.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["service", "tokio"] }
-jaq-core = "3.1.0"
+jaq-core = "3.1.2"
 jaq-json = { version = "2.0.1", features = ["serde"] }
-jaq-std = { version = "3.0.1", default-features = false, features = ["format", "log", "math", "regex", "std", "time"] }
+jaq-std = { version = "3.0.4", default-features = false, features = ["format", "log", "math", "regex", "std", "time"] }
 libc = "0.2.189"
 parking_lot = "0.12.5"
 arc-swap = "1.9.2"
@@ -79,7 +79,7 @@ percent-encoding = "2.3.2"
 opentelemetry = { version = "0.33.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 opentelemetry-appender-tracing = "0.33.0"
 opentelemetry-http = { version = "0.33.0", default-features = false }
-opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "internal-logs", "logs", "trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "internal-logs", "logs", "trace"] }
 opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 # The engine `jaq-std`'s `regex` feature already links into `dekopon-shell`. `grep -E`/`sed -E` use
 # that one directly rather than adding a second regex engine to the graph.
