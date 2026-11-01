@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.78.0] - 2026-11-01
+
+### Changed
+
+- Installed provider words unavailable in the conversation say not granted without exposing capabilities.
+- Input-schema refusals name the field and error kind without echoing input values.
+
+### Fixed
+
+- Slack messages containing &, < or > reach the agent as typed instead of as HTML entities.
+
+## [dekopon-chart-0.65.0] - 2026-11-01
+
+### Changed
+
+- Chart 0.65.0 targets core v0.78.0 and renders the `v0.78.0` image tag.
+
 ## [0.77.0] - 2026-11-01
 
 ### Fixed
