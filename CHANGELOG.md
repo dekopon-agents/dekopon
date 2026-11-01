@@ -7,6 +7,30 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.81.0] - 2026-11-01
+
+### Added
+
+- `dekopon-gatewayd` and `dekopon-brokerd` accept `--log-file` (with `--log-file-max-bytes` and `--log-file-keep`) to write their console JSON to a private, size-rotated file with a fixed disk ceiling instead of stdout.
+- dekopon-brokerd check warns unreachable-capability for a constraint set no permit policy names.
+
+### Changed
+
+- Messages addressed to the bot without a matching route are visible at the default log level.
+- A byte-limit failure names maxRequestBytes or maxResponseBytes, the granted limit and the bytes seen when refused.
+- OpenRouter models under anthropic/ with no cache block use explicitPrefix caching; cache: {style: automatic} opts out.
+
+### Fixed
+
+- The memory notice no longer moves the first prompt-cache marker, so instructions and skills stay cached across turns.
+- Chat document attachments up to 100 MiB are accepted; the limit was 8 MiB.
+
+## [dekopon-chart-0.68.0] - 2026-11-01
+
+### Changed
+
+- Chart 0.68.0 targets core v0.81.0 and renders the `v0.81.0` image tag.
+
 ## [0.80.0] - 2026-11-01
 
 ### Added
