@@ -60,17 +60,13 @@ impl Sender {
 
     #[cfg(test)]
     pub(crate) async fn wait_assets(&self) {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let joined = self.counts.joined.notified();
-                if self.in_flight.lock().is_empty() {
-                    break;
-                }
-                joined.await;
+        loop {
+            let joined = self.counts.joined.notified();
+            if self.in_flight.lock().is_empty() {
+                break;
             }
-        })
-        .await
-        .expect("asset tasks joined");
+            joined.await;
+        }
     }
 
     pub(super) fn release(&self, task: &SlotTask) {

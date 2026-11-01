@@ -116,7 +116,9 @@ permit(principal == Dekopon::Principal::"cpetersen",
     });
 
     let until = Instant::now() + Duration::from_secs(30);
-    while fs::symlink_metadata(&socket).is_err() {
+    while !fs::symlink_metadata(&socket)
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o7777 == 0o600)
+    {
         assert!(
             broker.0.try_wait().expect("inspect broker").is_none(),
             "the broker exited before it bound its socket: {:?}",
