@@ -21,7 +21,6 @@ use serde_json::{Map, Value};
 use settings::{CacheStyle, Settings};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    num::NonZeroU32,
     ops::{ControlFlow, Range},
     time::Duration,
 };
@@ -170,23 +169,12 @@ impl OpenRouterClient {
                 function,
             })
             .collect::<Vec<_>>();
-        let generation = self.settings.generation.as_ref();
-        let provider = self.settings.routing.as_ref().map(|routing| Provider {
-            allow_fallbacks: routing.allow_fallbacks,
-            require_parameters: routing.require_parameters,
-            only: routing.only.as_deref(),
-        });
         let body = RouterRequest {
             model: &self.model,
             messages,
             tools,
             tool_choice: "auto",
-            stream: true,
-            max_tokens: generation.and_then(|settings| settings.max_output_tokens),
-            temperature: generation.and_then(|settings| settings.temperature),
-            top_p: generation.and_then(|settings| settings.top_p),
-            reasoning: self.settings.reasoning.as_ref(),
-            provider,
+            settings: &self.settings,
             session_id: request.options.prompt_cache_key(),
         };
         tracing::Span::current().record("tool_choice", body.tool_choice);
@@ -391,24 +379,12 @@ impl InferenceModel for OpenRouterClient {
     }
 }
 
-#[derive(Serialize)]
 struct RouterRequest<'a> {
     model: &'a str,
     messages: Vec<RouterMessage<'a>>,
     tools: Vec<OpenAiTool<'a>>,
     tool_choice: &'static str,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<NonZeroU32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<&'a settings::Reasoning>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<Provider<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    settings: &'a Settings,
     session_id: Option<&'a str>,
 }
 
@@ -458,25 +434,11 @@ impl RouterRequest<'_> {
         body.raw(b",\"tool_choice\":");
         body.value(self.tool_choice)?;
         body.raw(b",\"stream\":true");
-        if let Some(value) = self.max_tokens {
-            body.raw(b",\"max_tokens\":");
-            body.value(&value)?;
-        }
-        if let Some(value) = self.temperature {
-            body.raw(b",\"temperature\":");
-            body.value(&value)?;
-        }
-        if let Some(value) = self.top_p {
-            body.raw(b",\"top_p\":");
-            body.value(&value)?;
-        }
-        if let Some(value) = self.reasoning {
-            body.raw(b",\"reasoning\":");
-            body.value(value)?;
-        }
-        if let Some(value) = &self.provider {
-            body.raw(b",\"provider\":");
-            body.value(value)?;
+        for (field, raw) in self.settings.request_fields()? {
+            body.raw(b",\"");
+            body.raw(field.name().as_bytes());
+            body.raw(b"\":");
+            body.raw(raw.as_bytes());
         }
         if let Some(value) = self.session_id {
             body.raw(b",\"session_id\":");
@@ -485,16 +447,6 @@ impl RouterRequest<'_> {
         body.raw(b"}");
         Ok(body.finish())
     }
-}
-
-#[derive(Serialize)]
-struct Provider<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allow_fallbacks: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    require_parameters: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    only: Option<&'a [String]>,
 }
 
 #[derive(Serialize)]

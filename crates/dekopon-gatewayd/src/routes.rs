@@ -57,11 +57,16 @@ pub(crate) struct BoundRoute {
 pub(crate) struct RoutingTable {
     routes: Vec<BoundRoute>,
     pub(crate) models: BTreeMap<String, Arc<ModelConfig>>,
+    guests: crate::proxy::Grants,
 }
 
 impl RoutingTable {
     pub(crate) fn routes(&self) -> &[BoundRoute] {
         &self.routes
+    }
+
+    pub(crate) const fn guests(&self) -> &crate::proxy::Grants {
+        &self.guests
     }
 
     pub(crate) fn follow_routes<'a>(
@@ -183,14 +188,20 @@ impl RoutingTable {
                 ambient: route.ambient,
             });
         }
+        let mut table = Self {
+            routes,
+            models: models
+                .into_iter()
+                .map(|model| (model.name().to_owned(), model))
+                .collect(),
+            guests: crate::proxy::Grants::new(),
+        };
+        match crate::proxy::grants(config.proxy.as_ref(), &table) {
+            Ok(guests) => table.guests = guests,
+            Err(proxy) => problems.extend(proxy.into_iter().map(RouteProblem::Proxy)),
+        }
         if problems.is_empty() {
-            Ok(Self {
-                routes,
-                models: models
-                    .into_iter()
-                    .map(|model| (model.name().to_owned(), model))
-                    .collect(),
-            })
+            Ok(table)
         } else {
             Err(RouteError { problems })
         }
@@ -297,6 +308,8 @@ pub enum RouteProblem {
         route: usize,
         problem: crate::config::memory::PolicyProblem,
     },
+    #[error(transparent)]
+    Proxy(crate::proxy::ProxyProblem),
     #[error("routes[{route}] names an agent which is not in the catalog")]
     UnknownAgent { route: usize },
     #[error("routes[{route}] names agent {agent:?}, which the catalog disables")]
