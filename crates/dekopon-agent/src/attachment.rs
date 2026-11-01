@@ -91,6 +91,24 @@ impl GeneratedImage {
             }
         }
     }
+    pub fn prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        match self.encoding {
+            AssetEncoding::Identity => self.data.read_prefix(limit),
+            AssetEncoding::Base64 => {
+                let mut decoded = Vec::with_capacity(self.decoded_len()?.min(limit));
+                DecoderReader::new(
+                    BlobReader {
+                        blob: &self.data,
+                        offset: 0,
+                    },
+                    &STANDARD,
+                )
+                .take(limit as u64)
+                .read_to_end(&mut decoded)?;
+                Ok(decoded)
+            }
+        }
+    }
     pub fn decoded_len(&self) -> Result<usize, BlobError> {
         match self.encoding {
             AssetEncoding::Identity => Ok(self.data.len()),
@@ -305,7 +323,10 @@ pub enum ChatAssetRefusal {
     UnsupportedMedia,
     #[error("one invocation may reference at most {MAX_ASSET_DESCRIPTORS} distinct assets")]
     PerInvocationLimit,
-    #[error("the assets exceed the 40 MiB per-invocation decoded-byte budget")]
+    #[error(
+        "the assets exceed the {} MiB per-invocation decoded-byte budget",
+        MAX_INVOCATION_ASSET_BYTES / (1024 * 1024)
+    )]
     ByteBudget,
     #[error("the attachment's bytes could not be read")]
     Unavailable,
@@ -756,6 +777,8 @@ mod tests {
             );
             assert_eq!(image.decoded_len().unwrap(), raw.len());
             assert_eq!(image.bytes().unwrap(), raw);
+            assert_eq!(image.prefix(9).unwrap(), &raw[..9]);
+            assert_eq!(image.prefix(usize::MAX).unwrap(), raw);
             assert!(!format!("{image:?}").contains("payload"));
         }
     }

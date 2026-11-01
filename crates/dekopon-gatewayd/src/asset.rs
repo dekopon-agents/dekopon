@@ -939,12 +939,11 @@ impl Registered {
 }
 
 fn byte_limit(mime: &str) -> u64 {
-    use dekopon_core::asset::{AssetKind, MAX_DECODED_ASSET_BYTES};
-    match AssetKind::of(mime) {
-        AssetKind::Image => MAX_DECODED_ASSET_BYTES as u64,
-        AssetKind::TextDocument | AssetKind::BinaryDocument | AssetKind::Other => {
-            dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64
-        }
+    let top = mime.split_once('/').map_or(mime, |(top, _)| top).trim();
+    if top.eq_ignore_ascii_case("image") {
+        dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64
+    } else {
+        dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64
     }
 }
 
@@ -1301,8 +1300,8 @@ impl Attempt {
         permits: Arc<Semaphore>,
         limit: u64,
     ) -> Completion {
-        let _permit = permits
-            .acquire()
+        let permit = permits
+            .acquire_owned()
             .await
             .map_err(|_closed| AssetFailure::Unavailable)?;
         if !self.ticket.access.is_active() {
@@ -1348,6 +1347,8 @@ impl Attempt {
         let subscriber = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
+            // The permit bounds the buffer, so it is released only after the store consumes it.
+            let _permit = permit;
             tracing::dispatcher::with_default(&subscriber, || {
                 span.in_scope(|| {
                     ticket
@@ -2044,6 +2045,14 @@ impl BlobSource for ScopedBlob {
             .get_access(&self.access, self.id, Instant::now())
             .ok_or(BlobError::Unauthorized)?;
         GeneratedImage::new(data, asset.mime, asset.encoding).bytes()
+    }
+    fn read_prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        let data = self.pin()?;
+        let store = self.store.upgrade().ok_or(BlobError::Reclaimed)?;
+        let asset = store
+            .get_access(&self.access, self.id, Instant::now())
+            .ok_or(BlobError::Unauthorized)?;
+        GeneratedImage::new(data, asset.mime, asset.encoding).prefix(limit)
     }
 }
 

@@ -206,8 +206,13 @@ impl DiskBlob {
     }
 
     pub fn read(&self) -> Result<Vec<u8>, BlobError> {
-        operation("read", self.len(), || {
-            let mut bytes = vec![0; self.len()];
+        self.read_prefix(self.len())
+    }
+
+    pub fn read_prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        let len = self.len().min(limit);
+        operation("read", len, || {
+            let mut bytes = vec![0; len];
             self.read_exact_at(&mut bytes, 0)?;
             Ok(bytes)
         })
@@ -218,6 +223,9 @@ pub trait BlobSource: Send + Sync {
     fn pin(&self) -> Result<DiskBlob, BlobError>;
     fn read(&self) -> Result<Vec<u8>, BlobError> {
         self.pin()?.read()
+    }
+    fn read_prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        self.pin()?.read_prefix(limit)
     }
 }
 
@@ -264,6 +272,9 @@ impl BlobReference {
                 .collect()
         });
         Ok(bytes)
+    }
+    pub fn read_prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        self.source.read_prefix(limit)
     }
     pub fn sha256(&self) -> Option<&str> {
         self.sha256.get().map(String::as_str)

@@ -1552,3 +1552,27 @@ async fn documents_fetch_up_to_one_hundred_mib_while_images_keep_their_limit() {
         ]
     );
 }
+
+#[test]
+fn every_image_type_keeps_the_image_ceiling_and_other_media_get_the_document_ceiling() {
+    let image = dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64;
+    let document = dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64;
+    for mime in [
+        "image/png",
+        "image/heic",
+        "image/avif",
+        "image/svg+xml",
+        "Image/JPEG; quality=high",
+        " image/webp",
+    ] {
+        assert_eq!(byte_limit(mime), image, "{mime}");
+    }
+    for mime in [
+        "application/pdf",
+        "text/plain; charset=utf-8",
+        "video/mp4",
+        "imagefile",
+    ] {
+        assert_eq!(byte_limit(mime), document, "{mime}");
+    }
+}
