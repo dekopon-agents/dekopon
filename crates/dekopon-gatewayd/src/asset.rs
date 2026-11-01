@@ -938,7 +938,14 @@ impl Registered {
     }
 }
 
-const MAX_ASSET_BYTES: u64 = dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64;
+fn byte_limit(mime: &str) -> u64 {
+    let top = mime.split_once('/').map_or(mime, |(top, _)| top).trim();
+    if top.eq_ignore_ascii_case("image") {
+        dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64
+    } else {
+        dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64
+    }
+}
 
 const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -1220,10 +1227,11 @@ impl SessionAssets {
         if let Some(data) = self.store.pin_for_use(&self.access, asset.id, recency)? {
             return Ok(Located::Resident(data));
         }
+        let limit = byte_limit(&asset.mime);
         if let Some(size) = asset.size
-            && size > MAX_ASSET_BYTES
+            && size > limit
         {
-            return Err(AssetFailure::TooLarge { size });
+            return Err(AssetFailure::TooLarge { size, limit });
         }
         self.store
             .check_size(asset.id, asset.size.unwrap_or_default() as usize)
@@ -1290,55 +1298,57 @@ impl Attempt {
         source: AssetSourceRef,
         fetcher: Arc<dyn AssetFetcher>,
         permits: Arc<Semaphore>,
+        limit: u64,
     ) -> Completion {
-        let _permit = permits
-            .acquire()
+        let permit = permits
+            .acquire_owned()
             .await
             .map_err(|_closed| AssetFailure::Unavailable)?;
         if !self.ticket.access.is_active() {
             return Err(AssetFailure::Refused(ChatAssetRefusal::Revoked));
         }
-        let data =
-            tokio::time::timeout(ASSET_FETCH_TIMEOUT, fetcher.fetch(&source, MAX_ASSET_BYTES))
-                .await
-                .map_err(|_elapsed| AssetFailure::TimedOut)?
-                .map_err(|error| {
-                    if let crate::transport::TransportError::AssetTooLarge { size } = error {
-                        return AssetFailure::TooLarge { size };
-                    }
-                    if let crate::transport::TransportError::AssetRefused {
-                        cause: MediaRefusal::Gone,
+        let data = tokio::time::timeout(ASSET_FETCH_TIMEOUT, fetcher.fetch(&source, limit))
+            .await
+            .map_err(|_elapsed| AssetFailure::TimedOut)?
+            .map_err(|error| {
+                if let crate::transport::TransportError::AssetTooLarge { size } = error {
+                    return AssetFailure::TooLarge { size, limit };
+                }
+                if let crate::transport::TransportError::AssetRefused {
+                    cause: MediaRefusal::Gone,
+                } = error
+                {
+                    return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
+                }
+                if let Retry::Refetch = self.ticket.retry
+                    && let crate::transport::TransportError::AssetRefused {
+                        cause: MediaRefusal::Download { status: 401 | 403 },
                     } = error
-                    {
-                        return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
-                    }
-                    if let Retry::Refetch = self.ticket.retry
-                        && let crate::transport::TransportError::AssetRefused {
-                            cause: MediaRefusal::Download { status: 401 | 403 },
-                        } = error
-                    {
-                        return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
-                    }
-                    if let crate::transport::TransportError::AssetRefused { cause } = error {
-                        return AssetFailure::Media(cause);
-                    }
-                    if let Retry::Refetch = self.ticket.retry
-                        && let crate::transport::TransportError::Service { code } = &error
-                        && matches!(
-                            code.strip_prefix("http-").unwrap_or(code),
-                            "404" | "410" | "401" | "403"
-                        )
-                    {
-                        return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
-                    }
-                    AssetFailure::Transport {
-                        category: error.category(),
-                    }
-                })?;
+                {
+                    return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
+                }
+                if let crate::transport::TransportError::AssetRefused { cause } = error {
+                    return AssetFailure::Media(cause);
+                }
+                if let Retry::Refetch = self.ticket.retry
+                    && let crate::transport::TransportError::Service { code } = &error
+                    && matches!(
+                        code.strip_prefix("http-").unwrap_or(code),
+                        "404" | "410" | "401" | "403"
+                    )
+                {
+                    return AssetFailure::Refused(ChatAssetRefusal::PlatformGone);
+                }
+                AssetFailure::Transport {
+                    category: error.category(),
+                }
+            })?;
         let ticket = self.ticket.clone();
         let subscriber = tracing::dispatcher::get_default(Clone::clone);
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
+            // The permit bounds the buffer, so it is released only after the store consumes it.
+            let _permit = permit;
             tracing::dispatcher::with_default(&subscriber, || {
                 span.in_scope(|| {
                     ticket
@@ -1493,6 +1503,7 @@ impl AssetStore {
                 let (sender, outcome) = watch::channel(None);
                 let attempt_ticket = ticket(attempt);
                 let permits = Arc::clone(&self.downloads.permits);
+                let limit = byte_limit(&row.asset.mime);
                 let task = self.downloads.spawn(
                     async move {
                         // Built on first poll: a runtime that drops the unpolled future inside
@@ -1501,7 +1512,7 @@ impl AssetStore {
                             ticket: attempt_ticket,
                             outcome: RefetchOutcome::Unavailable,
                         };
-                        let completion = task.download(source, fetcher, permits).await;
+                        let completion = task.download(source, fetcher, permits, limit).await;
                         // The entry leaves Downloading before waiters wake, so a retry never joins
                         // a finished attempt.
                         task.finish(completion);
@@ -1605,7 +1616,7 @@ enum AssetFailure {
     Storage(dekopon_model::asset::BlobError),
     Unknown,
     Unreadable { reason: &'static str },
-    TooLarge { size: u64 },
+    TooLarge { size: u64, limit: u64 },
     Media(crate::transport::MediaRefusal),
     Unavailable,
     TimedOut,
@@ -1629,10 +1640,10 @@ impl AssetFailure {
             Self::Unreadable { reason } => {
                 format!("chat-asset:{id} cannot be opened: {reason}.")
             }
-            Self::TooLarge { size } => format!(
+            Self::TooLarge { size, limit } => format!(
                 "chat-asset:{id} is {} which is over the {} the gateway will read.",
                 kibibytes(size),
-                kibibytes(MAX_ASSET_BYTES)
+                kibibytes(limit)
             ),
             Self::Media(MediaRefusal::Gone) => {
                 Self::Refused(ChatAssetRefusal::PlatformGone).for_model(id)
@@ -1991,7 +2002,7 @@ impl AssetStore {
             | Attachment::PlatformGone => (),
         }
         row.asset.size = Some(bytes.len() as u64);
-        let result = if bytes.len() > dekopon_model::asset::MAX_ATTACHMENT_BYTES {
+        let result = if bytes.len() as u64 > byte_limit(&row.asset.mime) {
             Err(BlobError::TooLarge)
         } else {
             retention
@@ -2035,6 +2046,14 @@ impl BlobSource for ScopedBlob {
             .ok_or(BlobError::Unauthorized)?;
         GeneratedImage::new(data, asset.mime, asset.encoding).bytes()
     }
+    fn read_prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        let data = self.pin()?;
+        let store = self.store.upgrade().ok_or(BlobError::Reclaimed)?;
+        let asset = store
+            .get_access(&self.access, self.id, Instant::now())
+            .ok_or(BlobError::Unauthorized)?;
+        GeneratedImage::new(data, asset.mime, asset.encoding).prefix(limit)
+    }
 }
 
 impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
@@ -2056,7 +2075,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
             };
             let len = usize::try_from(metadata.bytes).unwrap_or(usize::MAX);
             let result = retention.check_size(id, len).and_then(|()| DiskBlob::from_descriptor(descriptor, len)).and_then(|data| {
-                if GeneratedImage::new(data.clone(), metadata.content_type.clone(), metadata.encoding).decoded_len()? > dekopon_model::asset::MAX_ATTACHMENT_BYTES {
+                if GeneratedImage::new(data.clone(), metadata.content_type.clone(), metadata.encoding).decoded_len()? > dekopon_core::asset::MAX_DECODED_ASSET_BYTES {
                     return Err(BlobError::TooLarge);
                 }
                 let detected = sniff(&data, metadata.encoding)?;
@@ -4420,7 +4439,7 @@ pub(crate) mod retention_tests {
     async fn encoded_intake_and_reference_budget_use_decoded_limits() {
         let store = store(64 * 1024 * 1024);
         let session = session(Arc::clone(&store), access("encoded-limits"));
-        let raw = vec![0; dekopon_model::asset::MAX_ATTACHMENT_BYTES];
+        let raw = vec![0; dekopon_core::asset::MAX_DECODED_ASSET_BYTES];
         let encoded = STANDARD.encode(&raw);
         assert_eq!(encoded.len(), 11_184_812);
         let mut references = Vec::new();

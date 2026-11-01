@@ -944,3 +944,31 @@ async fn an_image_model_removed_by_reload_stops_only_nonfinal_asset_parts() {
     assert_eq!(slots[2], Slot::Generated("kept".into()));
     assert_eq!(script.calls.load(Ordering::Relaxed), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_document_at_the_attachment_ceiling_reaches_the_summary_model_whole() {
+    let size = dekopon_model::asset::MAX_ATTACHMENT_BYTES;
+    let world = World::with_budget(size);
+    let mut document = b"%PDF-1.4".to_vec();
+    document.resize(size, b' ');
+    let header = world.arrive(&["application/pdf"], Some(&document), 1);
+    drop(document);
+    let (resources, script) = world.resources([Action::Text("a scanned contract")]);
+    let _next = run(
+        Arc::new(resources),
+        Queued {
+            task: world.task(&header, 0),
+            since: Instant::now(),
+        },
+        watch::channel(false).1,
+    )
+    .await;
+    assert!(matches!(
+        &script.parts.lock()[..],
+        [SeenPart::File { bytes, .. }] if bytes.len() == size
+    ));
+    assert_eq!(
+        world.slots(&header, 0),
+        [Slot::Generated("a scanne".into())]
+    );
+}
