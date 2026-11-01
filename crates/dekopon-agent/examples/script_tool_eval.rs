@@ -1149,6 +1149,7 @@ mod tests {
     use dekopon_model_token_governor::ModelUsage;
     use dekopon_process::ExitCode;
     use dekopon_test_support::LoopbackServer;
+    use time::format_description::well_known::Rfc3339;
 
     fn parse(arguments: &[&str]) -> Result<Arguments, EvalError> {
         Arguments::parse_from(arguments.iter().map(|value| (*value).to_owned()))
@@ -1477,19 +1478,13 @@ mod tests {
     }
 
     #[test]
-    fn freshness_rejects_a_malformed_latest_bound_before_constructing_a_client() {
+    fn freshness_rejects_malformed_bounds_before_constructing_a_client() {
         let directory = tempfile::tempdir().unwrap();
         let instruction = include_str!("eval/freshness/fresh-news/instruction.md");
-        let mut expected: Value =
+        let expected: Value =
             serde_json::from_str(include_str!("eval/freshness/fresh-news/expected.json")).unwrap();
         std::fs::write(directory.path().join("instruction.md"), instruction).unwrap();
         let expected_path = directory.path().join("expected.json");
-        expected["research"]["end_latest"] = json!("2026-11-01");
-        std::fs::write(&expected_path, expected.to_string()).unwrap();
-        assert!(
-            matches!(Task::load(directory.path()), Err(EvalError::Expected { source, .. })
-            if source.classify() == serde_json::error::Category::Data)
-        );
         let out = directory.path().join("rows.jsonl");
         let arguments = parse(&[
             "--model",
@@ -1500,16 +1495,28 @@ mod tests {
             out.to_str().unwrap(),
         ])
         .unwrap();
-        let constructed = std::cell::Cell::new(false);
-        let result = run(&arguments, |_, _| {
-            constructed.set(true);
-            Err(EvalError::Credential)
-        });
-        assert!(matches!(result, Err(EvalError::Expected { source, .. })
-            if source.classify() == serde_json::error::Category::Data));
-        assert!(!constructed.get());
-        assert!(!out.exists());
-        expected["research"]["end_latest"] = json!("2026-11-01T00:00:00Z");
+        for field in ["start", "end", "end_latest"] {
+            let mut invalid = expected.clone();
+            invalid["research"][field] = json!("2026-11-01");
+            std::fs::write(&expected_path, invalid.to_string()).unwrap();
+            assert!(
+                matches!(Task::load(directory.path()), Err(EvalError::Expected { source, .. })
+                if source.classify() == serde_json::error::Category::Data),
+                "{field}"
+            );
+            let constructed = std::cell::Cell::new(false);
+            let result = run(&arguments, |_, _| {
+                constructed.set(true);
+                Err(EvalError::Credential)
+            });
+            assert!(
+                matches!(result, Err(EvalError::Expected { source, .. })
+                if source.classify() == serde_json::error::Category::Data),
+                "{field}"
+            );
+            assert!(!constructed.get(), "{field}");
+            assert!(!out.exists(), "{field}");
+        }
         std::fs::write(&expected_path, expected.to_string()).unwrap();
         let task = Task::load(directory.path()).unwrap();
         assert_eq!(
@@ -1537,7 +1544,7 @@ mod tests {
                 let expected = task.expected.research.as_ref().unwrap();
                 let valid = amended || expected.historical;
                 let input = if valid {
-                    json!({"query":"AI developer announcements", "startPublishedDate":expected.start,"endPublishedDate":expected.end})
+                    json!({"query":"AI developer announcements", "startPublishedDate":expected.start.format(&Rfc3339).unwrap(),"endPublishedDate":expected.end.format(&Rfc3339).unwrap()})
                 } else {
                     json!({"query":"AI developer announcements June 2026", "contents":{"maxAgeHours":72}})
                 };

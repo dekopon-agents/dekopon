@@ -31,11 +31,20 @@ fn timestamp(text: &str) -> Option<OffsetDateTime> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expected {
-    pub start: String,
-    pub end: String,
+    #[serde(deserialize_with = "deserialize_timestamp")]
+    pub start: OffsetDateTime,
+    #[serde(deserialize_with = "deserialize_timestamp")]
+    pub end: OffsetDateTime,
     #[serde(default, deserialize_with = "deserialize_end_latest")]
     pub end_latest: Option<OffsetDateTime>,
     pub historical: bool,
+}
+
+fn deserialize_timestamp<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<OffsetDateTime, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    OffsetDateTime::parse(&text, &Rfc3339).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_end_latest<'de, D: serde::Deserializer<'de>>(
@@ -93,8 +102,8 @@ pub fn judge(
     if calls.is_empty() {
         problems.push(Problem::NoSearch);
     }
-    let start = timestamp(&expected.start).expect("fixture start timestamp");
-    let end = timestamp(&expected.end).expect("fixture end timestamp");
+    let start = expected.start;
+    let end = expected.end;
     let end_latest = expected.end_latest.unwrap_or(end);
     for call in calls {
         let query = call["query"].as_str().unwrap_or_default().to_lowercase();
@@ -302,8 +311,8 @@ mod tests {
 
     fn window() -> Expected {
         Expected {
-            start: "2026-10-28T18:40:00Z".into(),
-            end: NOW.into(),
+            start: timestamp("2026-10-28T18:40:00Z").unwrap(),
+            end: timestamp(NOW).unwrap(),
             end_latest: None,
             historical: false,
         }
@@ -367,7 +376,7 @@ mod tests {
             let expected: Expected = serde_json::from_value(fixture["research"].clone()).unwrap();
             let call = |end: &str| {
                 json!({"query":"AI developer announcements",
-                "startPublishedDate":expected.start,"endPublishedDate":end})
+                "startPublishedDate":expected.start.format(&Rfc3339).unwrap(),"endPublishedDate":end})
             };
             let reference_score = judge(&expected, Some(NOW), &[call(NOW)], Some(&answer));
             assert_eq!(reference_score, []);
@@ -435,13 +444,13 @@ mod tests {
     #[test]
     fn historical_scope_does_not_require_guessing_an_unprovided_current_time() {
         let expected = Expected {
-            start: "2026-06-01T00:00:00Z".into(),
-            end: "2026-06-30T23:59:59Z".into(),
+            start: timestamp("2026-06-01T00:00:00Z").unwrap(),
+            end: timestamp("2026-06-30T23:59:59Z").unwrap(),
             end_latest: None,
             historical: true,
         };
         let call = json!({"query":"AI developer announcements June 2026",
-            "startPublishedDate":expected.start,"endPublishedDate":expected.end});
+            "startPublishedDate":expected.start.format(&Rfc3339).unwrap(),"endPublishedDate":expected.end.format(&Rfc3339).unwrap()});
         let answer = json!({"referenceUtc":null,"claims":[
             {"source":"june","fact":"june-release","basis":"publication"}
         ]})
