@@ -20,6 +20,7 @@ use crate::{
 };
 
 const SUBJECT: &str = "dekopon:gylmar-vm";
+const SESSION: &str = "019a3c2e-7b4d-7c1a-9e2f-0123456789ab";
 
 enum Step {
     Write(Vec<u8>),
@@ -408,15 +409,15 @@ async fn a_proxied_call_records_subject_session_model_and_outcome() {
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
         .post("/v1/chat/completions", CHAT_CALL)
-        .header(SESSION_HEADER, " vm-session-7 ")
+        .header(SESSION_HEADER, format!(" {SESSION} "))
         .send()
         .await
         .unwrap();
     assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
-    assert!(!upstream.request().contains("vm-session-7"));
+    assert!(!upstream.request().contains(SESSION));
     let expected = [
         ("vm.subject", SUBJECT),
-        ("vm.session", "vm-session-7"),
+        ("vm.session", SESSION),
         ("agent", "gylmar"),
         ("model.name", "glm-flash"),
         ("usage.input_tokens", "5"),
@@ -428,50 +429,125 @@ async fn a_proxied_call_records_subject_session_model_and_outcome() {
 }
 
 #[tokio::test]
-async fn a_call_without_a_session_header_still_records_its_subject() {
-    let (_, spans, _guard) = capture();
-    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
-    let running = proxy(&upstream.url, 100_000).await;
-    let response = running.post("/v1/chat/completions", CHAT_CALL).send().await;
-    assert_eq!(response.unwrap().text().await.unwrap(), USAGE_ANSWER);
-    let span = spans.only();
-    assert_eq!(span["vm.subject"], SUBJECT);
-    assert_eq!(span["vm.session"], "");
-}
-
-#[tokio::test]
-async fn an_oversized_session_header_is_recorded_empty() {
-    let (_, spans, _guard) = capture();
+async fn a_vm_calls_meter_record_names_its_launch_session_after_the_telemetry_bridge() {
+    if std::env::var_os("DEKOPON_TEST_PROXY_METER_SUBSCRIBER").is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_vm_calls_meter_record_names_its_launch_session_after_the_telemetry_bridge",
+            ])
+            .env("DEKOPON_TEST_PROXY_METER_SUBSCRIBER", "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "subscriber test: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        return;
+    }
+    let exported = ExportedLogs::default();
+    let telemetry = dekopon_telemetry::Install::new(dekopon_telemetry::Console {
+        format: dekopon_telemetry::ConsoleFormat::Json,
+        writer: dekopon_telemetry::ConsoleWriter::Stderr,
+        filter: dekopon_telemetry::ConsoleFilter::Directive("off".into()),
+    })
+    .with_logs(
+        opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build(),
+        "job=debug,meter=info",
+    )
+    .install()
+    .unwrap();
     let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
     let running = proxy(&upstream.url, 100_000).await;
     let response = running
         .post("/v1/chat/completions", CHAT_CALL)
-        .header(SESSION_HEADER, "s".repeat(129))
+        .header(SESSION_HEADER, SESSION)
         .send()
-        .await;
-    assert_eq!(response.unwrap().status(), 200);
-    let span = spans.only();
-    assert_eq!(span["vm.session"], "");
-    assert_eq!(span["outcome"], "succeeded");
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
+    drop(running);
+    telemetry.shutdown().unwrap();
+
+    assert!(!upstream.request().contains(SESSION));
+    let records = exported.0.lock();
+    let [record] = &records[..] else {
+        panic!("one exported meter record: {records:?}");
+    };
+    assert_eq!(record["vm.session"], SESSION);
+    assert_eq!(record["meter.via"], "proxy");
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExportedLogs(Arc<Mutex<Vec<Fields>>>);
+
+impl opentelemetry_sdk::logs::LogExporter for ExportedLogs {
+    async fn export(
+        &self,
+        batch: opentelemetry_sdk::logs::LogBatch<'_>,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        for (record, _) in batch.iter() {
+            let fields = record
+                .attributes_iter()
+                .filter_map(|(key, value)| {
+                    let opentelemetry::logs::AnyValue::String(text) = value else {
+                        return None;
+                    };
+                    Some((key.as_str().to_owned(), text.as_str().to_owned()))
+                })
+                .collect();
+            self.0.lock().push(fields);
+        }
+        Ok(())
+    }
 }
 
 #[tokio::test]
-async fn a_nonprintable_session_header_is_recorded_empty() {
-    let (_, spans, _guard) = capture();
-    let running = proxy("http://127.0.0.1:9", 100_000).await;
-    for session in ["session\tlabel", "séance"] {
-        let response = running
-            .post("/v1/chat/completions", r#"{"model":"glm-ungranted"}"#)
-            .header(SESSION_HEADER, session)
-            .send()
-            .await;
-        assert_eq!(response.unwrap().status(), 403);
+async fn a_missing_or_malformed_session_header_records_no_session() {
+    let (records, spans, _guard) = capture();
+    let overlong = format!("{SESSION}0");
+    let cases = [
+        None,
+        Some("019a3c2e-7b4d-4c1a-9e2f-0123456789ab"),
+        Some("019A3C2E-7B4D-7C1A-9E2F-0123456789AB"),
+        Some(overlong.as_str()),
+        Some("vm-session-7"),
+        Some("session\tlabel"),
+        Some("séance"),
+    ];
+    for session in cases {
+        let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+        let running = proxy(&upstream.url, 100_000).await;
+        let mut request = running.post("/v1/chat/completions", CHAT_CALL);
+        if let Some(session) = session {
+            request = request.header(SESSION_HEADER, session);
+            assert!(!upstream_saw(&upstream, request).await.contains(session));
+        } else {
+            upstream_saw(&upstream, request).await;
+        }
+    }
+    let meters = records.0.lock();
+    assert_eq!(meters.len(), cases.len(), "{meters:?}");
+    for meter in meters.iter() {
+        assert!(!meter.contains_key("vm.session"), "{meter:?}");
+        assert_eq!(meter["meter.via"], "proxy");
     }
     let spans = spans.0.lock();
-    assert_eq!(spans.len(), 2, "{spans:?}");
+    assert_eq!(spans.len(), cases.len(), "{spans:?}");
     for span in spans.values() {
+        assert_eq!(span["vm.subject"], SUBJECT);
         assert_eq!(span["vm.session"], "");
     }
+}
+
+async fn upstream_saw(upstream: &FakeUpstream, request: reqwest::RequestBuilder) -> String {
+    let response = request.send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), USAGE_ANSWER);
+    upstream.request()
 }
 
 #[tokio::test]
@@ -480,14 +556,14 @@ async fn a_refused_call_records_its_outcome_on_the_span() {
     let running = proxy("http://127.0.0.1:9", 100_000).await;
     let response = running
         .post("/v1/chat/completions", r#"{"model":"glm-ungranted"}"#)
-        .header(SESSION_HEADER, "vm-session-7")
+        .header(SESSION_HEADER, SESSION)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 403);
     let expected = [
         ("vm.subject", SUBJECT),
-        ("vm.session", "vm-session-7"),
+        ("vm.session", SESSION),
         ("agent", "gylmar"),
         ("usage.input_tokens", "0"),
         ("usage.output_tokens", "0"),
