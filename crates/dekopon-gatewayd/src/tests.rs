@@ -15599,7 +15599,22 @@ async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
     assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
     provider.force_flush().unwrap();
 
-    let spans = exported.0.lock().clone();
+    let spans = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            {
+                let spans = exported.0.lock();
+                if ["gateway.message", "gateway.session"]
+                    .into_iter()
+                    .all(|name| spans.iter().filter(|span| span.name == name).count() >= 2)
+                {
+                    break spans.clone();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two gateway.message and two gateway.session spans are exported");
     let statuses = spans
         .iter()
         .filter(|span| span.name == "gateway.message")
