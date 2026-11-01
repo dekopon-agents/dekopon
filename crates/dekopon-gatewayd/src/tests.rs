@@ -3781,7 +3781,7 @@ impl ModelScript {
         let messages = prompts
             .get(index)
             .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1));
-        messages.iter().map(message_text).collect()
+        messages.iter().map(task_time::payload_message).collect()
     }
 }
 
@@ -4941,7 +4941,7 @@ impl InterruptibleModel {
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
         self.prompts.lock()[index]
             .iter()
-            .map(message_text)
+            .map(task_time::payload_message)
             .collect()
     }
 
@@ -9578,7 +9578,11 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     .await;
 
     assert_eq!(
-        driver.replies(),
+        driver
+            .replies()
+            .iter()
+            .map(|reply| task_time::payload_message(&ModelMessage::user(reply)).1)
+            .collect::<Vec<_>>(),
         vec!["[gateway: unmapped participant]\nwhat broke?".to_owned()]
     );
     assert_eq!(
@@ -18764,6 +18768,8 @@ mod steering;
 #[path = "tests/steering_e2e.rs"]
 mod steering_e2e;
 mod subscriptions;
+#[path = "tests/task_time.rs"]
+mod task_time;
 mod wake_reason;
 #[path = "tests/wakes.rs"]
 mod wakes;

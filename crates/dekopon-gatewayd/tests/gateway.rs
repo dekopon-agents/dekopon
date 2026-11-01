@@ -1201,7 +1201,13 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
     .expect("the follow-up completes");
     assert_eq!(second, "The second one was the database.");
 
-    let follow_up = fixture.prompt(1);
+    let mut follow_up = fixture.prompt(1);
+    let (_, current) = follow_up.last_mut().expect("current user context");
+    let (payload, sample) = current
+        .rsplit_once("\n\n[gateway: Dekopon runtime time reference, sampled for this task: ")
+        .expect("gateway time reference follows the current payload");
+    assert!(sample.ends_with("otherwise state the sample's age limitation.]"));
+    *current = payload.to_owned();
     assert_eq!(
         follow_up
             .iter()
@@ -1265,8 +1271,15 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
     let second_prompt = format!(
         "[gateway: authenticated participant: {OTHER_MAPPED_PRINCIPAL}]\nand the second one?"
     );
+    let mut follow_up = fixture.prompt(1);
+    let (_, current) = follow_up.last_mut().expect("current user context");
+    let (payload, sample) = current
+        .rsplit_once("\n\n[gateway: Dekopon runtime time reference, sampled for this task: ")
+        .expect("gateway time reference follows the current payload");
+    assert!(sample.ends_with("otherwise state the sample's age limitation.]"));
+    *current = payload.to_owned();
     assert_eq!(
-        fixture.prompt(1),
+        follow_up,
         vec![
             (
                 "system".to_owned(),

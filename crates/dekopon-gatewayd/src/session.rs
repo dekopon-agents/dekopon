@@ -255,7 +255,7 @@ impl ConfiguredModels {
         self.construct_with(model, |variable| std::env::var_os(variable))
     }
 
-    fn construct_with(
+    pub(crate) fn construct_with(
         &self,
         model: &ModelConfig,
         mut resolve: impl FnMut(&str) -> Option<std::ffi::OsString>,
@@ -2112,6 +2112,19 @@ impl SessionSteers {
     }
 }
 
+fn task_time_reference(
+    now: dekopon_model_token_governor::UnixMillis,
+) -> Result<String, time::error::Error> {
+    let timestamp = time::OffsetDateTime::from_unix_timestamp(now.0.div_euclid(1_000))?
+        .format(&time::format_description::well_known::Rfc3339)?;
+    Ok(format!(
+        "[gateway: Dekopon runtime time reference, sampled for this task: {timestamp} (UTC). \
+         This is a fixed sample, not a continuously advancing clock. UTC does not establish \
+         your timezone. For time-sensitive work much later, obtain a newer reading through \
+         an already-authorized clock if available; otherwise state the sample's age limitation.]"
+    ))
+}
+
 async fn session(
     runner: &SessionRunner,
     route: &BoundRoute,
@@ -2154,6 +2167,13 @@ async fn session_turn(
     (cancellation, admission): (SessionCancellation, TurnAdmission),
     publication: &mut Option<asset::Publication>,
 ) -> Ended {
+    let time_reference = match task_time_reference(runner.metering.now()) {
+        Ok(reference) => reference,
+        Err(error) => {
+            tracing::error!(event = "gateway_session_failed", category = "time-reference", %error, "gateway.session.failed");
+            return MessageOutcome::Failed.into();
+        }
+    };
     // Only trusted route configuration decides whether the subject participates in the state key;
     // message text, transport presentation, and model output never influence that choice.
     let mut key = conversation_key(route, message);
@@ -2638,6 +2658,7 @@ async fn session_turn(
     );
     let text = participants::with_handle(text, asker_handle);
     let text = participants::with_join(text, asker_join.as_deref());
+    let text = format!("{text}\n\n{time_reference}");
     let (participant_drain, participant_requests) = participants::channel(
         mapped_participants && message.pull_request_links.is_none(),
         &cancellation,
