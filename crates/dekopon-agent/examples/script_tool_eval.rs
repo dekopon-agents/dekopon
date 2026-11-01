@@ -1446,7 +1446,7 @@ mod tests {
                 } else {
                     "model-new"
                 };
-                let answer = json!({"referenceUtc":freshness::NOW,"claims":[{"source":source,"fact":fact,"basis":"publication"}]}).to_string();
+                let answer = json!({"referenceUtc":if expected.historical && !amended {None} else {Some(freshness::NOW)},"claims":[{"source":source,"fact":fact,"basis":"publication"}]}).to_string();
                 let command = format!("exa search --input-json '{}'", input);
                 let arguments = json!({"command":command}).to_string();
                 let tool = json!({"type":"response.output_item.done","item":{"type":"function_call","id":"fc_search","call_id":"search","name":"bash","arguments":arguments}});

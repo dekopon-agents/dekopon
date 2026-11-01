@@ -40,7 +40,7 @@ pub enum Problem {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Answer {
-    reference_utc: String,
+    reference_utc: Option<String>,
     claims: Vec<Claim>,
 }
 
@@ -81,7 +81,12 @@ pub fn judge(expected: &Expected, calls: &[Value], answer: Option<&str>) -> Vec<
         problems.push(Problem::AnswerFormat);
         return problems;
     };
-    if answer.reference_utc != NOW {
+    if answer
+        .reference_utc
+        .as_deref()
+        .is_some_and(|now| now != NOW)
+        || (!expected.historical && answer.reference_utc.is_none())
+    {
         problems.push(Problem::Reference);
     }
     let sources = sources();
@@ -304,6 +309,22 @@ mod tests {
             judge(&window(), &[input], Some(&answer)),
             [Problem::StaleQuery]
         );
+    }
+
+    #[test]
+    fn historical_scope_does_not_require_guessing_an_unprovided_current_time() {
+        let expected = Expected {
+            start: "2026-06-01T00:00:00Z".into(),
+            end: "2026-06-30T23:59:59Z".into(),
+            historical: true,
+        };
+        let call = json!({"query":"AI developer announcements June 2026",
+            "startPublishedDate":expected.start,"endPublishedDate":expected.end});
+        let answer = json!({"referenceUtc":null,"claims":[
+            {"source":"june","fact":"june-release","basis":"publication"}
+        ]})
+        .to_string();
+        assert_eq!(judge(&expected, &[call], Some(&answer)), []);
     }
 
     #[test]
