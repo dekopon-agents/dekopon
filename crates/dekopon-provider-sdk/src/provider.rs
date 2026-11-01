@@ -1,6 +1,7 @@
 mod bounded;
 pub mod endpoint;
 mod handles;
+mod input;
 #[cfg(not(target_arch = "wasm32"))]
 mod port;
 mod stdio;
@@ -408,7 +409,7 @@ fn failure(failure: &impl Failure) -> ComponentFailure {
 
 fn run<C: Capability>(input: &str, out: &mut Stdout) -> Result<(), stdio::Exit> {
     let input = serde_json::from_str::<C::Input>(input)
-        .map_err(|_invalid| stdio::Exit::from(&SdkFailure::InvalidInput))?;
+        .map_err(|_invalid| stdio::Exit::from(&input::refusal::<C::Input>(input)))?;
     let needs = <C::Needs as sealed::Needs>::grant().map_err(|error| stdio::Exit::from(&error))?;
     C::run(input, needs, out).map_err(|error| stdio::Exit::from(&error))
 }

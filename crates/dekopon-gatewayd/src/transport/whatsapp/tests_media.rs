@@ -6,6 +6,7 @@ use tokio::sync::oneshot;
 
 pub(crate) const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfake-png-pixels";
 pub(crate) const JPEG: &[u8] = b"\xff\xd8\xfffake-jpeg-pixels";
+pub(crate) const PDF: &[u8] = b"%PDF-1.7\n1 0 obj << /Total (4,217.50) >> endobj\n%%EOF\n";
 
 pub(crate) struct MediaRequest {
     pub path: String,
@@ -133,6 +134,22 @@ pub(crate) fn photo_webhook(mime: &str, caption: Option<&str>) -> Value {
         "messaging_product":"whatsapp", "metadata":{"phone_number_id":"456"}, "contacts":[{"wa_id":"15550000001"}],
         "messages":[{"from":"15550000001", "id":"wamid.photo", "type":"image", "image":image}]
     }}]}]})
+}
+
+pub(crate) fn message_webhook(kind: &str, body: Value) -> Value {
+    let mut webhook = photo_webhook("image/png", None);
+    let message = &mut webhook["entry"][0]["changes"][0]["value"]["messages"][0];
+    message["id"] = json!(format!("wamid.{kind}"));
+    message["type"] = json!(kind);
+    if let Some(object) = message.as_object_mut() {
+        object.remove("image");
+    }
+    message[kind] = body;
+    webhook
+}
+
+pub(crate) fn document_webhook(document: Value) -> Value {
+    message_webhook("document", document)
 }
 
 #[tokio::test]
@@ -543,6 +560,10 @@ pub(crate) async fn admitted_photo(
     mime: &str,
     caption: Option<&str>,
 ) -> (WhatsappTransport, InboundMessage) {
+    admitted(origin, &photo_webhook(mime, caption)).await
+}
+
+pub(crate) async fn admitted(origin: &str, webhook: &Value) -> (WhatsappTransport, InboundMessage) {
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve address");
     let address = reservation.local_addr().expect("address");
     drop(reservation);
@@ -561,7 +582,7 @@ pub(crate) async fn admitted_photo(
     )
     .expect("transport");
     transport.connect().await.expect("listener");
-    let body = photo_webhook(mime, caption).to_string();
+    let body = webhook.to_string();
     let digest = hmac_sha256(b"secret", body.as_bytes());
     let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     let response = credential_client(Duration::from_secs(2))
@@ -583,16 +604,17 @@ pub(crate) async fn admitted_photo(
 #[tokio::test]
 async fn invalid_image_envelopes_and_unsigned_photos_enqueue_nothing() {
     for case in [
-        "unsigned", "scope", "phone", "mime", "media-id", "caption", "group", "contact", "self",
+        "unsigned", "scope", "phone", "group", "contact", "self", "reaction",
     ] {
         let (state, mut receiver) = super::tests::state_and_receiver();
         let mut body = photo_webhook("image/png", Some("edit"));
         let value = &mut body["entry"][0]["changes"][0]["value"];
         match case {
             "phone" => value["metadata"]["phone_number_id"] = json!("999"),
-            "mime" => value["messages"][0]["image"]["mime_type"] = json!("image/webp"),
-            "media-id" => value["messages"][0]["image"]["id"] = json!("../trap?token"),
-            "caption" => value["messages"][0]["image"]["caption"] = json!(32),
+            "reaction" => {
+                value["messages"][0]["type"] = json!("reaction");
+                value["messages"][0]["reaction"] = json!({"message_id":"wamid.x", "emoji":"👍"});
+            }
             "group" => value["messages"][0]["group_id"] = json!("group"),
             "contact" => value["contacts"] = json!([]),
             "self" => value["metadata"]["display_phone_number"] = json!("+1 555 000 0001"),
@@ -674,6 +696,211 @@ async fn a_stalled_download_times_out_without_exposing_the_signed_url() {
     );
     assert_eq!(peer.requests.lock().len(), 2);
     drop(peer);
+}
+
+#[tokio::test]
+async fn a_signed_pdf_document_becomes_one_message_with_one_lazy_asset_and_its_caption() {
+    let long = format!("{}.pdf", "é".repeat(100));
+    for (caption, filename, text, name) in [
+        (
+            Some("What is the total?"),
+            Some("Q3 invoice.pdf"),
+            "What is the total?",
+            "Q3 invoice.pdf",
+        ),
+        (None, None, "", "document.pdf"),
+        (None, Some(""), "", "document.pdf"),
+        (None, Some("../../etc/pass\u{0}wd.pdf"), "", "passwd.pdf"),
+        (None, Some(r"C:\Users\x\..\.."), "", "document.pdf"),
+        (None, Some(long.as_str()), "", &long[..128]),
+    ] {
+        let peer = MediaPeer::new(|_, _| panic!("admission must not call Graph or download")).await;
+        let mut document = json!({"id":"789", "mime_type":"application/pdf",
+            "sha256":"ignored", "url":"https://evil.invalid/ignored"});
+        if let Some(caption) = caption {
+            document["caption"] = json!(caption);
+        }
+        if let Some(filename) = filename {
+            document["filename"] = json!(filename);
+        }
+        let (_transport, message) = admitted(&peer.origin, &document_webhook(document)).await;
+        assert_eq!(message.text, text);
+        assert_eq!(message.input_refusal, None);
+        assert_eq!(message.assets.len(), 1);
+        assert_eq!(message.assets[0].name, name);
+        assert_eq!(message.assets[0].mime, "application/pdf");
+        assert_eq!(message.assets[0].size, None);
+        assert_eq!(message.assets[0].source, Some(source("application/pdf")));
+        assert!(peer.requests.lock().is_empty());
+        peer.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_pdf_is_fetched_through_graph_metadata_then_the_trusted_download_once_each() {
+    let mut bytes = PDF.to_vec();
+    bytes.resize(media::MAX_IMAGE_BYTES + 1, b' ');
+    let served = bytes.clone();
+    let peer = MediaPeer::new(move |origin, index| match index {
+        0 => metadata(origin, "application/pdf", &served),
+        1 => bytes_reply(&served),
+        _ => panic!("one metadata and one download request"),
+    })
+    .await;
+    let fetched = driver(&peer.origin)
+        .fetch(&source("application/pdf"), 8 * 1024 * 1024)
+        .await
+        .expect("PDF over the image limit and within the asset limit downloads");
+    assert_eq!(fetched, bytes);
+    {
+        let requests = peer.requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/v25.0/789?phone_number_id=456");
+        assert_eq!(
+            requests[1].path,
+            "/whatsapp_business/attachments/?mid=789&signed=URL_SENTINEL"
+        );
+        for request in requests.iter() {
+            assert_eq!(request.headers["authorization"], "Bearer TOKEN_SENTINEL");
+        }
+    }
+    peer.finish().await;
+}
+
+#[tokio::test]
+async fn pdf_fetch_refusals_carry_their_typed_cause_without_the_token_url_or_body() {
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    for case in [
+        "signature",
+        "advertised",
+        "streamed",
+        "not-found",
+        "download-refused",
+    ] {
+        let peer = MediaPeer::new(move |origin, index| match (case, index) {
+            ("not-found", 0) => (
+                StatusCode::NOT_FOUND,
+                "TOKEN_SENTINEL URL_SENTINEL raw body",
+            )
+                .into_response(),
+            ("advertised", 0) => json_reply(json!({"id":"789", "mime_type":"application/pdf",
+                "file_size": LIMIT + 1,
+                "url":format!("{origin}/whatsapp_business/attachments/?signed=URL_SENTINEL")})),
+            (_, 0) => metadata(origin, "application/pdf", PDF),
+            ("signature", 1) => bytes_reply(&vec![b'X'; PDF.len()]),
+            ("streamed", 1) => bytes_reply(&vec![b'%'; usize::try_from(LIMIT).unwrap() + 1]),
+            ("download-refused", 1) => {
+                (StatusCode::FORBIDDEN, "TOKEN_SENTINEL raw body").into_response()
+            }
+            _ => panic!("no request after a refusal"),
+        })
+        .await;
+        let error = driver(&peer.origin)
+            .fetch(&source("application/pdf"), LIMIT)
+            .await
+            .expect_err(case);
+        let expected = match case {
+            "advertised" | "streamed" => TransportError::AssetTooLarge { size: LIMIT + 1 },
+            "signature" => TransportError::AssetRefused {
+                cause: MediaRefusal::Signature,
+            },
+            "not-found" => TransportError::AssetRefused {
+                cause: MediaRefusal::Gone,
+            },
+            _ => TransportError::AssetRefused {
+                cause: MediaRefusal::Download { status: 403 },
+            },
+        };
+        assert_eq!(format!("{error:?}"), format!("{expected:?}"), "{case}");
+        let debug = format!("{error:?} {error}");
+        assert!(
+            !debug.contains("TOKEN_SENTINEL")
+                && !debug.contains("URL_SENTINEL")
+                && !debug.contains("raw body"),
+            "{debug}"
+        );
+        peer.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_signed_document_is_marked_for_refusal_and_never_fetched() {
+    for case in ["word", "media-id", "no-mime", "caption"] {
+        let peer = MediaPeer::new(|_, _| panic!("a refused document is never fetched")).await;
+        let mut document = json!({"id":"789", "mime_type":"application/pdf", "filename":"a.pdf"});
+        match case {
+            "word" => document["mime_type"] = json!("application/msword"),
+            "media-id" => document["id"] = json!("../trap?token"),
+            "no-mime" => document = json!({"id":"789"}),
+            _ => document["caption"] = json!(32),
+        }
+        let (_transport, message) = admitted(&peer.origin, &document_webhook(document)).await;
+        assert_eq!(
+            message.input_refusal,
+            Some(InputRefusal::Unsupported),
+            "{case}"
+        );
+        assert!(message.assets.is_empty(), "{case}");
+        assert!(peer.requests.lock().is_empty());
+        peer.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn an_unsigned_or_group_document_enqueues_nothing() {
+    for case in ["unsigned", "group"] {
+        let (state, mut receiver) = super::tests::state_and_receiver();
+        let mut body = document_webhook(json!({"id":"789", "mime_type":"application/msword"}));
+        if case == "group" {
+            body["entry"][0]["changes"][0]["value"]["messages"][0]["group_id"] = json!("group");
+        }
+        let body = body.to_string();
+        let mut request = super::tests::signed_request(body.as_bytes());
+        if case == "unsigned" {
+            request.headers_mut().remove("x-hub-signature-256");
+        }
+        receive_webhook(State(state), request).await;
+        assert!(receiver.try_recv().is_err(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn an_unhandled_message_kind_or_refused_image_is_marked_for_refusal_and_never_fetched() {
+    for (kind, body) in [
+        (
+            "audio",
+            json!({"id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true}),
+        ),
+        ("video", json!({"id":"789", "mime_type":"video/mp4"})),
+        (
+            "sticker",
+            json!({"id":"789", "mime_type":"image/webp", "animated":false}),
+        ),
+        ("location", json!({"latitude":1.5, "longitude":2.5})),
+        ("contacts", json!([{"name":{"formatted_name":"A"}}])),
+        ("image", json!({"id":"789", "mime_type":"image/webp"})),
+        ("image", json!({"id":"789", "mime_type":"image/gif"})),
+        (
+            "image",
+            json!({"id":"../trap?token", "mime_type":"image/png"}),
+        ),
+        (
+            "image",
+            json!({"id":"789", "mime_type":"image/png", "caption":32}),
+        ),
+    ] {
+        let peer = MediaPeer::new(|_, _| panic!("a refused message is never fetched")).await;
+        let (_transport, message) = admitted(&peer.origin, &message_webhook(kind, body)).await;
+        assert_eq!(
+            message.input_refusal,
+            Some(InputRefusal::Unsupported),
+            "{kind}"
+        );
+        assert!(message.assets.is_empty(), "{kind}");
+        assert_eq!(message.text, "", "{kind}");
+        assert!(peer.requests.lock().is_empty());
+        peer.finish().await;
+    }
 }
 
 #[tokio::test]

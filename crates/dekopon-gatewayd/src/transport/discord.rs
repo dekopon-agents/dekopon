@@ -668,6 +668,7 @@ impl DiscordTransport {
         let conversation_id = conversation.key();
 
         Ok(Some(InboundMessage {
+            control_text: None,
             pull_request_links: None,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Discord,
@@ -695,6 +696,7 @@ impl DiscordTransport {
             asset_overflow: message["attachments"]
                 .as_array()
                 .is_some_and(|files| files.len() > MAX_ATTACHMENTS),
+            input_refusal: None,
         }))
     }
 

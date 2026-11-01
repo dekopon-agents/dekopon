@@ -50,9 +50,11 @@ pub(crate) struct InboundMessage {
     pub conversation: Conversation,
     pub message_id: MessageId,
     pub text: String,
+    pub control_text: Option<String>,
     pub pull_request_links: Option<crate::pull_request_links::PullRequestLinkContext>,
     pub assets: Vec<PendingAsset>,
     pub asset_overflow: bool,
+    pub input_refusal: Option<InputRefusal>,
     pub addressed: Option<bool>,
     pub thread_continuation: Option<ThreadContinuation>,
     pub reply: ReplyTarget,
@@ -62,6 +64,32 @@ pub(crate) struct InboundMessage {
     pub native_group: Option<String>,
     pub constituents: Vec<tracing::Span>,
     pub folded: Vec<String>,
+}
+
+impl InboundMessage {
+    pub(crate) fn control_text(&self) -> &str {
+        self.control_text.as_deref().unwrap_or(&self.text)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaRefusal {
+    Gone,
+    Signature,
+    Download { status: u16 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputRefusal {
+    Unsupported,
+}
+
+impl InputRefusal {
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported-message",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -659,6 +687,10 @@ pub enum TransportError {
     Request(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("chat service returned an error: {code}")]
     Service { code: String },
+    #[error("chat service media is {size} bytes, over the limit the gateway will read")]
+    AssetTooLarge { size: u64 },
+    #[error("chat service media was refused: {cause:?}")]
+    AssetRefused { cause: MediaRefusal },
     #[error(
         "Discord refused the requested gateway intents (close 4014): messageContent: true needs \
          Developer Portal > Bot > Privileged Gateway Intents > Message Content Intent turned on"
@@ -701,6 +733,8 @@ impl TransportError {
             Self::NonUtf8Credential { .. } => "non-utf8-credential",
             Self::Request(_) => "request",
             Self::Service { .. } => "service",
+            Self::AssetTooLarge { .. } => "asset-too-large",
+            Self::AssetRefused { .. } => "asset-refused",
             Self::DisallowedIntents => "disallowed-intents",
             Self::Response => "response",
             Self::MalformedResponse(_) => "malformed-response",

@@ -603,13 +603,13 @@ impl Gateway {
                 .is_some_and(|route| route.follow)
             && transport::is_stop_word(
                 self.identities.get(&message.transport),
-                &message.text,
+                message.control_text(),
                 &["mute".to_owned()],
             );
         if follow_mute
             || transport::is_stop_word(
                 self.identities.get(&message.transport),
-                &message.text,
+                message.control_text(),
                 &generation.stop_words,
             )
         {
@@ -809,6 +809,7 @@ impl Gateway {
                         "collection-full" => "Busy collecting other requests. Please try again shortly.",
                         "incompatible-group" => "Another media group is still being collected. Please retry this group separately.",
                         "deadline-overflow" => "Input refused: the configured media collection deadline cannot be represented.",
+                        "unsupported-message" => "I can only read text, PDF documents, and PNG or JPEG images. Please send your message in one of those forms.",
                         _ => "Input refused: too many attachments or messages, or too much text. Please send a smaller request.",
                     };
                     session::answer(&driver, &message, reply).await;
