@@ -34,7 +34,7 @@ use crate::{
         AssetFetcher, ChatDriver, ChatTransport, InboundMessage, InputRefusal, LivenessTarget,
         MediaRefusal, MessageId, OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError,
         TransportEvent, TransportIdentity, TypingLease, bound_inbound, credential_client,
-        receive_span, record_conversation, split_message,
+        receive_span, record_conversation,
         webhook::{
             self, MAX_WEBHOOK_CONCURRENCY, VerifyFailure, WEBHOOK_REQUEST_TIMEOUT, content_free,
             text_response,
@@ -710,7 +710,12 @@ impl ChatDriver for WhatsappDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, images } = reply;
+        let OutboundReply {
+            text,
+            images,
+            footer,
+        } = reply;
+        let suffix = footer.as_ref().map(|footer| format!("_{}_", footer.line()));
         super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Photos)?;
         let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::WhatsApp { recipient } = target else {
@@ -725,22 +730,37 @@ impl ChatDriver for WhatsappDriver {
             return Err(media::failure("image-too-large"));
         }
         let caption_fits = !images.is_empty() && text.chars().count() <= media::MAX_CAPTION_CHARS;
+        let caption = suffix.as_deref().and_then(|suffix| {
+            crate::progress::Footer::caption(
+                &text,
+                suffix,
+                media::MAX_CAPTION_CHARS,
+                TextUnit::Scalar,
+            )
+        });
+        let caption_text = caption.as_deref().unwrap_or(&text);
         let mut accepted = 0_usize;
         while let Some(read) = images.next().await {
             let (index, image) = match read {
                 Ok(read) => read,
                 Err(error) => return Err(self.reply_failure(error, accepted)),
             };
-            let caption = (caption_fits && index == 0 && !text.is_empty()).then_some(text.as_str());
+            let caption =
+                (caption_fits && index == 0 && !caption_text.is_empty()).then_some(caption_text);
             if let Err(error) = self.send_image(recipient, caption, image).await {
                 return Err(self.reply_failure(error, accepted));
             }
             accepted += 1;
         }
-        if caption_fits {
+        if caption_fits && (footer.is_none() || caption.is_some()) {
             return Ok(());
         }
-        for chunk in split_message(&text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar) {
+        for chunk in crate::progress::Footer::chunks(
+            if caption_fits { "" } else { &text },
+            suffix.as_deref(),
+            MAX_WHATSAPP_TEXT_CHARS,
+            TextUnit::Scalar,
+        ) {
             match self.send_text(recipient, &chunk).await {
                 Ok(()) => accepted += 1,
                 Err(error) => return Err(self.reply_failure(error, accepted)),
@@ -1379,7 +1399,7 @@ mod tests {
     }
 
     fn split(text: &str) -> Vec<String> {
-        split_message(text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar)
+        super::super::split_message(text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar)
     }
 
     #[test]

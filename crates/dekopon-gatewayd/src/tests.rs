@@ -3217,6 +3217,7 @@ async fn telegram_call_failures_never_render_bot_tokens() {
                     .reply(
                         &answering,
                         OutboundReply {
+                            footer: None,
                             text: "a caption".to_owned(),
                             images: generated_images(1),
                         },
@@ -4020,6 +4021,14 @@ impl ChatDriver for RecordingDriver {
         _target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        match _target {
+            ReplyTarget::GithubTrace | ReplyTarget::Local { .. } => assert!(reply.footer.is_none()),
+            ReplyTarget::Slack { .. }
+            | ReplyTarget::Fauxlack { .. }
+            | ReplyTarget::Discord { .. }
+            | ReplyTarget::Telegram { .. }
+            | ReplyTarget::WhatsApp { .. } => {}
+        }
         if let Some(kind) = self.charge_reply() {
             return Err(injected(kind));
         }
@@ -17384,7 +17393,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             assert_eq!(
                 requests.len(),
                 8,
-                "one inbound fetch reused by model and provider, then three uploads/sends"
+                "one inbound fetch reused by model and provider, then three uploads and captioned image sends"
             );
             for edit in 0..3 {
                 assert!(
@@ -17395,7 +17404,18 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
                 );
                 let sent: Value =
                     serde_json::from_slice(&requests[edit * 2 + 3].body).expect("image send");
-                assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
+                let text = sent["image"]["caption"].as_str().unwrap();
+                let seconds = text
+                    .strip_prefix("Edited image.\n\n_portable · 4 steps · ")
+                    .unwrap()
+                    .strip_suffix(" s_")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                assert_eq!(
+                    sent["image"],
+                    json!({"id":"987","caption":format!("Edited image.\n\n_portable · 4 steps · {seconds} s_")})
+                );
             }
         }
         peer.finish().await;
@@ -24432,3 +24452,6 @@ pub(super) async fn native_join<F: std::future::Future>(join: F) -> F::Output {
 
 #[path = "tests/digests.rs"]
 mod digests;
+
+#[path = "tests/footer.rs"]
+mod footer;

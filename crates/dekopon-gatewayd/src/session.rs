@@ -23,7 +23,7 @@ use dekopon_agent::{
     },
 };
 use dekopon_broker_protocol::{
-    Attestation, ChatScopeClaim, ClientError, ConversationKind, DeliveredAnswer,
+    Attestation, ChatScopeClaim, ChatTransportKind, ClientError, ConversationKind, DeliveredAnswer,
     DeliveredTurnRequest, DeliveryIdentity, ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT,
     ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED,
     InvocationOutcome, InvocationResult, SessionRefusal,
@@ -69,7 +69,7 @@ use crate::{
     routes::BoundRoute,
     transport::{
         AssetFetcher, CancelRequest, ChatDriver, InboundMessage, MessageId, OutboundReply,
-        PastMessage, ThreadOwnership, TransportError, bound_inbound, bound_outbound,
+        PastMessage, ReplyTarget, ThreadOwnership, TransportError, bound_inbound, bound_outbound,
         credential_from,
     },
     wake::{Anchor, SessionWakes},
@@ -1306,7 +1306,12 @@ impl Recall<'_> {
                     delta = 0,
                     "gateway.recalled"
                 );
-                Some(platform_window(messages, &names, window))
+                Some(platform_window(
+                    messages,
+                    &names,
+                    window,
+                    self.message.transport_kind,
+                ))
             }
         }
     }
@@ -1443,6 +1448,7 @@ fn platform_window(
     messages: Vec<PastMessage>,
     names: &Names,
     window: MemoryWindow,
+    transport_kind: ChatTransportKind,
 ) -> RecalledWindow {
     let newest = messages.last().map(|message| message.id.clone());
     let mut turns = Vec::new();
@@ -1451,7 +1457,21 @@ fn platform_window(
     let mut next_asset_id = 1;
     for message in messages {
         let label = names.label(&message);
-        let mut text = message.text;
+        let mut text = if message.from_bot {
+            match transport_kind {
+                ChatTransportKind::Discord => {
+                    crate::progress::Footer::without_discord_footer(&message.text).to_owned()
+                }
+                ChatTransportKind::Fauxlack
+                | ChatTransportKind::Slack
+                | ChatTransportKind::Telegram
+                | ChatTransportKind::Whatsapp
+                | ChatTransportKind::Github
+                | ChatTransportKind::Local => message.text,
+            }
+        } else {
+            message.text
+        };
         for asset in message.assets {
             text.push_str(&asset::attached_marker(next_asset_id, &asset.name));
             assets.push(RecalledAsset {
@@ -1462,6 +1482,9 @@ fn platform_window(
             next_asset_id += 1;
         }
         if message.from_bot {
+            if text.is_empty() {
+                continue;
+            }
             let user = if pending_user.is_empty() {
                 "[gateway: earlier in this conversation]".to_owned()
             } else {
@@ -2748,7 +2771,6 @@ async fn session_turn(
             .with_participant(asker_handle.map(participants::Handle::as_str)),
         ));
     }
-    drop(sink);
     let space_access = leg.space_grants().is_some() && !is_space_wake;
     let review_progress = message
         .message_id
@@ -3350,8 +3372,16 @@ async fn session_turn(
             } else {
                 OutboundReply::with_images(text.clone(), images)
             };
+            let footer = match message.reply {
+                ReplyTarget::Slack { .. }
+                | ReplyTarget::Fauxlack { .. }
+                | ReplyTarget::Discord { .. }
+                | ReplyTarget::Telegram { .. }
+                | ReplyTarget::WhatsApp { .. } => sink.take_footer(),
+                ReplyTarget::GithubTrace | ReplyTarget::Local { .. } => None,
+            };
             (
-                Terminal::Answered(reply),
+                Terminal::Answered(reply.with_footer(footer)),
                 MessageOutcome::Answered,
                 Some(text),
             )

@@ -1096,7 +1096,14 @@ impl ChatDriver for DiscordDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, images } = reply;
+        let OutboundReply {
+            text,
+            images,
+            footer,
+        } = reply;
+        let suffix = footer
+            .as_ref()
+            .map(|footer| format!("-# {}", footer.line()));
         super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
         let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Discord {
@@ -1110,9 +1117,14 @@ impl ChatDriver for DiscordDriver {
             return Err(TransportError::Response);
         }
         let mut accepted = false;
-        for (index, chunk) in split_message(&text, MAX_MESSAGE_CHARS, TextUnit::Utf16)
-            .into_iter()
-            .enumerate()
+        for (index, chunk) in crate::progress::Footer::chunks(
+            &text,
+            suffix.as_deref(),
+            MAX_MESSAGE_CHARS,
+            TextUnit::Utf16,
+        )
+        .into_iter()
+        .enumerate()
         {
             let mut body = json!({
                 "content": chunk,
@@ -1640,7 +1652,16 @@ impl DiscordDriver {
                 code: "answer-has-attachments".to_owned(),
             });
         }
-        let chunks = split_message(&reply.text, MAX_MESSAGE_CHARS, TextUnit::Utf16);
+        let suffix = reply
+            .footer
+            .as_ref()
+            .map(|footer| format!("-# {}", footer.line()));
+        let chunks = crate::progress::Footer::chunks(
+            &reply.text,
+            suffix.as_deref(),
+            MAX_MESSAGE_CHARS,
+            TextUnit::Utf16,
+        );
         let [content] = chunks.as_slice() else {
             return Err(TransportError::Service {
                 code: "answer-too-long".to_owned(),
@@ -3407,5 +3428,27 @@ mod unit_tests {
             .await;
 
         assert!(matches!(early, Err(TransportError::Closed)), "{early:?}");
+    }
+
+    #[tokio::test]
+    async fn a_finalized_answer_ends_with_its_footer_subtext() {
+        let (endpoint, server) = loopback(vec![(200, "{}".to_owned())]);
+        let driver = driver(&endpoint);
+        let reply = OutboundReply::text("done").with_footer(Some(crate::progress::Footer::new(
+            &["model-a".into()],
+            1,
+            Duration::from_millis(7999),
+        )));
+        driver
+            .progress()
+            .unwrap()
+            .finalize(&progress_message(), &reply)
+            .await
+            .unwrap();
+        let posted = server.await.unwrap();
+        assert_eq!(
+            posted[0].body["content"],
+            "done\n\n-# model-a · 1 step · 8 s"
+        );
     }
 }

@@ -479,7 +479,11 @@ impl ChatDriver for LocalDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, images } = reply;
+        let OutboundReply {
+            text,
+            images,
+            footer: _,
+        } = reply;
         super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
         let images = super::hydration::hydrate_images(images).await?;
         let &ReplyTarget::Local { connection } = target else {
