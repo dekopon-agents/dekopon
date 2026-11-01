@@ -1037,7 +1037,7 @@ impl AssetSource for SessionAssets {
         use dekopon_model::model::ContentPart;
         let mut request = dekopon_agent::prompt::AssetRequest::default();
         let mut remaining =
-            dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(text_bytes);
+            dekopon_agent::prompt::MAX_REQUEST_ASSET_BYTES.saturating_sub(text_bytes);
         let mut residents = HashMap::new();
         for data in messages
             .iter()
@@ -1076,8 +1076,9 @@ impl AssetSource for SessionAssets {
                 };
                 if data.len() > remaining {
                     *part = ContentPart::Text(format!(
-                        "chat-asset:{} will not be shown: the model request would exceed the 40 MiB decoded asset limit.",
-                        data.id()
+                        "chat-asset:{} will not be shown: the model request would exceed the {} MiB decoded asset limit.",
+                        data.id(),
+                        dekopon_agent::prompt::MAX_REQUEST_ASSET_BYTES / (1024 * 1024)
                     ));
                     continue;
                 }
@@ -1086,7 +1087,8 @@ impl AssetSource for SessionAssets {
                     if let Some(decoded) = decoded {
                         if decoded > remaining {
                             *part = ContentPart::Text(format!(
-                                "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit."
+                                "chat-asset:{id} will not be shown: the model request would exceed the {} MiB decoded asset limit.",
+                                dekopon_agent::prompt::MAX_REQUEST_ASSET_BYTES / (1024 * 1024)
                             ));
                         } else {
                             remaining -= decoded;
@@ -1118,7 +1120,8 @@ impl AssetSource for SessionAssets {
                         seen.insert(id, Some(decoded));
                         if decoded > remaining {
                             *part = ContentPart::Text(format!(
-                                "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit."
+                                "chat-asset:{id} will not be shown: the model request would exceed the {} MiB decoded asset limit.",
+                                dekopon_agent::prompt::MAX_REQUEST_ASSET_BYTES / (1024 * 1024)
                             ));
                             continue;
                         }

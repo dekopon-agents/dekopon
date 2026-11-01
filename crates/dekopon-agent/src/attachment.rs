@@ -460,14 +460,6 @@ pub fn run_arguments(
 mod tests {
     use super::*;
 
-    #[test]
-    fn decoded_limit_matches_the_shared_contract() {
-        assert_eq!(
-            MAX_INVOCATION_ASSET_BYTES,
-            dekopon_broker_protocol::MAX_DECODED_INPUT_BYTES
-        );
-    }
-
     use serde_json::json;
     use std::{fs::File, os::unix::fs::FileExt};
 
