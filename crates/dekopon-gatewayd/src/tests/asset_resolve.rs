@@ -369,8 +369,8 @@ async fn five_generated_base64_images_spend_their_decoded_length_against_the_mod
             .register(descriptor, &metadata, "image.edit", "invocation")
             .unwrap();
     }
-    assert!(5 * raw.len() <= dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES);
-    assert!(4 * encoded.len() > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES);
+    assert!(5 * raw.len() <= dekopon_agent::prompt::MAX_REQUEST_ASSET_BYTES);
+    assert!(4 * encoded.len() > dekopon_agent::prompt::MAX_REQUEST_ASSET_BYTES);
     tokio::task::spawn_blocking(move || {
         let capture = dekopon_test_support::CaptureLayer::workspace();
         let _guard = tracing_subscriber::registry()

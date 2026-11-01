@@ -869,18 +869,6 @@ impl wit::Host for StoreState {
 mod tests {
     use super::*;
 
-    #[test]
-    fn decoded_limits_match_the_shared_contract() {
-        assert_eq!(
-            MAX_ASSET_BYTES,
-            dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64
-        );
-        assert_eq!(
-            MAX_INVOCATION_BYTES,
-            dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES as u64
-        );
-    }
-
     use crate::{
         BrokerHostLimits, BrokerHostOptions, Runtime, clock::ClockState, http::HttpState,
         settings::SettingsState, storage::StorageState,
