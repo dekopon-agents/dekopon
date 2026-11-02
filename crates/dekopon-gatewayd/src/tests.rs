@@ -12849,6 +12849,33 @@ async fn discord_posts_every_attachment_on_the_first_bounded_multipart_message()
         !calls[1].1.contains("name=\"files["),
         "two attachments are still one message"
     );
+
+    let single = spawn_http_mock(|_path, _body| {
+        json!({
+            "id": "444444444444444444",
+            "channel_id": DISCORD_CHANNEL,
+            "attachments": [
+                {"id": "555555555555555555", "filename": "asset-1.png"},
+                {"id": "555555555555555556", "filename": "asset-2.mp4"}
+            ]
+        })
+    });
+    discord(&single.base)
+        .driver()
+        .reply(
+            &ReplyTarget::Discord {
+                channel_id: DISCORD_CHANNEL.to_owned(),
+                reply_to: None,
+            },
+            OutboundReply::with_images("Two kittens.", vec![generated_image(), generated_video()]),
+        )
+        .await
+        .expect("one multipart post carries both attachments");
+    assert_eq!(
+        single.calls().len(),
+        1,
+        "two attachments are still one message"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
