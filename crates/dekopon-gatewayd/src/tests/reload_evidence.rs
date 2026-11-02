@@ -5,12 +5,7 @@ async fn an_unchanged_configuration_emits_no_indicator_records_on_reload_ticks()
     use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
     use dekopon_test_support::BrokerFixture;
 
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &config);
@@ -34,15 +29,7 @@ async fn an_unchanged_configuration_emits_no_indicator_records_on_reload_ticks()
         }),
     );
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path, candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path, candidate, BTreeMap::new());
     let records = || {
         capture.events_where(
             "dekopon_gatewayd",
@@ -54,11 +41,7 @@ async fn an_unchanged_configuration_emits_no_indicator_records_on_reload_ticks()
     tick.reset();
     for _ in 0..3 {
         tick.tick().await;
-        gateway.reconcile().await;
-        assert!(matches!(
-            broker.request().await.request,
-            BrokerRequest::PrepareGeneration { .. }
-        ));
+        reconcile_to_prepare(&mut gateway, &mut broker).await;
         assert_eq!(records().len(), expected);
     }
 }
@@ -68,12 +51,7 @@ async fn session_spans_keep_the_generation_activated_for_each_turn() {
     use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
     use dekopon_test_support::{BrokerFixture, Record};
 
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
     config["routes"][0]["conversation"]["kind"] = json!(["directMessage", "groupDirectMessage"]);
@@ -115,15 +93,7 @@ async fn session_spans_keep_the_generation_activated_for_each_turn() {
     let driver = Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>;
     let mut drivers = BTreeMap::new();
     drivers.insert("dev".to_owned(), driver);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(drivers),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path.clone(), candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path.clone(), candidate, drivers);
     let old_digest = gateway.digest_for_test();
     let old_generation = gateway.generation_for_test();
     let (capture, _guard) = capture_spans();
@@ -135,11 +105,7 @@ async fn session_spans_keep_the_generation_activated_for_each_turn() {
         route["indicators"] = json!({"mode": "off"});
     }
     write_config(root.path(), &config);
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     let indicators = capture.events_where(
         "dekopon_gatewayd",
         &[("event", "gateway_indicators_effective")],
@@ -182,26 +148,13 @@ async fn session_spans_keep_the_generation_activated_for_each_turn() {
 #[tokio::test]
 async fn unsafe_reload_refusal_and_monitor_failure_are_not_activation() {
     use dekopon_test_support::BrokerFixture;
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &config);
     let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path.clone(), candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path.clone(), candidate, BTreeMap::new());
     let old_digest = gateway.digest_for_test();
     const SENTINEL: &str = "vendor-config-secret-sentinel-397";
     config["routes"][0]["agent"] = json!(SENTINEL);
@@ -264,26 +217,13 @@ async fn unsafe_reload_refusal_and_monitor_failure_are_not_activation() {
 async fn repeated_invalid_gateway_sources_emit_once_until_edit_or_repair() {
     use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
     use dekopon_test_support::BrokerFixture;
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &config);
     let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path, candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path, candidate, BTreeMap::new());
     let active = gateway.digest_for_test();
     let (capture, _guard) = capture_spans();
     config["routes"][0]["agent"] = json!("unknown-first");
@@ -310,11 +250,7 @@ async fn repeated_invalid_gateway_sources_emit_once_until_edit_or_repair() {
             },
         }],
     );
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     let applied = capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_applied")]);
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].field("category.count"), Some("0"));
@@ -328,26 +264,13 @@ async fn repeated_invalid_gateway_sources_emit_once_until_edit_or_repair() {
 
 #[tokio::test]
 async fn rejected_budget_and_summary_model_values_stay_out_of_reload_and_boot_diagnostics() {
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &config);
     let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path.clone(), candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path.clone(), candidate, BTreeMap::new());
     const KEY: &str = "untrusted budget key sentinel";
     const MODEL: &str = "untrusted-budget-model-sentinel";
     const ROUTINE: &str = "untrusted-routine-model-sentinel";
@@ -448,26 +371,13 @@ async fn rejected_budget_and_summary_model_values_stay_out_of_reload_and_boot_di
 async fn a_monitor_outcome_does_not_mask_a_later_refusal_for_the_same_sources() {
     use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
     use dekopon_test_support::BrokerFixture;
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &config);
     let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path, candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path, candidate, BTreeMap::new());
     config["routes"][0]["steering"] = json!("boundary");
     write_config(root.path(), &config);
     let (capture, _guard) = capture_spans();
@@ -480,16 +390,8 @@ async fn a_monitor_outcome_does_not_mask_a_later_refusal_for_the_same_sources() 
         },
     };
     let mut broker = BrokerFixture::answering(root.path(), [response.clone(), response]);
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     assert_eq!(
         capture
             .events_where(
@@ -506,26 +408,13 @@ async fn a_monitor_outcome_does_not_mask_a_later_refusal_for_the_same_sources() 
 
 #[tokio::test]
 async fn twelve_invalid_budgets_render_eight_individual_reasons() {
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &config);
     let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path, candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path, candidate, BTreeMap::new());
     let budgets = (0..12)
         .map(|index| {
             (
@@ -552,26 +441,13 @@ async fn twelve_invalid_budgets_render_eight_individual_reasons() {
 
 #[tokio::test]
 async fn gateway_refusal_identifies_each_unknown_route_without_echoing_its_value() {
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &config);
     let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path, candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path, candidate, BTreeMap::new());
     let mut second = config["routes"][0].clone();
     second["agent"] = json!("unknown-second-sentinel");
     config["routes"][0]["agent"] = json!("unknown-first-sentinel");
@@ -594,12 +470,7 @@ async fn a_refused_proxy_rebuild_names_the_model_and_variable_it_lacks() {
     use dekopon_model_token_governor::Metering;
     let pki = pki();
     let tls = pki.directory.path();
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["broker"]["serverUid"] = json!(crate::current_uid());
     config["models"].as_array_mut().unwrap().push(json!({
@@ -708,12 +579,7 @@ async fn boot_never_echoes_auth_file_content() {
     let pki = pki();
     let tls = pki.directory.path();
     for (field, value, sentinel) in planted {
-        let root = temporary();
-        fs::write(
-            root.path().join("dekopon.yaml"),
-            catalog_text(true, Some("reasoning")),
-        )
-        .unwrap();
+        let root = catalog_root();
         let auth = root.path().join("auth.json");
         let mut credential = valid.clone();
         credential[field] = value;
@@ -771,12 +637,7 @@ async fn replacing_a_model_ca_at_the_same_path_activates_new_client_trust() {
     use crate::session::ModelFactory as _;
     use dekopon_broker_protocol::{BrokerResponse, GenerationOutcome, ProtocolVersion};
     use dekopon_test_support::BrokerFixture;
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let first = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
         .unwrap()
         .cert
@@ -794,15 +655,7 @@ async fn replacing_a_model_ca_at_the_same_path_activates_new_client_trust() {
     let (candidate, _) = crate::boot_candidate(&path).await.unwrap();
     let sources = gateway_sources(&candidate.config).await;
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path.clone(), candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path.clone(), candidate, BTreeMap::new());
     let original = gateway.generation_for_test();
     let before = gateway.digest_for_test();
     let original_model = original.routes.models.values().next().unwrap();
@@ -836,11 +689,7 @@ async fn replacing_a_model_ca_at_the_same_path_activates_new_client_trust() {
             },
         }],
     );
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     assert_ne!(gateway.digest_for_test(), before);
     let current = gateway.generation_for_test();
     let model = current.routes.models.values().next().unwrap();

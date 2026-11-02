@@ -230,14 +230,47 @@ pub(crate) fn temporary() -> tempfile::TempDir {
     directory
 }
 
-#[tokio::test]
-async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_snapshot() {
+pub(crate) fn catalog_root() -> tempfile::TempDir {
     let root = temporary();
     fs::write(
         root.path().join("dekopon.yaml"),
         catalog_text(true, Some("reasoning")),
     )
     .unwrap();
+    root
+}
+
+pub(crate) async fn reconcile_to_prepare(
+    gateway: &mut crate::gateway::Gateway,
+    broker: &mut dekopon_test_support::BrokerFixture,
+) {
+    gateway.reconcile().await;
+    assert!(matches!(
+        broker.request().await.request,
+        BrokerRequest::PrepareGeneration { .. }
+    ));
+}
+
+pub(crate) fn reloading_gateway(
+    runner: Arc<SessionRunner>,
+    path: PathBuf,
+    candidate: crate::Candidate,
+    drivers: BTreeMap<String, Arc<dyn ChatDriver>>,
+) -> crate::gateway::Gateway {
+    crate::gateway::Gateway::new(
+        runner,
+        Arc::new(candidate.routes.clone()),
+        Arc::new(BTreeMap::new()),
+        Arc::new(drivers),
+        Arc::new(Vec::new()),
+    )
+    .with_reload(path, candidate, "b".repeat(64))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn resident_gateway_edits_refuse_the_whole_reload_and_preserve_the_old_snapshot() {
+    let root = catalog_root();
     let path = write_config(root.path(), &document(root.path()));
     let active = config::load(&path, crate::current_uid()).await.unwrap();
     let active_routes = active_routes(&active);
@@ -284,12 +317,7 @@ async fn active_reload_ignores_unset_transport_token_but_still_checks_model_cred
     const MODEL_KEY: &str = "DEKOPON_GATEWAYD_TEST_UNSET_RELOAD_MODEL_E82C";
     assert!(std::env::var_os(BOT_TOKEN).is_none());
     assert!(std::env::var_os(MODEL_KEY).is_none());
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut config = document(root.path());
     config["transports"] = json!([{
         "name": "dev", "kind": "telegramLongPoll", "botTokenEnv": BOT_TOKEN,
@@ -1642,12 +1670,7 @@ async fn distinct_whatsapp_paths_on_one_bind_refuse_duplicate_github_mount() {
     reason = "one config fixture checks structure and boot credential outcomes"
 )]
 async fn github_config_checks_structure_before_boot_secret_and_mount() {
-    let directory = temporary();
-    fs::write(
-        directory.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let directory = catalog_root();
     let mut doc = document(directory.path());
     doc["transports"][0] = json!({"kind": "githubWebhook", "name": "github", "bind": "127.0.0.1:9080", "secretEnv": "CC07_S2_ABSENT_SECRET"});
     doc["routes"][0]["transport"] = json!("github");
@@ -1808,12 +1831,7 @@ async fn github_config_checks_structure_before_boot_secret_and_mount() {
 async fn github_first_selector_wins_before_event_filter() {
     use crate::config::GithubEvent;
     use dekopon_broker_protocol::{Conversation, ConversationKind};
-    let directory = temporary();
-    fs::write(
-        directory.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let directory = catalog_root();
     let mut doc = document(directory.path());
     doc["transports"][0] = json!({"kind": "githubWebhook", "name": "github", "bind": "127.0.0.1:9080", "secretEnv": "CC07_S2_ABSENT_SECRET"});
     let mut first = doc["routes"][0].clone();
@@ -1933,12 +1951,7 @@ async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
         BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
     };
     use dekopon_test_support::BrokerFixture;
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = probe.local_addr().unwrap();
     drop(probe);
@@ -2003,11 +2016,7 @@ async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
     );
     config["routes"][0]["githubEvents"] = json!(["pull_request", "workflow_run"]);
     write_config(root.path(), &config);
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     let added =
         take_github_delivery(&mut transport, send("run-added", "workflow_run", "REPO")).await;
     assert_eq!(
@@ -2023,11 +2032,7 @@ async fn signed_github_ingress_uses_the_published_routes_after_event_edits() {
     assert_eq!(before_remove.message_id.to_string(), "pr-before-remove");
     config["routes"][0]["githubEvents"] = json!(["workflow_run"]);
     write_config(root.path(), &config);
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     assert_eq!(
         send("pr-removed", "pull_request", "REPO").await,
         reqwest::StatusCode::OK
@@ -2106,12 +2111,7 @@ async fn authorize_github_fixture(
 )]
 async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_eviction() {
     use crate::transport::{ChatTransport, github::GithubTransport, webhook::hmac_sha256};
-    let directory = temporary();
-    fs::write(
-        directory.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let directory = catalog_root();
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = probe.local_addr().unwrap();
     drop(probe);
@@ -21332,12 +21332,7 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
             false,
         ),
     ] {
-        let root = temporary();
-        fs::write(
-            root.path().join("dekopon.yaml"),
-            catalog_text(true, Some("reasoning")),
-        )
-        .unwrap();
+        let root = catalog_root();
         let mut document = document(root.path());
         document["broker"]["serverUid"] = json!(crate::current_uid());
         let path = write_config(root.path(), &document);
@@ -21354,15 +21349,7 @@ async fn gateway_publishes_only_after_broker_confirms_the_prepared_generation() 
         let mut broker =
             BrokerFixture::answering(root.path(), [response(preparation), response(confirmation)]);
         let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-        let mut gateway = crate::gateway::Gateway::new(
-            runner,
-            Arc::new(candidate.routes.clone()),
-            Arc::new(BTreeMap::new()),
-            Arc::new(BTreeMap::new()),
-            Arc::new(Vec::new()),
-        )
-        .with_reload(path.clone(), candidate, "b".repeat(64))
-        .unwrap();
+        let mut gateway = reloading_gateway(runner, path.clone(), candidate, BTreeMap::new());
         if gateway_edit {
             document["routes"][0]["steering"] = json!("boundary");
             document["stopWords"] = json!(["halt"]);
@@ -21484,15 +21471,12 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
             now,
         );
     }
-    let mut gateway = crate::gateway::Gateway::new(
+    let mut gateway = reloading_gateway(
         Arc::clone(&runner),
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path.clone(), candidate, "b".repeat(64))
-    .unwrap();
+        path.clone(),
+        candidate,
+        BTreeMap::new(),
+    );
     let first = gateway.route_for_test(&message("first")).unwrap();
     let job_capacity = runner.jobs.free_permits();
     let owner = crate::jobs::JobOwner::of(&message("job"));
@@ -21538,11 +21522,7 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
     for (index, version) in ["next", "newer"].into_iter().enumerate() {
         document["models"][0]["model"] = json!(version);
         write_config(root.path(), &document);
-        gateway.reconcile().await;
-        assert!(matches!(
-            broker.request().await.request,
-            BrokerRequest::PrepareGeneration { .. }
-        ));
+        reconcile_to_prepare(&mut gateway, &mut broker).await;
         let selected = gateway.route_for_test(&message("after")).unwrap();
         assert!(!Arc::ptr_eq(&selected.model, &old_model));
         runner
@@ -21617,12 +21597,7 @@ async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_
         BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
     };
     use dekopon_test_support::BrokerFixture;
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let first_path = root.path().join("first-auth.json");
     let next_path = root.path().join("next-auth.json");
     let fixture = serde_json::json!({"version":1,"access":"synthetic","refresh":"synthetic","expiresAt":u64::MAX,"accountId":"synthetic"});
@@ -21673,33 +21648,21 @@ async fn two_reloads_reuse_the_credential_owner_and_a_new_auth_path_retires_the_
     let old = Arc::downgrade(&first);
     document["models"][0]["model"] = json!("second");
     write_config(root.path(), &document);
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     assert!(Arc::ptr_eq(
         &first,
         &configured.chatgpt_credential(Some(&first_path)).unwrap()
     ));
     document["routes"][0]["steering"] = json!("boundary");
     write_config(root.path(), &document);
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     assert!(Arc::ptr_eq(
         &first,
         &configured.chatgpt_credential(Some(&first_path)).unwrap()
     ));
     document["models"][0]["authFile"] = json!(next_path);
     write_config(root.path(), &document);
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     let next = configured.chatgpt_credential(Some(&next_path)).unwrap();
     assert!(!Arc::ptr_eq(&first, &next));
     drop(first);
@@ -21753,15 +21716,7 @@ async fn collected_media_never_crosses_a_removed_or_replaced_route() {
         let driver = Arc::new(RecordingDriver::default());
         let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
         drivers.insert("dev".into(), Arc::clone(&driver) as Arc<dyn ChatDriver>);
-        let gateway = crate::gateway::Gateway::new(
-            runner,
-            Arc::new(candidate.routes.clone()),
-            Arc::new(BTreeMap::new()),
-            Arc::new(drivers),
-            Arc::new(Vec::new()),
-        )
-        .with_reload(path.clone(), candidate, "b".repeat(64))
-        .unwrap();
+        let gateway = reloading_gateway(runner, path.clone(), candidate, drivers);
         let (capture, _guard) = capture_spans();
         let (tx, rx) = mpsc::channel(4);
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -21862,12 +21817,7 @@ async fn collected_media_never_crosses_a_removed_or_replaced_route() {
 
 #[tokio::test(start_paused = true)]
 async fn inbound_starts_while_reconcile_waits_for_broker_prepare() {
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
@@ -21898,15 +21848,7 @@ async fn inbound_starts_while_reconcile_waits_for_broker_prepare() {
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
     let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
     drivers.insert("dev".to_owned(), Arc::new(RecordingDriver::default()));
-    let gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(drivers),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path, candidate, "b".repeat(64))
-    .unwrap();
+    let gateway = reloading_gateway(runner, path, candidate, drivers);
     let (tx, rx) = mpsc::channel(2);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let serving = tokio::spawn(gateway.serve(
@@ -21950,12 +21892,7 @@ async fn dispatched_message_starts_on_its_captured_generation_after_route_remova
         BrokerResponse, GenerationOutcome, ProtocolVersion, ResponseEnvelope,
     };
     use dekopon_test_support::BrokerFixture;
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
@@ -21973,23 +21910,11 @@ async fn dispatched_message_starts_on_its_captured_generation_after_route_remova
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
     let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
     drivers.insert("dev".to_owned(), Arc::new(RecordingDriver::default()));
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(drivers),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path.clone(), candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path.clone(), candidate, drivers);
     let dispatched = gateway.generation_for_test();
     document["routes"][0]["conversation"]["kind"] = json!(["channel"]);
     write_config(root.path(), &document);
-    gateway.reconcile().await;
-    assert!(matches!(
-        broker.request().await.request,
-        BrokerRequest::PrepareGeneration { .. }
-    ));
+    reconcile_to_prepare(&mut gateway, &mut broker).await;
     assert!(gateway.route_for_test(&message("not routed now")).is_none());
     let mut sessions = tokio::task::JoinSet::new();
     gateway.start_with_generation_for_test(
@@ -22015,12 +21940,7 @@ async fn refused_broker_digest_is_adopted_for_next_prepare_and_publication() {
     };
     use dekopon_test_support::BrokerFixture;
 
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
@@ -22172,12 +22092,7 @@ async fn a_lost_commit_confirmation_requires_observation_before_gateway_publicat
     };
     use dekopon_test_support::BrokerFixture;
 
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     document["broker"]["serverUid"] = json!(crate::current_uid());
     let path = write_config(root.path(), &document);
@@ -22212,15 +22127,7 @@ async fn a_lost_commit_confirmation_requires_observation_before_gateway_publicat
         ))
     });
     let runner = runner(candidate.config.broker.clone(), ModelScript::forbidden(), 4);
-    let mut gateway = crate::gateway::Gateway::new(
-        runner,
-        Arc::new(candidate.routes.clone()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(BTreeMap::new()),
-        Arc::new(Vec::new()),
-    )
-    .with_reload(path.clone(), candidate, "b".repeat(64))
-    .unwrap();
+    let mut gateway = reloading_gateway(runner, path.clone(), candidate, BTreeMap::new());
     document["routes"][0]["steering"] = json!("boundary");
     write_config(root.path(), &document);
     let (capture, _guard) = capture_spans();
@@ -22297,12 +22204,7 @@ async fn changed_model_is_compared_with_active_memory_not_the_overwritten_source
         openrouter_endpoint: Some(vendor.endpoint.clone()),
         environment: probe_environment,
     };
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     document["models"]
         .as_array_mut()
@@ -22336,12 +22238,7 @@ async fn model_ca_only_changes_reprobe_otherwise_unchanged_models() {
         openrouter_endpoint: Some(vendor.endpoint.clone()),
         environment: probe_environment,
     };
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let ca = root.path().join("roots.pem");
     let generate_ca = || {
         rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
@@ -22386,12 +22283,7 @@ async fn changed_model_probe_refusal_or_outage_never_prepares_a_candidate_and_re
         openrouter_endpoint: Some(vendor.endpoint.clone()),
         environment: probe_environment,
     };
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let live_path = write_config(root.path(), &document(root.path()));
     let active = config::load(&live_path, crate::current_uid())
         .await
@@ -23562,12 +23454,7 @@ async fn a_well_formed_canary_tool_call_passes() {
 
 async fn canary_result(model: &str, passes: bool) {
     let vendor = spawn_fake_vendor();
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     document["models"] = json!([openrouter_model("router", model, 5_000)]);
     document["routes"][0]["model"] = json!("router");
@@ -23616,12 +23503,7 @@ async fn canary_result(model: &str, passes: bool) {
 #[tokio::test]
 async fn rebinding_an_unchanged_model_is_probed_but_unchanged_bindings_are_not() {
     let vendor = spawn_fake_vendor();
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     document["models"] = json!([
         openrouter_model("first", "vendor/first", 5_000),
@@ -23695,12 +23577,7 @@ async fn catalog_rebinding_uses_the_active_routes_and_refuses_the_reload() {
 #[tokio::test]
 async fn a_canary_deadline_names_the_model_and_routes() {
     let vendor = spawn_fake_vendor();
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     document["models"] = json!([openrouter_model("router", "vendor/deadline", 100)]);
     document["routes"][0]["model"] = json!("router");
@@ -23730,12 +23607,7 @@ mod lost_task;
 #[tokio::test]
 async fn a_text_only_model_passes_the_tool_canary_without_an_image() {
     let vendor = spawn_fake_vendor();
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     let mut model = openrouter_model("router", "vendor/text-only", 5_000);
     model.as_object_mut().unwrap().remove("modalities");
@@ -23756,12 +23628,7 @@ async fn a_text_only_model_passes_the_tool_canary_without_an_image() {
 #[tokio::test]
 async fn a_candidate_catalog_override_does_not_rebind_the_against_baseline() {
     let vendor = spawn_fake_vendor();
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let candidate_catalog = root.path().join("candidate-agents.yaml");
     fs::write(&candidate_catalog, catalog_text(true, Some("vision"))).unwrap();
     let mut document = document(root.path());
@@ -23800,12 +23667,7 @@ async fn a_candidate_catalog_override_does_not_rebind_the_against_baseline() {
 #[tokio::test]
 async fn an_unloadable_baseline_catalog_probes_even_when_candidate_routes_fail() {
     let vendor = spawn_fake_vendor();
-    let root = temporary();
-    fs::write(
-        root.path().join("dekopon.yaml"),
-        catalog_text(true, Some("reasoning")),
-    )
-    .unwrap();
+    let root = catalog_root();
     let mut document = document(root.path());
     document["models"] = json!([openrouter_model("router", "vendor/refused", 5_000)]);
     document["routes"][0]["model"] = json!("router");
