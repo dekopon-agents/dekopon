@@ -10380,6 +10380,27 @@ fn slack_handler(sockets: Vec<String>) -> impl Fn(&str, &str) -> Value + Send + 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_redelivered_slack_envelope_is_routed_once() {
+    let event = direct_message("u9xyz", "1700000000.000001", "hello");
+    let socket = spawn_socket_mock(vec![
+        events_envelope("envelope-1", event.clone()),
+        events_envelope("envelope-2", event),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let first = expect_message(transport.next().await.expect("the first delivery routes"));
+    assert_eq!(first.text, "hello");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), transport.next())
+            .await
+            .is_err(),
+        "a redelivery of the same message must not route a second session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_slack_envelope_is_acknowledged_before_its_session_posts_a_markdown_answer() {
     // Slack redelivers an unacknowledged event in about three seconds, far sooner than a session
     // can finish, so acknowledging after the work would guarantee duplicate replies.
