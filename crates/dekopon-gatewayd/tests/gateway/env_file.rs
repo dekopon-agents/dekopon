@@ -419,3 +419,33 @@ async fn a_model_key_follows_inherited_then_file() {
     );
     fixture.shutdown().await;
 }
+
+#[test]
+fn helper_modes_refuse_the_log_file_and_create_nothing() {
+    let directory = temporary();
+    let log = directory.path().join("gateway.log");
+    let helpers: [&[&str]; 4] = [
+        &["auth", "chatgpt", "status"],
+        &["check", "gateway.json"],
+        &["--help"],
+        &["--version"],
+    ];
+    for helper in helpers {
+        let output = finished(
+            gateway()
+                .current_dir(directory.path())
+                .arg("--log-file")
+                .arg(&log)
+                .args(helper),
+        );
+        let expected = if helper[0].starts_with("--") { 0 } else { 2 };
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{helper:?}: {}",
+            output_text(&output)
+        );
+        assert!(!log.exists(), "{helper:?}");
+    }
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+}

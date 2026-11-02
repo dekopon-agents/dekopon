@@ -361,7 +361,7 @@ async fn five_generated_base64_images_spend_their_decoded_length_against_the_mod
         Handle::current(),
         true,
     ));
-    let raw = vec![0; dekopon_model::asset::MAX_ATTACHMENT_BYTES];
+    let raw = vec![0; dekopon_core::asset::MAX_DECODED_ASSET_BYTES];
     let encoded = STANDARD.encode(&raw);
     for _ in 0..5 {
         let (descriptor, metadata) = received(encoded.as_bytes(), AssetEncoding::Base64);
@@ -1235,7 +1235,7 @@ async fn a_larger_refill_cannot_sneak_duplicate_history_images_past_the_request_
         let text_bytes = 256 * 1024;
         let mut parts = Vec::new();
         for index in 0..5 {
-            let size = dekopon_model::asset::MAX_ATTACHMENT_BYTES
+            let size = dekopon_core::asset::MAX_DECODED_ASSET_BYTES
                 - if index == 0 { text_bytes + 3 } else { 0 };
             let carried = register(&store, &access, Some(size as u64));
             drop(
@@ -1439,7 +1439,7 @@ async fn a_larger_history_refill_counts_retained_text_against_the_same_byte_budg
             _: u64,
         ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(vec![b'z'; dekopon_model::asset::MAX_ATTACHMENT_BYTES]) })
+            Box::pin(async { Ok(vec![b'z'; dekopon_core::asset::MAX_DECODED_ASSET_BYTES]) })
         }
     }
     let store = store(64 * 1024 * 1024);
@@ -1457,7 +1457,7 @@ async fn a_larger_history_refill_counts_retained_text_against_the_same_byte_budg
         let mut parts = Vec::new();
         let mut smaller = 0;
         for index in 0..5 {
-            let size = dekopon_model::asset::MAX_ATTACHMENT_BYTES - if index == 4 { text_bytes } else { 0 };
+            let size = dekopon_core::asset::MAX_DECODED_ASSET_BYTES - if index == 4 { text_bytes } else { 0 };
             let id = register(&store, &access, Some(size as u64));
             drop(store.admit(&access, id, &vec![index as u8; size]).unwrap());
             let image = session.fetch(id).unwrap();
@@ -1477,4 +1477,102 @@ async fn a_larger_history_refill_counts_retained_text_against_the_same_byte_budg
         assert_eq!(messages[1].content().unwrap().len(), text_bytes);
         assert_eq!(fetcher.0.load(Ordering::SeqCst), 1);
     }).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn documents_fetch_up_to_one_hundred_mib_while_images_keep_their_limit() {
+    use dekopon_agent::attachment::{ChatAssetRefusal, ChatAssetSource as _};
+    struct Limits(parking_lot::Mutex<Vec<u64>>);
+    impl AssetFetcher for Limits {
+        fn fetch(
+            &self,
+            source: &AssetSourceRef,
+            max_bytes: u64,
+        ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+            self.0.lock().push(max_bytes);
+            let png =
+                matches!(source, AssetSourceRef::WhatsApp { mime, .. } if mime == "image/png");
+            let bytes = if png {
+                b"\x89PNG\r\n\x1a\n".to_vec()
+            } else {
+                b"%PDF-1.7\n".to_vec()
+            };
+            Box::pin(async move { Ok(bytes) })
+        }
+    }
+    const DOCUMENT: u64 = 100 * 1024 * 1024;
+    let store = store(1 << 30);
+    let access = access("document-limit");
+    let fetcher = Arc::new(Limits(parking_lot::Mutex::new(Vec::new())));
+    let session = SessionAssets::new(
+        Arc::clone(&store),
+        access.clone(),
+        Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
+        Handle::current(),
+        true,
+    );
+    let pending = |name: &str, mime: &str, size| PendingAsset {
+        name: name.into(),
+        mime: mime.into(),
+        size: Some(size),
+        source: Some(AssetSourceRef::WhatsApp {
+            media_id: name.into(),
+            mime: mime.into(),
+        }),
+    };
+    let mut ids: Vec<u64> = store
+        .assets_for_access(
+            &access,
+            vec![
+                pending("fits.pdf", "application/pdf", DOCUMENT),
+                pending("over.pdf", "application/pdf", DOCUMENT + 1),
+                pending("photo.png", "image/png", 8),
+            ],
+            Instant::now(),
+        )
+        .inventory
+        .iter()
+        .map(|asset| asset.id)
+        .collect();
+    ids.sort_unstable();
+    let [fits, over, photo] = ids[..] else {
+        panic!("three registered assets");
+    };
+    assert!(session.resolve_input(fits).await.is_ok());
+    assert!(matches!(
+        session.resolve_input(over).await,
+        Err(ChatAssetRefusal::Unavailable)
+    ));
+    drop(session.resolve_input(photo).await);
+    assert_eq!(
+        *fetcher.0.lock(),
+        [
+            DOCUMENT,
+            dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64
+        ]
+    );
+}
+
+#[test]
+fn every_image_type_keeps_the_image_ceiling_and_other_media_get_the_document_ceiling() {
+    let image = dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64;
+    let document = dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64;
+    for mime in [
+        "image/png",
+        "image/heic",
+        "image/avif",
+        "image/svg+xml",
+        "Image/JPEG; quality=high",
+        " image/webp",
+    ] {
+        assert_eq!(byte_limit(mime), image, "{mime}");
+    }
+    for mime in [
+        "application/pdf",
+        "text/plain; charset=utf-8",
+        "video/mp4",
+        "imagefile",
+    ] {
+        assert_eq!(byte_limit(mime), document, "{mime}");
+    }
 }

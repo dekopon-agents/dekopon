@@ -105,6 +105,7 @@ async fn completed_answers_follow_completion_order_and_progress_is_not_a_transcr
             container: "cteam",
             thread: Some(root.id()),
             text: "working",
+            context: None,
             files: Vec::new(),
             publication: Publication::Progress,
         })
@@ -118,6 +119,7 @@ async fn completed_answers_follow_completion_order_and_progress_is_not_a_transcr
             container: "cteam",
             thread: Some(root.id()),
             text: "first completed",
+            context: None,
             files: Vec::new(),
             publication: Publication::Final,
         })
@@ -133,7 +135,10 @@ async fn completed_answers_follow_completion_order_and_progress_is_not_a_transcr
     assert!(server.progress(
         progress.id(),
         "second completed",
-        Progress::Finalize(Vec::new())
+        Progress::Finalize {
+            files: Vec::new(),
+            context: None
+        }
     ));
     assert_eq!(
         thread
@@ -142,13 +147,21 @@ async fn completed_answers_follow_completion_order_and_progress_is_not_a_transcr
             .id,
         progress.id()
     );
-    assert!(!server.progress(progress.id(), "duplicate", Progress::Finalize(Vec::new())));
+    assert!(!server.progress(
+        progress.id(),
+        "duplicate",
+        Progress::Finalize {
+            files: Vec::new(),
+            context: None
+        }
+    ));
     let deleted = server
         .publish(Draft {
             author: "udekopon",
             container: "cteam",
             thread: Some(root.id()),
             text: "never completed",
+            context: None,
             files: Vec::new(),
             publication: Publication::Progress,
         })

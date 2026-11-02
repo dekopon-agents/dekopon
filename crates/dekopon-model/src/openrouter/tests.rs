@@ -520,6 +520,54 @@ async fn explicit_cache_marks_the_replayed_history_end_with_the_configured_ttl_a
 }
 
 #[tokio::test]
+async fn a_changing_memory_notice_leaves_the_marked_system_prefix_byte_identical_across_turns() {
+    let server = MockServer::start(Vec::new());
+    let client = client(
+        &server,
+        Settings {
+            cache: Some(settings::Cache {
+                style: CacheStyle::ExplicitPrefix,
+                ttl: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let answer = || assistant_message(&AssistantTurn::new(Some("answer".into()), vec![], None));
+    let mut prefixes = Vec::new();
+    for (first_shown, earlier) in [(3, "turn 3"), (4, "turn 4")] {
+        let messages = [
+            ModelMessage::system("rules"),
+            ModelMessage::system("skills"),
+            ModelMessage::system(format!("Turns before record {first_shown} are not shown.")),
+            ModelMessage::user(earlier),
+            answer(),
+            ModelMessage::user("now"),
+        ];
+        let options = CompletionOptions::default()
+            .with_stable_prefix(5)
+            .with_stable_system(2);
+        let bytes = client
+            .prepare(GenerateRequest {
+                messages: &messages,
+                tools: &[],
+                options: &options,
+            })
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let messages = body["messages"].as_array().unwrap().clone();
+        let marked = messages
+            .iter()
+            .position(|message| message["content"][0].get("cache_control").is_some())
+            .unwrap();
+        assert_eq!(marked, 1);
+        prefixes.push(serde_json::to_vec(&messages[..=marked]).unwrap());
+    }
+    assert_eq!(prefixes[0], prefixes[1]);
+    assert!(server.requests().is_empty());
+}
+
+#[tokio::test]
 async fn zero_leading_system_messages_refuses_explicit_cache_before_sending() {
     let server = MockServer::start(Vec::new());
     let client = client(

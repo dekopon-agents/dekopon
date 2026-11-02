@@ -1,0 +1,1 @@
+[gateway: Dekopon runtime time reference, sampled for this task: 2026-10-31T18:40:00Z (UTC). This is a fixed sample, not a continuously advancing clock. UTC does not establish your timezone. For time-sensitive work much later, obtain a newer reading through an already-authorized clock if available; otherwise state the sample's age limitation.]

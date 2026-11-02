@@ -52,7 +52,7 @@ impl wit::Host for StoreState {
                         DownloadError::RedirectRefused => wit::ErrorCode::RedirectRefused,
                         DownloadError::RequestLimit => wit::ErrorCode::RequestLimit,
                         DownloadError::Timeout => wit::ErrorCode::Timeout,
-                        DownloadError::ResponseTooLarge => wit::ErrorCode::ResponseTooLarge,
+                        DownloadError::ResponseTooLarge(_) => wit::ErrorCode::ResponseTooLarge,
                         DownloadError::Incomplete => wit::ErrorCode::Incomplete,
                         DownloadError::Storage => wit::ErrorCode::Storage,
                         DownloadError::Internal => wit::ErrorCode::Internal,

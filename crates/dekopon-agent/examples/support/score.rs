@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expected {
+    pub research: Option<super::freshness::Expected>,
     #[serde(default)]
     all_of: Vec<String>,
     #[serde(default)]
@@ -28,6 +29,7 @@ pub struct Expected {
 pub enum Rules {
     Basic,
     Orchard,
+    Freshness,
 }
 
 pub struct Attempt<'a> {
@@ -46,6 +48,7 @@ pub struct ScriptView<'a> {
 #[serde(tag = "problem", rename_all = "kebab-case")]
 pub enum Problem {
     Fatal { kind: String },
+    Research { reason: super::freshness::Problem },
     AnswerMissing { needle: String },
     AnswerForbidden { needle: String },
     AnswerAnyOfMissing { needles: Vec<String> },
@@ -156,6 +159,7 @@ pub fn judge(rules: Rules, expected: &Expected, attempt: &Attempt<'_>) -> Vec<Pr
     let require_clean = expected.require_clean.unwrap_or(match rules {
         Rules::Basic => true,
         Rules::Orchard => false,
+        Rules::Freshness => true,
     });
     if require_clean && !attempt.scripts.iter().any(|script| script.exit_code == 0) {
         problems.push(Problem::NoCleanScript);

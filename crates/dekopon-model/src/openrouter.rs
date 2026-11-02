@@ -119,6 +119,11 @@ impl OpenRouterClient {
         if explicit.is_some() && leading == 0 {
             return Err(RequestError::CacheAnchor.into());
         }
+        let anchor = request
+            .options
+            .stable_system()
+            .filter(|stable| (1..=leading).contains(stable))
+            .unwrap_or(leading);
         let mut messages = Vec::with_capacity(request.messages.len());
         for (index, message) in request.messages.iter().enumerate() {
             if let ModelMessage::Journal { message } = message {
@@ -148,7 +153,7 @@ impl OpenRouterClient {
             } else {
                 let mut wire = WireMessage::prepare(message).await?;
                 if let Some(cache) = explicit
-                    && index + 1 == leading
+                    && index + 1 == anchor
                 {
                     wire.mark_cache(cache.ttl)?;
                 }

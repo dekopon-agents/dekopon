@@ -69,6 +69,7 @@ pub struct Message {
     pub container: String,
     pub thread: Option<String>,
     pub text: String,
+    pub context: Option<String>,
     pub mentions: Vec<String>,
     pub files: Vec<File>,
 }
@@ -271,6 +272,7 @@ impl Server {
             container,
             thread,
             text,
+            context,
             files,
             publication,
         } = draft;
@@ -309,6 +311,7 @@ impl Server {
                 container: container.into(),
                 thread: root,
                 text: text.into(),
+                context: context.map(str::to_owned),
                 mentions: mentions(text),
                 files,
             };
@@ -407,7 +410,7 @@ impl Server {
                     row.state = MessageState::Progress;
                 }
             }
-            Progress::Finalize(files) => {
+            Progress::Finalize { files, context } => {
                 let already = state
                     .messages
                     .get(&number)
@@ -423,6 +426,7 @@ impl Server {
                 if let Some(row) = state.messages.get_mut(&number) {
                     row.message.text = text.into();
                     row.message.files = files;
+                    row.message.context = context;
                     row.state = MessageState::Final(completion);
                 }
             }
@@ -437,6 +441,7 @@ pub(crate) struct Draft<'a> {
     pub container: &'a str,
     pub thread: Option<&'a str>,
     pub text: &'a str,
+    pub context: Option<&'a str>,
     pub files: Vec<File>,
     pub publication: Publication,
 }
@@ -448,7 +453,10 @@ pub(crate) enum Publication {
 pub(crate) enum Progress {
     Edit,
     Delete,
-    Finalize(Vec<File>),
+    Finalize {
+        files: Vec<File>,
+        context: Option<String>,
+    },
 }
 impl User {
     pub async fn post(&self, container: &str, text: &str) -> Result<Posted, PostError> {
@@ -466,6 +474,7 @@ impl User {
                 container,
                 thread: None,
                 text,
+                context: None,
                 files: self.server.files(files)?,
                 publication: Publication::Posted,
             })
@@ -481,6 +490,7 @@ impl User {
                 container: &posted.message.container,
                 thread: posted.message.thread.as_deref(),
                 text,
+                context: None,
                 files: Vec::new(),
                 publication: Publication::Posted,
             })

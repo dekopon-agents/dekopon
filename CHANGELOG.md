@@ -7,6 +7,76 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.82.0] - 2026-11-02
+
+### Fixed
+
+- Scripts that exceed their deadline report the deadline error instead of cancellation.
+
+## [dekopon-chart-0.69.0] - 2026-11-02
+
+### Changed
+
+- Chart 0.69.0 targets core v0.82.0 and renders the `v0.82.0` image tag.
+
+## [0.81.0] - 2026-11-01
+
+### Added
+
+- `dekopon-gatewayd` and `dekopon-brokerd` accept `--log-file` (with `--log-file-max-bytes` and `--log-file-keep`) to write their console JSON to a private, size-rotated file with a fixed disk ceiling instead of stdout.
+- dekopon-brokerd check warns unreachable-capability for a constraint set no permit policy names.
+
+### Changed
+
+- Messages addressed to the bot without a matching route are visible at the default log level.
+- A byte-limit failure names maxRequestBytes or maxResponseBytes, the granted limit and the bytes seen when refused.
+- OpenRouter models under anthropic/ with no cache block use explicitPrefix caching; cache: {style: automatic} opts out.
+
+### Fixed
+
+- The memory notice no longer moves the first prompt-cache marker, so instructions and skills stay cached across turns.
+- Chat document attachments up to 100 MiB are accepted; the limit was 8 MiB.
+
+## [dekopon-chart-0.68.0] - 2026-11-01
+
+### Changed
+
+- Chart 0.68.0 targets core v0.81.0 and renders the `v0.81.0` image tag.
+
+## [0.80.0] - 2026-11-01
+
+### Added
+
+- Proxy `meter` records for VM model calls carry `vm.session`, the jail's launch session; a missing or malformed session header records none.
+- A broker execution that launches a VM records the jail's launch session as `vm.session`, the same id its proxy `meter` records carry.
+
+### Fixed
+
+- New tasks receive a runtime-sampled UTC time reference.
+
+## [dekopon-chart-0.67.0] - 2026-11-01
+
+### Changed
+
+- Chart 0.67.0 targets core v0.80.0 and renders the `v0.80.0` image tag.
+
+## [0.79.0] - 2026-11-01
+
+### Added
+
+- A VM guest in `proxy.guests` without `models` runs on its agent's model and generation settings, charged to that agent's budget; a model the VM names is replaced.
+- Chat answers name the models used, step count and elapsed seconds in a footer line.
+
+### Deprecated
+
+- `proxy.guests.<subject>.models`; `check` and startup warn for each guest that still lists it.
+
+## [dekopon-chart-0.66.0] - 2026-11-01
+
+### Changed
+
+- Chart 0.66.0 targets core v0.79.0 and renders the `v0.79.0` image tag.
+
 ## [0.78.0] - 2026-11-01
 
 ### Changed

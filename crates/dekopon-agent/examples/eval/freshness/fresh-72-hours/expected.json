@@ -1,0 +1,9 @@
+{
+  "require_clean": true,
+  "max_scripts": 4,
+  "research": {
+    "start": "2026-10-28T18:40:00Z",
+    "end": "2026-10-31T18:40:00Z",
+    "historical": false
+  }
+}

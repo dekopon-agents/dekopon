@@ -30,7 +30,7 @@ use axum::{
     routing::post,
 };
 use bytes::Bytes;
-use dekopon_core::{AgentId, Redacted};
+use dekopon_core::{AgentId, Redacted, VM_SESSION_HEADER, VmSession};
 use dekopon_model::{
     chatgpt::{CredentialFile, RefreshClient},
     wire::{Field, PeekError, RequestPeek},
@@ -46,7 +46,6 @@ use tee::{Shape, Timing};
 
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const SUBJECT_HEADER: &str = "x-dekopon-vm-subject";
-pub const SESSION_HEADER: &str = "x-dekopon-vm-session";
 const MAX_LABEL_BYTES: usize = 128;
 pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -255,24 +254,30 @@ impl ModelProxy {
 
 struct CallSpan {
     inner: Span,
+    session: Option<VmSession>,
     usage: ModelUsage,
     settled: bool,
 }
 
 impl CallSpan {
     fn open(headers: &HeaderMap) -> Self {
+        let session = headers
+            .get(VM_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(VmSession::parse);
         Self {
             inner: tracing::info_span!(
                 target: "model",
                 "model.proxy.call",
                 vm.subject = label(headers, SUBJECT_HEADER),
-                vm.session = label(headers, SESSION_HEADER),
+                vm.session = session.as_ref().map_or("", VmSession::as_str),
                 agent = Empty,
                 model.name = Empty,
                 usage.input_tokens = Empty,
                 usage.output_tokens = Empty,
                 outcome = Empty,
             ),
+            session,
             usage: ModelUsage::default(),
             settled: false,
         }
@@ -456,7 +461,9 @@ async fn call(
             agent: grant.agent.clone(),
             model: model.name.clone(),
             backend: model.backend,
-            via: Via::Proxy,
+            via: Via::Proxy {
+                session: span.session,
+            },
         };
         let estimate = Estimate::from_sizes(
             Sizes {

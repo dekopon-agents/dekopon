@@ -373,3 +373,86 @@ fn a_file_supplied_ca_path_is_not_echoed() {
         assert!(fs::symlink_metadata(directory.path().join("broker.sock")).is_err());
     }
 }
+
+#[test]
+fn helper_modes_refuse_the_log_file_and_create_nothing() {
+    let directory = private_directory();
+    let log = directory.path().join("broker.log");
+    let helpers: [&[&str]; 5] = [
+        &["probe", "--socket", "broker.sock"],
+        &["check", "broker.json"],
+        &[
+            "provider",
+            "--lock-file",
+            "lock",
+            "--store",
+            "store",
+            "verify",
+        ],
+        &["--help"],
+        &["--version"],
+    ];
+    for helper in helpers {
+        let output = finished(
+            broker()
+                .current_dir(directory.path())
+                .arg("--log-file")
+                .arg(&log)
+                .args(helper),
+        );
+        let expected = if helper[0].starts_with("--") { 0 } else { 2 };
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{helper:?}: {}",
+            output_text(&output)
+        );
+    }
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn an_unsafe_log_directory_stops_the_broker_before_serving() {
+    let directory = private_directory();
+    let config = write_config(directory.path(), &config_document(directory.path()));
+    let shared = directory.path().join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let output = finished(
+        broker()
+            .arg("--config")
+            .arg(&config)
+            .arg("--log-file")
+            .arg(shared.join("broker.log")),
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&*shared.to_string_lossy()));
+    assert!(fs::symlink_metadata(directory.path().join("broker.sock")).is_err());
+    assert_eq!(fs::read_dir(&shared).unwrap().count(), 0);
+}
+
+#[test]
+fn a_serving_broker_writes_console_json_to_its_log_file() {
+    let directory = private_directory();
+    let config = write_config(directory.path(), &config_document(directory.path()));
+    let socket = directory.path().join("broker.sock");
+    let log = directory.path().join("broker.log");
+    let process = serving(
+        broker()
+            .arg("--config")
+            .arg(&config)
+            .arg("--log-file")
+            .arg(&log),
+        &socket,
+    );
+    assert!(terminated(process).success());
+    let metadata = fs::metadata(&log).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    let records: Vec<Value> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!records.is_empty());
+    assert!(records.iter().all(|record| record["level"].is_string()));
+}

@@ -49,6 +49,15 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(error) => return dekopon_core::render_cli_error(error, Cli::command()),
     };
+    if cli.log.log_file.is_some() {
+        match &cli.command {
+            None => {}
+            Some(cli::Command::Auth(_) | cli::Command::Check(_)) => {
+                eprintln!("dekopon-gatewayd: --log-file is accepted only when serving");
+                return ExitCode::from(2);
+            }
+        }
+    }
     if let Some(env_file) = &cli.env_file {
         match &cli.command {
             None => {}
@@ -107,10 +116,17 @@ fn main() -> ExitCode {
         eprintln!("dekopon-gatewayd: jq worker executable already supplied");
         return ExitCode::FAILURE;
     }
+    let log = match cli.log.open(dekopon_gatewayd::current_uid()).transpose() {
+        Ok(log) => log,
+        Err(error) => {
+            eprintln!("dekopon-gatewayd: {}", error_chain(&error));
+            return ExitCode::FAILURE;
+        }
+    };
     match bounded_runtime(
         builder,
         BLOCKING_EXIT_TIMEOUT,
-        serve(config, cli.shell_threads.get()),
+        serve(config, cli.shell_threads.get(), log),
     ) {
         Ok(code) => code,
         Err(error) => {
@@ -247,7 +263,11 @@ async fn run_check(check: &cli::CheckArgs) -> ExitCode {
 }
 
 #[cfg(unix)]
-async fn serve(config: &std::path::Path, shell_threads: u32) -> ExitCode {
+async fn serve(
+    config: &std::path::Path,
+    shell_threads: u32,
+    log: Option<dekopon_telemetry::LogFile>,
+) -> ExitCode {
     let settings = dekopon_gatewayd::telemetry_settings(&config, dekopon_gatewayd::current_uid())
         .await
         .ok()
@@ -264,7 +284,13 @@ async fn serve(config: &std::path::Path, shell_threads: u32) -> ExitCode {
     );
     let mut install = Install::new(Console {
         format: ConsoleFormat::Json,
-        writer: ConsoleWriter::Stdout("gw-stdout"),
+        writer: match log {
+            Some(log) => ConsoleWriter::File {
+                thread: "gw-log",
+                log,
+            },
+            None => ConsoleWriter::Stdout("gw-stdout"),
+        },
         filter: ConsoleFilter::Environment("info".to_owned()),
     });
     if let Some(provider) = tracer_provider {

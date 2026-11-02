@@ -677,11 +677,15 @@ where
             "This is a PR subscription re-review. Refresh the subscribed PR's head-pinned GitHub review using your granted tools. You may call decline_chat_reply when blocking findings are unchanged only if every capability invocation in the turn successfully refreshed the subscribed PR's review. Any other invocation, including a failed review or a review of another PR, requires a chat report even if the subscribed review was refreshed."
         )),
     }
+    let stable_system = messages.len();
     if let Some(notice) = memory_notice {
         messages.push(ModelMessage::system(notice.text()));
     }
     messages.extend_from_slice(prior);
-    let options = options.clone().with_stable_prefix(messages.len());
+    let options = options
+        .clone()
+        .with_stable_prefix(messages.len())
+        .with_stable_system(stable_system);
     messages.push(ModelMessage::user(prompt));
 
     let mut record = RecordBuilder::new(recorded.unwrap_or(prompt), model.model_key(), capture_cap);
@@ -867,6 +871,7 @@ where
     let mut skill_reads = SkillReads::default();
     let mut suggestions = Vec::new();
 
+    let mut models = Vec::new();
     let mut completed_turns = 0;
     loop {
         if completed_turns == limits.max_steps {
@@ -908,6 +913,10 @@ where
             source.prepare_request(&mut request_messages, asset_bytes.text)
         });
         let inventory = asset_request.inventory;
+        let upstream = model.model_key().upstream().to_owned();
+        if !models.contains(&upstream) {
+            models.push(upstream);
+        }
         let completion = {
             let mut on_event = |event| stream.observe(event);
             model.complete(&request_messages, &model_tools, options, &mut on_event)
@@ -1122,6 +1131,7 @@ where
             emit(
                 progress,
                 ProgressEvent::Finished {
+                    models,
                     outcome: SessionOutcome::Answered,
                     elapsed: session_started.elapsed(),
                     turns: model_turns,
@@ -1186,6 +1196,7 @@ where
                 emit(
                     progress,
                     ProgressEvent::Finished {
+                        models,
                         outcome: SessionOutcome::Declined,
                         elapsed: session_started.elapsed(),
                         turns: model_turns,
@@ -1841,21 +1852,18 @@ fn fetch_asset_into(
             return Ok(RecordedOutcome::Refused);
         }
     };
-    let text = if is_textual(&asset.mime) {
-        match asset.data.read() {
-            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+    let (text, truncated) = if is_textual(&asset.mime) {
+        match textual_asset(&asset.data) {
+            Ok(Textual::Whole(text)) => (Some(text), false),
+            Ok(Textual::Truncated(text)) => (Some(text), true),
             Err(error) => {
                 messages.push(ModelMessage::tool(call.id.clone(), error.to_string()));
                 return Ok(RecordedOutcome::Failed);
             }
         }
     } else {
-        None
+        (None, false)
     };
-    let truncated = text
-        .as_ref()
-        .is_some_and(|text| text.len() > MAX_TEXTUAL_ASSET_BYTES);
-    let text = text.map(clamp_textual_asset);
     let bytes = text.as_ref().map_or(asset.data.len(), String::len);
     if bytes > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(asset_bytes.total) {
         let reason = format!(
@@ -1913,18 +1921,29 @@ fn fetch_asset_into(
     Ok(RecordedOutcome::Exit(0))
 }
 
-fn clamp_textual_asset(mut text: String) -> String {
-    let total = text.len();
-    if total <= MAX_TEXTUAL_ASSET_BYTES {
-        return text;
+enum Textual {
+    Whole(String),
+    Truncated(String),
+}
+
+fn textual_asset(
+    data: &dekopon_model::asset::BlobReference,
+) -> Result<Textual, dekopon_model::asset::BlobError> {
+    let total = data.len();
+    let prefix = data.read_prefix(MAX_TEXTUAL_ASSET_BYTES)?;
+    let lossy = String::from_utf8_lossy(&prefix);
+    if total <= MAX_TEXTUAL_ASSET_BYTES && lossy.len() <= MAX_TEXTUAL_ASSET_BYTES {
+        return Ok(Textual::Whole(lossy.into_owned()));
     }
-    let mut end = MAX_TEXTUAL_ASSET_BYTES;
-    while !text.is_char_boundary(end) {
+    let mut end = lossy.len().min(MAX_TEXTUAL_ASSET_BYTES);
+    while !lossy.is_char_boundary(end) {
         end -= 1;
     }
-    text.truncate(end);
-    text.push_str(&format!("\n[truncated at {end} bytes of {total}]"));
-    text
+    let notice = format!("\n[truncated at {end} bytes of {}]", total.max(lossy.len()));
+    let mut text = String::with_capacity(end + notice.len());
+    text.push_str(&lossy[..end]);
+    text.push_str(&notice);
+    Ok(Textual::Truncated(text))
 }
 
 #[expect(
@@ -2178,23 +2197,31 @@ mod tests {
         MAX_TEXTUAL_ASSET_BYTES, MAX_TOOL_CALLS_PER_TURN, ModelUsageObserver, PromptError,
         PromptLimits, PromptOutcome, ReplyDisposition, ReviewProgress, SCRIPT_TOOL_DESCRIPTION,
         SCRIPT_TOOL_NAME, SKILL_TOOL_NAME, ScriptRuntime, Seal, SessionInputs, Steer, SteerSource,
-        agent_config_tool, asset_argument, format_script_outcome, reject_tool_call, run_prompt,
-        run_prompt_session, run_prompt_with_history, run_prompt_with_history_and_options,
-        script_argument, script_tool, unknown_tool_feedback,
+        Textual, agent_config_tool, asset_argument, format_script_outcome, reject_tool_call,
+        run_prompt, run_prompt_session, run_prompt_with_history,
+        run_prompt_with_history_and_options, script_argument, script_tool, textual_asset,
+        unknown_tool_feedback,
     };
 
     struct ScriptedModel {
+        models: Vec<dekopon_model::model::ModelKey>,
         turns: Mutex<VecDeque<AssistantTurn>>,
         observed_tools: Mutex<Vec<Vec<ModelTool>>>,
         observed_messages: Mutex<Vec<Vec<ModelMessage>>>,
+        observed_options: Mutex<Vec<CompletionOptions>>,
     }
 
     impl ScriptedModel {
         fn new(turns: impl IntoIterator<Item = AssistantTurn>) -> Self {
             Self {
+                models: vec![dekopon_model::model::ModelKey::new(
+                    dekopon_model::model::Backend::OpenAiCompatible,
+                    "portable",
+                )],
                 turns: Mutex::new(turns.into_iter().collect()),
                 observed_tools: Mutex::new(Vec::new()),
                 observed_messages: Mutex::new(Vec::new()),
+                observed_options: Mutex::new(Vec::new()),
             }
         }
 
@@ -2230,15 +2257,25 @@ mod tests {
     }
 
     impl ChatModel for ScriptedModel {
+        fn model_key(&self) -> dekopon_model::model::ModelKey {
+            self.models[self
+                .observed_messages
+                .lock()
+                .len()
+                .min(self.models.len() - 1)]
+            .clone()
+        }
+
         fn complete(
             &self,
             messages: &[ModelMessage],
             tools: &[ModelTool],
-            _options: &CompletionOptions,
+            options: &CompletionOptions,
             _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         ) -> Result<AssistantTurn, InferenceError> {
             self.observed_tools.lock().push(tools.to_vec());
             self.observed_messages.lock().push(messages.to_vec());
+            self.observed_options.lock().push(options.clone());
             self.turns
                 .lock()
                 .pop_front()
@@ -2246,6 +2283,38 @@ mod tests {
                     dekopon_model::error::ProtocolFailure::NoChoices,
                 ))
         }
+    }
+
+    #[test]
+    fn a_finished_turn_lists_distinct_configured_models_in_first_use_order() {
+        use dekopon_model::model::{Backend, ModelKey};
+        let mut model = ScriptedModel::new([
+            script_call("a", "true"),
+            script_call("b", "true"),
+            answer("done"),
+        ]);
+        model.models = ["model-b", "model-a", "model-b"]
+            .into_iter()
+            .map(|id| {
+                ModelKey::new(Backend::OpenAiCompatible, id)
+                    .with_reported(Some("reported-model".to_owned()))
+            })
+            .collect();
+        let (sink, progress) = recording_sink();
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("work", limits(3, 3)).with_progress(progress),
+            &[],
+        )
+        .0
+        .unwrap();
+        let events = sink.events.lock();
+        let Some(ProgressEvent::Finished { models, turns, .. }) = events.last() else {
+            panic!("the session finished");
+        };
+        assert_eq!(models, &["model-b", "model-a"]);
+        assert_eq!(*turns, 3);
     }
 
     struct RecordingRuntime {
@@ -2399,6 +2468,26 @@ mod tests {
                 (Some(3), "user".to_owned(), "msg2".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn the_memory_notice_follows_the_stable_system_prefix() {
+        let model = ScriptedModel::new([answer("one")]);
+        let notice =
+            super::MemoryNotice::new(&[super::MemoryFact::GrantBoundary], None).expect("notice");
+        run_prompt_session(
+            &model,
+            &RecordingRuntime::new(0),
+            SessionInputs::new("msg", limits(1, 1))
+                .with_system(Some("rules"))
+                .with_memory_notice(Some(&notice)),
+            &[],
+        )
+        .0
+        .expect("answered");
+        let stable = model.observed_options.lock()[0].stable_system();
+        assert_eq!(stable, Some(1));
+        assert_eq!(model.first_request()[1].content(), Some(notice.text()));
     }
 
     #[test]
@@ -5394,6 +5483,50 @@ mod tests {
         assert!(messages[0].ends_with(&trailer), "no truncation trailer");
         assert_eq!(messages[0].len(), retained + trailer.len());
         assert!(messages[0].starts_with('☃'));
+    }
+
+    #[test]
+    fn repeated_fetches_of_a_large_text_attachment_retain_only_the_textual_ceiling() {
+        struct PrefixOnly(Mutex<Vec<usize>>);
+        impl dekopon_model::asset::BlobSource for PrefixOnly {
+            fn pin(
+                &self,
+            ) -> Result<dekopon_model::asset::DiskBlob, dekopon_model::asset::BlobError>
+            {
+                panic!("a textual fetch pinned the whole document")
+            }
+            fn read(&self) -> Result<Vec<u8>, dekopon_model::asset::BlobError> {
+                panic!("a textual fetch read the whole document")
+            }
+            fn read_prefix(
+                &self,
+                limit: usize,
+            ) -> Result<Vec<u8>, dekopon_model::asset::BlobError> {
+                self.0.lock().push(limit);
+                Ok(vec![0xff; limit])
+            }
+        }
+        let source = Arc::new(PrefixOnly(Mutex::new(Vec::new())));
+        let document = dekopon_model::asset::BlobReference::new(
+            Arc::clone(&source) as Arc<dyn dekopon_model::asset::BlobSource>,
+            dekopon_model::asset::MAX_ATTACHMENT_BYTES,
+            1,
+        );
+        let retained: Vec<_> = (0..7)
+            .map(|_| match textual_asset(&document).unwrap() {
+                Textual::Truncated(text) => text,
+                Textual::Whole(_) => panic!("a 100 MiB document was not truncated"),
+            })
+            .collect();
+        for text in &retained {
+            assert!(text.len() <= text.capacity());
+            assert!(
+                text.capacity() <= MAX_TEXTUAL_ASSET_BYTES + 64,
+                "{}",
+                text.capacity()
+            );
+        }
+        assert_eq!(*source.0.lock(), [MAX_TEXTUAL_ASSET_BYTES; 7]);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::{
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 
-pub const MAX_ATTACHMENT_BYTES: usize = dekopon_core::asset::MAX_DECODED_ASSET_BYTES;
+pub const MAX_ATTACHMENT_BYTES: usize = dekopon_core::asset::MAX_DECODED_DOCUMENT_BYTES;
 pub const MAX_STORED_ATTACHMENT_BYTES: usize = MAX_ATTACHMENT_BYTES.div_ceil(3) * 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -206,8 +206,13 @@ impl DiskBlob {
     }
 
     pub fn read(&self) -> Result<Vec<u8>, BlobError> {
-        operation("read", self.len(), || {
-            let mut bytes = vec![0; self.len()];
+        self.read_prefix(self.len())
+    }
+
+    pub fn read_prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        let len = self.len().min(limit);
+        operation("read", len, || {
+            let mut bytes = vec![0; len];
             self.read_exact_at(&mut bytes, 0)?;
             Ok(bytes)
         })
@@ -218,6 +223,9 @@ pub trait BlobSource: Send + Sync {
     fn pin(&self) -> Result<DiskBlob, BlobError>;
     fn read(&self) -> Result<Vec<u8>, BlobError> {
         self.pin()?.read()
+    }
+    fn read_prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        self.pin()?.read_prefix(limit)
     }
 }
 
@@ -264,6 +272,9 @@ impl BlobReference {
                 .collect()
         });
         Ok(bytes)
+    }
+    pub fn read_prefix(&self, limit: usize) -> Result<Vec<u8>, BlobError> {
+        self.source.read_prefix(limit)
     }
     pub fn sha256(&self) -> Option<&str> {
         self.sha256.get().map(String::as_str)
@@ -418,7 +429,7 @@ mod tests {
     fn decoded_limit_matches_the_shared_contract() {
         assert_eq!(
             MAX_ATTACHMENT_BYTES,
-            dekopon_core::asset::MAX_DECODED_ASSET_BYTES
+            dekopon_core::asset::MAX_DECODED_DOCUMENT_BYTES
         );
     }
 

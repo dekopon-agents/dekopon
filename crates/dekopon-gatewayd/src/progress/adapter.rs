@@ -3,7 +3,10 @@ use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
-use dekopon_agent::{ProgressEvent, ProgressSink};
+use dekopon_agent::{ProgressEvent, ProgressSink, SessionOutcome};
+use parking_lot::Mutex;
+
+use super::Footer;
 use dekopon_model::ModelText;
 use tokio::sync::{mpsc, watch};
 
@@ -35,6 +38,7 @@ pub(crate) struct ProgressAdapter {
     turn: AtomicU32,
     notes: AtomicU32,
     counters: Arc<ProgressCounters>,
+    footer: Mutex<Option<Footer>>,
 }
 
 impl ProgressAdapter {
@@ -51,12 +55,32 @@ impl ProgressAdapter {
             turn: AtomicU32::new(NO_TURN),
             notes: AtomicU32::new(0),
             counters,
+            footer: Mutex::new(None),
         }
+    }
+}
+
+impl ProgressAdapter {
+    pub(crate) fn take_footer(&self) -> Option<Footer> {
+        self.footer.lock().take()
     }
 }
 
 impl ProgressSink for ProgressAdapter {
     fn emit(&self, event: ProgressEvent) {
+        if let ProgressEvent::Finished {
+            models,
+            outcome,
+            turns,
+            elapsed,
+            ..
+        } = &event
+        {
+            *self.footer.lock() = match outcome {
+                SessionOutcome::Answered => Some(Footer::new(models, *turns, *elapsed)),
+                SessionOutcome::Declined => None,
+            };
+        }
         if matches!(event, ProgressEvent::Note { .. })
             && self
                 .notes
@@ -227,21 +251,28 @@ pub(crate) fn record(event: &ProgressEvent) {
             "gateway.progress"
         ),
         ProgressEvent::Finished {
+            models,
             outcome,
             elapsed,
             turns,
             tool_calls,
-        } => tracing::info!(
-            target: "dekopon_gatewayd::audit",
-            {
-                audit.event = "gateway.progress",
-                kind = "finished",
-                outcome = outcome.label(),
-                elapsed_ms = elapsed.as_millis() as u64,
-                turns = *turns,
-                tool_calls = *tool_calls,
+        } => dekopon_telemetry::with_event_string_array(
+            "models",
+            &models.iter().map(String::as_str).collect::<Vec<_>>(),
+            || {
+                tracing::info!(
+                    target: "dekopon_gatewayd::audit",
+                    {
+                        audit.event = "gateway.progress",
+                        kind = "finished",
+                        outcome = outcome.label(),
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        turns = *turns,
+                        tool_calls = *tool_calls,
+                    },
+                    "gateway.progress"
+                )
             },
-            "gateway.progress"
         ),
     }
 }

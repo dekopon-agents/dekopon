@@ -266,7 +266,7 @@ pub(crate) fn error(error: dekopon_http_host::DownloadError) -> sdk::DownloadErr
             E::RedirectRefused => sdk::ErrorCode::RedirectRefused,
             E::RequestLimit => sdk::ErrorCode::RequestLimit,
             E::Timeout => sdk::ErrorCode::Timeout,
-            E::ResponseTooLarge => sdk::ErrorCode::ResponseTooLarge,
+            E::ResponseTooLarge(_) => sdk::ErrorCode::ResponseTooLarge,
             E::Incomplete => sdk::ErrorCode::Incomplete,
             E::Storage => sdk::ErrorCode::Storage,
             E::Internal => sdk::ErrorCode::Internal,

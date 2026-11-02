@@ -541,10 +541,16 @@ async fn enforces_response_bytes_while_streaming() {
         error.as_ref(),
         BrokerHostError::HostCallRejected {
             reason: dekopon_broker_host::HostCallRejection::Http(
-                dekopon_http_host::PolicyViolation::ByteLimit
+                dekopon_http_host::PolicyViolation::ByteLimit(Some(
+                    dekopon_http_host::ByteLimitExceeded {
+                        key: dekopon_http_host::ByteLimitKey::MaxResponseBytes,
+                        limit: 128,
+                        observed,
+                    }
+                ))
             ),
             ..
-        }
+        } if *observed > 128
     ));
     server.join();
 }

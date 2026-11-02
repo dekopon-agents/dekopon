@@ -69,6 +69,7 @@ pub enum ProgressEvent {
         class: FailureClass,
     },
     Finished {
+        models: Vec<String>,
         outcome: SessionOutcome,
         elapsed: Duration,
         turns: u32,

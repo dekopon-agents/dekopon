@@ -84,7 +84,7 @@ Dekopon creates no accounts or services. As an administrator:
    grace. Load the broker, wait for `dekopon-brokerd probe --socket <path>`, then the gateway. At
    boot the order is arbitrary; `KeepAlive` relaunches a gateway that found no broker.
 
-Keep the Mac awake, and bound the logs yourself; launchd doesn't.
+Keep the Mac awake, and start each daemon with `--log-file`; launchd never rotates stdout.
 
 ## Slack
 

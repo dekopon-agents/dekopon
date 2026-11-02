@@ -3237,6 +3237,7 @@ async fn telegram_call_failures_never_render_bot_tokens() {
                     .reply(
                         &answering,
                         OutboundReply {
+                            footer: None,
                             text: "a caption".to_owned(),
                             images: generated_images(1),
                         },
@@ -3800,7 +3801,7 @@ impl ModelScript {
         let messages = prompts
             .get(index)
             .unwrap_or_else(|| panic!("the model received at least {} requests", index + 1));
-        messages.iter().map(message_text).collect()
+        messages.iter().map(task_time::payload_message).collect()
     }
 }
 
@@ -4040,6 +4041,14 @@ impl ChatDriver for RecordingDriver {
         _target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        match _target {
+            ReplyTarget::GithubTrace | ReplyTarget::Local { .. } => assert!(reply.footer.is_none()),
+            ReplyTarget::Slack { .. }
+            | ReplyTarget::Fauxlack { .. }
+            | ReplyTarget::Discord { .. }
+            | ReplyTarget::Telegram { .. }
+            | ReplyTarget::WhatsApp { .. } => {}
+        }
         if let Some(kind) = self.charge_reply() {
             return Err(injected(kind));
         }
@@ -4958,7 +4967,7 @@ impl InterruptibleModel {
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
         self.prompts.lock()[index]
             .iter()
-            .map(message_text)
+            .map(task_time::payload_message)
             .collect()
     }
 
@@ -9601,7 +9610,11 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     .await;
 
     assert_eq!(
-        driver.replies(),
+        driver
+            .replies()
+            .iter()
+            .map(|reply| task_time::payload_message(&ModelMessage::user(reply)).1)
+            .collect::<Vec<_>>(),
         vec!["[gateway: unmapped participant]\nwhat broke?".to_owned()]
     );
     assert_eq!(
@@ -10064,6 +10077,154 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
     assert!(
         !path.exists(),
         "the spawned leave removes the marker after the stalled write"
+    );
+}
+
+async fn dispatch_notice(inbound: InboundMessage) -> (dekopon_test_support::CaptureLayer, usize) {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["conversation"] = json!({"kind": ["channel"], "ids": ["c0123abc"]});
+    let config = resolved(directory.path(), &document).await;
+    let routes = Arc::new(
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
+    );
+    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let runner = runner(broker, ModelScript::forbidden(), 4);
+    let identities = BTreeMap::from([(
+        "dev".to_owned(),
+        TransportIdentity {
+            user_id: Some("U0BOTBOT".to_owned()),
+            handle: None,
+        },
+    )]);
+    let drivers = BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )]);
+    let mut sessions = tokio::task::JoinSet::new();
+    let capture = {
+        let (capture, _guard) = capture_spans();
+        crate::dispatch(
+            &runner,
+            &routes,
+            &identities,
+            &drivers,
+            NO_STOP_WORDS,
+            &mut sessions,
+            &mut crate::collection::Collector::new(&[], 4),
+            &mut crate::follow::Debounce::default(),
+            inbound,
+        );
+        capture
+    };
+    let session_count = sessions.len();
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+    (capture, session_count)
+}
+
+fn unrouted_channel(text: &str) -> InboundMessage {
+    InboundMessage {
+        conversation: Conversation {
+            kind: ConversationKind::Channel,
+            container: Some("T0123ABC".to_owned()),
+            id: "c9999zzz".to_owned(),
+            thread: None,
+        },
+        ..message(text)
+    }
+}
+
+fn unrouted_info(capture: &dekopon_test_support::CaptureLayer) -> dekopon_test_support::Record {
+    let mut records =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_message_ignored")]);
+    assert_eq!(records.len(), 1, "one ignored-message record");
+    let record = records.pop().expect("ignored-message record");
+    assert!(matches!(
+        record,
+        dekopon_test_support::Record::Event { level: "INFO", .. }
+    ));
+    for (name, value) in [
+        ("reason", "unrouted"),
+        ("transport", "dev"),
+        ("message", "gateway.message.ignored"),
+    ] {
+        assert_eq!(record.field(name), Some(value), "{name}");
+    }
+    for name in [
+        "text",
+        "sender.display_name",
+        "subject",
+        "mention",
+        "direct_message",
+    ] {
+        assert_eq!(record.field(name), None, "{name}");
+    }
+    record
+}
+
+#[tokio::test]
+async fn an_unrouted_mention_emits_one_info_record_without_text() {
+    for (text, addressed) in [
+        ("<@U0BOTBOT> private message text", None),
+        ("private message text", Some(true)),
+    ] {
+        let mut inbound = unrouted_channel(text);
+        inbound.addressed = addressed;
+        let (capture, sessions) = dispatch_notice(inbound).await;
+        assert_eq!(sessions, 0);
+        let record = unrouted_info(&capture);
+        assert_eq!(record.field("conversation.kind"), Some("channel"));
+        assert_eq!(record.field("conversation.container"), Some("T0123ABC"));
+        assert_eq!(record.field("addressing_cause"), Some("mention"));
+    }
+}
+
+#[tokio::test]
+async fn an_unrouted_direct_message_emits_one_info_record_without_text() {
+    for addressed in [None, Some(true)] {
+        let mut inbound = message("private message text");
+        inbound.addressed = addressed;
+        let (capture, sessions) = dispatch_notice(inbound).await;
+        assert_eq!(sessions, 0);
+        let record = unrouted_info(&capture);
+        assert_eq!(record.field("conversation.kind"), Some("directMessage"));
+        assert_eq!(record.field("conversation.container"), Some(""));
+        assert_eq!(record.field("addressing_cause"), Some("direct_message"));
+    }
+}
+
+#[tokio::test]
+async fn an_unaddressed_unrouted_channel_message_stays_at_debug() {
+    for (text, addressed) in [
+        ("private message text", None),
+        ("<@U0BOTBOT> private message text", Some(false)),
+    ] {
+        let mut inbound = unrouted_channel(text);
+        inbound.addressed = addressed;
+        let (capture, sessions) = dispatch_notice(inbound).await;
+        assert_eq!(sessions, 0);
+        let records =
+            capture.events_where("dekopon_gatewayd", &[("event", "gateway_message_ignored")]);
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0],
+            dekopon_test_support::Record::Event { level: "DEBUG", .. }
+        ));
+        assert_eq!(records[0].field("reason"), Some("unrouted"));
+    }
+}
+
+#[tokio::test]
+async fn a_routed_mention_still_starts_a_session_without_an_ignored_record() {
+    let mut inbound = unrouted_channel("<@U0BOTBOT> private message text");
+    inbound.conversation.id = "c0123abc".to_owned();
+    let (capture, sessions) = dispatch_notice(inbound).await;
+    assert_eq!(sessions, 1);
+    assert!(
+        capture
+            .events_where("dekopon_gatewayd", &[("event", "gateway_message_ignored")])
+            .is_empty()
     );
 }
 
@@ -15593,7 +15754,7 @@ async fn a_stopped_turn_marks_its_stop_reply_delivered_as_cancelled() {
     assert_eq!(delivered[0].parent(), Some("gateway.session"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
     use opentelemetry::trace::{Status, TracerProvider as _};
     use opentelemetry_sdk::{
@@ -15642,22 +15803,7 @@ async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
     assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
     provider.force_flush().unwrap();
 
-    let spans = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            {
-                let spans = exported.0.lock();
-                if ["gateway.message", "gateway.session"]
-                    .into_iter()
-                    .all(|name| spans.iter().filter(|span| span.name == name).count() >= 2)
-                {
-                    break spans.clone();
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("two gateway.message and two gateway.session spans are exported");
+    let spans = exported.0.lock().clone();
     let statuses = spans
         .iter()
         .filter(|span| span.name == "gateway.message")
@@ -17433,7 +17579,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             assert_eq!(
                 requests.len(),
                 8,
-                "one inbound fetch reused by model and provider, then three uploads/sends"
+                "one inbound fetch reused by model and provider, then three uploads and captioned image sends"
             );
             for edit in 0..3 {
                 assert!(
@@ -17444,7 +17590,18 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
                 );
                 let sent: Value =
                     serde_json::from_slice(&requests[edit * 2 + 3].body).expect("image send");
-                assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
+                let text = sent["image"]["caption"].as_str().unwrap();
+                let seconds = text
+                    .strip_prefix("Edited image.\n\n_portable · 4 steps · ")
+                    .unwrap()
+                    .strip_suffix(" s_")
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap();
+                assert_eq!(
+                    sent["image"],
+                    json!({"id":"987","caption":format!("Edited image.\n\n_portable · 4 steps · {seconds} s_")})
+                );
             }
         }
         peer.finish().await;
@@ -17629,17 +17786,17 @@ async fn a_whatsapp_pdf_fetch_refusal_tells_the_model_its_cause_and_sends_no_fil
         MediaPeer, PDF, admitted, bytes_reply, document_webhook, json_reply, metadata,
     };
     use axum::{http::StatusCode, response::IntoResponse as _};
-    const LIMIT: usize = 8 * 1024 * 1024;
+    const LIMIT: usize = dekopon_model::asset::MAX_ATTACHMENT_BYTES;
     for (case, requests, expected) in [
         (
             "advertised",
             1,
-            "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read.",
+            "chat-asset:1 is 100.0 MB which is over the 100.0 MB the gateway will read.",
         ),
         (
             "streamed",
             2,
-            "chat-asset:1 is 8.0 MB which is over the 8.0 MB the gateway will read.",
+            "chat-asset:1 is 100.0 MB which is over the 100.0 MB the gateway will read.",
         ),
         (
             "signature",
@@ -18798,6 +18955,8 @@ mod steering;
 #[path = "tests/steering_e2e.rs"]
 mod steering_e2e;
 mod subscriptions;
+#[path = "tests/task_time.rs"]
+mod task_time;
 mod wake_reason;
 #[path = "tests/wakes.rs"]
 mod wakes;
@@ -24528,3 +24687,6 @@ pub(super) async fn native_join<F: std::future::Future>(join: F) -> F::Output {
 
 #[path = "tests/digests.rs"]
 mod digests;
+
+#[path = "tests/footer.rs"]
+mod footer;

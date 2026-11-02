@@ -1297,6 +1297,7 @@ fn answered_with_tool(turn: u32) -> ProgressEvent {
 
 fn finished() -> ProgressEvent {
     ProgressEvent::Finished {
+        models: vec!["model-a".to_owned()],
         outcome: SessionOutcome::Answered,
         elapsed: Duration::from_millis(900),
         turns: 1,
@@ -2721,4 +2722,68 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
             }
         }
     }
+}
+
+#[test]
+fn a_finished_footer_survives_a_full_progress_queue() {
+    let (adapter, _events, counters) = note_adapter();
+    for _ in 0..EVENT_QUEUE {
+        adapter.emit(started());
+    }
+    adapter.emit(finished());
+    assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        adapter.take_footer().unwrap().line(),
+        "model-a · 1 step · 1 s"
+    );
+    assert!(adapter.take_footer().is_none());
+}
+
+#[test]
+fn cancelled_failed_and_declined_turns_have_no_footer() {
+    for event in [
+        ProgressEvent::Cancelled {
+            by: CancelSource::Operator,
+        },
+        ProgressEvent::Failed {
+            class: dekopon_agent::FailureClass::Model,
+        },
+        ProgressEvent::Finished {
+            models: vec!["model".into()],
+            outcome: SessionOutcome::Declined,
+            elapsed: Duration::ZERO,
+            turns: 1,
+            tool_calls: 0,
+        },
+    ] {
+        let (adapter, _events, _) = note_adapter();
+        adapter.emit(event);
+        assert!(adapter.take_footer().is_none());
+    }
+}
+
+#[test]
+fn a_finished_audit_record_carries_a_scoped_structured_model_list() {
+    use tracing_subscriber::prelude::*;
+    #[derive(Clone, Default)]
+    struct Arrays(Arc<Mutex<Vec<Option<Vec<String>>>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Arrays {
+        fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            self.0.lock().push(
+                opentelemetry::Context::current()
+                    .get::<dekopon_telemetry::EventStringArray>()
+                    .map(|array| {
+                        assert_eq!(array.name, "models");
+                        array.values.clone()
+                    }),
+            );
+        }
+    }
+    let arrays = Arrays::default();
+    let _guard = tracing_subscriber::registry()
+        .with(arrays.clone())
+        .set_default();
+    super::adapter::record(&finished());
+    super::adapter::record(&started());
+    assert_eq!(*arrays.0.lock(), [Some(vec!["model-a".to_owned()]), None]);
 }
