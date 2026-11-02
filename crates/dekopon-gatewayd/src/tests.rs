@@ -81,7 +81,7 @@ impl<'a> Dispatcher<'a> {
 
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
     fs,
     ops::ControlFlow,
@@ -8876,6 +8876,46 @@ fn routed(transport: &str, kind: ConversationKind, id: &str) -> InboundMessage {
 
 fn secret(byte: u8) -> CacheKeySecret {
     CacheKeySecret::from_bytes([byte; 32])
+}
+
+#[test]
+fn a_different_secret_conversation_agent_transport_or_audience_names_a_different_cache_key() {
+    let agent: AgentId = "reviewer".parse().expect("valid agent fixture");
+    let other_agent: AgentId = "helper".parse().expect("valid agent fixture");
+    let subject: Subject = SUBJECT.parse().expect("canonical subject fixture");
+    let base = ConversationKey::private(&agent, "dev", "c0123abc", &subject);
+    let mut keys = [
+        ConversationKey::private(&agent, "dev", "c0123abd", &subject),
+        ConversationKey::private(&other_agent, "dev", "c0123abc", &subject),
+        ConversationKey::private(&agent, "dev-other", "c0123abc", &subject),
+        ConversationKey::private(
+            &agent,
+            "dev",
+            "c0123abc",
+            &"drn:tel:number::16035550100"
+                .parse()
+                .expect("canonical subject fixture"),
+        ),
+        ConversationKey::shared(&agent, "dev", "c0123abc"),
+    ]
+    .iter()
+    .map(|key| secret(7).for_conversation(key))
+    .collect::<BTreeSet<_>>();
+    keys.insert(secret(7).for_conversation(&base));
+    keys.insert(secret(8).for_conversation(&base));
+    assert_eq!(keys.len(), 7);
+
+    let routes = [
+        secret(7).for_route(&agent, "dev", 0),
+        secret(8).for_route(&agent, "dev", 0),
+        secret(7).for_route(&agent, "dev", 1),
+        secret(7).for_route(&other_agent, "dev", 0),
+        secret(7).for_route(&agent, "dev-other", 0),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(routes.len(), 5);
+    assert!(routes.is_disjoint(&keys));
 }
 
 #[test]
