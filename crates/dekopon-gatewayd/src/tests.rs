@@ -5128,15 +5128,8 @@ impl ChatModel for BlockedHandle {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, mut observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Everything looks fine.")]);
     let driver = Arc::new(RecordingDriver::default());
 
@@ -5325,15 +5318,7 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_call_to_generate_image_is_now_an_unknown_tool() {
     let directory = temporary();
-    let (broker, _) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([generate_image("a cheerful watercolor kitten")]);
     let driver = Arc::new(RecordingDriver::default());
 
@@ -5902,15 +5887,8 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
 #[tokio::test(flavor = "multi_thread")]
 async fn authorized_work_publishes_status_until_after_the_durable_reply() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let model = BlockedModel::new("All good.");
     let driver = Arc::new(RecordingDriver::default().with_status());
     let runner = runner_with(
@@ -5949,15 +5927,8 @@ async fn authorized_work_publishes_status_until_after_the_durable_reply() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_cosmetic_call_cannot_hold_the_answer_and_cleanup_follows_it() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let model = BlockedModel::new("not delayed");
     let driver = Arc::new(DelayedStatusDriver::default());
     let runner = runner_with(
@@ -6024,15 +5995,7 @@ async fn working_reaction_is_additive_or_fallback_and_cleanup_is_turn_local() {
         (WorkingReaction::Auto, true, true, true, false, false),
     ] {
         let directory = temporary();
-        let (broker, _) = stub_broker(
-            directory.path(),
-            vec![ResponseEnvelope::capabilities(
-                vec![capability("cli-probe.upper")],
-                Vec::new(),
-                BTreeMap::new(),
-            )],
-        )
-        .await;
+        let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
         let mut driver = RecordingDriver::default().with_reaction();
         if status {
             driver = driver.with_status();
@@ -6167,15 +6130,7 @@ async fn a_failed_working_reaction_is_cleared_without_losing_the_reply() {
 
     let (capture, _guard) = capture_spans();
     let directory = temporary();
-    let (broker, _) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let driver = Arc::new(
         RecordingDriver::default()
             .with_reaction()
@@ -6256,15 +6211,7 @@ async fn steer_seen_targets_only_the_second_authenticated_inbound_on_supported_d
 
     for transport in ["slack", "discord", "whatsapp"] {
         let directory = temporary();
-        let (broker, _) = stub_broker(
-            directory.path(),
-            vec![ResponseEnvelope::capabilities(
-                vec![capability("cli-probe.upper")],
-                Vec::new(),
-                BTreeMap::new(),
-            )],
-        )
-        .await;
+        let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
         let model = BlockedModel::new("final answer");
         let runner = runner_with(
             broker,
@@ -6666,15 +6613,8 @@ async fn a_bound_route_carries_the_skills_its_agent_mounts() {
 async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
     let directory = temporary();
     let skill = mounted_skill(directory.path(), "counting");
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([
         read_skill("counting"),
         inspect_agent_config(),
@@ -6732,15 +6672,8 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_suggestion_tool_is_offered_on_every_route() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([suggest_improvement(), answer("Noted.")]);
     let driver = Arc::new(RecordingDriver::default());
     let route = route(model_config());
@@ -6789,15 +6722,8 @@ async fn a_leftover_improvement_suggestions_key_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_with_no_assets_keeps_the_fetch_tool_on_every_turn_and_refuses_the_call() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([
         AssistantTurn::new(
             None,
@@ -6850,15 +6776,8 @@ async fn a_session_with_no_assets_keeps_the_fetch_tool_on_every_turn_and_refuses
 #[tokio::test(flavor = "multi_thread")]
 async fn an_authorized_agent_can_inspect_its_credential_free_effective_configuration() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, mut observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([
         inspect_agent_config(),
         answer("I have prepared the configuration table."),
@@ -6942,15 +6861,8 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_scope_is_visible_in_effective_configuration_without_identity() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([inspect_agent_config(), answer("Configured.")]);
     let driver = Arc::new(RecordingDriver::default());
 
@@ -6985,15 +6897,8 @@ async fn shared_scope_is_visible_in_effective_configuration_without_identity() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_delivers_the_model_answer() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Done.")]);
     let driver = Arc::new(RecordingDriver::default());
     run_session(
@@ -7498,15 +7403,8 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
     // A prompt error can carry model text, a provider message, or a transport diagnostic; none of
     // those may ever reach chat as the reply.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([]);
     let driver = Arc::new(RecordingDriver::default());
 
@@ -7547,15 +7445,8 @@ async fn an_unreachable_broker_fails_the_session_without_reaching_a_model() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_failure_template_is_bounded_before_delivery() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, models, 4);
@@ -7594,15 +7485,8 @@ async fn an_oversized_failure_template_is_bounded_before_delivery() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let long = format!("BEGIN{}END", "y".repeat(MAX_OUTBOUND_TEXT_BYTES * 2));
     let models = ModelScript::new([answer(&long)]);
     let driver = Arc::new(RecordingDriver::default());
@@ -10984,15 +10868,8 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
     let mut transport = slack(&http.base);
     transport.connect().await.expect("slack transport connects");
 
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let model = BlockedModel::new("All good.");
     let driver = transport.driver();
     let message = expect_message(
@@ -12405,15 +12282,8 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     let mut transport = slack(&http.base);
     transport.connect().await.expect("slack transport connects");
 
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let answer_text = "**Puñeta** is *vulgar*.\n\n| a | b |\n|---|---|\n| 1 | 2 |";
     let models = ModelScript::new([answer(answer_text)]);
     let driver = transport.driver();
@@ -12475,15 +12345,8 @@ async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
         }).await.expect("stand-in finishes within ten seconds")
     });
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("answer-payload-sentinel")]);
     let mut inbound = message("question-payload-sentinel");
     inbound.reply = ReplyTarget::Slack {
@@ -15563,15 +15426,8 @@ async fn whatsapp_upload_and_send_spans_remain_children_of_the_message() {
 
 async fn answer_once(message: InboundMessage) {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     run_session(
         runner(broker, ModelScript::new([answer("answered")]), 4),
         route(model_config()),
@@ -15783,15 +15639,8 @@ async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
 
     answer_once(message("answer this")).await;
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let driver = Arc::new(RecordingDriver::default());
     run_session(
         runner(broker, ModelScript::new([]), 4),
@@ -16094,15 +15943,8 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
     let directory = temporary();
     let config = resolved(directory.path(), &document(directory.path())).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Collected answer.")]);
     let runner = runner(broker, Arc::clone(&models), 4);
     let driver = Arc::new(RecordingDriver::default());
@@ -16687,15 +16529,8 @@ async fn a_session_parked_on_its_capability_listing_is_stoppable_before_its_gran
 async fn every_origin_stops_a_session_before_its_first_model_turn() {
     for origin in CancelOrigin::EVERY {
         let directory = temporary();
-        let (broker, _observed) = stub_broker(
-            directory.path(),
-            vec![ResponseEnvelope::capabilities(
-                vec![capability("cli-probe.upper")],
-                Vec::new(),
-                BTreeMap::new(),
-            )],
-        )
-        .await;
+        let (broker, _observed) =
+            stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
         let models = ParkedBuild::new();
         let driver = Arc::new(RecordingDriver::default().with_status());
         let runner = runner_with(
@@ -16738,15 +16573,8 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let first_delta = dekopon_model::events_from_transcript(
         dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
         dekopon_model::TranscriptDialect::ChatCompletions,
@@ -16836,15 +16664,8 @@ async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
 async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
     for origin in CancelOrigin::EVERY {
         let directory = temporary();
-        let (broker, _observed) = stub_broker(
-            directory.path(),
-            vec![ResponseEnvelope::capabilities(
-                vec![capability("cli-probe.upper")],
-                Vec::new(),
-                BTreeMap::new(),
-            )],
-        )
-        .await;
+        let (broker, _observed) =
+            stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
         let model = Arc::new(
             dekopon_test_support::ScriptedStreamModel::from_transcript(
                 dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
@@ -17001,15 +16822,8 @@ async fn wall_clock_stops_after(
 async fn a_steer_keeps_the_original_wall_clock_deadline() {
     let (capture, _guard) = capture_spans();
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let model = Arc::new(dekopon_test_support::ScriptedStreamModel::parked(
         answer("too late"),
         Duration::from_secs(30),
@@ -17137,15 +16951,8 @@ async fn a_follow_up_after_a_wall_clock_stop_gets_its_full_budget() {
 async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
     for origin in CancelOrigin::EVERY {
         let directory = temporary();
-        let (broker, _observed) = stub_broker(
-            directory.path(),
-            vec![ResponseEnvelope::capabilities(
-                vec![capability("cli-probe.upper")],
-                Vec::new(),
-                BTreeMap::new(),
-            )],
-        )
-        .await;
+        let (broker, _observed) =
+            stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
         let driver = Arc::new(ParkedReplyDriver::default());
         let runner = runner(broker, ModelScript::new([answer("the real answer")]), 4);
         let session = tokio::spawn(run_session(
@@ -17193,15 +17000,8 @@ async fn wait_for_delivery(driver: &ParkedReplyDriver) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn another_subjects_press_is_acknowledged_and_ignored() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let model = BlockedModel::new("the answer stands");
     let driver = Arc::new(RecordingDriver::default().with_cancel_button());
     let runner = runner_with(
@@ -17258,15 +17058,8 @@ async fn another_subjects_press_is_acknowledged_and_ignored() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let model = BlockedModel::new("stale answer");
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner_with(
@@ -17369,15 +17162,8 @@ async fn the_route_table_matches_on_kind_container_id_and_subjects_in_declaratio
 #[tokio::test(flavor = "multi_thread")]
 async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Nothing to show.")]);
     let driver = Arc::new(RecordingDriver::default());
     let route = crate::routes::BoundRoute {
@@ -17829,15 +17615,8 @@ async fn a_whatsapp_pdf_fetch_refusal_tells_the_model_its_cause_and_sends_no_fil
         let document = json!({"id":"789", "mime_type":"application/pdf", "caption":"Total?"});
         let (transport, upload) = admitted(&peer.origin, &document_webhook(document)).await;
         let directory = temporary();
-        let (broker, _observed) = stub_broker(
-            directory.path(),
-            vec![ResponseEnvelope::capabilities(
-                vec![capability("cli-probe.upper")],
-                Vec::new(),
-                BTreeMap::new(),
-            )],
-        )
-        .await;
+        let (broker, _observed) =
+            stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
         let models = ModelScript::new([fetch_asset_call(1), answer("I could not read it.")]);
         let mut runner = runner(broker, Arc::clone(&models), 4);
         Arc::get_mut(&mut runner)
@@ -18077,15 +17856,8 @@ fn whatsapp_debounce_is_unsigned_strict_and_defaults_to_five_seconds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_turn() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, mut observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Edited together.")]);
     let driver = Arc::new(RecordingDriver::default());
     let mut collector = burst_collector(None);
@@ -18188,15 +17960,8 @@ async fn photo_burst_serve_flushes_after_quiet_interval_with_one_lead_reply() {
     doc["models"][0]["modalities"] = json!(["image"]);
     let config = resolved(directory.path(), &doc).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
-    let (broker, _observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("One answer.")]);
     let driver = Arc::new(RecordingDriver::default());
     let drivers = Arc::new(BTreeMap::from([(
@@ -18320,15 +18085,8 @@ async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stop
         let config = resolved(directory.path(), &document(directory.path())).await;
         let routes =
             Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
-        let (broker, _observed) = stub_broker(
-            directory.path(),
-            vec![ResponseEnvelope::capabilities(
-                vec![capability("cli-probe.upper")],
-                Vec::new(),
-                BTreeMap::new(),
-            )],
-        )
-        .await;
+        let (broker, _observed) =
+            stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
         let model = BlockedModel::new("the earlier answer");
         let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 4);
         let earlier = Arc::new(ParkedReplyDriver::default());
@@ -22545,15 +22303,7 @@ async fn only_a_model_absent_from_or_different_in_the_live_config_is_probed() {
 async fn an_agent_over_its_budget_replies_with_the_refusal_sentence() {
     let (capture, _guard) = capture_spans();
     let directory = temporary();
-    let (broker, _) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("never asked")]);
     let driver = Arc::new(RecordingDriver::default());
 
@@ -22593,15 +22343,7 @@ async fn an_agent_over_its_budget_replies_with_the_refusal_sentence() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_agent_without_a_budget_is_never_refused() {
     let directory = temporary();
-    let (broker, _) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, _) = stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("hi there")]);
     let driver = Arc::new(RecordingDriver::default());
 
