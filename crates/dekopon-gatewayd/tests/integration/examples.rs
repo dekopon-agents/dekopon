@@ -138,12 +138,14 @@ fn both_slack_manifests_receive_follow_events_while_only_agent_enables_agent_ui(
     assert!(agent_scopes.iter().any(|scope| scope == "channels:history"));
     assert!(agent_scopes.iter().any(|scope| scope == "groups:history"));
     assert!(agent_scopes.iter().any(|scope| scope == "reactions:write"));
+    assert!(agent_scopes.iter().any(|scope| scope == "mpim:history"));
     assert!(
         classic_scopes
             .iter()
             .any(|scope| matches!(scope.as_str(), "channels:history" | "groups:history"))
     );
     for manifest in [&classic, &agent] {
+        assert_eq!(manifest["settings"]["interactivity"]["is_enabled"], true);
         let scopes = scopes(manifest);
         for required in [
             "channels:history",
@@ -169,6 +171,11 @@ fn both_slack_manifests_receive_follow_events_while_only_agent_enables_agent_ui(
     let agent_events = agent["settings"]["event_subscriptions"]["bot_events"]
         .as_sequence()
         .expect("Agent events are a sequence");
+    assert!(
+        agent_events
+            .iter()
+            .any(|event| event.as_str() == Some("message.mpim"))
+    );
     assert!(
         agent_events
             .iter()
