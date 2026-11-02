@@ -28,10 +28,9 @@ misspelled agent loads and matches nothing.
 
 The gateway relays who the chat service said someone is. The broker authenticates the gateway by its
 Unix peer UID; a peer the owner gave an attestor grant may attach an attestation to a request: a
-canonical subject such as `slack.t0123abc.u9xyz`, the agent answering and the chat scope. The broker
-checks that the subject lies inside the namespaces the grant allows, then maps it to a principal
-through the owner's subject map (`crates/dekopon-brokerd/src/config.rs`). An unmapped subject
-resolves to nothing.
+subject such as `drn:slack:user:t0123abc:u9xyz`, the agent answering and the chat scope. The broker
+checks that the grant covers every form, then maps them to one principal through the subject map
+(`crates/dekopon-brokerd/src/config.rs`).
 
 Policy sees the attestor's principal as `context.via` and the agent as `context.agent`, and every
 action requires both. A direct peer has no `via`, so its request fails Cedar's schema check: every

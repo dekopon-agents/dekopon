@@ -311,7 +311,7 @@ mod tests {
         std::fs::write(&component, std::fs::read(wasm).unwrap()).unwrap();
         std::fs::write(&policy, r#"@id("console-agent") permit(principal == Dekopon::Principal::"maintainer", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"reviewer") when { context.via == "dekopon-console" };
 @id("console-read") permit(principal == Dekopon::Principal::"maintainer", action == Dekopon::Action::"cli-probe.upper", resource == Dekopon::Provider::"cli-probe") when { context.via == "dekopon-console" && context.agent == "reviewer" };"#).unwrap();
-        std::fs::write(&config, format!("apiVersion: dekopon.dev/brokerd/v1alpha1\nsocketPath: {}\npoliciesPath: {}\nproviders: [{}]\nidentities:\n  - uid: {}\n    principal: dekopon-console\n    attestor:\n      namespaces: [slack.t0123abc]\nprincipals:\n  maintainer:\n    subjects: [slack.t0123abc.u9xyz]\ncapabilities:\n  cli-probe:\n    capabilities:\n      cli-probe.upper:\n        constraints: {{timeoutMs: 30000}}\n", socket.display(), policy.display(), component.display(), rustix::process::geteuid().as_raw())).unwrap();
+        std::fs::write(&config, format!("apiVersion: dekopon.dev/brokerd/v1alpha1\nsocketPath: {}\npoliciesPath: {}\nproviders: [{}]\nidentities:\n  - uid: {}\n    principal: dekopon-console\n    attestor:\n      namespaces: [drn:slack:*:t0123abc:*]\nprincipals:\n  maintainer:\n    subjects: [drn:slack:user:t0123abc:u9xyz]\ncapabilities:\n  cli-probe:\n    capabilities:\n      cli-probe.upper:\n        constraints: {{timeoutMs: 30000}}\n", socket.display(), policy.display(), component.display(), rustix::process::geteuid().as_raw())).unwrap();
         for path in [&component, &policy, &config] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
@@ -343,7 +343,7 @@ mod tests {
             return;
         };
         let socket = fixture.dir.path().join("broker.sock");
-        let subject = "slack.t0123abc.u9xyz".parse().unwrap();
+        let subject = "drn:slack:user:t0123abc:u9xyz".parse().unwrap();
         let mut options = ConsoleOptions::new(
             subject,
             "unused".into(),
@@ -366,7 +366,7 @@ mod tests {
         };
         let app = App::new(
             vec![agent],
-            "slack.t0123abc.u9xyz".into(),
+            "drn:slack:user:t0123abc:u9xyz".into(),
             socket.display().to_string(),
             "none".into(),
         );
@@ -419,7 +419,7 @@ mod tests {
                 panic!("broker fixture required for child");
             };
             let socket = fixture.dir.path().join("broker.sock");
-            let subject = "slack.t0123abc.u9xyz".parse().unwrap();
+            let subject = "drn:slack:user:t0123abc:u9xyz".parse().unwrap();
             let mut options = ConsoleOptions::new(
                 subject,
                 "unused".into(),
@@ -442,7 +442,7 @@ mod tests {
             };
             let app = App::new(
                 vec![agent],
-                "slack.t0123abc.u9xyz".into(),
+                "drn:slack:user:t0123abc:u9xyz".into(),
                 socket.display().to_string(),
                 "none".into(),
             );

@@ -111,7 +111,7 @@ mod tests {
             StorageAccess::ReadWrite,
             StorageScope::Agent,
             "assistant".parse().unwrap(),
-            dekopon_core::ExternalSubject::slack("T123", "U123").unwrap(),
+            dekopon_core::Subject::slack_user("T123", "U123").unwrap(),
             "slack",
             "work",
             "c123",

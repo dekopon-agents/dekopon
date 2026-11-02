@@ -50,7 +50,7 @@ fn console() -> App {
     };
     App::new(
         vec![agent],
-        "slack.t0123abc.u9xyz".to_owned(),
+        "drn:slack:user:t0123abc:u9xyz".to_owned(),
         "/run/dekopon/broker.sock".to_owned(),
         "/config/dekopon/chatgpt-auth.console.json".to_owned(),
     )
@@ -113,7 +113,7 @@ fn cancelled_running_event_loop_restores_pty_after_join() {
             app.busy = true;
             app.transcript.open("in flight".into());
             let mut options = ConsoleOptions::new(
-                "slack.t0123abc.u9xyz".parse().unwrap(),
+                "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
                 "unused".into(),
                 dekopon_test_support::shell_threads(),
             );
@@ -541,8 +541,8 @@ fn cancellation_does_not_erase_an_effect_the_broker_already_accepted() {
 
 #[tokio::test]
 async fn switching_profiles_clears_the_model_replay_and_visible_history() {
-    let first = "slack.t0123abc.u9xyz".parse().unwrap();
-    let second = "slack.t0123abc.u8xyz".parse().unwrap();
+    let first = "drn:slack:user:t0123abc:u9xyz".parse().unwrap();
+    let second = "drn:slack:user:t0123abc:u8xyz".parse().unwrap();
     let mut options = ConsoleOptions::new(
         first,
         "test-model".into(),
@@ -593,7 +593,7 @@ async fn switching_profiles_clears_the_model_replay_and_visible_history() {
     )
     .await;
     assert_eq!(app.profile.as_deref(), Some("second"));
-    assert_eq!(app.subject, "slack.t0123abc.u8xyz");
+    assert_eq!(app.subject, "drn:slack:user:t0123abc:u8xyz");
     assert_eq!(app.model_source, crate::session::ModelSource::Default);
     assert_eq!(app.model, crate::session::DEFAULT_MODEL);
     assert!(
@@ -657,7 +657,7 @@ fn composing_is_only_offered_where_there_is_something_to_type_into() {
 async fn profile_switches_preserve_cli_override_and_update_model_provenance() {
     use crate::session::{DEFAULT_MODEL, ModelSource};
     let mut options = ConsoleOptions::new(
-        "slack.t0123abc.u9xyz".parse().unwrap(),
+        "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
         DEFAULT_MODEL.into(),
         dekopon_test_support::shell_threads(),
     );
@@ -866,14 +866,14 @@ async fn a_refused_hop_opens_the_broker_refusal_in_full() {
         &report,
         &[
             "open broker session failed",
-            "subject: slack.t0123abc.u9xyz",
+            "subject: drn:slack:user:t0123abc:u9xyz",
             "agent: ville-github",
             "scope: subject-only",
             "error: could not open a broker session for this subject and agent: broker returned \
              unauthenticated: attestation refused: no attestor authority for this subject",
             "broker refusal code: unauthenticated",
             "broker refusal message: attestation refused: no attestor authority for this subject",
-            "event=broker_capabilities_refused, subject=slack.t0123abc.u9xyz, agent=ville-github",
+            "event=broker_capabilities_refused, subject=drn:slack:user:t0123abc:u9xyz, agent=ville-github",
         ],
     );
     assert_contains_all(
@@ -955,7 +955,7 @@ async fn an_empty_surface_says_what_the_broker_accepted() {
             "error: broker grants no capabilities for this context",
             "permitted agent.prompt",
             "context.agent == \"ville-github\"",
-            "subject: slack.t0123abc.u9xyz",
+            "subject: drn:slack:user:t0123abc:u9xyz",
         ],
     );
 }
@@ -993,7 +993,7 @@ async fn smoke_record_uses_existing_frame_and_binds_invocation() {
     });
     let result = crate::session::smoke_record(
         &client,
-        "slack.t0123abc.u9xyz".parse().unwrap(),
+        "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
         "ville-github".parse().unwrap(),
         "marker".into(),
     )
@@ -1001,7 +1001,7 @@ async fn smoke_record_uses_existing_frame_and_binds_invocation() {
     assert!(result.is_err());
     let second = crate::session::smoke_record(
         &client,
-        "slack.t0123abc.u9xyz".parse().unwrap(),
+        "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
         "ville-github".parse().unwrap(),
         "second".into(),
     )

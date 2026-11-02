@@ -44,7 +44,7 @@ use std::{
 };
 
 use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
-use dekopon_core::{AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId};
+use dekopon_core::{AgentId, CapabilityId, InvocationId, ProviderId, Subject};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -116,7 +116,7 @@ pub struct StorageGrantRequest {
     access: StorageAccess,
     scope: StorageScope,
     agent: AgentId,
-    subject: ExternalSubject,
+    subject: Subject,
     transport_kind: String,
     transport: String,
     channel: String,
@@ -146,7 +146,7 @@ impl StorageGrantRequest {
         access: StorageAccess,
         scope: StorageScope,
         agent: AgentId,
-        subject: ExternalSubject,
+        subject: Subject,
         transport_kind: impl Into<String>,
         transport: impl Into<String>,
         channel: impl Into<String>,

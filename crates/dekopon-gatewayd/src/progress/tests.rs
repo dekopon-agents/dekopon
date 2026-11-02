@@ -2604,7 +2604,7 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
                 .write_all(
                     format!(
                         "{}\n",
-                        json!({"subject": "tel.16034700182", "text": "hello"})
+                        json!({"subject": "drn:tel:number::16034700182", "text": "hello"})
                     )
                     .as_bytes(),
                 )

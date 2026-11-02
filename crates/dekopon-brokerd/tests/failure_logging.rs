@@ -23,7 +23,7 @@ use dekopon_broker_protocol::{
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
 use dekopon_capability::{EffectKind, ExecutionConstraints};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId, RiskLevel,
+    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, Subject,
 };
 use dekopon_test_support::{CaptureLayer, provider_fixture, shutdown_on};
 use serde_json::json;
@@ -36,7 +36,7 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
-const SUBJECT: &str = "slack.t0123abc.u9xyz";
+const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
 
 const POLICY: &str = r#"
 @id("chat-agent-session")
@@ -138,9 +138,7 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
             catalog,
             CredentialStore::empty(),
             IdentityDirectory::new([(
-                SUBJECT
-                    .parse::<ExternalSubject>()
-                    .expect("canonical subject"),
+                SUBJECT.parse::<Subject>().expect("canonical subject"),
                 "cpetersen".parse::<PrincipalId>().expect("valid principal"),
             )])
             .expect("one mapping builds a directory"),
@@ -232,9 +230,10 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     client
         .invoke(
             Some(Attestation::for_subject(
-                SUBJECT
-                    .parse::<ExternalSubject>()
-                    .expect("canonical subject"),
+                dekopon_core::AttestedSubject::one(
+                    SUBJECT.parse::<Subject>().expect("canonical subject"),
+                )
+                .expect("one-form subject"),
                 "chat-agent".parse::<AgentId>().expect("valid agent"),
             )),
             request,

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use dekopon_core::{ExternalSubject, SubjectSegment, SubjectService};
+use dekopon_core::{Namespace, Subject, SubjectKind};
 use serde::{Deserialize, Serialize};
 
 use crate::ChatTransportKind;
@@ -87,7 +87,7 @@ impl Conversation {
         clippy::wildcard_enum_match_arm,
         reason = "reshaped by the unit that next rewrites this"
     )]
-    pub fn is_canonical_for(&self, kind: ChatTransportKind, subject: &ExternalSubject) -> bool {
+    pub fn is_canonical_for(&self, kind: ChatTransportKind, subject: &Subject) -> bool {
         if !self.is_bounded() || !kind.produces(self.kind) {
             return false;
         }
@@ -95,7 +95,7 @@ impl Conversation {
         let thread = self.thread.as_deref();
         match kind {
             ChatTransportKind::Fauxlack => {
-                subject.service() == SubjectService::Fauxlack
+                subject.namespace() == Namespace::Fauxlack
                     && container == subject.tenant()
                     && lowercase_token(&self.id)
                     && match self.kind {
@@ -108,7 +108,7 @@ impl Conversation {
                     }
             }
             ChatTransportKind::Slack => {
-                subject.service() == SubjectService::Slack
+                subject.namespace() == Namespace::Slack
                     && container.is_some_and(lowercase_token)
                     && lowercase_token(&self.id)
                     && match self.kind {
@@ -119,7 +119,7 @@ impl Conversation {
                     }
             }
             ChatTransportKind::Discord => {
-                subject.service() == SubjectService::Discord
+                subject.namespace() == Namespace::Discord
                     && canonical_unsigned_decimal(&self.id)
                     && match self.kind {
                         ConversationKind::DirectMessage => container.is_none() && thread.is_none(),
@@ -134,7 +134,7 @@ impl Conversation {
                     }
             }
             ChatTransportKind::Telegram => {
-                subject.service() == SubjectService::Telegram
+                subject.namespace() == Namespace::Telegram
                     && container.is_none()
                     && thread.is_none_or(canonical_positive_service_decimal)
                     && match self.kind {
@@ -142,8 +142,7 @@ impl Conversation {
                         // message claiming a different chat id is claiming someone else's
                         // conversation.
                         ConversationKind::DirectMessage => {
-                            canonical_positive_service_decimal(&self.id)
-                                && self.id == subject.subject()
+                            canonical_positive_service_decimal(&self.id) && self.id == subject.id()
                         }
                         ConversationKind::Channel => canonical_negative_decimal(&self.id),
                         ConversationKind::Thread => {
@@ -153,25 +152,21 @@ impl Conversation {
                     }
             }
             ChatTransportKind::Whatsapp => {
-                subject.service() == SubjectService::Whatsapp
+                subject.namespace() == Namespace::Whatsapp
                     && self.kind == ConversationKind::DirectMessage
                     && container.is_some_and(canonical_whatsapp_container)
                     && canonical_meta_decimal(&self.id)
                     // For WhatsApp, the sender is the conversation; an individual message can't be
                     // addressed to anything else.
-                    && self.id == subject.subject()
+                    && self.id == subject.id()
                     && thread.is_none()
             }
             ChatTransportKind::Github => {
-                subject.service() == SubjectService::Github
+                subject.kind() == SubjectKind::GithubRepo
                     && self.kind == ConversationKind::Thread
                     && container == subject.tenant()
                     && self.id
-                        == format!(
-                            "{}.{}",
-                            subject.tenant().unwrap_or_default(),
-                            subject.subject()
-                        )
+                        == format!("{}.{}", subject.tenant().unwrap_or_default(), subject.id())
                     && thread.is_some_and(|value| {
                         value.parse::<dekopon_core::github::GithubThread>().is_ok()
                     })
@@ -424,9 +419,7 @@ fn canonical_container_for(transport: ChatTransportKind, value: &str) -> bool {
             ChatTransportKind::Fauxlack | ChatTransportKind::Slack => lowercase_token(value),
             ChatTransportKind::Discord => canonical_unsigned_decimal(value),
             ChatTransportKind::Whatsapp => canonical_whatsapp_container(value),
-            ChatTransportKind::Github => {
-                SubjectService::Github.admits_segment(SubjectSegment::Tenant, value)
-            }
+            ChatTransportKind::Github => SubjectKind::GithubRepo.admits_tenant(value),
             ChatTransportKind::Local => lowercase_scope_value(value),
             ChatTransportKind::Telegram => false,
         }
@@ -434,8 +427,7 @@ fn canonical_container_for(transport: ChatTransportKind, value: &str) -> bool {
 
 fn canonical_github_id(value: &str) -> bool {
     value.split_once('.').is_some_and(|(owner, repo)| {
-        SubjectService::Github.admits_segment(SubjectSegment::Tenant, owner)
-            && SubjectService::Github.admits_segment(SubjectSegment::Subject, repo)
+        SubjectKind::GithubRepo.admits_tenant(owner) && SubjectKind::GithubRepo.admits_id(repo)
     })
 }
 
@@ -575,8 +567,8 @@ mod local_selector_tests {
     #[test]
     fn github_thread_is_bound_to_its_subject_owner_and_repo() {
         use super::Conversation;
-        use dekopon_core::ExternalSubject;
-        let subject = ExternalSubject::github("a", "x").unwrap();
+        use dekopon_core::Subject;
+        let subject = Subject::github_repo("a", "x").unwrap();
         let conversation = Conversation {
             kind: ConversationKind::Thread,
             container: Some("a".into()),
@@ -586,7 +578,7 @@ mod local_selector_tests {
         assert!(conversation.is_canonical_for(ChatTransportKind::Github, &subject));
         assert!(!conversation.is_canonical_for(
             ChatTransportKind::Github,
-            &ExternalSubject::github("b", "x").unwrap()
+            &Subject::github_repo("b", "x").unwrap()
         ));
         assert_ne!(
             conversation.key(),
@@ -609,8 +601,16 @@ mod local_selector_tests {
             ..conversation.clone()
         }));
         assert!(
+            ConversationMatch {
+                ids: Some(vec!["a.a.github.io".into()]),
+                ..selector.clone()
+            }
+            .validate(ChatTransportKind::Github)
+            .is_empty()
+        );
+        assert!(
             !ConversationMatch {
-                ids: Some(vec!["a.x.y".into()]),
+                ids: Some(vec!["a.x/y".into()]),
                 ..selector
             }
             .validate(ChatTransportKind::Github)

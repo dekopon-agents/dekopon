@@ -7,7 +7,7 @@ use std::{
 };
 
 use dekopon_agent::prompt::{ConversationTurn, History};
-use dekopon_core::{AgentId, ExternalSubject};
+use dekopon_core::{AgentId, Subject};
 use sha2::{Digest, Sha256, digest::Update};
 
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum ConversationAudience {
-    Private(ExternalSubject),
+    Private(Subject),
     Shared,
 }
 
@@ -36,7 +36,7 @@ impl ConversationKey {
         agent: &AgentId,
         transport: &str,
         conversation: &dekopon_broker_protocol::Conversation,
-        subject: Option<&ExternalSubject>,
+        subject: Option<&Subject>,
     ) -> Self {
         Self {
             space: dekopon_core::SpaceKey {
@@ -54,12 +54,7 @@ impl ConversationKey {
     }
 
     #[cfg(test)]
-    pub fn private(
-        agent: &AgentId,
-        transport: &str,
-        channel: &str,
-        subject: &ExternalSubject,
-    ) -> Self {
+    pub fn private(agent: &AgentId, transport: &str, channel: &str, subject: &Subject) -> Self {
         Self {
             space: dekopon_core::SpaceKey {
                 agent: agent.clone(),

@@ -52,13 +52,13 @@ identities:
     attestor:
       # Segment-boundary prefixes, service name first. This grant lets the gateway *name* Slack
       # subjects in this workspace; it resolves none of them to a principal.
-      namespaces: [slack.t0123abcd]
+      namespaces: ["drn:slack:*:t0123abcd:*"]
 
 principals:
   # The only place a Slack user becomes a principal. An unmapped sender reaches nothing, which is
   # why the Slack app can be installed workspace-wide without widening anything.
   cpetersen:
-    subjects: [slack.t0123abcd.u0123abcd]
+    subjects: [drn:slack:user:t0123abcd:u0123abcd]
 
 capabilities:
   # One block per provider. Only the capabilities listed under it run: an unlisted one, including

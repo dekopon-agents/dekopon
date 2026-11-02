@@ -115,11 +115,15 @@ jobs:
         shell: bash
         env:
           SMOKE_MODE: ${{ inputs.mode }}
+          SMOKE_DAEMONS: ${{ inputs.daemons }}
         run: |
           set -euo pipefail
+          subjects=()
+          if [ "$SMOKE_DAEMONS" = checkout ]; then subjects=(--drn-subjects); fi
           "$RUNNER_TEMP/dekopon-compat-venv/bin/python" ci/macos-compat-smoke.py \
             --launchd \
             "--$SMOKE_MODE" \
+            "${subjects[@]}" \
             --expected-version "$DEKOPON_EXPECTED_VERSION" \
             --bin-dir "$DEKOPON_BIN_DIR" \
             --provider "$RUNNER_TEMP/jsonplaceholder-provider.wasm" \

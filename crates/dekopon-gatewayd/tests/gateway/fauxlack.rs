@@ -7,18 +7,18 @@ pub(super) fn configure_broker(config: &mut Value, policies: &mut String, server
     config["identities"][0]["attestor"]["namespaces"] = json!(
         servers
             .iter()
-            .map(|server| format!("fauxlack.{server}"))
+            .map(|server| format!("drn:fauxlack:*:{server}:*"))
             .collect::<Vec<_>>()
     );
     config["principals"] = json!({
-        "alice": {"subjects": ["fauxlack.acme.ualice"]},
-        "bob": {"subjects": ["fauxlack.acme.ubob"]},
-        "carol": {"subjects": ["fauxlack.acme.ucarol"]},
-        "team": {"subjects": ["fauxlack.acme.cteam"]}
+        "alice": {"subjects": ["drn:fauxlack:user:acme:ualice"]},
+        "bob": {"subjects": ["drn:fauxlack:user:acme:ubob"]},
+        "carol": {"subjects": ["drn:fauxlack:user:acme:ucarol"]},
+        "team": {"subjects": ["drn:fauxlack:channel:acme:cteam"]}
     });
     if servers.len() > 1 {
-        config["principals"]["galice"] = json!({"subjects": ["fauxlack.globex.ualice"]});
-        config["principals"]["gteam"] = json!({"subjects": ["fauxlack.globex.cteam"]});
+        config["principals"]["galice"] = json!({"subjects": ["drn:fauxlack:user:globex:ualice"]});
+        config["principals"]["gteam"] = json!({"subjects": ["drn:fauxlack:channel:globex:cteam"]});
     }
     config["providers"] = json!([
         provider("cli-probe"),
@@ -190,7 +190,7 @@ async fn sequential_turns_in_a_mapped_thread_each_run_as_their_asker_intersected
         &audit,
         "cli-probe.upper",
         "alice",
-        "fauxlack.acme.ualice",
+        "drn:fauxlack:user:acme:ualice",
         Scope {
             server: "acme",
             id: "cteam",
@@ -203,7 +203,7 @@ async fn sequential_turns_in_a_mapped_thread_each_run_as_their_asker_intersected
         &audit,
         "cli-probe.upper",
         "bob",
-        "fauxlack.acme.ubob",
+        "drn:fauxlack:user:acme:ubob",
         Scope {
             server: "acme",
             id: "cteam",
@@ -216,7 +216,7 @@ async fn sequential_turns_in_a_mapped_thread_each_run_as_their_asker_intersected
         &audit,
         "cli-probe.reverse",
         "alice",
-        "fauxlack.acme.ualice",
+        "drn:fauxlack:user:acme:ualice",
         Scope {
             server: "acme",
             id: "dalice",
@@ -346,7 +346,7 @@ async fn two_servers_keep_identical_ids_in_separate_authority_scopes_and_transcr
         &audit,
         "cli-probe.upper",
         "alice",
-        "fauxlack.acme.ualice",
+        "drn:fauxlack:user:acme:ualice",
         Scope {
             server: "acme",
             id: "cteam",
@@ -359,7 +359,7 @@ async fn two_servers_keep_identical_ids_in_separate_authority_scopes_and_transcr
         &audit,
         "cli-probe.upper",
         "galice",
-        "fauxlack.globex.ualice",
+        "drn:fauxlack:user:globex:ualice",
         Scope {
             server: "globex",
             id: "cteam",

@@ -7,12 +7,10 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints};
-use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, RiskLevel,
-};
+use dekopon_core::{Actor, AgentId, CapabilityId, InvocationId, PrincipalId, RiskLevel, Subject};
 use dekopon_test_support::provider_fixture;
 
-pub(crate) const SUBJECT: &str = "slack.t0123abc.u9xyz";
+pub(crate) const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
 
 const POLICY: &str = r#"
 @id("http-fetch")
@@ -43,9 +41,8 @@ pub(crate) async fn invoke_as_caller(
     )
     .expect("gateway context binds");
     let attestation = Attestation::for_subject(
-        SUBJECT
-            .parse::<ExternalSubject>()
-            .expect("canonical subject"),
+        dekopon_core::AttestedSubject::one(SUBJECT.parse::<Subject>().expect("canonical subject"))
+            .expect("one-form subject"),
         "provider-test".parse::<AgentId>().expect("valid agent"),
     )
     .bound_to(request.id.clone());

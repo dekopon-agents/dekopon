@@ -18,9 +18,12 @@ fn listing(principal: &str, mapped: bool) -> ResponseEnvelope {
 
 fn speaker(index: usize, text: &str) -> InboundMessage {
     let mut inbound = owned_slack_message(text, false);
-    inbound.subject = format!("slack.t0123abc.u{index}xyz")
-        .parse()
-        .expect("subject");
+    inbound.subject = dekopon_core::AttestedSubject::one(
+        format!("drn:slack:user:t0123abc:u{index}xyz")
+            .parse()
+            .expect("subject"),
+    )
+    .expect("one-form subject");
     inbound.message_id = MessageId::Native(format!("1700000000.{index:06}"));
     inbound.thread_continuation = None;
     inbound
@@ -79,7 +82,7 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
             .cancel(&CancelRequest {
                 transport: first.transport.clone(),
                 conversation_id: first.conversation.key(),
-                subject: speaker(8, "").subject.canonical().to_owned(),
+                subject: speaker(8, "").subject.name().canonical().to_owned(),
                 via: CancelVia::StopReply,
             })
             .running,
@@ -131,7 +134,7 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
         else {
             panic!("lookup expected")
         };
-        assert_eq!(claim.subject, speaker(index, "").subject);
+        assert_eq!(claim.subjects, speaker(index, "").subject);
         assert_eq!(
             claim.scope.as_ref().unwrap().delivery,
             Some(DeliveryIdentity::Slack {
@@ -157,11 +160,11 @@ async fn mapped_participants_are_consumed_once_with_their_own_attribution_and_jo
     assert_eq!(lookups[0].parent(), Some("gateway.session"));
     assert_eq!(
         lookups[0].field("turn.owner"),
-        Some(first.subject.canonical()).as_deref()
+        Some(first.subject.name().canonical()).as_deref()
     );
     assert_eq!(
         lookups[0].field("subject"),
-        Some(speaker(8, "").subject.canonical()).as_deref()
+        Some(speaker(8, "").subject.name().canonical()).as_deref()
     );
 }
 
@@ -487,7 +490,7 @@ async fn final_step_leftovers_never_fold_an_unchecked_participant_into_another_s
             else {
                 panic!("each leftover must get its own capability lookup");
             };
-            assert_eq!(claim.subject, speaker(subject, "").subject);
+            assert_eq!(claim.subjects, speaker(subject, "").subject);
         }
         assert!(models.prompt(1).iter().any(|(role, text)| role == "user"
             && text.starts_with("[gateway: authenticated participant: ana, handle p1]\n")
@@ -632,7 +635,7 @@ async fn scripts_select_only_current_participant_legs_and_default_to_the_asker()
             .zip([(8, "p2"), (8, "p2"), (9, "p1"), (9, "p1"), (8, "p2")])
     {
         assert_eq!(word.as_str(), "probe");
-        assert_eq!(claim.subject, speaker(subject, "").subject);
+        assert_eq!(claim.subjects, speaker(subject, "").subject);
         let scope = claim.scope.as_ref().unwrap();
         assert_eq!(scope.participant.as_deref(), Some(handle));
         assert_eq!(
@@ -738,7 +741,7 @@ async fn unmapped_route_call_with_as_runs_as_the_asker_and_exits_zero() {
     else {
         panic!("command expected")
     };
-    assert_eq!(claim.subject, speaker(9, "").subject);
+    assert_eq!(claim.subjects, speaker(9, "").subject);
     assert_eq!(claim.scope.unwrap().participant, None);
     assert!(observed.try_recv().is_err());
     assert!(
@@ -777,9 +780,9 @@ async fn participant_broker(
         "socketPath": socket, "policiesPath": policy_path,
         "providers": [dekopon_test_support::provider_fixture("cli-probe-provider.wasm")],
         "identities": [{"uid": crate::current_uid(), "principal": "gateway",
-            "actor": {"type":"service", "principal":"gateway"}, "attestor":{"namespaces":["slack"]}}],
-        "principals": {"asker":{"subjects":["slack.t0123abc.u9xyz"]},
-            "ana":{"subjects":["slack.t0123abc.u8xyz"]}, "space":{"subjects":["slack.t0123abc.c0123abc"]}},
+            "actor": {"type":"service", "principal":"gateway"}, "attestor":{"namespaces":["drn:slack:*:*:*"]}}],
+        "principals": {"asker":{"subjects":["drn:slack:user:t0123abc:u9xyz"]},
+            "ana":{"subjects":["drn:slack:user:t0123abc:u8xyz"]}, "space":{"subjects":["drn:slack:channel:t0123abc:c0123abc"]}},
         "capabilities":{"cli-probe":{"constraints":{"timeoutMs":30000}, "capabilities":{"cli-probe.upper":{}}}}
     })).unwrap()).unwrap();
     fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1008,7 +1011,7 @@ async fn another_speakers_grant_cannot_authorize_a_pr_link_turn() {
     models.wait_until_entered().await;
     let initial = observed.recv().await.unwrap();
     assert!(
-        matches!(initial.request,BrokerRequest::Capabilities { attestation: Some(Attestation { subject, .. }) } if subject == first.subject)
+        matches!(initial.request,BrokerRequest::Capabilities { attestation: Some(Attestation { subjects, .. }) } if subjects == first.subject)
     );
     run_session(
         Arc::clone(&runner),
@@ -1039,12 +1042,12 @@ async fn another_speakers_grant_cannot_authorize_a_pr_link_turn() {
         && text.contains("not granted")));
     assert_eq!(requests.len(), 3);
     assert!(
-        matches!(&requests[0].request,BrokerRequest::Run { attestation: Some(claim), .. } if claim.subject == first.subject)
+        matches!(&requests[0].request,BrokerRequest::Run { attestation: Some(claim), .. } if claim.subjects == first.subject)
     );
     assert!(
-        matches!(&requests[1].request,BrokerRequest::Capabilities { attestation: Some(claim) } if claim.subject == other.subject)
+        matches!(&requests[1].request,BrokerRequest::Capabilities { attestation: Some(claim) } if claim.subjects == other.subject)
     );
     assert!(
-        matches!(&requests[2].request,BrokerRequest::Run { attestation: Some(claim), .. } if claim.subject == other.subject)
+        matches!(&requests[2].request,BrokerRequest::Run { attestation: Some(claim), .. } if claim.subjects == other.subject)
     );
 }

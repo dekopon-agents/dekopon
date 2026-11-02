@@ -46,12 +46,16 @@ async fn wake_reason_never_names_a_subject_or_conversation() {
     let route = route(model_config());
     let driver = Arc::new(RecordingDriver::default());
     let mut first = wakes::slack_message("first");
-    first.subject = "slack.t0123abc.u1".parse().unwrap();
+    first.subject =
+        dekopon_core::AttestedSubject::one("drn:slack:user:t0123abc:u1".parse().expect("subject"))
+            .unwrap();
     first.conversation.container = Some("t0123abc".into());
     first.conversation.id = "d0123abc".into();
     first.conversation.thread = Some("1750000000.000001".into());
     let mut follow = first.clone();
-    follow.subject = "slack.t0123abc.u2".parse().unwrap();
+    follow.subject =
+        dekopon_core::AttestedSubject::one("drn:slack:user:t0123abc:u2".parse().expect("subject"))
+            .unwrap();
     follow.message_id = MessageId::Native("1750000000.000002".into());
     follow.text = "follow-up".into();
     let held = tokio::spawn(run_session(
@@ -124,7 +128,9 @@ async fn wake_reason_is_offered_on_every_gateway_session() {
             let mut inbound = message("why?");
             match &id {
                 MessageId::Github(_) => {
-                    inbound.subject = "github.owner.repo".parse().unwrap();
+                    inbound.subject =
+                        dekopon_core::AttestedSubject::github_repository("owner", "repo", 1)
+                            .unwrap();
                     inbound.transport_kind = ChatTransportKind::Github;
                     inbound.conversation.kind = ConversationKind::Thread;
                     inbound.conversation.container = Some("owner".into());

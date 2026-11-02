@@ -206,7 +206,7 @@ async fn native_history_drops_the_bot_footer_before_the_model_sees_it() {
     let prompt = cold_recall(
         ChatTransportKind::Discord,
         vec![
-            past("0000000001", "U1", "tel.16035550101", user),
+            past("0000000001", "U1", "drn:tel:number::16035550101", user),
             bot_past("0000000002", "Earlier answer.\n\n-# model · 1 step · 7 s"),
             bot_past("0000000003", "-# model · 1 step · 7 s"),
         ],

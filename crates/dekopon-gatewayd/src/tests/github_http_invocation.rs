@@ -41,19 +41,19 @@ async fn signed_repo_delivery_reaches_only_its_fresh_broker_authorized_silent_tu
             panic!("no other broker operation permitted")
         };
         assert_eq!(claim.agent.as_str(), "reviewer");
-        let response = match claim.subject.canonical().as_str() {
-            "github.owner.denied" => ResponseEnvelope::error(
+        let response = match claim.subjects.name().canonical().as_str() {
+            "drn:github:repo:owner:denied" => ResponseEnvelope::error(
                 dekopon_broker_protocol::ERROR_UNAUTHENTICATED,
                 "agent-denied",
             ),
-            "github.owner.repo" => ResponseEnvelope::chat_capabilities(
+            "drn:github:repo:owner:repo" => ResponseEnvelope::chat_capabilities(
                 vec![capability("repo.read")],
                 vec![],
                 BTreeMap::new(),
                 None,
                 Some("repo-principal".parse().unwrap()),
             ),
-            "github.owner.other" => ResponseEnvelope::chat_capabilities(
+            "drn:github:repo:owner:other" => ResponseEnvelope::chat_capabilities(
                 vec![capability("repo.read"), capability("turso.exec")],
                 vec![],
                 BTreeMap::new(),
@@ -127,9 +127,9 @@ async fn signed_repo_delivery_reaches_only_its_fresh_broker_authorized_silent_tu
         "no automatic fix or note invocation from reported runs"
     );
     for (request, (_guid, principal_subject)) in requests.iter().zip([
-        ("first", "github.owner.repo"),
-        ("second", "github.owner.other"),
-        ("no-prompt", "github.owner.denied"),
+        ("first", "drn:github:repo:owner:repo"),
+        ("second", "drn:github:repo:owner:other"),
+        ("no-prompt", "drn:github:repo:owner:denied"),
     ]) {
         let BrokerRequest::Capabilities {
             attestation: Some(claim),
@@ -137,7 +137,7 @@ async fn signed_repo_delivery_reaches_only_its_fresh_broker_authorized_silent_tu
         else {
             panic!("fresh capabilities required")
         };
-        assert_eq!(claim.subject.canonical(), principal_subject);
+        assert_eq!(claim.subjects.name().canonical(), principal_subject);
         assert_eq!(
             claim.scope.as_ref().unwrap().conversation.thread.as_deref(),
             Some("repository")

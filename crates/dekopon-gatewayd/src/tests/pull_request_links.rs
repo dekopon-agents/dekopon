@@ -133,7 +133,6 @@ fn pull_request_targets_are_parsed_deduplicated_and_rendered_as_structured_data(
         "<{PR}|review> HTTPS://GITHUB.COM/ACME/WIDGET/pull/17/files?x=1#diff \
          https://github.com/other/repo-name/pull/18/checks/"
     ))
-    .unwrap()
     .unwrap();
     assert_eq!(links.targets.len(), 2);
     assert_eq!(links.targets[0].coordinates().0, "acme");
@@ -166,10 +165,7 @@ fn pull_request_targets_are_parsed_deduplicated_and_rendered_as_structured_data(
         "https://github.com/acme/widget/pull/17x",
         "https://github.com/acme%2felse/widget/pull/17",
     ] {
-        assert!(
-            PullRequestLinkContext::parse(url).unwrap().is_none(),
-            "{url}"
-        );
+        assert!(PullRequestLinkContext::parse(url).is_none(), "{url}");
     }
 }
 
@@ -179,7 +175,6 @@ fn a_non_pr_slack_hyperlink_does_not_start_a_review_from_its_display_label() {
         PullRequestLinkContext::parse(
             "<https://github.com/acme/widget/issues/17|https://github.com/other/repo/pull/18>"
         )
-        .unwrap()
         .is_none()
     );
 }
@@ -190,7 +185,6 @@ fn a_pr_slack_hyperlink_reviews_only_its_url_and_bare_links_outside_it() {
         "{PR} <{PR}|https://github.com/other/repo/pull/18> \
          https://github.com/third/project/pull/19"
     ))
-    .unwrap()
     .unwrap();
     assert_eq!(links.targets.len(), 2);
     assert_eq!(links.targets[0].coordinates().0, "acme");
@@ -214,13 +208,13 @@ fn a_truncated_pr_link_is_never_reinterpreted_as_a_shorter_number() {
         "{}{url}",
         " ".repeat(MAX_INBOUND_TEXT_BYTES - url.len() + 1)
     );
-    assert!(PullRequestLinkContext::parse(&text).unwrap().is_none());
+    assert!(PullRequestLinkContext::parse(&text).is_none());
 }
 
 #[test]
 fn truncation_keeps_complete_slack_hyperlinks_and_drops_incomplete_ones() {
     let complete = format!("<{PR}|review>{}", "x".repeat(MAX_INBOUND_TEXT_BYTES));
-    let links = PullRequestLinkContext::parse(&complete).unwrap().unwrap();
+    let links = PullRequestLinkContext::parse(&complete).unwrap();
     assert_eq!(links.targets.len(), 1);
     assert_eq!(
         links.targets[0].number,
@@ -230,11 +224,7 @@ fn truncation_keeps_complete_slack_hyperlinks_and_drops_incomplete_ones() {
         "<https://github.com/acme/widget/issues/17|{PR} {}>",
         "x".repeat(MAX_INBOUND_TEXT_BYTES)
     );
-    assert!(
-        PullRequestLinkContext::parse(&incomplete)
-            .unwrap()
-            .is_none()
-    );
+    assert!(PullRequestLinkContext::parse(&incomplete).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -336,7 +326,8 @@ async fn a_pr_link_starts_one_poster_authorized_threaded_turn_and_opens_the_foll
             assert_eq!(inbound.addressed, Some(false));
             assert_eq!(
                 inbound.subject,
-                ExternalSubject::slack(TEAM, "u9xyz").unwrap()
+                dekopon_core::AttestedSubject::one(Subject::slack_user(TEAM, "u9xyz").unwrap())
+                    .expect("one-form subject")
             );
             assert_eq!(
                 inbound.pull_request_links.as_ref().unwrap().targets.len(),
@@ -422,7 +413,7 @@ async fn a_pr_link_starts_one_poster_authorized_threaded_turn_and_opens_the_foll
             );
             let request = broker.request().await;
             assert!(
-                matches!(request.request, BrokerRequest::Capabilities { attestation: Some(Attestation { subject, scope: Some(ref scope), .. }) } if subject == inbound.subject && scope.trigger == dekopon_broker_protocol::Trigger::Message)
+                matches!(request.request, BrokerRequest::Capabilities { attestation: Some(Attestation { subjects, scope: Some(ref scope), .. }) } if subjects == inbound.subject && scope.trigger == dekopon_broker_protocol::Trigger::Message)
             );
             let runs = broker
                 .recorded()
@@ -441,7 +432,7 @@ async fn a_pr_link_starts_one_poster_authorized_threaded_turn_and_opens_the_foll
             };
             assert_eq!(word, "follow");
             assert_eq!(argv, &[dekopon_broker_protocol::Arg::Text("stay".into())]);
-            assert_eq!(claim.subject, inbound.subject);
+            assert_eq!(claim.subjects, inbound.subject);
             assert_eq!(
                 claim.scope.as_ref().unwrap().participant.as_deref(),
                 mapped.then_some("p1")
@@ -456,7 +447,7 @@ fn other_speakers_stay_queued_before_and_after_pr_link_mapping_resolves() {
         let gate = SessionGate::new(1);
         let route = persistent_route(model_config(), shared_window());
         let mut first = owned_slack_message(PR, false);
-        first.pull_request_links = PullRequestLinkContext::parse(PR).unwrap();
+        first.pull_request_links = PullRequestLinkContext::parse(PR);
         let key = (first.transport.clone(), first.conversation.key());
         let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(vec![]))
         else {
@@ -466,7 +457,9 @@ fn other_speakers_stay_queued_before_and_after_pr_link_mapping_resolves() {
             gate.resolve_mapping(&key, &admission.cancellation(), true);
         }
         let mut other = owned_slack_message("Bob asks", false);
-        other.subject = ExternalSubject::slack(TEAM, "u8other").unwrap();
+        other.subject =
+            dekopon_core::AttestedSubject::one(Subject::slack_user(TEAM, "u8other").unwrap())
+                .expect("one-form subject");
         assert!(matches!(
             gate.admit(&route, other.clone(), Dispositions(vec![])),
             Admit::Queued

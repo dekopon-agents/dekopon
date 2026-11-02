@@ -1102,7 +1102,8 @@ async fn jobs_wait_and_kill_restrict_rows_to_the_person_who_started_them() {
     assert!(output.contains("[1] killed exit"), "{output}");
     let owner = JobOwner::of(&message("control"));
     let mut foreign = message("control");
-    foreign.subject = subject_named("foreign");
+    foreign.subject =
+        dekopon_core::AttestedSubject::one(subject_named("foreign")).expect("one-form subject");
     let foreign = JobOwner::of(&foreign);
     assert!(runner.jobs.list(&foreign).is_empty());
     assert_eq!(
@@ -1134,7 +1135,7 @@ async fn stopping_a_persons_jobs_does_not_stop_someone_elses() {
     let request = crate::transport::CancelRequest {
         transport: message("start").transport,
         conversation_id: message("start").conversation.key(),
-        subject: message("start").subject.canonical(),
+        subject: message("start").subject.name().canonical(),
         via: dekopon_agent::CancelVia::NativeStop,
     };
     crate::cancel_session(&runner, &request);
@@ -1236,13 +1237,13 @@ async fn a_job_a_probe_starts_attests_as_a_probe() {
     assert_eq!(job_triggers(&mut observed), [Trigger::Probe]);
 }
 
-pub(super) fn subject_named(name: &str) -> ExternalSubject {
+pub(super) fn subject_named(name: &str) -> Subject {
     let number = if name == "a" {
         "16030000001"
     } else {
         "16030000002"
     };
-    ExternalSubject::telephone(number).expect("a telephone subject")
+    Subject::telephone(number).expect("a telephone subject")
 }
 
 fn admitted(
@@ -1251,7 +1252,8 @@ fn admitted(
     text: &str,
 ) -> Result<crate::jobs::JobRun, dekopon_shell::JobRefusal> {
     let mut inbound = message(subject_text);
-    inbound.subject = subject_named(subject_text);
+    inbound.subject =
+        dekopon_core::AttestedSubject::one(subject_named(subject_text)).expect("one-form subject");
     let anchor =
         crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).expect("an anchor");
     jobs.admit(
@@ -1266,7 +1268,8 @@ fn admitted(
 
 pub(super) fn owned_by(subject_text: &str) -> JobOwner {
     let mut inbound = message(subject_text);
-    inbound.subject = subject_named(subject_text);
+    inbound.subject =
+        dekopon_core::AttestedSubject::one(subject_named(subject_text)).expect("one-form subject");
     JobOwner::of(&inbound)
 }
 
@@ -1423,7 +1426,8 @@ pub(super) async fn until(within: Duration, mut reached: impl FnMut() -> bool) {
 
 pub(super) fn from(subject_text: &str, text: &str) -> InboundMessage {
     let mut inbound = message(text);
-    inbound.subject = subject_named(subject_text);
+    inbound.subject =
+        dekopon_core::AttestedSubject::one(subject_named(subject_text)).expect("one-form subject");
     inbound
 }
 

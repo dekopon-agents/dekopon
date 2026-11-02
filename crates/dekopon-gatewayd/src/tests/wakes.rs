@@ -537,7 +537,10 @@ fn a_pending_watch_restarts_with_its_probe_and_original_chat_anchor() {
     };
     let inbound = fired.into_inbound();
     assert_eq!(inbound.transport, anchor().transport().to_string());
-    assert_eq!(inbound.subject, anchor().subject().clone());
+    assert_eq!(
+        inbound.subject,
+        dekopon_core::AttestedSubject::one(anchor().subject().clone()).expect("one-form subject")
+    );
     assert_eq!(inbound.conversation, anchor().conversation().clone());
     assert_eq!(inbound.reply, slack_message("anchor").reply);
     assert!(inbound.text.contains("pass"));
@@ -786,4 +789,99 @@ async fn a_wake_queues_until_the_running_conversation_finishes() {
     held.await.expect("holder and follow-up finish");
     assert_eq!(driver.replies(), ["finished", "finished"]);
     assert_eq!(triggers(&mut observed), [Trigger::Message, Trigger::Wake]);
+}
+
+fn github_message() -> InboundMessage {
+    InboundMessage {
+        transport: "github".to_owned(),
+        transport_kind: dekopon_broker_protocol::ChatTransportKind::Github,
+        subject: dekopon_core::AttestedSubject::github_repository("owner", "repo", 42)
+            .expect("webhook facts"),
+        conversation: Conversation {
+            kind: ConversationKind::Thread,
+            container: Some("owner".to_owned()),
+            id: "owner.repo".to_owned(),
+            thread: Some("7".to_owned()),
+        },
+        reply: ReplyTarget::GithubTrace,
+        ..message("review")
+    }
+}
+
+#[test]
+fn a_wake_or_job_from_a_github_turn_re_attests_the_stored_twin() {
+    let directory = temporary();
+    let now = SystemTime::now();
+    let twin = github_message().subject;
+    let anchor =
+        Anchor::from_inbound(&github_message(), &route(model_config()).agent).expect("anchorable");
+    assert_eq!(anchor.claim(Trigger::Job).subjects, twin);
+    {
+        let store = wake_store(directory.path());
+        store
+            .register(
+                anchor,
+                "re-review".to_owned(),
+                now,
+                Schedule::Once {
+                    after: Duration::from_secs(1),
+                },
+            )
+            .expect("registered");
+    }
+    let store = wake_store(directory.path());
+    let fired = store
+        .take_due(now + Duration::from_secs(2))
+        .expect("readable")
+        .fired
+        .pop()
+        .expect("restored wake");
+    assert_eq!(fired.into_inbound().subject, twin);
+}
+
+#[test]
+fn a_legacy_store_is_rewritten_once_keeping_a_pre_drn_copy() {
+    use tracing_subscriber::prelude::*;
+    let directory = temporary();
+    let now = SystemTime::now();
+    let path = directory.path().join("wakes").join("wakes.jsonl");
+    {
+        let store = wake_store(directory.path());
+        once(&store, "kept", now);
+    }
+    let mut line: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&path).expect("store text").trim())
+            .expect("one line");
+    line["subject"] = "slack.t0123abc.w9xyz".into();
+    let mut github = line.clone();
+    github["id"] = 2.into();
+    github["subject"] = "github.owner.repo".into();
+    let legacy = format!("{line}\n{github}\n");
+    fs::write(&path, &legacy).expect("legacy store");
+
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let store = {
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        wake_store(directory.path())
+    };
+    let user: dekopon_core::Subject = "drn:slack:user:t0123abc:w9xyz".parse().expect("subject");
+    assert_eq!(store.list(&user, now).len(), 1);
+    assert_eq!(
+        fs::read_to_string(directory.path().join("wakes").join("wakes.jsonl.pre-drn"))
+            .expect("rollback copy"),
+        legacy
+    );
+    assert_eq!(
+        fs::read_to_string(&path)
+            .expect("rewritten")
+            .lines()
+            .count(),
+        1
+    );
+    let rewritten = capture.events_where("dekopon_gatewayd", &[("event", "wake.store.rewritten")]);
+    assert_eq!(rewritten.len(), 1);
+    assert_eq!(rewritten[0].field("rewritten"), Some("1"));
+    assert_eq!(rewritten[0].field("dropped_github"), Some("1"));
 }

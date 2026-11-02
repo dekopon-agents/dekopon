@@ -220,7 +220,7 @@ async fn console_turn_exports_one_causal_trace_through_model_script_broker_and_p
     .install()
     .unwrap();
     let mut options = ConsoleOptions::new(
-        "slack.t0123abc.u9xyz".parse().unwrap(),
+        "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
         "synthetic-model".into(),
         dekopon_test_support::shell_threads(),
     );

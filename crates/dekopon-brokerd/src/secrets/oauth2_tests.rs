@@ -742,7 +742,7 @@ async fn two_drns_over_one_record_share_one_refresh() {
             constraints,
             CredentialStore::empty(),
             IdentityDirectory::new([(
-                "slack.t0123abc.u9xyz".parse().unwrap(),
+                "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
                 "caller".parse().unwrap(),
             )])
             .unwrap(),
@@ -775,7 +775,10 @@ async fn two_drns_over_one_record_share_one_refresh() {
             )
             .unwrap();
             let attestation = Attestation::for_subject(
-                "slack.t0123abc.u9xyz".parse().unwrap(),
+                dekopon_core::AttestedSubject::one(
+                    "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+                )
+                .unwrap(),
                 "agent".parse::<AgentId>().unwrap(),
             )
             .bound_to(id);

@@ -9,15 +9,13 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
-use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, PrincipalId, ProviderId, RiskLevel,
-};
+use dekopon_core::{Actor, AgentId, CapabilityId, PrincipalId, ProviderId, RiskLevel, Subject};
 use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
-const SUBJECT: &str = "slack.t0123abc.u9xyz";
+const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
 
 const POLICIES: &str = r#"
 @id("allow-count")
@@ -78,9 +76,7 @@ async fn broker() -> Broker<InMemoryAuditLog> {
         ConstraintCatalog::new([constraint_set()]).expect("one capability builds a catalog"),
         CredentialStore::empty(),
         IdentityDirectory::new([(
-            SUBJECT
-                .parse::<ExternalSubject>()
-                .expect("canonical subject"),
+            SUBJECT.parse::<Subject>().expect("canonical subject"),
             principal("caller"),
         )])
         .expect("one mapping builds a directory"),
@@ -111,9 +107,8 @@ async fn a_proposal_past_the_cap_is_recorded_truncated_beside_its_full_length() 
         .parse::<dekopon_core::InvocationId>()
         .expect("valid invocation fixture");
     let attestation = Attestation::for_subject(
-        SUBJECT
-            .parse::<ExternalSubject>()
-            .expect("canonical subject"),
+        dekopon_core::AttestedSubject::one(SUBJECT.parse::<Subject>().expect("canonical subject"))
+            .expect("one-form subject"),
         "reviewer".parse::<AgentId>().expect("valid agent"),
     )
     .bound_to(id.clone());

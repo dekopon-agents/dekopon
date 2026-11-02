@@ -18,10 +18,10 @@ servers:
       - { id: ualice, name: Alice }
       - { id: ualice, name: Duplicate }
       - { id: cperson, name: Space }
-      - { id: UPPER, name: Bad }
+      - { id: up-per, name: Bad }
     channels:
       - { id: notspace, name: Bad, members: [missing] }
-      - { id: BAD, name: Invalid, members: [] }
+      - { id: b-ad, name: Invalid, members: [] }
     directMessages:
       - { id: dbad, members: [missing, missing] }
       - { id: dsmall, members: [ualice] }
@@ -37,12 +37,11 @@ servers:
     let ManifestError::Invalid { problems } = error else {
         panic!("semantic problems");
     };
-    assert!(problems.iter().any(|p| matches!(p, ManifestProblem::Subject { source, .. } if source == &dekopon_core::ExternalSubject::fauxlack("acme", "UPPER").unwrap_err())));
+    assert!(problems.iter().any(|p| matches!(p, ManifestProblem::Subject { source, .. } if source == &dekopon_core::Subject::fauxlack_user("acme", "up-per").unwrap_err())));
     let categories = problems
         .iter()
         .map(|problem| match problem {
             ManifestProblem::Subject { .. } => "subject",
-            ManifestProblem::Kind { .. } => "kind",
             ManifestProblem::Conversation { .. } => "conversation",
             ManifestProblem::DuplicateServer { .. } => "server",
             ManifestProblem::DuplicateId { .. } => "id",
@@ -58,7 +57,6 @@ servers:
         categories,
         std::collections::BTreeSet::from([
             "subject",
-            "kind",
             "conversation",
             "server",
             "id",

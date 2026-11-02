@@ -573,6 +573,18 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             if config.identities.is_empty() {
                 report.warnings.push(StartupWarning::IdentitiesRequired);
             }
+            report.warnings.extend(
+                config
+                    .identities
+                    .iter()
+                    .filter_map(|identity| identity.attestor.as_ref()?.namespaces.as_ref())
+                    .flatten()
+                    .filter(|scope| scope.names_every_kind())
+                    .map(|scope| StartupWarning::ScopeKinds {
+                        scope: scope.to_string(),
+                        kinds: scope.kinds().iter().map(ToString::to_string).collect(),
+                    }),
+            );
             // A Check load leaves a providerSet's providers for this function to resolve.
             let resolved = match (config.providers.is_empty(), providers) {
                 (true, Some(providers)) => {
@@ -1498,6 +1510,8 @@ pub enum StartupWarning {
     IdentitiesRequired,
     #[error("{stage} not checked: a stage it needs failed")]
     Skipped { stage: Stage },
+    #[error("attestor scope {scope} covers the kinds {}", kinds.join(", "))]
+    ScopeKinds { scope: String, kinds: Vec<String> },
 }
 
 impl StartupWarning {
@@ -1530,6 +1544,11 @@ impl StartupWarning {
             Self::Skipped { .. } => tracing::warn!(
                 target: "dekopon_brokerd::audit",
                 { audit.event = "config.startup.warning", reason = "skipped-stage" },
+                "{self}"
+            ),
+            Self::ScopeKinds { .. } => tracing::warn!(
+                target: "dekopon_brokerd::audit",
+                { audit.event = "config.startup.warning", reason = "wildcard-kind-scope" },
                 "{self}"
             ),
             Self::CredentialRequired { .. }

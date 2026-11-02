@@ -30,9 +30,12 @@ impl Settings {
         config["identities"][0]["attestor"]["namespaces"]
             .as_array_mut()
             .unwrap()
-            .push(json!("github"));
-        config["principals"]["repository"] = json!({"subjects":["github.acme.widget"]});
-        config["principals"]["outside"] = json!({"subjects":["github.acme.outside"]});
+            .extend([
+                json!("drn:github:repo:acme:*"),
+                json!("drn:github:repo-id::*"),
+            ]);
+        config["principals"]["repository"] = json!({"subjects":["drn:github:repo:acme:widget"]});
+        config["principals"]["outside"] = json!({"subjects":["drn:github:repo:acme:outside"]});
         policies.push_str(&format!(r#"
 @id("subscription-repository-prompt")
 permit(principal == Dekopon::Principal::"repository", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"{AGENT}") when {{ context.via == "{GATEWAY_PRINCIPAL}" }};
@@ -70,7 +73,7 @@ fn subscription(root: &str, repository: &str, id: u32) -> Value {
         .unwrap()
         .as_millis()
         + 14 * 24 * 60 * 60 * 1000;
-    json!({"id":id,"transport":"acme-chat","kind":"fauxlack","subject":"fauxlack.acme.cteam","conversation":{"kind":"thread","container":"acme","id":"cteam","thread":root},"reply":{"kind":"fauxlack","server":"acme","container":"cteam","thread":root},"agent":AGENT,"note":"review this PR","nextAtMs":u64::try_from(expires).unwrap(),"subscription":{"repository":repository,"number":17}})
+    json!({"id":id,"transport":"acme-chat","kind":"fauxlack","subject":"drn:fauxlack:channel:acme:cteam","conversation":{"kind":"thread","container":"acme","id":"cteam","thread":root},"reply":{"kind":"fauxlack","server":"acme","container":"cteam","thread":root},"agent":AGENT,"note":"review this PR","nextAtMs":u64::try_from(expires).unwrap(),"subscription":{"repository":repository,"number":17}})
 }
 
 async fn boot_subscriptions(chat: &Fauxlack, responses: Vec<Value>, settings: Settings) -> Fixture {

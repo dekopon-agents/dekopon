@@ -10,8 +10,8 @@ use dekopon_broker::{
 use dekopon_broker_host::{BoundCredential, BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, InvocationOutcome};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId, Redacted,
-    RiskLevel,
+    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, Redacted, RiskLevel,
+    Subject,
 };
 use dekopon_test_support::{CaptureLayer, LoopbackServer, Record, provider_fixture};
 use sha2::{Digest, Sha256};
@@ -19,7 +19,7 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 
 const SECRET: &str = "audit-log-record-must-never-see-this";
 
-const SUBJECT: &str = "slack.t0123abc.u9xyz";
+const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
 
 const POLICY: &str = r#"
 @id("http-fetch")
@@ -50,9 +50,8 @@ async fn invoke_as_caller(
     )
     .expect("gateway context binds");
     let attestation = Attestation::for_subject(
-        SUBJECT
-            .parse::<ExternalSubject>()
-            .expect("canonical subject"),
+        dekopon_core::AttestedSubject::one(SUBJECT.parse::<Subject>().expect("canonical subject"))
+            .expect("one-form subject"),
         "provider-test".parse::<AgentId>().expect("valid agent"),
     )
     .bound_to(request.id.clone());
@@ -213,9 +212,7 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         )])
         .expect("credential store builds"),
         IdentityDirectory::new([(
-            SUBJECT
-                .parse::<ExternalSubject>()
-                .expect("canonical subject"),
+            SUBJECT.parse::<Subject>().expect("canonical subject"),
             principal("caller"),
         )])
         .expect("one mapping builds a directory"),

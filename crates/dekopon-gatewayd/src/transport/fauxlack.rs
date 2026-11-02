@@ -118,7 +118,8 @@ impl ChatTransport for FauxlackTransport {
                     pull_request_links: None,
                     transport: self.name.clone(),
                     transport_kind: ChatTransportKind::Fauxlack,
-                    subject: user.subject.clone(),
+                    subject: dekopon_core::AttestedSubject::one(user.subject.clone())
+                        .map_err(TransportError::Subject)?,
                     conversation,
                     message_id: MessageId::Native(event.id),
                     text: bound_inbound(&event.text),

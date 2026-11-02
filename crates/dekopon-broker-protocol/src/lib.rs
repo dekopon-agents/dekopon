@@ -37,7 +37,7 @@ use conversation::{
     canonical_signed_decimal, canonical_slack_timestamp, canonical_unsigned_decimal,
 };
 use dekopon_core::{
-    AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
+    AgentId, AttestedSubject, CapabilityId, InvocationId, PrincipalId, ProviderId,
     SecretUseProposal, TraceId, TraceIdError, TransportId,
 };
 use dekopon_provider_sdk::ProviderCapability;
@@ -386,7 +386,7 @@ where
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Attestation {
-    pub subject: ExternalSubject,
+    pub subjects: AttestedSubject,
     pub agent: AgentId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<ChatScopeClaim>,
@@ -402,9 +402,9 @@ impl fmt::Debug for Attestation {
 
 impl Attestation {
     #[must_use]
-    pub const fn for_subject(subject: ExternalSubject, agent: AgentId) -> Self {
+    pub const fn for_subject(subjects: AttestedSubject, agent: AgentId) -> Self {
         Self {
-            subject,
+            subjects,
             agent,
             scope: None,
             invocation: None,
@@ -412,9 +412,13 @@ impl Attestation {
     }
 
     #[must_use]
-    pub const fn for_chat(subject: ExternalSubject, agent: AgentId, scope: ChatScopeClaim) -> Self {
+    pub const fn for_chat(
+        subjects: AttestedSubject,
+        agent: AgentId,
+        scope: ChatScopeClaim,
+    ) -> Self {
         Self {
-            subject,
+            subjects,
             agent,
             scope: Some(scope),
             invocation: None,

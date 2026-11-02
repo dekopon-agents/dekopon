@@ -692,7 +692,7 @@ fn a_source_less_row_survives_two_append_reopen_cycles() {
         &"reviewer".parse().unwrap(),
         "whatsapp-test",
         "15550001111",
-        &"tel.16034700182".parse().unwrap(),
+        &"drn:tel:number::16034700182".parse().unwrap(),
     );
     let stem = key.journal_stem();
     let whatsapp = |index: usize| AssetSourceRef::WhatsApp {

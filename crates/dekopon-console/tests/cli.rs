@@ -78,7 +78,7 @@ fn structured_requires_both_streams_non_tty_and_reaches_catalog() {
         .args([
             "--structured",
             "--subject",
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "--agent",
             "reviewer",
             "--config",
@@ -99,7 +99,7 @@ fn structured_requires_both_streams_non_tty_and_reaches_catalog() {
 fn default_non_tty_refusal_and_structured_idle_conflict() {
     let (_dir, config) = catalog();
     let output = binary()
-        .args(["--subject", "slack.t0123abc.u9xyz", "--config"])
+        .args(["--subject", "drn:slack:user:t0123abc:u9xyz", "--config"])
         .arg(config)
         .output()
         .unwrap();
@@ -200,7 +200,7 @@ fn every_flag_together_passes_parsing_and_stops_at_the_tty_gate() {
         .args(["--socket".as_ref(), socket.as_os_str()])
         .args([
             "--subject",
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "--model",
             "gpt-5.6-luna",
             "--endpoint",
@@ -239,7 +239,7 @@ fn explicit_chatgpt_auth_file_passes_parsing_and_stops_at_the_tty_gate() {
         .args(["--socket".as_ref(), socket.as_os_str()])
         .args([
             "--subject",
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "--auth-file",
             "/nonexistent/dekopon/chatgpt-auth.console.json",
         ])
@@ -262,7 +262,7 @@ fn profile_fixture(text: &str) -> (TempDir, std::path::PathBuf, std::path::PathB
     (dir, catalog, profiles)
 }
 
-const PROFILE: &str = "defaultProfile: family\nprofiles:\n  - name: family\n    agent: reviewer\n    subject: slack.t0123abc.u9xyz\n    model: test-model\n    maxSteps: 2\n    maxCapabilityCalls: 3\n";
+const PROFILE: &str = "defaultProfile: family\nprofiles:\n  - name: family\n    agent: reviewer\n    subject: drn:slack:user:t0123abc:u9xyz\n    model: test-model\n    maxSteps: 2\n    maxCapabilityCalls: 3\n";
 
 #[test]
 fn authored_default_profile_is_accepted_without_subject_or_model_credential() {
@@ -293,12 +293,12 @@ fn explicit_profile_is_bound_to_its_agent() {
 fn explicit_subject_cannot_be_replaced_by_a_later_picker_profile() {
     // Neither profile is selected at startup; without the conflict check a picker hop could
     // silently replace the explicitly supplied subject with either authored identity.
-    let profiles_text = "profiles:\n  - name: first\n    agent: reviewer\n    subject: slack.t0123abc.u9xyz\n  - name: second\n    agent: other\n    subject: slack.t0123abc.u8xyz\n";
+    let profiles_text = "profiles:\n  - name: first\n    agent: reviewer\n    subject: drn:slack:user:t0123abc:u9xyz\n  - name: second\n    agent: other\n    subject: drn:slack:user:t0123abc:u8xyz\n";
     let (_dir, catalog, profiles) = profile_fixture(profiles_text);
     let output = binary()
         .args(["--config".as_ref(), catalog.as_os_str()])
         .args(["--profiles".as_ref(), profiles.as_os_str()])
-        .args(["--subject", "slack.t0123abc.u7xyz"])
+        .args(["--subject", "drn:slack:user:t0123abc:u7xyz"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -316,7 +316,7 @@ fn explicit_subject_cannot_be_replaced_by_a_later_picker_profile() {
 #[test]
 fn ambiguous_profiles_never_select_the_first_identity() {
     let duplicate = format!(
-        "{}  - name: second\n    agent: reviewer\n    subject: slack.t0123abc.u9xyz\n",
+        "{}  - name: second\n    agent: reviewer\n    subject: drn:slack:user:t0123abc:u9xyz\n",
         PROFILE
     );
     let (_dir, catalog, profiles) = profile_fixture(&duplicate);
@@ -361,10 +361,10 @@ fn unknown_agent_and_profile_names_refuse_before_connecting() {
 fn malformed_profile_document_and_missing_default_are_refused() {
     for text in [
         "defaultProfile: missing\nprofiles: []\n",
-        "profiles:\n  - name: family\n    agent: reviewer\n    subject: slack.t0123abc.u9xyz\n    maxSteps: 0\n",
-        "profiles:\n  - name: family\n    agent: reviewer\n    subject: slack.t0123abc.u9xyz\n    scope: {kind: slack, transport: operator, conversation: {kind: directMessage, id: d0123abc}, trigger: message}\n",
-        "profiles:\n  - name: family\n    agent: reviewer\n    subject: slack.t0123abc.u9xyz\n    unknownField: true\n",
-        "profiles:\n  - name: family\n    agent: reviewer\n    subject: slack.t0123abc.u9xyz\n  - name: family\n    agent: reviewer\n    subject: slack.t0123abc.u9xyz\n",
+        "profiles:\n  - name: family\n    agent: reviewer\n    subject: drn:slack:user:t0123abc:u9xyz\n    maxSteps: 0\n",
+        "profiles:\n  - name: family\n    agent: reviewer\n    subject: drn:slack:user:t0123abc:u9xyz\n    scope: {kind: slack, transport: operator, conversation: {kind: directMessage, id: d0123abc}, trigger: message}\n",
+        "profiles:\n  - name: family\n    agent: reviewer\n    subject: drn:slack:user:t0123abc:u9xyz\n    unknownField: true\n",
+        "profiles:\n  - name: family\n    agent: reviewer\n    subject: drn:slack:user:t0123abc:u9xyz\n  - name: family\n    agent: reviewer\n    subject: drn:slack:user:t0123abc:u9xyz\n",
     ] {
         let (_dir, catalog, profiles) = profile_fixture(text);
         let output = binary()
@@ -405,7 +405,7 @@ fn no_terminal_refuses_direct_selection_without_contacting_broker_or_model() {
         .args(["--config".as_ref(), catalog.as_os_str()])
         .args([
             "--subject",
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "--agent",
             "reviewer",
             "--endpoint",
@@ -437,7 +437,12 @@ fn an_agents_directory_in_dekopon_config_loads_every_agent_and_its_instructions_
     for agent in ["lange-family", "reviewer"] {
         let output = binary()
             .env("DEKOPON_CONFIG", dir.path())
-            .args(["--subject", "slack.t0123abc.u9xyz", "--agent", agent])
+            .args([
+                "--subject",
+                "drn:slack:user:t0123abc:u9xyz",
+                "--agent",
+                agent,
+            ])
             .args(["--endpoint", "http://127.0.0.1:9/v1"])
             .output()
             .unwrap();
@@ -462,7 +467,7 @@ fn an_empty_catalog_refuses_before_terminal_or_model_setup() {
     std::fs::write(&empty, "").unwrap();
     let output = binary()
         .args(["--config".as_ref(), empty.as_os_str()])
-        .args(["--subject", "slack.t0123abc.u9xyz"])
+        .args(["--subject", "drn:slack:user:t0123abc:u9xyz"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -507,7 +512,7 @@ fn pty_broker_fixture() -> Option<PtyBroker> {
         std::fs::write(path, bytes).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    std::fs::write(&config, format!("apiVersion: dekopon.dev/brokerd/v1alpha1\nsocketPath: {}\npoliciesPath: {}\nproviders: [{}]\nidentities:\n  - uid: {}\n    principal: dekopon-console\n    attestor:\n      namespaces: [slack.t0123abc]\nprincipals:\n  maintainer:\n    subjects: [slack.t0123abc.u9xyz]\ncapabilities:\n  cli-probe:\n    capabilities:\n      cli-probe.upper:\n        constraints: {{timeoutMs: 30000}}\n", socket.display(), policy.display(), component.display(), rustix::process::geteuid().as_raw())).unwrap();
+    std::fs::write(&config, format!("apiVersion: dekopon.dev/brokerd/v1alpha1\nsocketPath: {}\npoliciesPath: {}\nproviders: [{}]\nidentities:\n  - uid: {}\n    principal: dekopon-console\n    attestor:\n      namespaces: [drn:slack:*:t0123abc:*]\nprincipals:\n  maintainer:\n    subjects: [drn:slack:user:t0123abc:u9xyz]\ncapabilities:\n  cli-probe:\n    capabilities:\n      cli-probe.upper:\n        constraints: {{timeoutMs: 30000}}\n", socket.display(), policy.display(), component.display(), rustix::process::geteuid().as_raw())).unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
     let log = std::fs::File::create(dir.path().join("broker.log")).unwrap();
     let mut child = Command::new(broker)
@@ -568,7 +573,7 @@ fn pty_console(socket: &Path, catalog: &Path, direct: bool) -> String {
     // request is made by the picker or by opening the exact agent's broker snapshot.
     cmd.env("DEKOPON_CONFIG", catalog)
         .env("DEKOPON_BROKER_SOCKET", socket)
-        .env("DEKOPON_CONSOLE_SUBJECT", "slack.t0123abc.u9xyz")
+        .env("DEKOPON_CONSOLE_SUBJECT", "drn:slack:user:t0123abc:u9xyz")
         .env_remove("DEKOPON_CHATGPT_AUTH_FILE");
     #[cfg(target_os = "macos")]
     if direct {
@@ -664,7 +669,7 @@ fn structured_refuses_implicit_default_profile_before_broker_connection() {
     let catalog = dir.path().join("agents.yaml");
     let profiles = dir.path().join("profiles.yaml");
     std::fs::write(&catalog, format!("{CATALOG}---\napiVersion: dekopon.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: second\nspec:\n  description: Second agent\n  enabled: true\n")).unwrap();
-    std::fs::write(&profiles, "defaultProfile: second-profile\nprofiles:\n  - name: second-profile\n    agent: second\n    subject: slack.t0123abc.u9xyz\n").unwrap();
+    std::fs::write(&profiles, "defaultProfile: second-profile\nprofiles:\n  - name: second-profile\n    agent: second\n    subject: drn:slack:user:t0123abc:u9xyz\n").unwrap();
     let output = binary()
         .args(["--structured", "--config"])
         .arg(catalog)
@@ -705,7 +710,7 @@ fn structured_fixture_accepts_exactly_64_completed_commands() {
             "--agent",
             "reviewer",
             "--subject",
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "--config",
         ])
         .arg(config)
@@ -759,7 +764,7 @@ fn structured_fixture_refuses_65th_command_with_a_frame() {
             "--agent",
             "reviewer",
             "--subject",
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "--config",
         ])
         .arg(config)
@@ -813,7 +818,7 @@ fn structured_fixture_orders_local_commands_and_ends_at_eof() {
             "--agent",
             "reviewer",
             "--subject",
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "--config",
         ])
         .arg(config)
@@ -861,7 +866,10 @@ fn idle_starts_without_a_catalog_or_model_and_exits_on_sigterm() {
         .args(["--telemetry", "/nonexistent/ignored-by-idle.yaml"])
         .env("DEKOPON_BROKER_SOCKET", "/nonexistent/broker.sock")
         .env("DEKOPON_BROKER_UID", "65532")
-        .env("DEKOPON_CONSOLE_SUBJECT", "discord.578258790881951745")
+        .env(
+            "DEKOPON_CONSOLE_SUBJECT",
+            "drn:discord:user::578258790881951745",
+        )
         .env("DEKOPON_CONFIG", "/nonexistent/dekopon.yaml")
         .spawn()
         .expect("idle process starts");

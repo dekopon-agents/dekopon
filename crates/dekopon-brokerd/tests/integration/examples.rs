@@ -92,7 +92,7 @@ fn capability(name: &str) -> CapabilityId {
 fn attested(via: Option<&str>, agent: Option<&str>) -> PolicyContext {
     PolicyContext {
         via: via.map(str::to_owned),
-        subject: Some("slack.t0123abcd.u0123abcd".to_owned()),
+        subject: Some("drn:slack:user:t0123abcd:u0123abcd".to_owned()),
         agent: agent.map(str::to_owned),
         ..PolicyContext::default()
     }
@@ -381,13 +381,13 @@ fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
     let identity = config.identities.first().expect("one peer identity");
     let grant = identity.attestor.as_ref().expect("the gateway may attest");
     let (principal, entry) = config.principals.iter().next().expect("one principal");
-    let subject = entry.subjects.first().expect("one subject").canonical();
+    let subject = entry.subjects.first().expect("one subject");
     assert!(
         grant
             .namespaces
             .iter()
             .flatten()
-            .any(|namespace| subject == *namespace || subject.starts_with(&format!("{namespace}."))),
+            .any(|namespace| namespace.covers(subject)),
         "{subject} sits outside the gateway's attestor namespaces"
     );
     assert_eq!(principal.as_str(), PRINCIPAL);

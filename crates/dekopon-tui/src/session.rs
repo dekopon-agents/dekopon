@@ -23,7 +23,7 @@ use dekopon_broker_protocol::{
     DeliveryIdentity, FrameLimits, InvocationOutcome, ResolvedBrokerSocket, TraceParent, Trigger,
 };
 use dekopon_config::Skill;
-use dekopon_core::{AgentId, ExternalSubject};
+use dekopon_core::{AgentId, AttestedSubject, Subject};
 use dekopon_model::{
     blocking::BlockingModel,
     chatgpt::{self, ChatGptError},
@@ -132,7 +132,7 @@ pub struct ConsoleOptions {
     pub socket: Option<PathBuf>,
     pub server_uid: Option<u32>,
     pub frame_limits: FrameLimits,
-    pub subject: ExternalSubject,
+    pub subject: Subject,
     pub scope: Option<ChatScopeClaim>,
     pub smoke_conversation: bool,
     pub profiles: Vec<OperatorProfile>,
@@ -154,7 +154,7 @@ pub struct ConsoleOptions {
 
 impl ConsoleOptions {
     #[must_use]
-    pub fn new(subject: ExternalSubject, model: String, shell_threads: ShellThreads) -> Self {
+    pub fn new(subject: Subject, model: String, shell_threads: ShellThreads) -> Self {
         Self {
             catalog: None,
             socket: None,
@@ -277,7 +277,7 @@ impl SmokeIdentity {
 
 pub async fn smoke_record(
     client: &BrokerClient,
-    subject: ExternalSubject,
+    subject: Subject,
     agent: AgentId,
     text: String,
 ) -> Result<(String, bool), ClientError> {
@@ -286,7 +286,8 @@ pub async fn smoke_record(
     let identity = IDENTITY.get_or_init(|| SmokeIdentity::new(parent.trace_id()));
     let turn = identity.turn(parent, text);
     let attestation =
-        Attestation::for_chat(subject, agent, smoke_claim()).bound_to(turn.id.clone());
+        Attestation::for_chat(AttestedSubject::configured(subject), agent, smoke_claim())
+            .bound_to(turn.id.clone());
     let result = client.record_delivered_turn(attestation, turn).await?;
     let succeeded = result.outcome == InvocationOutcome::Succeeded;
     Ok((
@@ -297,7 +298,7 @@ pub async fn smoke_record(
 
 pub async fn open_agent(
     client: BrokerClient,
-    subject: ExternalSubject,
+    subject: Subject,
     agent: AgentId,
     scope: Option<ChatScopeClaim>,
 ) -> Result<BrokerLeg, SessionError> {
@@ -313,14 +314,14 @@ pub async fn open_agent(
 
 pub async fn open_agent_with_assets(
     client: BrokerClient,
-    subject: ExternalSubject,
+    subject: Subject,
     agent: AgentId,
     scope: Option<ChatScopeClaim>,
     store: Arc<assets::ConsoleAssets>,
 ) -> Result<BrokerLeg, SessionError> {
     let attestation = match scope {
-        Some(scope) => Attestation::for_chat(subject, agent, scope),
-        None => Attestation::for_subject(subject, agent),
+        Some(scope) => Attestation::for_chat(AttestedSubject::configured(subject), agent, scope),
+        None => Attestation::for_subject(AttestedSubject::configured(subject), agent),
     };
     let leg = BrokerLeg::connect(client, Some(attestation))
         .await

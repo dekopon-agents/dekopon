@@ -26,9 +26,9 @@ use serde_json::{Value, json};
 use tokio::sync::{MutexGuard, oneshot};
 use tracing_subscriber::layer::SubscriberExt as _;
 
-const MAPPED_SUBJECT: &str = "tel.16034700182";
-const OTHER_MAPPED_SUBJECT: &str = "tel.16035550100";
-const UNMAPPED_SUBJECT: &str = "tel.19999999999";
+const MAPPED_SUBJECT: &str = "drn:tel:number::16034700182";
+const OTHER_MAPPED_SUBJECT: &str = "drn:tel:number::16035550100";
+const UNMAPPED_SUBJECT: &str = "drn:tel:number::19999999999";
 const MAPPED_PRINCIPAL: &str = "cpetersen";
 const OTHER_MAPPED_PRINCIPAL: &str = "jortega";
 const GATEWAY_PRINCIPAL: &str = "dekopon-gatewayd";
@@ -97,7 +97,7 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             "uid": uid,
             "principal": GATEWAY_PRINCIPAL,
             "actor": {"type": "service", "principal": GATEWAY_PRINCIPAL},
-            "attestor": {"namespaces": ["tel"]}
+            "attestor": {"namespaces": ["drn:tel:*:*:*"]}
         }],
         "principals": {
             MAPPED_PRINCIPAL: {"subjects": [MAPPED_SUBJECT]},

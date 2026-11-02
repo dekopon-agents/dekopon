@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use dekopon_broker_protocol::ConversationKind;
-use dekopon_core::ExternalSubject;
+use dekopon_core::Subject;
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -30,7 +30,7 @@ pub(crate) struct Facts {
 pub(crate) struct Person {
     pub name: String,
     pub bot: bool,
-    pub subject: ExternalSubject,
+    pub subject: Subject,
 }
 pub(crate) struct Container {
     pub name: Option<String>,

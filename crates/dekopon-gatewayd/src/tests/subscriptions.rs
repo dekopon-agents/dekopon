@@ -12,32 +12,14 @@ fn subscription_anchor() -> Anchor {
 }
 
 #[test]
-fn a_dotted_repository_is_refused_at_pr_link_parse_and_persists_nothing() {
-    let directory = temporary();
-    let store = wakes::wake_store(directory.path());
-    let before = dekopon_test_support::snapshot_tree(directory.path());
-    let refusal =
-        PullRequestLinkContext::parse("https://github.com/other/repo.name/pull/18").unwrap_err();
+fn a_dotted_repository_pr_link_parses_to_its_lowercase_full_name() {
+    let links = PullRequestLinkContext::parse(
+        "https://github.com/Dekopon-Agents/Dekopon-Agents.github.io/pull/18",
+    )
+    .expect("a dotted repository is a pull request link");
     assert_eq!(
-        refusal,
-        ExternalSubject::github("other", "repo.name").unwrap_err()
-    );
-    assert!(matches!(
-        refusal,
-        dekopon_core::SubjectError::InvalidSegment {
-            segment: "subject",
-            ..
-        }
-    ));
-    assert_eq!(
-        dekopon_test_support::snapshot_tree(directory.path()),
-        before
-    );
-    assert!(
-        store
-            .list_subscriptions(&subscription_anchor(), std::time::SystemTime::now())
-            .unwrap()
-            .is_empty()
+        links.targets[0].repository.as_str(),
+        "dekopon-agents/dekopon-agents.github.io"
     );
 }
 
@@ -50,7 +32,6 @@ fn the_sixty_fifth_subscription_is_refused_per_agent_across_channels() {
     for number in 1..=64 {
         let target =
             PullRequestLinkContext::parse(&format!("https://github.com/acme/widget/pull/{number}"))
-                .unwrap()
                 .unwrap()
                 .targets
                 .remove(0);
@@ -67,7 +48,6 @@ fn the_sixty_fifth_subscription_is_refused_per_agent_across_channels() {
         store.subscribe(channel, target, now).unwrap();
     }
     let target = PullRequestLinkContext::parse("https://github.com/acme/widget/pull/65")
-        .unwrap()
         .unwrap()
         .targets
         .remove(0);
@@ -91,7 +71,6 @@ fn a_subscription_expires_at_its_fourteen_day_deadline_without_firing() {
     let anchor = subscription_anchor();
     let created = std::time::SystemTime::now();
     let target = PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
-        .unwrap()
         .unwrap()
         .targets
         .remove(0);
@@ -124,9 +103,7 @@ fn only_a_confirmed_review_of_a_link_target_creates_a_space_subscription() {
     let observer = crate::wake::ReviewSubscriptions::Subscribe {
         anchor: Box::new(subscription_anchor()),
         store: Arc::clone(&store),
-        links: PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
-            .unwrap()
-            .unwrap(),
+        links: PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17").unwrap(),
     };
     let input = json!({"owner":"acme","repo":"widget","number":17});
     observer.reviewed(
@@ -204,13 +181,13 @@ async fn a_subscription_wake_decline_makes_no_slack_http_calls() {
 
 pub(super) fn subscription_wake() -> InboundMessage {
     let mut message = owned_slack_message("Refresh this PR and decline if unchanged.", false);
-    message.subject = subscription_anchor().subject().clone();
+    message.subject = dekopon_core::AttestedSubject::one(subscription_anchor().subject().clone())
+        .expect("one-form subject");
     message.message_id = MessageId::Wake {
         id: dekopon_agent::wake::WakeId(1),
         notice: "review".into(),
         origin: crate::wake::WakeOrigin::Subscription(
             PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
-                .unwrap()
                 .unwrap()
                 .targets
                 .remove(0),
@@ -253,7 +230,7 @@ async fn a_revoked_space_subscription_wake_makes_no_slack_http_calls() {
     else {
         panic!("space leg")
     };
-    assert_eq!(claim.subject, *subscription_anchor().subject());
+    assert_eq!(claim.subjects.name(), subscription_anchor().subject());
     let scope = claim.scope.unwrap();
     assert_eq!(scope.trigger, dekopon_broker_protocol::Trigger::Wake);
     assert!(scope.participant.is_none());
@@ -351,7 +328,7 @@ async fn busy_and_sealed_subscription_wakes_remain_audited_without_slack_http_ca
                 &bound.agent,
                 &bound.transport,
                 &message.conversation,
-                Some(&message.subject),
+                Some(message.subject.name()),
             );
             assert!(crate::session::seal_conversation(&running, &bound, &message, &key).await);
             None
@@ -444,7 +421,6 @@ fn only_a_successful_review_of_the_subscribed_target_confirms_a_refresh() {
     use dekopon_agent::prompt::ReviewProgress;
     use dekopon_shell::CapabilityCallResult;
     let review_target = PullRequestLinkContext::parse("https://github.com/acme/widget/pull/17")
-        .unwrap()
         .unwrap()
         .targets
         .remove(0);
@@ -552,7 +528,6 @@ fn a_subscription_close_is_recorded_separately_from_deadline_expiry() {
     ] {
         let target =
             PullRequestLinkContext::parse(&format!("https://github.com/acme/widget/pull/{number}"))
-                .unwrap()
                 .unwrap()
                 .targets
                 .remove(0);

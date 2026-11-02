@@ -25,10 +25,7 @@ from slack_socket_fixture import SlackSocketFixture
 VERSION = "0.74.0"
 PROVIDER_SHA256 = "64914f342a367129f69f857c78871e37c967dfb8eff8215c047899007e326462"
 GH_PROVIDER_SHA256 = "b2abb6a8a2dec689cb345b2b394b41a291d66196b2672a8fd86a014fe5cdee32"
-SUBJECT = "slack.t0123abc.u0123abc"
-COLLEAGUE_SUBJECT = "slack.t0123abc.u456def"
-DENIED_SUBJECT = "slack.t0123abc.udenied"
-UNMAPPED_SUBJECT = "slack.t0123abc.uunknown"
+TEAM = "t0123abc"
 BROKER_PAT = "synthetic-broker-pat-${GITHUB_TOKEN}-literal"
 BROKER_GITHUB_TOKEN = "broker-environment-value-must-not-expand"
 MODEL_KEY = "synthetic-model-key-$literal-only"
@@ -84,7 +81,30 @@ def command(args, env, check=True, timeout=15):
     return result
 
 
-def configure(root, port, gateway, slack_endpoint, mode):
+def slack_subject(drn, kind, slack_id):
+    return f"drn:slack:{kind}:{TEAM}:{slack_id}" if drn else f"slack.{TEAM}.{slack_id}"
+
+
+def slack_scope(drn):
+    return f"drn:slack:*:{TEAM}:*" if drn else f"slack.{TEAM}"
+
+
+def slack_id(subject):
+    return re.split(r"[.:]", subject)[-1]
+
+
+def subjects(drn):
+    global SUBJECT, COLLEAGUE_SUBJECT, DENIED_SUBJECT, UNMAPPED_SUBJECT
+    SUBJECT = slack_subject(drn, "user", "u0123abc")
+    COLLEAGUE_SUBJECT = slack_subject(drn, "user", "u456def")
+    DENIED_SUBJECT = slack_subject(drn, "user", "udenied")
+    UNMAPPED_SUBJECT = slack_subject(drn, "user", "uunknown")
+
+
+subjects(False)
+
+
+def configure(root, port, gateway, slack_endpoint, mode, drn):
     credentials = root / "broker-credentials.yaml"
     credentials.write_text(f"""apiVersion: dekopon.dev/broker-credentials/v1alpha1
 credentials:
@@ -140,14 +160,14 @@ exec {shlex.quote(str(gateway))} --worker-threads 2 --blocking-threads 8 \\
         "identities": [{
             "uid": os.getuid(), "principal": "dekopon-gatewayd",
             "actor": {"type": "service", "principal": "dekopon-gatewayd"},
-            "attestor": {"namespaces": ["slack.t0123abc"]},
+            "attestor": {"namespaces": [slack_scope(drn)]},
         }],
         "principals": {
             "owner": {"subjects": [SUBJECT], "groups": ["pr-reviewers"]},
             "colleague": {"subjects": [COLLEAGUE_SUBJECT], "groups": ["pr-reviewers"]},
             "denied": {"subjects": [DENIED_SUBJECT]},
-            "review-room": {"subjects": ["slack.t0123abc.c0123abc"]},
-            "denied-room": {"subjects": ["slack.t0123abc.cdenied"]},
+            "review-room": {"subjects": [slack_subject(drn, "channel", "c0123abc")]},
+            "denied-room": {"subjects": [slack_subject(drn, "channel", "cdenied")]},
         },
         "providerSettings": {name: {"baseUrl": f"http://127.0.0.1:{port}"} for name in ("jsonplaceholder", "gh")},
         "http": {"plaintextHosts": ["127.0.0.1"]},
@@ -568,10 +588,10 @@ def event_in_thread(event, thread):
 
 
 def slack_turns(root, slack, requests, stop_started, stop_release, stop_finished):
-    owner = SUBJECT.rsplit(".", 1)[1]
+    owner = slack_id(SUBJECT)
     threads = {}
     for subject in (SUBJECT, COLLEAGUE_SUBJECT):
-        user = subject.rsplit(".", 1)[1]
+        user = slack_id(subject)
         before = list(requests)
         envelope, thread = slack.emit_mention(user, "Review PR 7.")
         slack.wait_ack(envelope)
@@ -599,7 +619,7 @@ def slack_turns(root, slack, requests, stop_started, stop_release, stop_finished
                                      (DENIED_SUBJECT, "c0123abc", "agent-denied"),
                                      (SUBJECT, "cdenied", "attestation-refused")):
         before = list(requests)
-        envelope, thread = slack.emit_mention(subject.rsplit(".", 1)[1], "Review PR 7.", channel=channel)
+        envelope, thread = slack.emit_mention(slack_id(subject), "Review PR 7.", channel=channel)
         slack.wait_ack(envelope)
         wait_gateway_event(root, lambda event: event.get("event") == "gateway_session_rejected"
                            and event.get("reason") == reason and event_in_thread(event, thread)
@@ -628,12 +648,12 @@ def slack_turns(root, slack, requests, stop_started, stop_release, stop_finished
                                  for call in slack.calls):
         raise RuntimeError("A direct message on the channel-only Slack route reached the agent or got a reply")
     before = list(requests)
-    envelope, thread = slack.emit_mention(SUBJECT.rsplit(".", 1)[1], "Wait for Stop.")
+    envelope, thread = slack.emit_mention(slack_id(SUBJECT), "Wait for Stop.")
     slack.wait_ack(envelope)
     status = slack.wait_status("processing", thread)
-    if status.get("initiator_user_id", "").casefold() != SUBJECT.rsplit(".", 1)[1] or not stop_started.wait(10):
+    if status.get("initiator_user_id", "").casefold() != slack_id(SUBJECT) or not stop_started.wait(10):
         raise RuntimeError("Native Stop was not tested against the initiating user's active model request")
-    envelope, _ = slack.send_stop(SUBJECT.rsplit(".", 1)[1], thread)
+    envelope, _ = slack.send_stop(slack_id(SUBJECT), thread)
     slack.wait_ack(envelope)
     wait_gateway_event(root, lambda event: event.get("event") == "gateway_session_stop_requested"
                        and event.get("transport") == "review-slack" and event.get("via") == "native-stop",
@@ -690,7 +710,8 @@ def serves_again(root, requests):
         raise RuntimeError("The restarted gateway did not serve the refusal turn without downstream calls")
 
 
-def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mode, expected_version):
+def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mode, expected_version, drn):
+    subjects(drn)
     for source, filename, expected in ((provider, "provider.wasm", PROVIDER_SHA256),
                                        (gh_provider, "gh-provider.wasm", GH_PROVIDER_SHA256)):
         component = source.read_bytes()
@@ -729,7 +750,7 @@ def smoke(root, bin_dir, provider, gh_provider, cassette_binary, use_launchd, mo
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         http_started = True
-        configure(root, server.server_port, binaries["gateway"], slack.endpoint, mode)
+        configure(root, server.server_port, binaries["gateway"], slack.endpoint, mode, drn)
         for name, binary in binaries.items():
             command([str(binary), "check", str(root / f"{name}.yaml")],
                     {**env, "RUST_LOG": "warn"}, timeout=60)
@@ -873,6 +894,8 @@ def main():
     modes.add_argument("--env-file", dest="mode", action="store_const", const=ENV_FILE,
                        help="Start both daemons directly with --env-file, restart them and force refused files (default).")
     parser.set_defaults(mode=ENV_FILE)
+    parser.add_argument("--drn-subjects", action="store_true",
+                        help="Spell subjects and attestor scopes as DRNs; daemons built after the DRN cutover.")
     args = parser.parse_args()
     # macOS TMPDIR paths can exceed sockaddr_un; resolve /tmp's symlink before protected-file checks.
     root = Path(tempfile.mkdtemp(prefix="deko-mac-", dir=Path("/tmp").resolve()))
@@ -880,7 +903,7 @@ def main():
     try:
         smoke(root, args.bin_dir.resolve(strict=True), args.provider.resolve(strict=True),
               args.gh_provider.resolve(strict=True), args.cassette_bin.resolve(strict=True), args.launchd,
-              args.mode, args.expected_version)
+              args.mode, args.expected_version, args.drn_subjects)
         remove = True
     except Exception as error:
         raise SystemExit(failure_text(error)) from None

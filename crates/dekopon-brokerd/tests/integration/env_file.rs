@@ -85,7 +85,7 @@ permit(principal == Dekopon::Principal::"cpetersen",
             "actor": {"type": "agent", "agent": "brokerd-test"},
             "attestor": {},
         }],
-        "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}},
+        "principals": {"cpetersen": {"subjects": ["drn:slack:user:t0123abc:u9xyz"]}},
         "capabilities": {
             "cli-probe": {
                 "constraints": {"timeoutMs": 30000},

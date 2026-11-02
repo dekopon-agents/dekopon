@@ -6,8 +6,14 @@ use std::sync::Arc;
 pub async fn broker(policies: &str) -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
     let principal = |name: &str| name.parse::<PrincipalId>().unwrap();
     let mappings = [
-        ("github.owner.repo".parse().unwrap(), principal("repo")),
-        ("slack.team.user".parse().unwrap(), principal("person")),
+        (
+            "drn:github:repo:owner:repo".parse().unwrap(),
+            principal("repo"),
+        ),
+        (
+            "drn:slack:user:team:user".parse().unwrap(),
+            principal("person"),
+        ),
     ];
     let world = PolicyWorld::new(
         [principal("repo"), principal("person")],
@@ -49,7 +55,7 @@ pub fn event(name: &str, delivery: &str) -> Value {
 pub fn claim(events: Vec<Value>) -> Attestation {
     let scope:ChatScopeClaim=serde_json::from_value(json!({"transport":"github","kind":"github","conversation":{"kind":"thread","container":"owner","id":"owner.repo","thread":"7"},"trigger":"message","delivery":{"kind":"github","delivery":"delivery-1"},"github":events})).unwrap();
     Attestation::for_chat(
-        "github.owner.repo".parse().unwrap(),
+        dekopon_core::AttestedSubject::github_repository("owner", "repo", 1).unwrap(),
         "some-agent".parse().unwrap(),
         scope,
     )

@@ -55,7 +55,7 @@ fn access(name: &str) -> AssetAccess {
             &"reviewer".parse().unwrap(),
             "dev",
             name,
-            &"tel.15550000001".parse().unwrap(),
+            &"drn:tel:number::15550000001".parse().unwrap(),
         ),
         1,
         Arc::new(AssetFence::new()),

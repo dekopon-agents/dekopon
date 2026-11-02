@@ -23,7 +23,7 @@ broker:
             type: service
             principal: dekopon-gatewayd
           attestor:
-            namespaces: [slack.t0123abcd]
+            namespaces: ["drn:slack:*:t0123abcd:*"]
         - uid: 65532
           principal: dekopon-gatewayd
           actor:
@@ -31,7 +31,7 @@ broker:
             principal: dekopon-gatewayd
       principals:
         maintainer:
-          subjects: [slack.t0123abcd.u0123abcd]
+          subjects: [drn:slack:user:t0123abcd:u0123abcd]
       capabilities:
         gh:
           credential: github-pat

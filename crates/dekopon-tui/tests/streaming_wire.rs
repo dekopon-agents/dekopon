@@ -120,7 +120,7 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
         FrameLimits::default(),
     )
     .unwrap();
-    let subject: dekopon_core::ExternalSubject = "slack.t0123abc.u9xyz".parse().unwrap();
+    let subject: dekopon_core::Subject = "drn:slack:user:t0123abc:u9xyz".parse().unwrap();
     let agent: dekopon_core::AgentId = "reviewer".parse().unwrap();
     let inventory = Arc::new(ConsoleAssets::default());
     let first = open_agent_with_assets(
@@ -241,7 +241,10 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
                 .unwrap();
             let request = &frame["request"];
             assert_eq!(request["operation"], operation);
-            assert_eq!(request["attestation"]["subject"], "slack.t0123abc.u9xyz");
+            assert_eq!(
+                request["attestation"]["subjects"],
+                serde_json::json!(["drn:slack:user:t0123abc:u9xyz"])
+            );
             assert_eq!(request["attestation"]["agent"], "reviewer");
             let response = match operation {
                 "capabilities" => {
@@ -299,7 +302,7 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
     .unwrap();
     let leg = open_agent(
         client,
-        "slack.t0123abc.u9xyz".parse().unwrap(),
+        "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
         "reviewer".parse().unwrap(),
         None,
     )

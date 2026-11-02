@@ -373,7 +373,10 @@ async fn ipc_process_boundary() {
         .unwrap();
         let result = client
             .session_surface(Some(dekopon_broker_protocol::Attestation::for_subject(
-                "slack.t0123abc.u9xyz".parse().unwrap(),
+                dekopon_core::AttestedSubject::one(
+                    "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+                )
+                .unwrap(),
                 "chat-agent".parse().unwrap(),
             )))
             .await
@@ -484,7 +487,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
         "apiVersion": "dekopon.dev/brokerd/v1alpha1", "socketPath": socket,
         "policiesPath": policy,
         "providers": [provider], "credentialsPath": credentials, "identities": identities,
-        "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}},
+        "principals": {"cpetersen": {"subjects": ["drn:slack:user:t0123abc:u9xyz"]}},
         "capabilities": {"cli-probe": {"constraints": {"timeoutMs": 30000}, "capabilities": {"cli-probe.upper": {}}}}
     })).unwrap()).unwrap();
     for path in [&provider, &credentials, &policy, &config] {

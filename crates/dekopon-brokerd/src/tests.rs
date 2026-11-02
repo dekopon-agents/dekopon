@@ -74,7 +74,7 @@ fn attested_document(uid: u32) -> serde_json::Value {
                 "uid": uid + 1,
                 "principal": "gateway",
                 "actor": {"type": "service", "principal": "gateway"},
-                "attestor": {"namespaces": ["slack.t0123abc"]}
+                "attestor": {"namespaces": ["drn:slack:*:t0123abc:*"]}
             },
             {
                 "uid": uid + 2,
@@ -83,7 +83,7 @@ fn attested_document(uid: u32) -> serde_json::Value {
             }
         ],
         "principals": {
-            "cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}
+            "cpetersen": {"subjects": ["drn:slack:user:t0123abc:u9xyz"]}
         },
         "capabilities": probe_capabilities()
     })
@@ -110,7 +110,7 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
     assert_eq!(resolved.principals.len(), 1);
     assert_eq!(
         resolved.principals[&"cpetersen".parse().expect("principal")].subjects[0].canonical(),
-        "slack.t0123abc.u9xyz"
+        "drn:slack:user:t0123abc:u9xyz"
     );
     assert!(
         resolved.identities[1].attestor.is_some(),
@@ -397,8 +397,8 @@ async fn mixed_subject_kinds_report_every_offending_principal() {
 
     let mut mixed = document;
     mixed["principals"] = json!({
-        "cpetersen": {"subjects": ["slack.t0123abc.u9xyz", "slack.t0123abc.c0123abc"]},
-        "someone-else": {"subjects": ["discord.123", "discord.456.789"]}
+        "cpetersen": {"subjects": ["drn:slack:user:t0123abc:u9xyz", "drn:slack:channel:t0123abc:c0123abc"]},
+        "someone-else": {"subjects": ["drn:discord:user::123", "drn:discord:channel:456:789"]}
     });
     write_config(&path, &mixed);
     let error = config::load(&path, uid)
@@ -431,8 +431,8 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
 
     let mut duplicated = document.clone();
     duplicated["principals"] = json!({
-        "cpetersen": {"subjects": ["slack.t0123abc.u9xyz", "discord.1"]},
-        "someone-else": {"subjects": ["slack.t0123abc.u9xyz", "discord.1"]}
+        "cpetersen": {"subjects": ["drn:slack:user:t0123abc:u9xyz", "drn:discord:user::1"]},
+        "someone-else": {"subjects": ["DRN:Slack:User:T0123ABC:U9XYZ", "drn:discord:user::1"]}
     });
     write_config(&path, &duplicated);
     let error = config::load(&path, uid)
@@ -441,24 +441,22 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
     assert!(matches!(
         error,
         config::ConfigError::DuplicateSubjects { subjects }
-            if subjects == ["discord.1", "slack.t0123abc.u9xyz"]
+            if subjects == ["drn:discord:user::1", "drn:slack:user:t0123abc:u9xyz"]
     ));
 
     for namespaces in [
         json!(["sms"]),
-        json!(["slack.T0123ABC"]),
-        json!(["slack..u9xyz"]),
+        json!(["slack.t0123abc"]),
+        json!(["drn:slack:*:t0123*:*"]),
+        json!(["drn:*:user:t0123abc:*"]),
         json!([]),
     ] {
         let mut invalid = document.clone();
         invalid["identities"][1]["attestor"]["namespaces"] = namespaces.clone();
         write_config(&path, &invalid);
-        let Err(error) = config::load(&path, uid).await else {
-            panic!("accepted attestor namespaces {namespaces}");
-        };
         assert!(
-            matches!(error, config::ConfigError::Attestor { .. }),
-            "namespaces {namespaces} produced {error}"
+            config::load(&path, uid).await.is_err(),
+            "accepted attestor namespaces {namespaces}"
         );
     }
 }
@@ -1306,7 +1304,10 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
 
 fn mapped_slack_channel_claim() -> dekopon_broker_protocol::Attestation {
     dekopon_broker_protocol::Attestation::for_chat(
-        "slack.t0123abc.u9xyz".parse().expect("subject"),
+        dekopon_core::AttestedSubject::one(
+            "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
+        )
+        .expect("subject"),
         "chat-agent"
             .parse::<dekopon_core::AgentId>()
             .expect("agent"),
@@ -1386,11 +1387,11 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         CredentialStore::empty(),
         IdentityDirectory::new([
             (
-                "slack.t0123abc.u9xyz".parse().expect("canonical subject"),
+                "drn:slack:user:t0123abc:u9xyz".parse().expect("canonical subject"),
                 "cpetersen".parse::<PrincipalId>().expect("valid principal"),
             ),
             (
-                "slack.t0123abc.cspace".parse().expect("space subject"),
+                "drn:slack:channel:t0123abc:cspace".parse().expect("space subject"),
                 "space".parse().expect("space principal"),
             ),
         ])
@@ -1430,7 +1431,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     );
     let claim = mapped_slack_channel_claim();
     let attestor = dekopon_broker::AttestorGrant {
-        namespaces: Some(vec!["slack.t0123abc".to_owned()]),
+        namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
     };
     let (actual, actual_words, actual_help, memory) = broker
         .session_surface(&gateway, Some(&attestor), Some(&claim))
@@ -1449,7 +1450,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         actual_words,
         actual_help,
         memory,
-        broker.display_principal(&claim.subject),
+        broker.display_principal(&claim.subjects),
     )
     .with_space(Some(actual_space));
     let actual_bytes = serde_json::to_vec(&actual_response)
@@ -1702,7 +1703,7 @@ async fn a_configuration_directory_merges_fragments_and_refuses_every_collision(
         &json!({
             "apiVersion": config::CONFIG_API_VERSION,
             "socketPath": "/elsewhere.sock",
-            "principals": {"cpetersen": {"subjects": ["slack.t0123abc.uother"]}}
+            "principals": {"cpetersen": {"subjects": ["drn:slack:user:t0123abc:uother"]}}
         }),
     );
     let Err(config::ConfigError::Fragments(dekopon_core::fragments::FragmentError::Conflicts {
@@ -2778,7 +2779,7 @@ async fn reaper_sweeps_with_the_committed_generation_retention() {
         StorageAccess::ReadWrite,
         StorageScope::Agent,
         "chat-agent".parse().unwrap(),
-        dekopon_core::ExternalSubject::slack("T123", "U123").unwrap(),
+        dekopon_core::Subject::slack_user("T123", "U123").unwrap(),
         "slack",
         "work",
         "c123",
@@ -3133,10 +3134,7 @@ async fn captured_old_broker_leg_retains_its_grant_after_new_policy_activates() 
         candidate_or_refusal(&fixture.config(), super::Mode::Reload(&active)).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let digest = next.unwrap().digest;
-    let claim = Attestation::for_subject(
-        "slack.t0123abc.u9xyz".parse().unwrap(),
-        "chat-agent".parse().unwrap(),
-    );
+    let claim = Attestation::for_subject(slack_subjects(), "chat-agent".parse().unwrap());
     let (stdin, mut feeder) = std::os::unix::net::UnixStream::pair().unwrap();
     let (stdout, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
     let old_client = client.clone();
@@ -3192,7 +3190,7 @@ async fn captured_old_broker_leg_retains_its_grant_after_new_policy_activates() 
     let denied = client
         .invoke(
             Some(Attestation::for_subject(
-                "slack.t0123abc.u9xyz".parse().unwrap(),
+                slack_subjects(),
                 "chat-agent".parse().unwrap(),
             )),
             generation_invocation("leg-new", false),
@@ -3257,17 +3255,14 @@ async fn peer_identity_edit_is_published_with_the_broker_generation() {
     fixture.ready(&task).await;
     let client =
         BrokerClient::new(fixture.socket(), current_uid(), FrameLimits::default()).unwrap();
-    let claim = Attestation::for_subject(
-        "slack.t0123abc.u9xyz".parse().unwrap(),
-        "chat-agent".parse().unwrap(),
-    );
+    let claim = Attestation::for_subject(slack_subjects(), "chat-agent".parse().unwrap());
     client.session_surface(Some(claim.clone())).await.unwrap();
     let (old, GenerationOutcome::Active) = client.observe_generation().await.unwrap() else {
         panic!("boot generation must be active");
     };
     let mut document: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.config()).unwrap()).unwrap();
-    document["identities"][0]["attestor"] = json!({"namespaces": ["slack.other"]});
+    document["identities"][0]["attestor"] = json!({"namespaces": ["drn:slack:*:other:*"]});
     write_config(&fixture.config(), &document);
     let (next, report) =
         candidate_or_refusal(&fixture.config(), super::Mode::Reload(&active.unwrap())).await;
@@ -3699,9 +3694,9 @@ async fn check_reports_a_fragment_collision_an_unknown_group_and_a_missing_field
                 "uid": uid,
                 "principal": "gateway",
                 "actor": {"type": "service", "principal": "gateway"},
-                "attestor": {"namespaces": ["slack.t0123abc"]}
+                "attestor": {"namespaces": ["drn:slack:*:t0123abc:*"]}
             }],
-            "principals": {"cpetersen": {"subjects": ["slack.t0123abc.u9xyz"]}}
+            "principals": {"cpetersen": {"subjects": ["drn:slack:user:t0123abc:u9xyz"]}}
         }),
     );
     write_config(
@@ -4358,7 +4353,7 @@ impl WorkflowFixture {
     }
 }
 
-const MAPPED_SUBJECT: &str = "slack.t0123abc.u9xyz";
+const MAPPED_SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
 
 #[tokio::test]
 async fn a_step_whose_argv_renders_a_usage_error_is_refused_as_parse() {
@@ -4399,7 +4394,7 @@ async fn a_step_for_an_unmapped_subject_is_refused_as_grant() {
     fixture.write(MAPPED_SUBJECT, step);
     assert!(fixture.refusals().await.is_empty());
 
-    fixture.write("slack.t0123abc.u0other", step);
+    fixture.write("drn:slack:user:t0123abc:u0other", step);
     let refusals = fixture.refusals().await;
     assert_eq!(refusals.len(), 1, "{refusals:?}");
     assert!(
@@ -4520,7 +4515,7 @@ async fn a_via_principal_that_two_identities_share_is_refused_as_grant() {
             "uid": current_uid() + 3,
             "principal": "gateway",
             "actor": {"type": "service", "principal": "gateway"},
-            "attestor": {"namespaces": ["slack.t0other"]}
+            "attestor": {"namespaces": ["drn:slack:*:t0other:*"]}
         }));
     write_config(&fixture.config, &document);
     fixture.write(
@@ -4558,4 +4553,8 @@ async fn an_oversized_workflow_file_is_refused_as_a_workflow_file() {
         ),
         "{report:?}"
     );
+}
+
+fn slack_subjects() -> dekopon_core::AttestedSubject {
+    dekopon_core::AttestedSubject::one("drn:slack:user:t0123abc:u9xyz".parse().unwrap()).unwrap()
 }

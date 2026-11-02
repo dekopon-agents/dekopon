@@ -136,11 +136,11 @@ fn private_shared_and_agent_scopes_have_distinct_resolved_identities() {
     let private = StorageScope::PrivateConversation;
     let shared = StorageScope::SharedConversation;
     let agent = StorageScope::Agent;
-    let a = "slack.t0123abc.u9xyz";
-    let b = "slack.t0123abc.u8xyz";
+    let a = "drn:slack:user:t0123abc:u9xyz";
+    let b = "drn:slack:user:t0123abc:u8xyz";
     assert_eq!(
         token(private, a, "reviewer", "storage-probe", "thread-1"),
-        "48f374ed95a5c6ae899b727e9d7648d5a9f9443c3f97bc0c2e4134019432380a"
+        "6b2bba73389f531924dac95bb3fe66cd5c38298c911047b79a41c01cbd1494da"
     );
     assert_ne!(
         token(private, a, "reviewer", "storage-probe", "thread-1"),
@@ -173,7 +173,7 @@ fn private_shared_and_agent_scopes_have_distinct_resolved_identities() {
     let cross_transport = |scope| {
         host.prepare_grant(request_at(
             scope,
-            "discord.123456789012345678",
+            "drn:discord:user::123456789012345678",
             "reviewer",
             "storage-probe",
             "discord",
@@ -223,7 +223,7 @@ fn private_shared_and_agent_scopes_have_distinct_resolved_identities() {
                     .begin(
                         host.grant(request_at(
                             agent,
-                            "discord.123456789012345678",
+                            "drn:discord:user::123456789012345678",
                             "reviewer",
                             "storage-probe",
                             "discord",
@@ -264,7 +264,7 @@ fn keep_and_legacy_are_preserved_while_expired_agent_data_is_removed_and_quota_r
     let host = StorageHost::open(&root, limits).unwrap();
     let first = request(
         StorageScope::Agent,
-        "slack.t0123abc.u9xyz",
+        "drn:slack:user:t0123abc:u9xyz",
         "reviewer",
         "storage-probe",
         "thread-1",
@@ -273,7 +273,7 @@ fn keep_and_legacy_are_preserved_while_expired_agent_data_is_removed_and_quota_r
     let token = host
         .prepare_grant(request(
             StorageScope::Agent,
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "reviewer",
             "storage-probe",
             "thread-1",
@@ -305,7 +305,7 @@ fn keep_and_legacy_are_preserved_while_expired_agent_data_is_removed_and_quota_r
     assert!(!base(&root, &token).exists());
     let second = request(
         StorageScope::PrivateConversation,
-        "slack.t0123abc.u9xyz",
+        "drn:slack:user:t0123abc:u9xyz",
         "reviewer",
         "storage-probe",
         "thread-2",
@@ -339,7 +339,7 @@ fn keep_and_legacy_are_preserved_while_expired_agent_data_is_removed_and_quota_r
     host.begin(
         host.grant(request(
             StorageScope::PrivateConversation,
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "reviewer",
             "storage-probe",
             "thread-2",
@@ -362,7 +362,7 @@ fn admitted_reads_refresh_mtime_and_future_markers_and_busy_leases_are_not_expir
     let make = || {
         request(
             StorageScope::Agent,
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "reviewer",
             "storage-probe",
             "thread-1",
@@ -414,7 +414,7 @@ fn missing_or_corrupt_metadata_cannot_authorize_deletion() {
     let make = || {
         request(
             StorageScope::Agent,
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "reviewer",
             "storage-probe",
             "thread-1",
@@ -467,7 +467,7 @@ fn concurrent_grant_and_sweep_never_recreate_a_path_behind_an_unlinked_lease() {
     let make = || {
         request(
             StorageScope::Agent,
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "reviewer",
             "storage-probe",
             "thread-1",
@@ -537,7 +537,7 @@ fn partial_sweep_preserves_metadata_and_releases_quota() {
         let make = |surface: &[u8]| {
             request(
                 StorageScope::PrivateConversation,
-                "slack.t0123abc.u9xyz",
+                "drn:slack:user:t0123abc:u9xyz",
                 "reviewer",
                 "storage-probe",
                 "thread-1",
@@ -669,7 +669,7 @@ fn partial_sweep_preserves_metadata_and_releases_quota() {
         host.begin(
             host.grant(request(
                 StorageScope::Agent,
-                "slack.t0123abc.u9xyz",
+                "drn:slack:user:t0123abc:u9xyz",
                 "reviewer",
                 "storage-probe",
                 "thread-2",
@@ -691,7 +691,7 @@ fn idle_space_storage_is_swept_with_its_configured_retention() {
     let make = || {
         request(
             StorageScope::Space,
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             "reviewer",
             "storage-probe",
             "thread-1",
@@ -726,7 +726,7 @@ fn a_long_space_identity_can_be_reopened_read_and_swept() {
     let make = || {
         request_at(
             StorageScope::Space,
-            "slack.t0123abc.u9xyz",
+            "drn:slack:user:t0123abc:u9xyz",
             &agent,
             "storage-probe",
             "slack",
