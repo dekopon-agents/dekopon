@@ -414,27 +414,11 @@ async fn an_idle_finished_job_starts_a_notice_turn_with_its_output() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_detached_job_records_its_start_root_finish_and_notice() {
     use opentelemetry::trace::{TraceId, TracerProvider as _};
-    use opentelemetry_sdk::{
-        error::OTelSdkResult,
-        trace::{SdkTracerProvider, SpanData, SpanExporter},
-    };
+    use opentelemetry_sdk::trace::SpanData;
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::prelude::*;
 
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-
-    impl SpanExporter for Exported {
-        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().extend(batch);
-            Ok(())
-        }
-    }
-
-    let exported = Exported::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exported.clone())
-        .build();
+    let (provider, exported) = exporting_provider();
     let capture = dekopon_test_support::CaptureLayer::workspace();
     let subscriber = tracing::Dispatch::new(
         tracing_subscriber::registry()

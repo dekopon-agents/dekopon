@@ -23,25 +23,8 @@ async fn a_memory_persist_span_reaches_the_installed_trace_pipeline() {
         );
         return;
     }
-    use opentelemetry_sdk::{
-        error::OTelSdkResult,
-        trace::{SdkTracerProvider, SpanData, SpanExporter},
-    };
 
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-
-    impl SpanExporter for Exported {
-        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().extend(batch);
-            Ok(())
-        }
-    }
-
-    let exported = Exported::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exported.clone())
-        .build();
+    let (provider, exported) = exporting_provider();
     let telemetry = dekopon_telemetry::Install::new(dekopon_telemetry::Console {
         format: dekopon_telemetry::ConsoleFormat::Json,
         writer: dekopon_telemetry::ConsoleWriter::Stderr,

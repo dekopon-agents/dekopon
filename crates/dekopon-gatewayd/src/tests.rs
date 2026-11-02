@@ -15309,6 +15309,27 @@ pub(crate) fn capture_spans() -> (
     (capture, guard)
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpanSink(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+impl opentelemetry_sdk::trace::SpanExporter for SpanSink {
+    async fn export(
+        &self,
+        batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0.lock().extend(batch);
+        Ok(())
+    }
+}
+
+pub(crate) fn exporting_provider() -> (opentelemetry_sdk::trace::SdkTracerProvider, SpanSink) {
+    let sink = SpanSink::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(sink.clone())
+        .build();
+    (provider, sink)
+}
+
 #[test]
 fn spool_spans_never_record_payload_or_paths() {
     use dekopon_model::asset::DiskBlob;
@@ -15340,26 +15361,9 @@ fn spool_spans_never_record_payload_or_paths() {
 fn retained_asset_does_not_hold_its_session_span_open() {
     use dekopon_model::asset::DiskBlob;
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::{
-        error::OTelSdkResult,
-        trace::{SdkTracerProvider, SpanData, SpanExporter},
-    };
     use tracing_subscriber::prelude::*;
 
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-
-    impl SpanExporter for Exported {
-        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().extend(batch);
-            Ok(())
-        }
-    }
-
-    let exported = Exported::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exported.clone())
-        .build();
+    let (provider, exported) = exporting_provider();
     let _subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("asset-retention-test")))
         .set_default();
@@ -15472,27 +15476,10 @@ fn assert_trace_opens_at_receipt(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_message_links_the_message_that_held_it() {
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::{
-        error::OTelSdkResult,
-        trace::{SdkTracerProvider, SpanData, SpanExporter},
-    };
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::prelude::*;
 
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-
-    impl SpanExporter for Exported {
-        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().extend(batch);
-            Ok(())
-        }
-    }
-
-    let exported = Exported::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exported.clone())
-        .build();
+    let (provider, exported) = exporting_provider();
     let _subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("queued-link-test")))
         .set_default();
@@ -15613,26 +15600,9 @@ async fn a_stopped_turn_marks_its_stop_reply_delivered_as_cancelled() {
 #[tokio::test]
 async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
     use opentelemetry::trace::{Status, TracerProvider as _};
-    use opentelemetry_sdk::{
-        error::OTelSdkResult,
-        trace::{SdkTracerProvider, SpanData, SpanExporter},
-    };
     use tracing_subscriber::prelude::*;
 
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-
-    impl SpanExporter for Exported {
-        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().extend(batch);
-            Ok(())
-        }
-    }
-
-    let exported = Exported::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exported.clone())
-        .build();
+    let (provider, exported) = exporting_provider();
     let _subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("message-status-test")))
         .set_default();
@@ -15679,26 +15649,9 @@ async fn a_failed_message_exports_an_error_status_and_an_answered_one_none() {
 #[tokio::test]
 async fn gateway_session_exports_the_configured_agent_invocation_under_the_message() {
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::{
-        error::OTelSdkResult,
-        trace::{SdkTracerProvider, SpanData, SpanExporter},
-    };
     use tracing_subscriber::prelude::*;
 
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-
-    impl SpanExporter for Exported {
-        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().extend(batch);
-            Ok(())
-        }
-    }
-
-    let exported = Exported::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exported.clone())
-        .build();
+    let (provider, exported) = exporting_provider();
     let _subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("agent-invocation-test")))
         .set_default();
@@ -15878,24 +15831,10 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
 #[expect(clippy::too_many_lines, reason = "one long test scenario")]
 async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixed_dispositions() {
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::{
-        error::OTelSdkResult,
-        trace::{SdkTracerProvider, SpanData, SpanExporter},
-    };
+    use opentelemetry_sdk::trace::SpanData;
     use tracing_subscriber::prelude::*;
 
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-    impl SpanExporter for Exported {
-        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().extend(batch);
-            Ok(())
-        }
-    }
-    let exported = Exported::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exported.clone())
-        .build();
+    let (provider, exported) = exporting_provider();
     let _subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("whatsapp-ingress-test")))
         .set_default();
@@ -24113,24 +24052,9 @@ async fn recall_then_dispatch_records_exactly_one_follow_leave() {
 #[tokio::test(start_paused = true)]
 async fn a_debounce_expiry_records_the_leave_on_the_originating_message_trace() {
     use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
-    use opentelemetry_sdk::{
-        error::OTelSdkResult,
-        trace::{SdkTracerProvider, SpanData, SpanExporter},
-    };
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
     use tracing_subscriber::prelude::*;
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-    impl SpanExporter for Exported {
-        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().extend(batch);
-            Ok(())
-        }
-    }
-    let exported = Exported::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exported.clone())
-        .build();
+    let (provider, exported) = exporting_provider();
     let _subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("follow-expiry-test")))
         .set_default();

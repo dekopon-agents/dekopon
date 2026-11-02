@@ -821,25 +821,10 @@ async fn participant_broker(
 #[tokio::test]
 async fn participant_calls_in_one_exported_turn_have_distinct_invocations_and_decisions() {
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::{
-        error::OTelSdkResult,
-        trace::{SdkTracerProvider, SpanData, SpanExporter},
-    };
     use tracing::Instrument as _;
     use tracing_subscriber::prelude::*;
 
-    #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-    impl SpanExporter for Exported {
-        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-            self.0.lock().extend(batch);
-            Ok(())
-        }
-    }
-    let exported = Exported::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exported.clone())
-        .build();
+    let (provider, exported) = exporting_provider();
     let capture = dekopon_test_support::CaptureLayer::workspace();
     let _subscriber = tracing_subscriber::registry()
         .with(capture.clone())

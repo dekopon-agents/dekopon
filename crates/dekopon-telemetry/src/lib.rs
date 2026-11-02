@@ -153,31 +153,43 @@ mod tests {
 }
 
 #[cfg(test)]
-mod aggregation_tests {
-    use opentelemetry::trace::TracerProvider as _;
+mod span_sink {
     use opentelemetry_sdk::{
         error::OTelSdkResult,
         trace::{SdkTracerProvider, SpanData, SpanExporter},
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
-    use tracing_subscriber::prelude::*;
 
     #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
-    impl SpanExporter for Exported {
+    pub(crate) struct SpanSink(pub(crate) Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for SpanSink {
         async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
             self.0.lock().extend(batch);
             Ok(())
         }
     }
 
+    pub(crate) fn exporting_provider() -> (SdkTracerProvider, SpanSink) {
+        let sink = SpanSink::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(sink.clone())
+            .build();
+        (provider, sink)
+    }
+}
+
+#[cfg(test)]
+mod aggregation_tests {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::prelude::*;
+
+    use crate::span_sink::exporting_provider;
+
     #[test]
     fn collected_execution_exports_lead_parent_and_every_constituent_link() {
-        let exported = Exported::default();
-        let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(exported.clone())
-            .build();
+        let (provider, exported) = exporting_provider();
         let subscriber = tracing_subscriber::registry()
             .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("aggregation-test")));
         tracing::subscriber::with_default(subscriber, || {
