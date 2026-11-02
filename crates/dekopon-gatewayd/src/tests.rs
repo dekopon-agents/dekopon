@@ -81,7 +81,7 @@ impl<'a> Dispatcher<'a> {
 
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
     fs,
     ops::ControlFlow,
@@ -7277,7 +7277,7 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
     let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
     let models = ModelScript::forbidden();
     let runner = runner(broker, Arc::clone(&models), 1);
-    let _held = runner
+    let held = runner
         .gate
         .admit_probe(("other".to_owned(), "other".to_owned()))
         .expect("the first session is admitted");
@@ -7293,6 +7293,13 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
 
     assert_eq!(driver.replies(), vec![BUSY_REPLY.to_owned()]);
     assert_eq!(models.requests(), 0);
+    drop(held);
+    assert!(
+        runner
+            .gate
+            .admit_probe(("third".to_owned(), "third".to_owned()))
+            .is_some()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7408,22 +7415,6 @@ async fn one_conversation_runs_one_session_at_a_time() {
         gate.admit_probe(key).is_some(),
         "a finished session releases its conversation"
     );
-}
-
-#[tokio::test]
-async fn concurrency_is_bounded_across_every_conversation() {
-    let gate = SessionGate::new(2);
-    let first = gate
-        .admit_probe(("a".to_owned(), "a".to_owned()))
-        .expect("first");
-    let second = gate
-        .admit_probe(("b".to_owned(), "b".to_owned()))
-        .expect("second");
-    assert!(gate.admit_probe(("c".to_owned(), "c".to_owned())).is_none());
-
-    drop(first);
-    assert!(gate.admit_probe(("c".to_owned(), "c".to_owned())).is_some());
-    drop(second);
 }
 
 #[tokio::test]
@@ -8313,6 +8304,10 @@ async fn history_records_a_file_by_its_arrival_line_and_only_the_current_prompt_
         "[gateway: unmapped participant]\nand now?\n\n[gateway: files in this conversation"
     ));
     assert!(second[4].1.contains("shot.png"), "{second:?}");
+    assert!(
+        !second[4].1.contains("attached to this message"),
+        "{second:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -8548,86 +8543,6 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
         begin_owned(&store, &keys[2], &allowed, now).history().len(),
         1
     );
-}
-
-#[test]
-fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
-    let allowed = granted(&["cli-probe.upper"]);
-    let now = Instant::now();
-    let by_turns = MemoryWindow {
-        scope: MemoryScope::PrivateConversation,
-        idle_timeout: Duration::from_secs(900),
-        limits: HistoryLimits {
-            max_turns: 2,
-            max_bytes: 64 * 1024,
-        },
-        recall: RecallSource::None,
-        forget_after: DEFAULT_FORGET_AFTER,
-    };
-    let by_bytes = MemoryWindow {
-        scope: MemoryScope::PrivateConversation,
-        idle_timeout: Duration::from_secs(900),
-        limits: HistoryLimits {
-            max_turns: 12,
-            max_bytes: 40,
-        },
-        recall: RecallSource::None,
-        forget_after: DEFAULT_FORGET_AFTER,
-    };
-
-    for (window, name) in [(by_turns, "turn bound"), (by_bytes, "byte bound")] {
-        let store = ConversationStore::new(8);
-        let key = private_conversation_key("dev", "dev", SUBJECT);
-        for text in ["question a", "question b", "question c"] {
-            commit(
-                &store,
-                &key,
-                &allowed,
-                window,
-                ConversationTurn::completed(text, "an answer"),
-                now,
-            );
-        }
-        let history = store
-            .begin(
-                &key,
-                &allowed,
-                window,
-                crate::conversation::Seed::Owned(None),
-                now,
-            )
-            .history()
-            .clone();
-        assert_eq!(history.len(), 2, "{name} keeps two exchanges");
-        assert_eq!(
-            history.turns()[0].user(),
-            "question b",
-            "{name} drops the oldest exchange first"
-        );
-    }
-}
-
-#[test]
-fn a_history_and_a_revoked_entry_are_two_different_removals() {
-    let store = ConversationStore::new(8);
-    let key = private_conversation_key("dev", "dev", SUBJECT);
-    let allowed = granted(&["cli-probe.upper"]);
-    let now = Instant::now();
-
-    assert!(
-        !store.remove(&key, EvictionReason::GrantChanged),
-        "removing a conversation nobody started is not an eviction"
-    );
-    commit(
-        &store,
-        &key,
-        &allowed,
-        window(),
-        ConversationTurn::completed("what broke?", "two things"),
-        now,
-    );
-    assert!(store.remove(&key, EvictionReason::GrantChanged));
-    assert_eq!(store.tracked(), 0);
 }
 
 #[test]
@@ -8910,6 +8825,7 @@ fn an_idle_replacement_is_not_overwritten_by_an_older_lease() {
     assert_eq!(resumed.history().len(), 1);
     assert_eq!(resumed.history().turns()[0].user(), "new");
     assert_eq!(resumed.cache_key, fresh_cache_key);
+    assert_eq!(resumed.cache_key, stale.cache_key);
 }
 
 #[test]
@@ -8960,69 +8876,6 @@ fn routed(transport: &str, kind: ConversationKind, id: &str) -> InboundMessage {
 
 fn secret(byte: u8) -> CacheKeySecret {
     CacheKeySecret::from_bytes([byte; 32])
-}
-
-#[test]
-fn a_cache_key_is_the_same_for_the_same_secret_and_conversation() {
-    let key = private_conversation_key("dev", "c0123abc", SUBJECT);
-    let first = secret(7).for_conversation(&key);
-    assert!(first.starts_with("gatewayd-conversation-"));
-    assert_eq!(first.len(), "gatewayd-conversation-".len() + 32);
-    assert!(
-        first["gatewayd-conversation-".len()..]
-            .chars()
-            .all(|digit| digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase())
-    );
-    assert_eq!(
-        secret(7).for_conversation(&private_conversation_key("dev", "c0123abc", SUBJECT)),
-        first
-    );
-
-    let agent: AgentId = "reviewer".parse().expect("valid agent fixture");
-    let route = secret(7).for_route(&agent, "dev", 0);
-    assert!(route.starts_with("gatewayd-route-"));
-    assert_eq!(route.len(), "gatewayd-route-".len() + 32);
-    assert_eq!(secret(7).for_route(&agent, "dev", 0), route);
-}
-
-#[test]
-fn a_different_secret_conversation_agent_transport_or_audience_names_a_different_cache_key() {
-    let agent: AgentId = "reviewer".parse().expect("valid agent fixture");
-    let other_agent: AgentId = "helper".parse().expect("valid agent fixture");
-    let subject: Subject = SUBJECT.parse().expect("canonical subject fixture");
-    let base = ConversationKey::private(&agent, "dev", "c0123abc", &subject);
-    let mut keys = [
-        ConversationKey::private(&agent, "dev", "c0123abd", &subject),
-        ConversationKey::private(&other_agent, "dev", "c0123abc", &subject),
-        ConversationKey::private(&agent, "dev-other", "c0123abc", &subject),
-        ConversationKey::private(
-            &agent,
-            "dev",
-            "c0123abc",
-            &"drn:tel:number::16035550100"
-                .parse()
-                .expect("canonical subject fixture"),
-        ),
-        ConversationKey::shared(&agent, "dev", "c0123abc"),
-    ]
-    .iter()
-    .map(|key| secret(7).for_conversation(key))
-    .collect::<BTreeSet<_>>();
-    keys.insert(secret(7).for_conversation(&base));
-    keys.insert(secret(8).for_conversation(&base));
-    assert_eq!(keys.len(), 7);
-
-    let routes = [
-        secret(7).for_route(&agent, "dev", 0),
-        secret(8).for_route(&agent, "dev", 0),
-        secret(7).for_route(&agent, "dev", 1),
-        secret(7).for_route(&other_agent, "dev", 0),
-        secret(7).for_route(&agent, "dev-other", 0),
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    assert_eq!(routes.len(), 5);
-    assert!(routes.is_disjoint(&keys));
 }
 
 #[test]
@@ -9098,39 +8951,6 @@ fn a_short_or_loose_cache_key_secret_is_rewritten_and_a_good_one_is_reused() {
             .path()
             .join("prompt-cache-key.secret.tmp")
             .exists()
-    );
-}
-
-#[test]
-fn an_evicted_conversation_comes_back_with_the_same_cache_key() {
-    let store = ConversationStore::new(8);
-    let key = private_conversation_key("dev", "dev", SUBJECT);
-    let allowed = granted(&["cli-probe.upper"]);
-    let start = Instant::now();
-
-    let first = begin_owned(&store, &key, &allowed, start);
-    let first_cache_key = first.cache_key.clone();
-    commit_owned(
-        first.lease,
-        ConversationTurn::completed("what broke?", "two things"),
-        &first_cache_key,
-        start,
-    );
-
-    let warm = begin_owned(&store, &key, &allowed, start + Duration::from_secs(60));
-    assert_eq!(
-        warm.cache_key, first_cache_key,
-        "a live conversation stays in the lane its own turns warmed"
-    );
-
-    let cold = begin_owned(&store, &key, &allowed, start + Duration::from_secs(900));
-    assert!(
-        cold.history().is_empty(),
-        "the idle timeout dropped the entry"
-    );
-    assert_eq!(
-        cold.cache_key, first_cache_key,
-        "the same conversation identity keeps the lane its leading prefix already warmed"
     );
 }
 
@@ -9248,6 +9068,15 @@ async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_
         models.cache_key(2),
         "two conversations share no prefix, so pointing them at one lane only wastes lookups"
     );
+    assert!(
+        models
+            .cache_key(0)
+            .strip_prefix("gatewayd-conversation-")
+            .is_some_and(|hex| hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f')))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -9277,6 +9106,10 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
 
     let lane = runner.conversations.route_cache_key(&route);
     assert_eq!(models.cache_key(0), lane);
+    assert!(
+        lane.strip_prefix("gatewayd-route-")
+            .is_some_and(|hex| hex.len() == 32)
+    );
     assert_eq!(
         models.cache_key(1),
         lane,
@@ -12378,45 +12211,6 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
 }
 
 #[test]
-fn idle_replacement_retires_attachment_metadata_and_numbering() {
-    let conversations = ConversationStore::new(8);
-    let store = AssetStore::new(4, Duration::from_secs(3_600));
-    let key = private_conversation_key("dev", "idle-assets", SUBJECT);
-    let allowed = granted(&["cli-probe.upper"]);
-    let now = Instant::now();
-    let first = begin_owned(&conversations, &key, &allowed, now);
-    let old_access = first.assets.clone();
-    store.assets_for_access(&old_access, vec![pending("old.png", "image/png", 10)], now);
-    let first_cache_key = first.cache_key.clone();
-    commit_owned(
-        first.lease,
-        ConversationTurn::completed("old", "old answer"),
-        &first_cache_key,
-        now,
-    );
-
-    let fresh = begin_owned(
-        &conversations,
-        &key,
-        &allowed,
-        now + Duration::from_secs(900),
-    );
-    assert!(fresh.history().is_empty());
-    assert!(
-        store
-            .get_access(&old_access, 1, now + Duration::from_secs(900))
-            .is_none()
-    );
-    let registered = store.assets_for_access(
-        &fresh.assets,
-        vec![pending("fresh.png", "image/png", 10)],
-        now + Duration::from_secs(900),
-    );
-    assert_eq!(registered.arrived, vec![1]);
-    assert_eq!(registered.inventory[0].name, "fresh.png");
-}
-
-#[test]
 fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
     let conversations = ConversationStore::new(1);
     let store = asset_store();
@@ -12728,238 +12522,11 @@ fn the_asset_store_debug_view_exposes_only_counts() {
     }
 }
 
-#[test]
-fn every_reachable_line_names_its_number() {
-    let store = asset_store();
-    let now = Instant::now();
-    let registered = store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        vec![
-            pending("shot.png", "image/png", 2048),
-            pending("clip.mov", "video/quicktime", 700 * 1024 * 1024),
-            PendingAsset {
-                name: "hidden".to_owned(),
-                mime: String::new(),
-                size: Some(0),
-                source: None,
-            },
-        ],
-        now,
-    );
-    let note = asset::reference_note(
-        &registered,
-        true,
-        crate::asset::TextReader::AssetCat,
-        crate::transport::MAX_INBOUND_TEXT_BYTES,
-    )
-    .text;
-
-    assert!(
-        note.contains("chat-asset:1 — shot.png (image/png, 2 KB)"),
-        "{note}"
-    );
-    assert!(note.contains("clip.mov"), "{note}");
-    assert!(note.contains("chat-asset:2"), "{note}");
-    assert!(
-        note.contains("the gateway cannot see this file at all"),
-        "{note}"
-    );
-    assert!(note.contains("fetch_chat_asset"), "{note}");
-    assert!(fetchable(&registered, true));
-}
-
-#[test]
-fn a_model_that_cannot_be_shown_images_still_gets_its_number() {
-    let store = asset_store();
-    let registered = store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        vec![pending("shot.png", "image/png", 2048)],
-        Instant::now(),
-    );
-    let note = asset::reference_note(
-        &registered,
-        false,
-        crate::asset::TextReader::AssetCat,
-        crate::transport::MAX_INBOUND_TEXT_BYTES,
-    )
-    .text;
-
-    assert!(!fetchable(&registered, false));
-    assert!(note.contains("chat-asset:"), "{note}");
-    assert!(note.contains("cannot be shown images"), "{note}");
-    assert!(!note.contains("fetch_chat_asset"), "{note}");
-}
-
 fn fetchable(registered: &asset::Registered, images_supported: bool) -> bool {
     registered
         .inventory
         .iter()
         .any(|asset| asset.is_fetchable(images_supported))
-}
-
-#[test]
-fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
-    let store = asset_store();
-    let now = Instant::now();
-    let first = store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        vec![pending("shot.png", "image/png", 2048)],
-        now,
-    );
-    assert!(fetchable(&first, true));
-
-    let second = store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        Vec::new(),
-        now,
-    );
-    assert!(
-        second.arrived.is_empty(),
-        "a message that carried nothing brought nothing"
-    );
-    assert!(
-        fetchable(&second, true),
-        "but the conversation's screenshot is still there to be looked at"
-    );
-    assert_eq!(
-        store
-            .get(&private_conversation_key("dev", "c1", SUBJECT), 1, now)
-            .map(|asset| asset.name),
-        Some("shot.png".to_owned())
-    );
-
-    let elsewhere = store.assets_for(
-        &private_conversation_key("dev", "c2", SUBJECT),
-        Vec::new(),
-        now,
-    );
-    assert!(!fetchable(&elsewhere, true));
-}
-
-#[test]
-fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
-    let store = asset_store();
-    let now = Instant::now();
-    store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        vec![PendingAsset {
-            name: "recipe.pdf".to_owned(),
-            mime: "application/pdf".to_owned(),
-            size: Some(1024),
-            source: Some(AssetSourceRef::Slack {
-                file_id: "F-pdf".to_owned(),
-                url: "https://files.slack.com/f/recipe".to_owned(),
-            }),
-        }],
-        now,
-    );
-
-    for _ in 0..9 {
-        store.assets_for(
-            &private_conversation_key("dev", "c1", SUBJECT),
-            Vec::new(),
-            now,
-        );
-    }
-
-    let registered = store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        vec![pending("shot.png", "image/png", 2048)],
-        now,
-    );
-    let note = asset::reference_note(
-        &registered,
-        true,
-        crate::asset::TextReader::AssetCat,
-        crate::transport::MAX_INBOUND_TEXT_BYTES,
-    )
-    .text;
-
-    assert!(note.contains("chat-asset:1 — recipe.pdf"), "{note}");
-    assert!(note.contains("chat-asset:2 — shot.png"), "{note}");
-    assert!(
-        note.contains("shot.png (image/png, 2 KB) — attached to this message"),
-        "{note}"
-    );
-    assert!(
-        !note.contains("recipe.pdf (application/pdf, 1 KB) — attached to this message"),
-        "the older file must not claim to be new: {note}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
-    let store = Arc::new(asset_store());
-    store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        vec![pending("shot.png", "image/png", 10)],
-        Instant::now(),
-    );
-    let assets = SessionAssets::new(
-        Arc::clone(&store),
-        AssetAccess::one_shot(private_conversation_key("dev", "c1", SUBJECT)),
-        None,
-        tokio::runtime::Handle::current(),
-        true,
-    );
-
-    let refusal = tokio::task::spawn_blocking(move || assets.fetch(99).expect_err("no such asset"))
-        .await
-        .expect("the blocking task completes");
-    assert!(refusal.contains("no chat-asset:99"), "{refusal}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlist() {
-    struct FixedFetcher(Vec<u8>);
-
-    impl AssetFetcher for FixedFetcher {
-        fn fetch(
-            &self,
-            _source: &AssetSourceRef,
-            _max_bytes: u64,
-        ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
-            let bytes = self.0.clone();
-            Box::pin(async move { Ok(bytes) })
-        }
-    }
-
-    let store = Arc::new(asset_store());
-    store.assets_for(
-        &private_conversation_key("dev", "c1", SUBJECT),
-        vec![pending("shot.png", "image/png", 10)],
-        Instant::now(),
-    );
-    let assets = Arc::new(SessionAssets::new(
-        Arc::clone(&store),
-        AssetAccess::one_shot(private_conversation_key("dev", "c1", SUBJECT)),
-        Some(Arc::new(FixedFetcher(b"\x89PNG\r\n\x1a\nshot".to_vec())) as Arc<dyn AssetFetcher>),
-        tokio::runtime::Handle::current(),
-        true,
-    ));
-    let inputs = dekopon_agent::attachment::ChatAssetInputs::new(
-        Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
-    );
-
-    let prepared = tokio::task::spawn_blocking(move || {
-        let input = json!({"images": ["chat-asset:1"]});
-        let dekopon_agent::attachment::PreparedRun { assets, pins, .. } =
-            tokio::runtime::Handle::current()
-                .block_on(inputs.prepare_run(
-                    &[dekopon_shell::Arg::Asset(
-                        dekopon_core::AssetNumber::parse("chat-asset:1").unwrap(),
-                    )],
-                    4,
-                ))
-                .expect("one reference");
-        assert_eq!(assets.descriptors.len(), 1);
-        assert_eq!(assets.rows[0].origin, "chat");
-        assert_eq!(pins[0].read().unwrap(), b"\x89PNG\r\n\x1a\nshot");
-        input
-    })
-    .await
-    .unwrap();
-    assert_eq!(prepared["images"][0], "chat-asset:1");
 }
 
 #[test]
@@ -14219,6 +13786,7 @@ fn a_document_does_not_need_the_image_modality() {
     assert!(note.contains("chat-asset:1 — spec.pdf"), "{note}");
     assert!(note.contains("chat-asset:2"), "{note}");
     assert!(note.contains("cannot be shown images"), "{note}");
+    assert!(!registered.inventory[1].is_fetchable(false));
 }
 
 #[test]
@@ -16805,6 +16373,9 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
                 panic!("attested run");
             };
             assert_eq!(word, "gpt-image");
+            if edit == 0 {
+                assert_eq!(assets[0].origin, "chat");
+            }
             assert_eq!(
                 assets.iter().map(|row| row.id).collect::<Vec<_>>(),
                 [u64::try_from(edit + 1).unwrap()]
