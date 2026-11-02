@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.82.0] - 2026-11-02
+
+### Fixed
+
+- Scripts that exceed their deadline report the deadline error instead of cancellation.
+
+## [dekopon-chart-0.69.0] - 2026-11-02
+
+### Changed
+
+- Chart 0.69.0 targets core v0.82.0 and renders the `v0.82.0` image tag.
+
 ## [0.81.0] - 2026-11-01
 
 ### Added
