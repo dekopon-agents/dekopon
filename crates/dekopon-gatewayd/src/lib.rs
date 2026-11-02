@@ -894,7 +894,7 @@ enum ServeOutcome {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{dispatch, serve};
+pub(crate) use tests::serve;
 
 fn observe_session(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result

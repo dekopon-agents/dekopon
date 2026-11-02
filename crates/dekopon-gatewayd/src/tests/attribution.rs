@@ -101,11 +101,10 @@ async fn dm_message_steer_and_follow_keep_authenticated_attribution_in_prompt_an
                 .1
                 .starts_with(&format!("{prefix}one more\n\n[gateway: files"))
         );
-        let remembered = runner.conversations.begin(
+        let remembered = begin_owned(
+            &runner.conversations,
             &private_conversation_key("dev", "dev", SUBJECT),
             &granted(&["cli-probe.upper"]),
-            window(),
-            crate::conversation::Seed::Owned(None),
             Instant::now(),
         );
         let users: Vec<_> = remembered

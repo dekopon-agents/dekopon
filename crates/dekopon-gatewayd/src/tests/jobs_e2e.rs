@@ -1277,20 +1277,10 @@ async fn a_stop_word_with_only_jobs_replies_stopped_and_cancels_only_its_owner()
     let other = admitted(&runner.jobs, "b", "sleep 5").expect("a second slot");
     let driver = Arc::new(RecordingDriver::default());
     let drivers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-    let mut sessions = tokio::task::JoinSet::new();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &BTreeMap::new(),
-        &drivers,
-        &["stop".to_owned()],
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        inbound,
-    );
+    let mut dispatcher = Dispatcher::new(&runner, &routes).with_drivers(drivers);
+    dispatcher.dispatch(&["stop".to_owned()], inbound);
     assert!(signal.is_cancelled());
-    while sessions.join_next().await.is_some() {}
+    while dispatcher.sessions.join_next().await.is_some() {}
     assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
     assert!(matches!(
         runner.jobs.list(&owned_by("b"))[0].state,
@@ -1467,18 +1457,8 @@ async fn a_stop_word_from_an_unrouted_conversation_still_cancels_its_persons_job
         )
         .map(|admitted| (admitted.run, admitted.signal))
         .unwrap();
-    let mut sessions = tokio::task::JoinSet::new();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        &["stop".to_owned()],
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        inbound,
-    );
+    let mut dispatcher = Dispatcher::new(&runner, &routes);
+    dispatcher.dispatch(&["stop".to_owned()], inbound);
     assert!(signal.is_cancelled());
     drop(run);
 }
@@ -1516,23 +1496,13 @@ async fn one_stop_word_ends_its_persons_running_turn_and_job_but_not_anothers_jo
     })
     .await;
     let drivers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-    let mut sessions = tokio::task::JoinSet::new();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &BTreeMap::new(),
-        &drivers,
-        &["stop".to_owned()],
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        from("a", "stop"),
-    );
+    let mut dispatcher = Dispatcher::new(&runner, &routes).with_drivers(drivers);
+    dispatcher.dispatch(&["stop".to_owned()], from("a", "stop"));
     tokio::time::timeout(Duration::from_secs(2), a_turn)
         .await
         .expect("the stop word ends A's turn")
         .expect("A's turn joins");
-    while sessions.join_next().await.is_some() {}
+    while dispatcher.sessions.join_next().await.is_some() {}
     let [row] = settled(&runner.jobs, &a, Duration::from_secs(2))
         .await
         .try_into()
@@ -2021,36 +1991,15 @@ async fn a_jobs_only_stop_reply_takes_a_refusal_permit_or_sends_nothing() {
     assert!(!held.is_empty());
     let driver = Arc::new(RecordingDriver::default());
     let drivers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-    let mut sessions = tokio::task::JoinSet::new();
-    let mut collector = crate::collection::Collector::new(&[], 4);
+    let mut dispatcher = Dispatcher::new(&runner, &routes).with_drivers(drivers);
     for _ in 0..3 {
-        crate::dispatch(
-            &runner,
-            &routes,
-            &BTreeMap::new(),
-            &drivers,
-            &["stop".to_owned()],
-            &mut sessions,
-            &mut collector,
-            &mut crate::follow::Debounce::default(),
-            inbound.clone(),
-        );
+        dispatcher.dispatch(&["stop".to_owned()], inbound.clone());
     }
     assert!(signal.is_cancelled());
-    assert!(sessions.is_empty());
+    assert!(dispatcher.sessions.is_empty());
     drop(held);
-    crate::dispatch(
-        &runner,
-        &routes,
-        &BTreeMap::new(),
-        &drivers,
-        &["stop".to_owned()],
-        &mut sessions,
-        &mut collector,
-        &mut crate::follow::Debounce::default(),
-        inbound,
-    );
-    while sessions.join_next().await.is_some() {}
+    dispatcher.dispatch(&["stop".to_owned()], inbound);
+    while dispatcher.sessions.join_next().await.is_some() {}
     assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
     drop(run);
 }
@@ -2217,19 +2166,9 @@ async fn the_stop_word_ends_a_job_and_its_child_while_killing_the_child_leaves_i
         }
         let drivers =
             BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-        let mut sessions = tokio::task::JoinSet::new();
-        crate::dispatch(
-            &runner,
-            &routes,
-            &BTreeMap::new(),
-            &drivers,
-            &["stop".to_owned()],
-            &mut sessions,
-            &mut crate::collection::Collector::new(&[], 4),
-            &mut crate::follow::Debounce::default(),
-            message("stop"),
-        );
-        while sessions.join_next().await.is_some() {}
+        let mut dispatcher = Dispatcher::new(&runner, &routes).with_drivers(drivers);
+        dispatcher.dispatch(&["stop".to_owned()], message("stop"));
+        while dispatcher.sessions.join_next().await.is_some() {}
         let rows = settled(&runner.jobs, &owner, Duration::from_secs(5)).await;
         assert_eq!(finished(&rows[0]).0, JobOutcome::Cancelled);
         assert_eq!(

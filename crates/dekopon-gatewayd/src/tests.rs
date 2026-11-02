@@ -21,29 +21,62 @@ where
         .await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "existing dispatch fixtures share one test setup"
-)]
-pub(crate) fn dispatch(
-    runner: &Arc<SessionRunner>,
-    routes: &Arc<RoutingTable>,
-    identities: &BTreeMap<String, TransportIdentity>,
-    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
-    stop_words: &[String],
-    sessions: &mut tokio::task::JoinSet<()>,
-    collector: &mut crate::collection::Collector,
-    follow_pending: &mut crate::follow::Debounce,
-    message: InboundMessage,
-) {
-    crate::gateway::Gateway::new(
-        Arc::clone(runner),
-        Arc::clone(routes),
-        Arc::new(identities.clone()),
-        Arc::new(drivers.clone()),
-        Arc::new(stop_words.to_vec()),
-    )
-    .dispatch(sessions, collector, follow_pending, message);
+pub(crate) struct Dispatcher<'a> {
+    runner: &'a Arc<SessionRunner>,
+    routes: &'a Arc<RoutingTable>,
+    pub(crate) identities: BTreeMap<String, TransportIdentity>,
+    pub(crate) drivers: BTreeMap<String, Arc<dyn ChatDriver>>,
+    pub(crate) sessions: tokio::task::JoinSet<()>,
+    pub(crate) collector: crate::collection::Collector,
+    pub(crate) pending: crate::follow::Debounce,
+}
+
+impl<'a> Dispatcher<'a> {
+    pub(crate) fn new(runner: &'a Arc<SessionRunner>, routes: &'a Arc<RoutingTable>) -> Self {
+        Self {
+            runner,
+            routes,
+            identities: BTreeMap::new(),
+            drivers: BTreeMap::new(),
+            sessions: tokio::task::JoinSet::new(),
+            collector: crate::collection::Collector::new(&[], 4),
+            pending: crate::follow::Debounce::default(),
+        }
+    }
+
+    pub(crate) fn with_identities(
+        mut self,
+        identities: BTreeMap<String, TransportIdentity>,
+    ) -> Self {
+        self.identities = identities;
+        self
+    }
+
+    pub(crate) fn with_drivers(mut self, drivers: BTreeMap<String, Arc<dyn ChatDriver>>) -> Self {
+        self.drivers = drivers;
+        self
+    }
+
+    pub(crate) fn with_collector(mut self, collector: crate::collection::Collector) -> Self {
+        self.collector = collector;
+        self
+    }
+
+    pub(crate) fn dispatch(&mut self, stop_words: &[String], message: InboundMessage) {
+        crate::gateway::Gateway::new(
+            Arc::clone(self.runner),
+            Arc::clone(self.routes),
+            Arc::new(self.identities.clone()),
+            Arc::new(self.drivers.clone()),
+            Arc::new(stop_words.to_vec()),
+        )
+        .dispatch(
+            &mut self.sessions,
+            &mut self.collector,
+            &mut self.pending,
+            message,
+        );
+    }
 }
 
 use parking_lot::Mutex;
@@ -5500,11 +5533,10 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
             .iter()
             .any(|(role, text)| role == "system" && text.contains("decline_chat_reply"))
     );
-    let remembered = runner.conversations.begin(
+    let remembered = begin_owned(
+        &runner.conversations,
         &key,
         &granted(&["memory.chat.recent", "memory.chat.search"]),
-        window(),
-        crate::conversation::Seed::Owned(None),
         Instant::now(),
     );
     assert_eq!(remembered.history().turns().len(), 1);
@@ -7615,6 +7647,39 @@ fn commit(
     );
 }
 
+fn begin_owned<'a>(
+    store: &'a ConversationStore,
+    key: &ConversationKey,
+    allowed: &[String],
+    now: Instant,
+) -> ConversationSeed<'a> {
+    store.begin(
+        key,
+        allowed,
+        window(),
+        crate::conversation::Seed::Owned(None),
+        now,
+    )
+}
+
+fn commit_owned(
+    lease: crate::conversation::ConversationLease<'_>,
+    turn: ConversationTurn,
+    cache_key: &str,
+    now: Instant,
+) -> bool {
+    lease.commit(
+        window(),
+        crate::conversation::Commit::Owned {
+            recalled: None,
+            turn,
+        },
+        TakenIn::default(),
+        cache_key,
+        now,
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_replayed_suggestion_receipts_do_not_imply_the_calls_did_not_run() {
     let directory = temporary();
@@ -8398,26 +8463,14 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
         start,
     );
 
-    let warm = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        start + Duration::from_secs(899),
-    );
+    let warm = begin_owned(&store, &key, &allowed, start + Duration::from_secs(899));
     assert_eq!(
         warm.history().len(),
         1,
         "inside the timeout the exchange is replayed"
     );
 
-    let cold = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        start + Duration::from_secs(900),
-    );
+    let cold = begin_owned(&store, &key, &allowed, start + Duration::from_secs(900));
     assert!(
         cold.history().is_empty(),
         "past the timeout the next message starts fresh"
@@ -8467,43 +8520,18 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
     let now = start + Duration::from_secs(4);
     assert_eq!(store.tracked(), 2, "the ceiling holds");
     assert!(
-        store
-            .begin(
-                &keys[1],
-                &allowed,
-                window(),
-                crate::conversation::Seed::Owned(None),
-                now
-            )
+        begin_owned(&store, &keys[1], &allowed, now)
             .history()
             .is_empty(),
         "the least recently used conversation is the one that goes"
     );
     assert_eq!(
-        store
-            .begin(
-                &keys[0],
-                &allowed,
-                window(),
-                crate::conversation::Seed::Owned(None),
-                now
-            )
-            .history()
-            .len(),
+        begin_owned(&store, &keys[0], &allowed, now).history().len(),
         2,
         "the conversation somebody is still having survives"
     );
     assert_eq!(
-        store
-            .begin(
-                &keys[2],
-                &allowed,
-                window(),
-                crate::conversation::Seed::Owned(None),
-                now
-            )
-            .history()
-            .len(),
+        begin_owned(&store, &keys[2], &allowed, now).history().len(),
         1
     );
 }
@@ -8595,20 +8623,8 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
 
-    let first = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
-    let second = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let first = begin_owned(&store, &key, &allowed, now);
+    let second = begin_owned(&store, &key, &allowed, now);
     assert!(first.history().is_empty() && second.history().is_empty());
     let ConversationSeed {
         cache_key: first_cache_key,
@@ -8621,34 +8637,20 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
         ..
     } = second;
 
-    first_lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("what broke?", "two things"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        first_lease,
+        ConversationTurn::completed("what broke?", "two things"),
         &first_cache_key,
         now,
     );
-    second_lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("still there?", "yes"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        second_lease,
+        ConversationTurn::completed("still there?", "yes"),
         &second_cache_key,
         now,
     );
 
-    let resumed = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let resumed = begin_owned(&store, &key, &allowed, now);
     assert_eq!(resumed.history().len(), 2);
     assert_eq!(resumed.history().turns()[0].user(), "what broke?");
     assert_eq!(resumed.history().turns()[1].user(), "still there?");
@@ -8728,30 +8730,14 @@ fn shared_history_cannot_cross_agent_transport_or_conversation_boundaries() {
         ConversationKey::shared(&reviewer, "slack", "other"),
     ] {
         assert!(
-            store
-                .begin(
-                    &isolated,
-                    &allowed,
-                    window(),
-                    crate::conversation::Seed::Owned(None),
-                    now
-                )
+            begin_owned(&store, &isolated, &allowed, now)
                 .history()
                 .is_empty(),
             "one changed boundary component must start a clean shared conversation"
         );
     }
     assert_eq!(
-        store
-            .begin(
-                &origin,
-                &allowed,
-                window(),
-                crate::conversation::Seed::Owned(None),
-                now
-            )
-            .history()
-            .len(),
+        begin_owned(&store, &origin, &allowed, now).history().len(),
         1,
         "the exact shared key still reaches its own turn"
     );
@@ -8773,50 +8759,24 @@ fn a_stale_wider_grant_commit_cannot_overwrite_its_replacement_generation() {
         now,
     );
 
-    let stale = store.begin(
-        &key,
-        &wide,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(1),
-    );
-    let fresh = store.begin(
-        &key,
-        &narrow,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(2),
-    );
+    let stale = begin_owned(&store, &key, &wide, now + Duration::from_secs(1));
+    let fresh = begin_owned(&store, &key, &narrow, now + Duration::from_secs(2));
     assert!(fresh.history().is_empty(), "the changed grant starts clean");
     let fresh_cache_key = fresh.cache_key.clone();
-    fresh.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("fresh question", "fresh answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        fresh.lease,
+        ConversationTurn::completed("fresh question", "fresh answer"),
         &fresh_cache_key,
         now + Duration::from_secs(3),
     );
-    stale.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("stale question", "stale privileged answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        stale.lease,
+        ConversationTurn::completed("stale question", "stale privileged answer"),
         &stale.cache_key,
         now + Duration::from_secs(4),
     );
 
-    let resumed = store.begin(
-        &key,
-        &narrow,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(5),
-    );
+    let resumed = begin_owned(&store, &key, &narrow, now + Duration::from_secs(5));
     assert_eq!(resumed.history().len(), 1);
     assert_eq!(resumed.history().turns()[0].user(), "fresh question");
     assert_eq!(resumed.cache_key, fresh_cache_key);
@@ -8836,35 +8796,19 @@ fn a_stale_commit_cannot_recreate_history_after_an_empty_grant_removes_it() {
         ConversationTurn::completed("old question", "old answer"),
         now,
     );
-    let stale = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(1),
-    );
+    let stale = begin_owned(&store, &key, &allowed, now + Duration::from_secs(1));
     let stale_cache_key = stale.cache_key.clone();
 
     assert!(store.remove(&key, EvictionReason::GrantChanged));
-    stale.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("late question", "late answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        stale.lease,
+        ConversationTurn::completed("late question", "late answer"),
         &stale_cache_key,
         now + Duration::from_secs(2),
     );
 
     assert_eq!(store.tracked(), 0);
-    let cold = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(3),
-    );
+    let cold = begin_owned(&store, &key, &allowed, now + Duration::from_secs(3));
     assert!(cold.history().is_empty());
     assert_eq!(cold.cache_key, stale_cache_key);
 }
@@ -8884,13 +8828,7 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
         ConversationTurn::completed("first", "answer one"),
         now,
     );
-    let stale = store.begin(
-        &first_key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(1),
-    );
+    let stale = begin_owned(&store, &first_key, &allowed, now + Duration::from_secs(1));
     let stale_cache_key = stale.cache_key.clone();
     commit(
         &store,
@@ -8901,40 +8839,22 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
         now + Duration::from_secs(2),
     );
 
-    stale.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("late first", "late answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        stale.lease,
+        ConversationTurn::completed("late first", "late answer"),
         &stale_cache_key,
         now + Duration::from_secs(3),
     );
 
     assert_eq!(store.tracked(), 1);
     assert!(
-        store
-            .begin(
-                &first_key,
-                &allowed,
-                window(),
-                crate::conversation::Seed::Owned(None),
-                now + Duration::from_secs(4)
-            )
+        begin_owned(&store, &first_key, &allowed, now + Duration::from_secs(4))
             .history()
             .is_empty(),
         "the evicted generation stays forgotten"
     );
     assert_eq!(
-        store
-            .begin(
-                &second_key,
-                &allowed,
-                window(),
-                crate::conversation::Seed::Owned(None),
-                now + Duration::from_secs(4)
-            )
+        begin_owned(&store, &second_key, &allowed, now + Duration::from_secs(4))
             .history()
             .turns()[0]
             .user(),
@@ -8956,49 +8876,23 @@ fn an_idle_replacement_is_not_overwritten_by_an_older_lease() {
         ConversationTurn::completed("old", "old answer"),
         now,
     );
-    let stale = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(899),
-    );
-    let fresh = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(900),
-    );
+    let stale = begin_owned(&store, &key, &allowed, now + Duration::from_secs(899));
+    let fresh = begin_owned(&store, &key, &allowed, now + Duration::from_secs(900));
     let fresh_cache_key = fresh.cache_key.clone();
-    fresh.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("new", "new answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        fresh.lease,
+        ConversationTurn::completed("new", "new answer"),
         &fresh_cache_key,
         now + Duration::from_secs(900),
     );
-    stale.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("late old", "late old answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        stale.lease,
+        ConversationTurn::completed("late old", "late old answer"),
         &stale.cache_key,
         now + Duration::from_secs(901),
     );
 
-    let resumed = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(901),
-    );
+    let resumed = begin_owned(&store, &key, &allowed, now + Duration::from_secs(901));
     assert_eq!(resumed.history().len(), 1);
     assert_eq!(resumed.history().turns()[0].user(), "new");
     assert_eq!(resumed.cache_key, fresh_cache_key);
@@ -9122,13 +9016,7 @@ fn a_cache_key_never_contains_the_raw_subject_or_conversation_id() {
     const DISTINCTIVE: &str = "drn:tel:number::15558675309";
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "c0123abc", DISTINCTIVE);
-    let seed = store.begin(
-        &key,
-        &granted(&["cli-probe.upper"]),
-        window(),
-        crate::conversation::Seed::Owned(None),
-        Instant::now(),
-    );
+    let seed = begin_owned(&store, &key, &granted(&["cli-probe.upper"]), Instant::now());
 
     for fragment in [DISTINCTIVE, "15558675309", "tel", "c0123abc", "reviewer"] {
         assert!(
@@ -9206,44 +9094,22 @@ fn an_evicted_conversation_comes_back_with_the_same_cache_key() {
     let allowed = granted(&["cli-probe.upper"]);
     let start = Instant::now();
 
-    let first = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        start,
-    );
+    let first = begin_owned(&store, &key, &allowed, start);
     let first_cache_key = first.cache_key.clone();
-    first.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("what broke?", "two things"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        first.lease,
+        ConversationTurn::completed("what broke?", "two things"),
         &first_cache_key,
         start,
     );
 
-    let warm = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        start + Duration::from_secs(60),
-    );
+    let warm = begin_owned(&store, &key, &allowed, start + Duration::from_secs(60));
     assert_eq!(
         warm.cache_key, first_cache_key,
         "a live conversation stays in the lane its own turns warmed"
     );
 
-    let cold = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        start + Duration::from_secs(900),
-    );
+    let cold = begin_owned(&store, &key, &allowed, start + Duration::from_secs(900));
     assert!(
         cold.history().is_empty(),
         "the idle timeout dropped the entry"
@@ -9270,24 +9136,10 @@ fn grant_empty_and_capacity_invalidation_each_keep_the_cache_lane() {
         ConversationTurn::completed("old", "old answer"),
         now,
     );
-    let before_grant_change = grant_store
-        .begin(
-            &grant_key,
-            &wider,
-            window(),
-            crate::conversation::Seed::Owned(None),
-            now,
-        )
+    let before_grant_change = begin_owned(&grant_store, &grant_key, &wider, now)
         .cache_key
         .clone();
-    let after_grant_change = grant_store
-        .begin(
-            &grant_key,
-            &allowed,
-            window(),
-            crate::conversation::Seed::Owned(None),
-            now,
-        )
+    let after_grant_change = begin_owned(&grant_store, &grant_key, &allowed, now)
         .cache_key
         .clone();
     assert_eq!(after_grant_change, before_grant_change);
@@ -9302,25 +9154,11 @@ fn grant_empty_and_capacity_invalidation_each_keep_the_cache_lane() {
         ConversationTurn::completed("old", "old answer"),
         now,
     );
-    let before_removal = removed_store
-        .begin(
-            &removed_key,
-            &allowed,
-            window(),
-            crate::conversation::Seed::Owned(None),
-            now,
-        )
+    let before_removal = begin_owned(&removed_store, &removed_key, &allowed, now)
         .cache_key
         .clone();
     assert!(removed_store.remove(&removed_key, EvictionReason::GrantChanged));
-    let after_removal = removed_store
-        .begin(
-            &removed_key,
-            &allowed,
-            window(),
-            crate::conversation::Seed::Owned(None),
-            now,
-        )
+    let after_removal = begin_owned(&removed_store, &removed_key, &allowed, now)
         .cache_key
         .clone();
     assert_eq!(after_removal, before_removal);
@@ -9336,14 +9174,7 @@ fn grant_empty_and_capacity_invalidation_each_keep_the_cache_lane() {
         ConversationTurn::completed("old", "old answer"),
         now,
     );
-    let before_capacity = capacity_store
-        .begin(
-            &displaced,
-            &allowed,
-            window(),
-            crate::conversation::Seed::Owned(None),
-            now,
-        )
+    let before_capacity = begin_owned(&capacity_store, &displaced, &allowed, now)
         .cache_key
         .clone();
     commit(
@@ -9354,16 +9185,14 @@ fn grant_empty_and_capacity_invalidation_each_keep_the_cache_lane() {
         ConversationTurn::completed("new", "new answer"),
         now + Duration::from_secs(1),
     );
-    let after_capacity = capacity_store
-        .begin(
-            &displaced,
-            &allowed,
-            window(),
-            crate::conversation::Seed::Owned(None),
-            now + Duration::from_secs(2),
-        )
-        .cache_key
-        .clone();
+    let after_capacity = begin_owned(
+        &capacity_store,
+        &displaced,
+        &allowed,
+        now + Duration::from_secs(2),
+    )
+    .cache_key
+    .clone();
     assert_eq!(after_capacity, before_capacity);
 }
 
@@ -9655,10 +9484,6 @@ async fn a_requested_shutdown_ends_the_daemon_successfully() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the one dispatch fixture exercises ticket admission, cancellation and banishment across the same route"
-)]
 async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -9689,9 +9514,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
     let mut runner = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
     runner.follow = Some(Arc::clone(&table));
     let runner = Arc::new(runner);
-    let mut pending = crate::follow::Debounce::default();
-    let mut sessions = tokio::task::JoinSet::new();
-    let mut collector = crate::collection::Collector::new(&[], 4);
+    let mut dispatcher = Dispatcher::new(&runner, &routes);
     let mut incoming = message("first");
     incoming.transport = "discord".into();
     incoming.conversation.kind = ConversationKind::Channel;
@@ -9702,21 +9525,9 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         channel_id: "c0123abc".into(),
         reply_to: None,
     };
-    let identities = BTreeMap::new();
-    let drivers = BTreeMap::new();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &drivers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut collector,
-        &mut pending,
-        incoming.clone(),
-    );
+    dispatcher.dispatch(NO_STOP_WORDS, incoming.clone());
     assert!(
-        pending.deadline().is_none(),
+        dispatcher.pending.deadline().is_none(),
         "without a ticket the not-addressed filter drops it"
     );
     table.stay_and_write(&key, SystemTime::now()).unwrap();
@@ -9727,25 +9538,17 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
             .join(format!("{key}.followed")),
     )
     .unwrap();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &drivers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut collector,
-        &mut pending,
-        incoming.clone(),
-    );
+    dispatcher.dispatch(NO_STOP_WORDS, incoming.clone());
     assert!(
-        pending.deadline().is_some(),
+        dispatcher.pending.deadline().is_some(),
         "dispatch consults resident memory, not disk"
     );
-    let fired = pending.due(tokio::time::Instant::now() + Duration::from_secs(30));
+    let fired = dispatcher
+        .pending
+        .due(tokio::time::Instant::now() + Duration::from_secs(30));
     assert!(matches!(fired[0].message_id, MessageId::Follow(_)));
     assert!(
-        sessions.is_empty(),
+        dispatcher.sessions.is_empty(),
         "follow waits for the debounce deadline"
     );
     let mut other = incoming.clone();
@@ -9753,32 +9556,12 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         dekopon_core::AttestedSubject::one(Subject::discord_user("123456789012345678").unwrap())
             .expect("one-form subject");
     other.text = "newest".into();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &drivers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut collector,
-        &mut pending,
-        other.clone(),
-    );
+    dispatcher.dispatch(NO_STOP_WORDS, other.clone());
     let mut addressed = other.clone();
     addressed.addressed = Some(true);
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &drivers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut collector,
-        &mut pending,
-        addressed,
-    );
+    dispatcher.dispatch(NO_STOP_WORDS, addressed);
     assert!(
-        pending.deadline().is_none(),
+        dispatcher.pending.deadline().is_none(),
         "an addressed message cancels only that speaker's pending follow"
     );
     let active = runner.gate.admit(
@@ -9790,17 +9573,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         panic!("active session admitted")
     };
     other.text = "stop".into();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &drivers,
-        &["stop".into()],
-        &mut sessions,
-        &mut collector,
-        &mut pending,
-        other,
-    );
+    dispatcher.dispatch(&["stop".into()], other);
     assert!(matches!(
         table.ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Absent
@@ -9816,7 +9589,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         crate::session::CancelOutcome::Cancelled
     ));
     drop(admission);
-    while sessions.join_next().await.is_some() {}
+    while dispatcher.sessions.join_next().await.is_some() {}
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -9897,25 +9670,13 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
     let dispatch_table = Arc::clone(&table);
     let dispatch_key = key.clone();
     let mut dispatch = tokio::task::spawn_blocking(move || {
-        let mut sessions = tokio::task::JoinSet::new();
-        let mut collector = crate::collection::Collector::new(&[], 4);
-        let mut pending = crate::follow::Debounce::default();
-        crate::dispatch(
-            &dispatch_runner,
-            &dispatch_routes,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &["stop".into()],
-            &mut sessions,
-            &mut collector,
-            &mut pending,
-            stop,
-        );
+        let mut dispatcher = Dispatcher::new(&dispatch_runner, &dispatch_routes);
+        dispatcher.dispatch(&["stop".into()], stop);
         let absent = matches!(
             dispatch_table.ticket(&dispatch_key, SystemTime::now()),
             crate::follow::FollowTicket::Absent
         );
-        (sessions, absent)
+        (dispatcher.sessions, absent)
     });
     let dispatched = tokio::time::timeout(Duration::from_secs(2), &mut dispatch).await;
     let returned_without_disk = dispatched.is_ok();
@@ -9985,25 +9746,17 @@ async fn dispatch_notice(inbound: InboundMessage) -> (dekopon_test_support::Capt
         "dev".to_owned(),
         Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
     )]);
-    let mut sessions = tokio::task::JoinSet::new();
+    let mut dispatcher = Dispatcher::new(&runner, &routes)
+        .with_identities(identities)
+        .with_drivers(drivers);
     let capture = {
         let (capture, _guard) = capture_spans();
-        crate::dispatch(
-            &runner,
-            &routes,
-            &identities,
-            &drivers,
-            NO_STOP_WORDS,
-            &mut sessions,
-            &mut crate::collection::Collector::new(&[], 4),
-            &mut crate::follow::Debounce::default(),
-            inbound,
-        );
+        dispatcher.dispatch(NO_STOP_WORDS, inbound);
         capture
     };
-    let session_count = sessions.len();
-    sessions.abort_all();
-    while sessions.join_next().await.is_some() {}
+    let session_count = dispatcher.sessions.len();
+    dispatcher.sessions.abort_all();
+    while dispatcher.sessions.join_next().await.is_some() {}
     (capture, session_count)
 }
 
@@ -10136,7 +9889,9 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     );
     let mut repliers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
     repliers.insert("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>);
-    let mut sessions = tokio::task::JoinSet::new();
+    let mut dispatcher = Dispatcher::new(&runner, &routes)
+        .with_identities(identities)
+        .with_drivers(repliers);
 
     let mut ambient = message("just chatting with my colleagues");
     ambient.conversation = Conversation {
@@ -10145,19 +9900,9 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         id: "c0123abc".to_owned(),
         thread: None,
     };
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &repliers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        ambient,
-    );
+    dispatcher.dispatch(NO_STOP_WORDS, ambient);
     assert_eq!(
-        sessions.len(),
+        dispatcher.sessions.len(),
         0,
         "ambient traffic must not start a session"
     );
@@ -10170,18 +9915,12 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         thread: None,
     };
     structurally_unaddressed.addressed = Some(false);
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &repliers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        structurally_unaddressed,
+    dispatcher.dispatch(NO_STOP_WORDS, structurally_unaddressed);
+    assert_eq!(
+        dispatcher.sessions.len(),
+        0,
+        "structured addressing must win"
     );
-    assert_eq!(sessions.len(), 0, "structured addressing must win");
 
     let mut elsewhere = message("<@U0BOTBOT> hello");
     elsewhere.conversation = Conversation {
@@ -10190,19 +9929,9 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         id: "c9999zzz".to_owned(),
         thread: None,
     };
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &repliers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        elsewhere,
-    );
+    dispatcher.dispatch(NO_STOP_WORDS, elsewhere);
     assert_eq!(
-        sessions.len(),
+        dispatcher.sessions.len(),
         0,
         "an unrouted channel must not start a session"
     );
@@ -10214,20 +9943,14 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         id: "c0123abc".to_owned(),
         thread: None,
     };
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &repliers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        addressed,
+    dispatcher.dispatch(NO_STOP_WORDS, addressed);
+    assert_eq!(
+        dispatcher.sessions.len(),
+        1,
+        "an addressed message starts one session"
     );
-    assert_eq!(sessions.len(), 1, "an addressed message starts one session");
-    sessions.abort_all();
-    while sessions.join_next().await.is_some() {}
+    dispatcher.sessions.abort_all();
+    while dispatcher.sessions.join_next().await.is_some() {}
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -10252,7 +9975,9 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
         },
     )]);
     let repliers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-    let mut sessions = tokio::task::JoinSet::new();
+    let mut dispatcher = Dispatcher::new(&runner, &routes)
+        .with_identities(identities)
+        .with_drivers(repliers);
     let mut continuation = message("and then?");
     continuation.conversation = Conversation {
         kind: ConversationKind::Channel,
@@ -10263,23 +9988,13 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
     continuation.addressed = Some(false);
     continuation.thread_continuation = Some(slack_thread_continuation(true));
 
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &repliers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        continuation,
-    );
+    dispatcher.dispatch(NO_STOP_WORDS, continuation);
     assert_eq!(
-        sessions.len(),
+        dispatcher.sessions.len(),
         1,
         "the owned continuation starts one session"
     );
-    while let Some(result) = sessions.join_next().await {
+    while let Some(result) = dispatcher.sessions.join_next().await {
         result.expect("continuation session completes");
     }
 
@@ -10308,7 +10023,9 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         },
     )]);
     let repliers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-    let mut sessions = tokio::task::JoinSet::new();
+    let mut dispatcher = Dispatcher::new(&runner, &routes)
+        .with_identities(identities)
+        .with_drivers(repliers);
 
     let mut ambient = message("just chatting with my colleagues");
     ambient.conversation = Conversation {
@@ -10317,19 +10034,9 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         id: "c9999zzz".to_owned(),
         thread: None,
     };
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &repliers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        ambient,
-    );
+    dispatcher.dispatch(NO_STOP_WORDS, ambient);
     assert_eq!(
-        sessions.len(),
+        dispatcher.sessions.len(),
         0,
         "a matched channel is not a wakeup on its own"
     );
@@ -10342,20 +10049,10 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         thread: None,
     };
     addressed.addressed = Some(true);
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &repliers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        addressed,
-    );
-    assert_eq!(sessions.len(), 1, "and being summoned in one is");
-    sessions.abort_all();
-    while sessions.join_next().await.is_some() {}
+    dispatcher.dispatch(NO_STOP_WORDS, addressed);
+    assert_eq!(dispatcher.sessions.len(), 1, "and being summoned in one is");
+    dispatcher.sessions.abort_all();
+    while dispatcher.sessions.join_next().await.is_some() {}
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -10410,26 +10107,18 @@ async fn a_local_channel_line_reaches_its_route_without_a_mention() {
         },
     )]);
     let repliers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-    let mut sessions = tokio::task::JoinSet::new();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &repliers,
-        NO_STOP_WORDS,
-        &mut sessions,
-        &mut crate::collection::Collector::new(&[], 4),
-        &mut crate::follow::Debounce::default(),
-        message,
-    );
+    let mut dispatcher = Dispatcher::new(&runner, &routes)
+        .with_identities(identities)
+        .with_drivers(repliers);
+    dispatcher.dispatch(NO_STOP_WORDS, message);
 
     assert_eq!(
-        sessions.len(),
+        dispatcher.sessions.len(),
         1,
         "the private socket is the authentication a mention stands in for elsewhere"
     );
-    sessions.abort_all();
-    while sessions.join_next().await.is_some() {}
+    dispatcher.sessions.abort_all();
+    while dispatcher.sessions.join_next().await.is_some() {}
 }
 
 fn expect_message(event: TransportEvent) -> InboundMessage {
@@ -12639,13 +12328,7 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     let narrow = granted(&["cli-probe.upper"]);
     let now = Instant::now();
 
-    let first = conversations.begin(
-        &key,
-        &wide,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let first = begin_owned(&conversations, &key, &wide, now);
     let old_access = first.assets.clone();
     let registered = store.assets_for_access(
         &old_access,
@@ -12654,24 +12337,14 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     );
     assert_eq!(registered.arrived, vec![1]);
     let first_cache_key = first.cache_key.clone();
-    first.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("old", "old answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        first.lease,
+        ConversationTurn::completed("old", "old answer"),
         &first_cache_key,
         now,
     );
 
-    let stale = conversations.begin(
-        &key,
-        &wide,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(1),
-    );
+    let stale = begin_owned(&conversations, &key, &wide, now + Duration::from_secs(1));
     assert_eq!(
         stale.cache_key, first_cache_key,
         "another participant with the same grant stays on the shared cache lane"
@@ -12698,13 +12371,7 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
         )
     });
     barrier.wait();
-    let fresh = conversations.begin(
-        &key,
-        &narrow,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(2),
-    );
+    let fresh = begin_owned(&conversations, &key, &narrow, now + Duration::from_secs(2));
     let _racing_result = racing_publication.join().expect("asset race completes");
 
     assert!(
@@ -12755,32 +12422,21 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
     let key = private_conversation_key("dev", "idle-assets", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
-    let first = conversations.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let first = begin_owned(&conversations, &key, &allowed, now);
     let old_access = first.assets.clone();
     store.assets_for_access(&old_access, vec![pending("old.png", "image/png", 10)], now);
     let first_cache_key = first.cache_key.clone();
-    first.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("old", "old answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        first.lease,
+        ConversationTurn::completed("old", "old answer"),
         &first_cache_key,
         now,
     );
 
-    let fresh = conversations.begin(
+    let fresh = begin_owned(
+        &conversations,
         &key,
         &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(900),
     );
     assert!(fresh.history().is_empty());
@@ -12807,13 +12463,7 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
     let second_key = private_conversation_key("dev", "second-assets", SUBJECT);
     let now = Instant::now();
 
-    let first = conversations.begin(
-        &first_key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let first = begin_owned(&conversations, &first_key, &allowed, now);
     let old_access = first.assets.clone();
     store.assets_for_access(
         &old_access,
@@ -12821,21 +12471,16 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
         now,
     );
     let first_cache_key = first.cache_key.clone();
-    first.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("first", "first answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        first.lease,
+        ConversationTurn::completed("first", "first answer"),
         &first_cache_key,
         now,
     );
-    let in_flight = conversations.begin(
+    let in_flight = begin_owned(
+        &conversations,
         &first_key,
         &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(1),
     );
     let in_flight_access = in_flight.assets.clone();
@@ -12866,11 +12511,10 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
         "an in-flight session cannot republish after its generation was displaced"
     );
 
-    let replacement = conversations.begin(
+    let replacement = begin_owned(
+        &conversations,
         &first_key,
         &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(4),
     );
     let registered = store.assets_for_access(
@@ -12891,13 +12535,7 @@ fn another_conversation_never_removes_or_aliases_a_live_asset_number() {
     let second_key = private_conversation_key("dev", "second-live-assets", SUBJECT);
     let now = Instant::now();
 
-    let first = conversations.begin(
-        &first_key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let first = begin_owned(&conversations, &first_key, &allowed, now);
     assert_eq!(
         store
             .assets_for_access(
@@ -12909,22 +12547,17 @@ fn another_conversation_never_removes_or_aliases_a_live_asset_number() {
         vec![1]
     );
     let first_cache_key = first.cache_key.clone();
-    first.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("first", "first answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        first.lease,
+        ConversationTurn::completed("first", "first answer"),
         &first_cache_key,
         now,
     );
 
-    let second = conversations.begin(
+    let second = begin_owned(
+        &conversations,
         &second_key,
         &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(1),
     );
     store.assets_for_access(
@@ -12932,11 +12565,10 @@ fn another_conversation_never_removes_or_aliases_a_live_asset_number() {
         vec![pending("displacing.png", "image/png", 20)],
         now + Duration::from_secs(1),
     );
-    let resumed = conversations.begin(
+    let resumed = begin_owned(
+        &conversations,
         &first_key,
         &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
         now + Duration::from_secs(2),
     );
     let replacement = store.assets_for_access(
@@ -12979,13 +12611,7 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     let key = private_conversation_key("dev", "removed-assets", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
-    let first = conversations.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let first = begin_owned(&conversations, &key, &allowed, now);
     let old_access = first.assets.clone();
     let registered = store.assets_for_access(
         &old_access,
@@ -12994,13 +12620,9 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     );
     assert!(fetchable(&registered, true));
     let first_cache_key = first.cache_key.clone();
-    first.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("old", "old answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        first.lease,
+        ConversationTurn::completed("old", "old answer"),
         &first_cache_key,
         now,
     );
@@ -13040,13 +12662,7 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
             .is_none()
     );
 
-    let fresh = conversations.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now + Duration::from_secs(1),
-    );
+    let fresh = begin_owned(&conversations, &key, &allowed, now + Duration::from_secs(1));
     let replacement = store.assets_for_access(
         &fresh.assets,
         vec![pending("new.png", "image/png", 10)],
@@ -13094,23 +12710,13 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
     let key = private_conversation_key("dev", "racing-byte-fetch", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
-    let seed = conversations.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let seed = begin_owned(&conversations, &key, &allowed, now);
     let access = seed.assets.clone();
     store.assets_for_access(&access, vec![pending("retired.png", "image/png", 10)], now);
     let cache_key = seed.cache_key.clone();
-    seed.lease.commit(
-        window(),
-        crate::conversation::Commit::Owned {
-            recalled: None,
-            turn: ConversationTurn::completed("old", "old answer"),
-        },
-        TakenIn::default(),
+    commit_owned(
+        seed.lease,
+        ConversationTurn::completed("old", "old answer"),
         &cache_key,
         now,
     );
@@ -15888,28 +15494,22 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
     let runner = runner(broker, Arc::clone(&models), 4);
     let driver = Arc::new(RecordingDriver::default());
     let drivers = BTreeMap::from([("dev".into(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-    let mut collector = burst_collector(None);
-    let mut sessions = tokio::task::JoinSet::new();
+    let mut dispatcher = Dispatcher::new(&runner, &routes)
+        .with_drivers(drivers)
+        .with_collector(burst_collector(None));
     for _ in 0..9 {
         let input = next_message(&mut transport).await;
-        crate::dispatch(
-            &runner,
-            &routes,
-            &BTreeMap::new(),
-            &drivers,
-            &[],
-            &mut sessions,
-            &mut collector,
-            &mut crate::follow::Debounce::default(),
-            input,
-        );
+        dispatcher.dispatch(&[], input);
     }
-    while let Some(result) = sessions.join_next().await {
+    while let Some(result) = dispatcher.sessions.join_next().await {
         result.unwrap();
     }
     assert_eq!(models.requests(), 0);
     assert_eq!(driver.replies().len(), 1, "only the ninth input is refused");
-    let batch = collector.take_due(collector.deadline().unwrap()).remove(0);
+    let batch = dispatcher
+        .collector
+        .take_due(dispatcher.collector.deadline().unwrap())
+        .remove(0);
     assert_eq!(batch.assets.len(), 8);
     run_session(runner, route(model_config()), batch, driver).await;
     assert_eq!(models.requests(), 1);
@@ -17371,19 +16971,10 @@ async fn unauthorized_and_unrouted_whatsapp_photos_fetch_nothing() {
                 BrokerRequest::Capabilities { .. }
             ));
         } else {
-            let mut sessions = tokio::task::JoinSet::new();
-            crate::dispatch(
-                &runner,
-                &Arc::new(RoutingTable::default()),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &[],
-                &mut sessions,
-                &mut crate::collection::Collector::new(&[], 4),
-                &mut crate::follow::Debounce::default(),
-                inbound,
-            );
-            assert!(sessions.is_empty());
+            let routes = Arc::new(RoutingTable::default());
+            let mut dispatcher = Dispatcher::new(&runner, &routes);
+            dispatcher.dispatch(&[], inbound);
+            assert!(dispatcher.sessions.is_empty());
             assert!(observed.try_recv().is_err());
         }
         assert_eq!(models.requests(), 0);
@@ -17599,19 +17190,9 @@ async fn refused_once_when_routed_and_silent_when_unrouted(kind: &str, body: Val
         let driver = Arc::new(RecordingDriver::default());
         let drivers =
             BTreeMap::from([("wa".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-        let mut sessions = tokio::task::JoinSet::new();
-        crate::dispatch(
-            &runner,
-            &routes,
-            &BTreeMap::new(),
-            &drivers,
-            &[],
-            &mut sessions,
-            &mut crate::collection::Collector::new(&[], 4),
-            &mut crate::follow::Debounce::default(),
-            message,
-        );
-        while sessions.join_next().await.is_some() {}
+        let mut dispatcher = Dispatcher::new(&runner, &routes).with_drivers(drivers);
+        dispatcher.dispatch(&[], message);
+        while dispatcher.sessions.join_next().await.is_some() {}
         assert_eq!(
             driver.replies(),
             if routed {
@@ -17704,11 +17285,10 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
     let store = Arc::new(asset_store());
     let conversations = ConversationStore::new(8);
     let key = private_conversation_key("wa", "one", "drn:whatsapp:number::15550000001");
-    let seed = conversations.begin(
+    let seed = begin_owned(
+        &conversations,
         &key,
         &granted(&["gpt-image.edit"]),
-        window(),
-        crate::conversation::Seed::Owned(None),
         Instant::now(),
     );
     let registered = store.assets_for_access(&seed.assets, inbound.assets, Instant::now());
@@ -17975,43 +17555,24 @@ async fn photo_burst_dispatch_stop_disposes_owned_pending_input_without_starting
     let (runner, routes) = idle_routing_loop(directory.path()).await;
     let driver = Arc::new(RecordingDriver::default());
     let drivers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
-    let mut collector = burst_collector(None);
-    let mut sessions = tokio::task::JoinSet::new();
-    let identities = BTreeMap::new();
+    let mut dispatcher = Dispatcher::new(&runner, &routes)
+        .with_drivers(drivers)
+        .with_collector(burst_collector(None));
     let stop_words = vec!["stop".to_owned()];
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &drivers,
-        &stop_words,
-        &mut sessions,
-        &mut collector,
-        &mut crate::follow::Debounce::default(),
-        burst_photo(""),
-    );
-    assert!(collector.deadline().is_some());
-    assert!(sessions.is_empty());
+    dispatcher.dispatch(&stop_words, burst_photo(""));
+    assert!(dispatcher.collector.deadline().is_some());
+    assert!(dispatcher.sessions.is_empty());
     let mut stop = burst_photo("stop");
     stop.assets.clear();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &drivers,
-        &stop_words,
-        &mut sessions,
-        &mut collector,
-        &mut crate::follow::Debounce::default(),
-        stop,
-    );
-    assert!(collector.deadline().is_none());
-    while let Some(result) = sessions.join_next().await {
+    dispatcher.dispatch(&stop_words, stop);
+    assert!(dispatcher.collector.deadline().is_none());
+    while let Some(result) = dispatcher.sessions.join_next().await {
         result.unwrap();
     }
     assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
     assert!(
-        collector
+        dispatcher
+            .collector
             .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
             .is_empty()
     );
@@ -18056,27 +17617,18 @@ async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stop
             "dev".to_owned(),
             Arc::clone(&acknowledgments) as Arc<dyn ChatDriver>,
         )]);
-        let mut collector = burst_collector(None);
-        let mut sessions = tokio::task::JoinSet::new();
+        let mut dispatcher = Dispatcher::new(&runner, &routes)
+            .with_drivers(drivers)
+            .with_collector(burst_collector(None));
         for text in ["", "stop", "stop"] {
             let mut input = burst_photo(text);
             if !text.is_empty() {
                 input.assets.clear();
             }
-            crate::dispatch(
-                &runner,
-                &routes,
-                &BTreeMap::new(),
-                &drivers,
-                &["stop".into()],
-                &mut sessions,
-                &mut collector,
-                &mut crate::follow::Debounce::default(),
-                input,
-            );
+            dispatcher.dispatch(&["stop".into()], input);
         }
-        assert!(collector.deadline().is_none());
-        while let Some(result) = sessions.join_next().await {
+        assert!(dispatcher.collector.deadline().is_none());
+        while let Some(result) = dispatcher.sessions.join_next().await {
             result.unwrap();
         }
         assert_eq!(
@@ -18104,7 +17656,8 @@ async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stop
             }]
         );
         assert!(
-            collector
+            dispatcher
+                .collector
                 .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
                 .is_empty()
         );
@@ -18196,8 +17749,9 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
             handle: Some("test_bot".into()),
         },
     )]);
-    let mut collector = crate::collection::Collector::new(&[], 4);
-    let mut sessions = tokio::task::JoinSet::new();
+    let mut dispatcher = Dispatcher::new(&runner, &routes)
+        .with_identities(identities)
+        .with_drivers(drivers);
     let mut member = burst_photo("");
     member.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
     member.subject = dekopon_core::AttestedSubject::one(Subject::telegram_user("123456").unwrap())
@@ -18214,39 +17768,23 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         reply_to: Some(1),
         message_thread_id: Some(42),
     };
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &drivers,
-        &[],
-        &mut sessions,
-        &mut collector,
-        &mut crate::follow::Debounce::default(),
-        member.clone(),
-    );
-    assert!(collector.deadline().is_none());
+    dispatcher.dispatch(&[], member.clone());
+    assert!(dispatcher.collector.deadline().is_none());
     let mut lead = member.clone();
     lead.text = "@test_bot edit these references".into();
-    crate::dispatch(
-        &runner,
-        &routes,
-        &identities,
-        &drivers,
-        &[],
-        &mut sessions,
-        &mut collector,
-        &mut crate::follow::Debounce::default(),
-        lead,
-    );
-    assert!(collector.deadline().is_some());
+    dispatcher.dispatch(&[], lead);
+    assert!(dispatcher.collector.deadline().is_some());
     let route = routes.route(&member).expect("bound topic route").clone();
     let identity = |message: &InboundMessage| crate::collection::RouteIdentity::of(&route, message);
-    assert!(collector.is_native_continuation(&identity(&member), &member));
+    assert!(
+        dispatcher
+            .collector
+            .is_native_continuation(&identity(&member), &member)
+    );
     let mut other = route.clone();
     other.agent = "other".parse().unwrap();
     assert!(
-        !collector.is_native_continuation(
+        !dispatcher.collector.is_native_continuation(
             &crate::collection::RouteIdentity::of(&other, &member),
             &member
         ),
@@ -18263,18 +17801,12 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
             1 => outsider.native_group = Some("other-group".into()),
             _ => outsider.conversation.thread = Some("43".into()),
         }
-        assert!(!collector.is_native_continuation(&identity(&outsider), &outsider));
-        crate::dispatch(
-            &runner,
-            &routes,
-            &identities,
-            &drivers,
-            &[],
-            &mut sessions,
-            &mut collector,
-            &mut crate::follow::Debounce::default(),
-            outsider,
+        assert!(
+            !dispatcher
+                .collector
+                .is_native_continuation(&identity(&outsider), &outsider)
         );
+        dispatcher.dispatch(&[], outsider);
     }
     for id in [2, 3] {
         member.message_id = MessageId::Native(id.to_string());
@@ -18283,20 +17815,15 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
             reply_to: Some(id),
             message_thread_id: Some(42),
         };
-        crate::dispatch(
-            &runner,
-            &routes,
-            &identities,
-            &drivers,
-            &[],
-            &mut sessions,
-            &mut collector,
-            &mut crate::follow::Debounce::default(),
-            member.clone(),
-        );
+        dispatcher.dispatch(&[], member.clone());
     }
-    assert!(sessions.is_empty(), "collection starts no effects");
-    let ready = collector.take_due(collector.deadline().unwrap());
+    assert!(
+        dispatcher.sessions.is_empty(),
+        "collection starts no effects"
+    );
+    let ready = dispatcher
+        .collector
+        .take_due(dispatcher.collector.deadline().unwrap());
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].assets.len(), 3);
     assert_eq!(ready[0].constituents.len(), 3);
@@ -18309,7 +17836,9 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         }
     );
     assert!(
-        !collector.is_native_continuation(&identity(&member), &member),
+        !dispatcher
+            .collector
+            .is_native_continuation(&identity(&member), &member),
         "sealed group cannot lend addressing"
     );
 }
@@ -20010,13 +19539,7 @@ fn a_committed_turn_sets_the_watermark_and_a_steer_is_taken_in_without_moving_it
     let now = Instant::now();
     let turn = |text: &str| ConversationTurn::completed(text, "ok");
 
-    let first = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let first = begin_owned(&store, &key, &allowed, now);
     first.lease.commit(
         window(),
         crate::conversation::Commit::Owned {
@@ -20030,13 +19553,7 @@ fn a_committed_turn_sets_the_watermark_and_a_steer_is_taken_in_without_moving_it
         &first.cache_key,
         now,
     );
-    let woken = store.begin(
-        &key,
-        &allowed,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let woken = begin_owned(&store, &key, &allowed, now);
     woken.lease.commit(
         window(),
         crate::conversation::Commit::Owned {
@@ -20067,13 +19584,7 @@ fn a_follow_up_commit_keeps_earlier_steers_and_never_moves_the_watermark_back() 
     let key = private_conversation_key("dev", "dev", SUBJECT);
     let now = Instant::now();
     let commit = |newest: &str, steers: &[&str]| {
-        let seed = store.begin(
-            &key,
-            &allowed,
-            window(),
-            crate::conversation::Seed::Owned(None),
-            now,
-        );
+        let seed = begin_owned(&store, &key, &allowed, now);
         seed.lease.commit(
             window(),
             crate::conversation::Commit::Owned {
@@ -21189,13 +20700,7 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
         )
         .map(|admitted| (admitted.run, admitted.signal))
         .unwrap();
-    let asset_seed = runner.conversations.begin(
-        &private,
-        &grant,
-        window(),
-        crate::conversation::Seed::Owned(None),
-        now,
-    );
+    let asset_seed = begin_owned(&runner.conversations, &private, &grant, now);
     let access = asset_seed.assets.clone();
     let arriving =
         runner
@@ -21259,15 +20764,7 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
             "kept.png"
         );
         for (key, text) in [(&private, "private past"), (&shared, "shared past")] {
-            let history = runner
-                .conversations
-                .begin(
-                    key,
-                    &grant,
-                    window(),
-                    crate::conversation::Seed::Owned(None),
-                    now,
-                )
+            let history = begin_owned(&runner.conversations, key, &grant, now)
                 .history()
                 .clone();
             assert_eq!(history.turns()[0].user(), text);
@@ -22805,11 +22302,10 @@ async fn cancelling_a_first_journaled_turn_reclaims_its_downloaded_upload() {
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     ));
     model.wait_until_entered().await;
-    let seed = runner.conversations.begin(
+    let seed = begin_owned(
+        &runner.conversations,
         &key,
         &granted(&["cli-probe.upper"]),
-        window(),
-        crate::conversation::Seed::Owned(None),
         Instant::now(),
     );
     assert!(!seed.created);
