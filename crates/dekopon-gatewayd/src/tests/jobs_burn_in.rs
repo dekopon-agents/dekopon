@@ -414,21 +414,11 @@ async fn the_same_person_in_two_conversations_sees_and_stops_only_that_conversat
     let output = tool_output_of(&runner, &models, route, y.clone()).await;
     assert_eq!(output.lines().next(), Some("rows=0"));
     assert!(output.lines().any(|line| line == "waited=1"), "{output}");
-    let mut sessions = tokio::task::JoinSet::new();
+    let mut dispatcher = Dispatcher::new(&runner, &routes);
     let y_id = y.conversation.id.clone();
     for mut inbound in [y, x] {
         inbound.text = "stop".to_owned();
-        crate::dispatch(
-            &runner,
-            &routes,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &["stop".to_owned()],
-            &mut sessions,
-            &mut crate::collection::Collector::new(&[], 4),
-            &mut crate::follow::Debounce::default(),
-            inbound.clone(),
-        );
+        dispatcher.dispatch(&["stop".to_owned()], inbound.clone());
         if inbound.conversation.id == y_id {
             assert!(!signal.is_cancelled());
         }
@@ -438,7 +428,7 @@ async fn the_same_person_in_two_conversations_sees_and_stops_only_that_conversat
     let rows = settled(&runner.jobs, &owner, Duration::from_secs(3)).await;
     assert_eq!(finished(&rows[0]).0, JobOutcome::Cancelled);
     assert!(notices.try_recv().is_err());
-    while let Some(result) = sessions.join_next().await {
+    while let Some(result) = dispatcher.sessions.join_next().await {
         result.unwrap();
     }
 }
