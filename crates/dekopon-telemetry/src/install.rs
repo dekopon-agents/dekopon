@@ -645,26 +645,10 @@ mod tests {
 
     #[test]
     fn an_error_field_on_an_event_does_not_set_its_span_status() {
+        use crate::span_sink::exporting_provider;
         use opentelemetry::trace::{Status, TracerProvider as _};
-        use opentelemetry_sdk::{
-            error::OTelSdkResult,
-            trace::{SdkTracerProvider, SpanData, SpanExporter},
-        };
 
-        #[derive(Clone, Debug, Default)]
-        struct Exported(Arc<Mutex<Vec<SpanData>>>);
-
-        impl SpanExporter for Exported {
-            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-                self.0.lock().extend(batch);
-                Ok(())
-            }
-        }
-
-        let exported = Exported::default();
-        let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(exported.clone())
-            .build();
+        let (provider, exported) = exporting_provider();
         tracing::subscriber::with_default(
             registry().with(super::trace_layer(provider.tracer("status-test"))),
             || {
