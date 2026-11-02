@@ -22,7 +22,6 @@ use crate::{
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-const PROBE_OUTPUT_TOKENS: NonZeroU32 = NonZeroU32::MIN.saturating_add(15);
 
 #[derive(Clone, Debug)]
 pub enum ProbeScope {
@@ -163,16 +162,16 @@ pub(crate) async fn probe(
         })
     };
     for model in &config.models {
-        if baseline
+        if baseline.as_ref().is_some_and(|old| {
+            old.probe.max_output_tokens == config.probe.max_output_tokens
+                && old.models.iter().any(|old| old == model)
+        }) && baseline_routes
             .as_ref()
-            .is_some_and(|old| old.models.iter().any(|old| old == model))
-            && baseline_routes.as_ref().is_some_and(|old| {
-                routes.is_none_or(|routes| !routes.new_binding(model.name(), old))
-            })
+            .is_some_and(|old| routes.is_none_or(|routes| !routes.new_binding(model.name(), old)))
         {
             continue;
         }
-        match probe_model(model, vendor).await {
+        match probe_model(model, config.probe.max_output_tokens, vendor).await {
             Ok(None) => {}
             Ok(Some(reason)) => report.warnings.push(CheckWarning::NotProbed {
                 model: model.name().to_owned(),
@@ -202,6 +201,7 @@ pub(crate) async fn probe(
 
 async fn probe_model(
     model: &ModelConfig,
+    max_output_tokens: NonZeroU32,
     vendor: &Vendor,
 ) -> Result<Option<NotProbed>, ProbeError> {
     match model {
@@ -216,7 +216,7 @@ async fn probe_model(
         } => {
             let settings = Settings {
                 generation: Some(Generation {
-                    max_output_tokens: Some(PROBE_OUTPUT_TOKENS),
+                    max_output_tokens: Some(max_output_tokens),
                     ..generation.clone().unwrap_or_default()
                 }),
                 reasoning: reasoning.clone(),
