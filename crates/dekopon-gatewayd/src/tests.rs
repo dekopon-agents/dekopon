@@ -1914,6 +1914,56 @@ async fn github_first_selector_wins_before_event_filter() {
     );
 }
 
+fn signature_hex(secret: &[u8], body: &[u8]) -> String {
+    crate::transport::webhook::hmac_sha256(secret, body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+async fn post_signed(
+    client: &reqwest::Client,
+    url: String,
+    secret: &[u8],
+    body: Vec<u8>,
+    headers: &[(&str, &str)],
+) -> reqwest::Response {
+    let mut request = client
+        .post(url)
+        .header(
+            "x-hub-signature-256",
+            format!("sha256={}", signature_hex(secret, &body)),
+        )
+        .body(body);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    request.send().await.expect("signed POST")
+}
+
+fn whatsapp_transport(
+    name: &str,
+    address: std::net::SocketAddr,
+    api_base: &str,
+    app_secret: &str,
+    liveness: LivenessSettings,
+) -> crate::transport::whatsapp::WhatsappTransport {
+    crate::transport::whatsapp::WhatsappTransport::new(
+        name.into(),
+        address,
+        "/wa".into(),
+        "123".into(),
+        "456".into(),
+        "v23.0".into(),
+        api_base.into(),
+        app_secret.into(),
+        "verify".into(),
+        "access".into(),
+        liveness,
+    )
+    .expect("WhatsApp transport builds")
+}
+
 async fn signed_github_request(
     client: &reqwest::Client,
     address: std::net::SocketAddr,
@@ -1940,25 +1990,19 @@ async fn signed_reload_delivery(
     event: &str,
     repo: &str,
 ) -> reqwest::StatusCode {
-    use crate::transport::webhook::hmac_sha256;
     let mut claim = crate::transport::github::tests::sample(event);
     claim["repository"]["owner"]["login"] = json!("OWNER");
     claim["repository"]["name"] = json!(repo);
     let body = serde_json::to_vec(&claim).unwrap();
-    let signature: String = hmac_sha256(b"secret", &body)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    client
-        .post(format!("http://{address}/webhooks/github"))
-        .header("x-hub-signature-256", format!("sha256={signature}"))
-        .header("x-github-delivery", guid)
-        .header("x-github-event", event)
-        .body(body)
-        .send()
-        .await
-        .expect("signed webhook delivery")
-        .status()
+    post_signed(
+        client,
+        format!("http://{address}/webhooks/github"),
+        b"secret",
+        body,
+        &[("x-github-delivery", guid), ("x-github-event", event)],
+    )
+    .await
+    .status()
 }
 
 async fn take_github_delivery(
@@ -2143,7 +2187,7 @@ async fn authorize_github_fixture(
     reason = "one mounted socket exercises signed dedupe, eviction and restart in order"
 )]
 async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_eviction() {
-    use crate::transport::{ChatTransport, github::GithubTransport, webhook::hmac_sha256};
+    use crate::transport::{ChatTransport, github::GithubTransport};
     let directory = catalog_root();
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = probe.local_addr().unwrap();
@@ -2165,10 +2209,7 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
         std::sync::Arc::new(crate::routes::RoutingTable::bind(&resolved, &catalog).unwrap());
     let body =
         serde_json::to_vec(&crate::transport::github::tests::sample("pull_request")).unwrap();
-    let signature: String = hmac_sha256(b"secret", &body)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let signature = signature_hex(b"secret", &body);
     let client = reqwest::Client::new();
     let mut transport = GithubTransport::new(
         "github".into(),
@@ -2225,10 +2266,7 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
     other["repository"]["id"] = json!(20);
     other["repository"]["owner"]["login"] = json!("OTHER");
     let other_body = serde_json::to_vec(&other).unwrap();
-    let other_signature: String = hmac_sha256(b"secret", &other_body)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let other_signature = signature_hex(b"secret", &other_body);
     assert_eq!(
         signed_github_request(
             &client,
@@ -2248,37 +2286,33 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
     );
     let run_body =
         serde_json::to_vec(&crate::transport::github::tests::sample("workflow_run")).unwrap();
-    let run_signature: String = hmac_sha256(b"secret", &run_body)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let run_status = client
-        .post(format!("http://{address}/webhooks/github"))
-        .header("x-hub-signature-256", format!("sha256={run_signature}"))
-        .header("x-github-delivery", "run-guid")
-        .header("x-github-event", "workflow_run")
-        .body(run_body)
-        .send()
-        .await
-        .unwrap();
+    let run_status = post_signed(
+        &client,
+        format!("http://{address}/webhooks/github"),
+        b"secret",
+        run_body,
+        &[
+            ("x-github-delivery", "run-guid"),
+            ("x-github-event", "workflow_run"),
+        ],
+    )
+    .await;
     assert_eq!(run_status.status(), reqwest::StatusCode::OK);
     let mut pending = crate::transport::github::tests::sample("workflow_run");
     pending["action"] = json!("requested");
     pending["workflow_run"]["conclusion"] = Value::Null;
     let pending_run = serde_json::to_vec(&pending).unwrap();
-    let pending_signature: String = hmac_sha256(b"secret", &pending_run)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let pending_status = client
-        .post(format!("http://{address}/webhooks/github"))
-        .header("x-hub-signature-256", format!("sha256={pending_signature}"))
-        .header("x-github-delivery", "pending-run-guid")
-        .header("x-github-event", "workflow_run")
-        .body(pending_run)
-        .send()
-        .await
-        .unwrap();
+    let pending_status = post_signed(
+        &client,
+        format!("http://{address}/webhooks/github"),
+        b"secret",
+        pending_run,
+        &[
+            ("x-github-delivery", "pending-run-guid"),
+            ("x-github-event", "workflow_run"),
+        ],
+    )
+    .await;
     assert_eq!(
         pending_status.status(),
         reqwest::StatusCode::OK,
@@ -2326,27 +2360,17 @@ async fn github_signed_mount_dedupes_in_process_but_accepts_after_restart_and_ev
 
 #[tokio::test]
 async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
-    use crate::transport::{
-        ChatTransport, TransportEvent, github::GithubTransport, webhook::hmac_sha256,
-        whatsapp::WhatsappTransport,
-    };
+    use crate::transport::{ChatTransport, TransportEvent, github::GithubTransport};
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = probe.local_addr().unwrap();
     drop(probe);
-    let wa = WhatsappTransport::new(
-        "wa".into(),
+    let wa = whatsapp_transport(
+        "wa",
         address,
-        "/wa".into(),
-        "123".into(),
-        "456".into(),
-        "v23.0".into(),
-        "http://127.0.0.1:9".into(),
-        "wa-secret".into(),
-        "verify".into(),
-        "access".into(),
-        crate::LivenessSettings::default(),
-    )
-    .unwrap();
+        "http://127.0.0.1:9",
+        "wa-secret",
+        LivenessSettings::default(),
+    );
     let combined = GithubTransport::new(
         "github".into(),
         address,
@@ -2362,20 +2386,13 @@ async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
     assert!(drivers.contains_key("github") && drivers.contains_key("wa"));
     assert!(fetchers.contains_key("wa"));
     assert!(!fetchers.contains_key("github"));
-    let lone = WhatsappTransport::new(
-        "wa-alone".into(),
+    let lone = whatsapp_transport(
+        "wa-alone",
         address,
-        "/wa".into(),
-        "123".into(),
-        "456".into(),
-        "v23.0".into(),
-        "http://127.0.0.1:9".into(),
-        "wa-secret".into(),
-        "verify".into(),
-        "access".into(),
-        crate::LivenessSettings::default(),
-    )
-    .unwrap();
+        "http://127.0.0.1:9",
+        "wa-secret",
+        LivenessSettings::default(),
+    );
     let _lone = crate::register_transport(Box::new(lone), &mut drivers, &mut fetchers, &mut owners);
     assert!(drivers.contains_key("wa-alone") && fetchers.contains_key("wa-alone"));
     combined.connect().await.unwrap();
@@ -2395,17 +2412,14 @@ async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
         "messages":[{"id":"wamid.1","from":"1603","type":"text","text":{"body":"hello"}}]}}]}]}),
     )
     .unwrap();
-    let signature: String = hmac_sha256(b"wa-secret", &body)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let response = client
-        .post(format!("http://{address}/wa"))
-        .header("x-hub-signature-256", format!("sha256={signature}"))
-        .body(body)
-        .send()
-        .await
-        .unwrap();
+    let response = post_signed(
+        &client,
+        format!("http://{address}/wa"),
+        b"wa-secret",
+        body,
+        &[],
+    )
+    .await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert!(
         matches!(combined.next().await.unwrap(), TransportEvent::Connected { name, .. } if name == "wa")
@@ -10157,9 +10171,9 @@ impl HttpMock {
     reason = "a mock that cannot finish writing its canned response leaves the transport under \
               test without one, which is what the calling test already asserts on"
 )]
-fn spawn_http_mock<H>(handler: H) -> HttpMock
+fn serve_http<R>(respond: R) -> String
 where
-    H: Fn(&str, &str) -> Value + Send + Sync + 'static,
+    R: Fn(&str, &str, &str) -> Vec<u8> + Send + Sync + 'static,
 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("mock endpoint binds");
     let address = listener.local_addr().expect("mock endpoint address");
@@ -10167,42 +10181,50 @@ where
         .set_nonblocking(true)
         .expect("mock endpoint is pollable");
     let listener = tokio::net::TcpListener::from_std(listener).expect("mock endpoint adopts");
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&calls);
-    let headers = Arc::new(Mutex::new(Vec::new()));
-    let recorded_headers = Arc::clone(&headers);
     tokio::spawn(async move {
-        let handler = Arc::new(handler);
+        let respond = Arc::new(respond);
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let handler = Arc::clone(&handler);
-            let recorded = Arc::clone(&recorded);
-            let recorded_headers = Arc::clone(&recorded_headers);
+            let respond = Arc::clone(&respond);
             tokio::spawn(async move {
                 let mut stream = stream;
                 let Some((path, headers, body)) = read_http_request_parts(&mut stream).await else {
                     return;
                 };
-                recorded.lock().push((path.clone(), body.clone()));
-                recorded_headers.lock().push(headers);
-                let response = handler(&path, &body);
-                let encoded = serde_json::to_vec(&response).expect("mock response serializes");
-                let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    encoded.len()
-                );
+                let response = respond(&path, &headers, &body);
                 use tokio::io::AsyncWriteExt as _;
-                let _ = stream.write_all(headers.as_bytes()).await;
-                let _ = stream.write_all(&encoded).await;
+                let _ = stream.write_all(&response).await;
                 let _ = stream.flush().await;
             });
         }
     });
+    format!("http://{address}")
+}
 
+fn spawn_http_mock<H>(handler: H) -> HttpMock
+where
+    H: Fn(&str, &str) -> Value + Send + Sync + 'static,
+{
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&calls);
+    let headers = Arc::new(Mutex::new(Vec::new()));
+    let recorded_headers = Arc::clone(&headers);
+    let base = serve_http(move |path, request_headers, body| {
+        recorded.lock().push((path.to_owned(), body.to_owned()));
+        recorded_headers.lock().push(request_headers.to_owned());
+        let encoded = serde_json::to_vec(&handler(path, body)).expect("mock response serializes");
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            encoded.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&encoded);
+        response
+    });
     HttpMock {
-        base: format!("http://{address}"),
+        base,
         calls,
         headers,
     }
@@ -10219,114 +10241,54 @@ impl RawHttpMock {
     }
 }
 
-#[allow(
-    clippy::let_underscore_must_use,
-    reason = "a mock that cannot finish writing its canned response leaves the transport under \
-              test without one, which is what the calling test already asserts on"
-)]
 fn spawn_raw_http_mock<H>(handler: H) -> RawHttpMock
 where
     H: Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + Sync + 'static,
 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("raw mock endpoint binds");
-    let address = listener.local_addr().expect("raw mock endpoint address");
-    listener
-        .set_nonblocking(true)
-        .expect("raw mock endpoint is pollable");
-    let listener = tokio::net::TcpListener::from_std(listener).expect("raw mock endpoint adopts");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&calls);
-    tokio::spawn(async move {
-        let handler = Arc::new(handler);
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let handler = Arc::clone(&handler);
-            let recorded = Arc::clone(&recorded);
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let Some((path, headers, _body)) = read_http_request_parts(&mut stream).await
-                else {
-                    return;
-                };
-                recorded.lock().push((path.clone(), headers));
-                let (status, content_type, response) = handler(&path);
-                let reason = if status == 200 { "OK" } else { "Not Found" };
-                let headers = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    response.len()
-                );
-                use tokio::io::AsyncWriteExt as _;
-                let _ = stream.write_all(headers.as_bytes()).await;
-                let _ = stream.write_all(&response).await;
-                let _ = stream.flush().await;
-            });
-        }
+    let base = serve_http(move |path, headers, _body| {
+        recorded.lock().push((path.to_owned(), headers.to_owned()));
+        let (status, content_type, body) = handler(path);
+        let reason = if status == 200 { "OK" } else { "Not Found" };
+        let mut response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        response
     });
-    RawHttpMock {
-        base: format!("http://{address}"),
-        calls,
-    }
+    RawHttpMock { base, calls }
 }
 
-#[allow(
-    clippy::let_underscore_must_use,
-    reason = "a mock that cannot finish writing its canned response leaves the transport under \
-              test without one, which is what the calling test already asserts on"
-)]
 fn spawn_redirecting_http_mock<H>(handler: H) -> RawHttpMock
 where
     H: Fn(&str) -> (u16, Vec<(String, String)>, Vec<u8>) + Send + Sync + 'static,
 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("redirecting mock binds");
-    let address = listener.local_addr().expect("redirecting mock address");
-    listener
-        .set_nonblocking(true)
-        .expect("redirecting mock is pollable");
-    let listener = tokio::net::TcpListener::from_std(listener).expect("redirecting mock adopts");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&calls);
-    tokio::spawn(async move {
-        let handler = Arc::new(handler);
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let handler = Arc::clone(&handler);
-            let recorded = Arc::clone(&recorded);
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let Some((path, headers, _body)) = read_http_request_parts(&mut stream).await
-                else {
-                    return;
-                };
-                recorded.lock().push((path.clone(), headers));
-                let (status, extra, response) = handler(&path);
-                let reason = match status {
-                    200 => "OK",
-                    302 => "Found",
-                    _ => "Not Found",
-                };
-                let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
-                for (name, value) in extra {
-                    head.push_str(&format!("{name}: {value}\r\n"));
-                }
-                head.push_str(&format!(
-                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    response.len()
-                ));
-                use tokio::io::AsyncWriteExt as _;
-                let _ = stream.write_all(head.as_bytes()).await;
-                let _ = stream.write_all(&response).await;
-                let _ = stream.flush().await;
-            });
+    let base = serve_http(move |path, headers, _body| {
+        recorded.lock().push((path.to_owned(), headers.to_owned()));
+        let (status, extra, body) = handler(path);
+        let reason = match status {
+            200 => "OK",
+            302 => "Found",
+            _ => "Not Found",
+        };
+        let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
+        for (name, value) in extra {
+            head.push_str(&format!("{name}: {value}\r\n"));
         }
+        head.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ));
+        let mut response = head.into_bytes();
+        response.extend_from_slice(&body);
+        response
     });
-    RawHttpMock {
-        base: format!("http://{address}"),
-        calls,
-    }
+    RawHttpMock { base, calls }
 }
 
 pub(crate) async fn read_http_request_parts(
@@ -15372,20 +15334,13 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
     let address = probe.local_addr().expect("probe address");
     drop(probe);
-    let mut transport = crate::transport::whatsapp::WhatsappTransport::new(
-        "support-whatsapp".to_owned(),
+    let mut transport = whatsapp_transport(
+        "support-whatsapp",
         address,
-        "/wa".to_owned(),
-        "123".to_owned(),
-        "456".to_owned(),
-        "v23.0".to_owned(),
-        "http://127.0.0.1:9".to_owned(),
-        "secret".to_owned(),
-        "verify".to_owned(),
-        "access".to_owned(),
+        "http://127.0.0.1:9",
+        "secret",
         LivenessSettings::default(),
-    )
-    .expect("WhatsApp transport builds");
+    );
     transport
         .connect()
         .await
@@ -15406,8 +15361,7 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
         }}]}]
     }))
     .expect("the delivery serializes");
-    let digest = crate::transport::webhook::hmac_sha256(b"secret", &body);
-    let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let signature = signature_hex(b"secret", &body);
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
         .expect("the callback accepts a connection");
@@ -15447,20 +15401,13 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = probe.local_addr().unwrap();
     drop(probe);
-    let mut transport = crate::transport::whatsapp::WhatsappTransport::new(
-        "dev".into(),
+    let mut transport = whatsapp_transport(
+        "dev",
         address,
-        "/wa".into(),
-        "123".into(),
-        "456".into(),
-        "v23.0".into(),
-        "http://127.0.0.1:9".into(),
-        "secret".into(),
-        "verify".into(),
-        "access".into(),
+        "http://127.0.0.1:9",
+        "secret",
         liveness_settings(LivenessMode::Off),
-    )
-    .unwrap();
+    );
     transport.connect().await.unwrap();
     let body = serde_json::to_vec(&json!({
         "object": "whatsapp_business_account",
@@ -15473,15 +15420,14 @@ async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixe
             })).collect::<Vec<_>>()
         }}]}]
     })).unwrap();
-    let digest = crate::transport::webhook::hmac_sha256(b"secret", &body);
-    let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    let response = reqwest::Client::new()
-        .post(format!("http://{address}/wa"))
-        .header("x-hub-signature-256", format!("sha256={signature}"))
-        .body(body)
-        .send()
-        .await
-        .unwrap();
+    let response = post_signed(
+        &reqwest::Client::new(),
+        format!("http://{address}/wa"),
+        b"secret",
+        body,
+        &[],
+    )
+    .await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     drop(response);
 

@@ -143,20 +143,13 @@ async fn whatsapp_posts_the_exact_italic_footer_and_the_next_prompt_has_none() {
     let http = spawn_http_mock(
         |_, _| json!({"messaging_product":"whatsapp","messages":[{"id":"wamid.reply"}]}),
     );
-    let transport = crate::transport::whatsapp::WhatsappTransport::new(
-        "wa".into(),
+    let transport = whatsapp_transport(
+        "wa",
         "127.0.0.1:0".parse().unwrap(),
-        "/wa".into(),
-        "123".into(),
-        "456".into(),
-        "v23.0".into(),
-        http.base.clone(),
-        "app-fixture".into(),
-        "verify-fixture".into(),
-        "access-fixture".into(),
+        &http.base,
+        "app-fixture",
         LivenessSettings::default(),
-    )
-    .unwrap();
+    );
     exchange(
         transport.driver(),
         ReplyTarget::WhatsApp {
@@ -476,20 +469,13 @@ async fn a_short_whatsapp_image_answer_is_one_captioned_message_ending_with_its_
         }
         other => panic!("unexpected WhatsApp image call: {other}"),
     });
-    let transport = crate::transport::whatsapp::WhatsappTransport::new(
-        "wa".into(),
+    let transport = whatsapp_transport(
+        "wa",
         "127.0.0.1:0".parse().unwrap(),
-        "/wa".into(),
-        "123".into(),
-        "456".into(),
-        "v23.0".into(),
-        http.base.clone(),
-        "app-fixture".into(),
-        "verify-fixture".into(),
-        "access-fixture".into(),
+        &http.base,
+        "app-fixture",
         LivenessSettings::default(),
-    )
-    .unwrap();
+    );
     transport
         .driver()
         .reply(
