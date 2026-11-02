@@ -41,7 +41,7 @@ opentelemetry-proto.workspace = true
 prost.workspace = true
 tempfile.workspace = true
 # Same WAT parser/version as core v0.33.0's brokerd spawn test fixture.
-wat = "=1.259.0"
+wat = "=1.262.0"
 
 [lints]
 workspace = true
