@@ -13,7 +13,7 @@ broker:
     inline: |
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
-      credentialsPath: /etc/dekopon/broker-credentials.yaml
+      secretMapPath: /etc/dekopon/secret-map.yaml
       policiesPath: /etc/dekopon/policies.cedar
       strict: true
       identities:
@@ -34,7 +34,7 @@ broker:
           subjects: [drn:slack:user:t0123abcd:u0123abcd]
       capabilities:
         gh:
-          credential: github-pat
+          defaultSecretUse: { drn: "drn:secret:github/pat", sink: httpBearer }
           constraints:
             timeoutMs: 10000
             maxOutputBytes: 262144
@@ -104,11 +104,13 @@ broker:
           && context has via && context.via == "dekopon-gatewayd" };
 
   # Created out of band, so the token never enters a values file or release:
-  #   kubectl create secret generic dekopon-broker-credentials \
-  #     --from-file=broker-credentials.yaml=./broker-credentials.yaml
-  credentials:
-    existingSecret: dekopon-broker-credentials
-    existingSecretKey: broker-credentials.yaml
+  #   kubectl create secret generic dekopon-broker-secret-map \
+  #     --from-file=secret-map.yaml=./secret-map.yaml
+  # Its entry for drn:secret:github/pat binds each gh capability above once, inside its
+  # destinations, and names where the token lives.
+  secretMap:
+    existingSecret: dekopon-broker-secret-map
+    existingSecretKey: secret-map.yaml
 
   env:
     - name: RUST_LOG

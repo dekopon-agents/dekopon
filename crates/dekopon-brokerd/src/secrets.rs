@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    num::NonZeroU64,
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -39,6 +40,11 @@ use tokio::{
 };
 use tracing::Instrument as _;
 
+use crate::github_app::{
+    Downscope, GithubAppCredential, GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES, Installation,
+};
+
+pub(crate) mod chatgpt;
 pub(crate) mod oauth2;
 
 pub const SECRET_MAP_API_VERSION: &str = "dekopon.dev/secret-map/v1alpha1";
@@ -53,24 +59,38 @@ const MAX_SOURCE_RESPONSE_HEADERS: usize = 128;
 const MAX_SOURCE_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BINDINGS_PER_SECRET: usize = 64;
 
+pub(crate) const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) const REAUTHORIZATION_CODES: [&str; 4] = [
+    "invalid_grant",
+    "refresh_token_reused",
+    "refresh_token_invalidated",
+    "refresh_token_expired",
+];
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub(crate) enum RefreshError {
+    #[error("the credential's authorization is gone and must be renewed by an operator")]
+    ReauthorizationRequired,
+    #[error("the credential could not be refreshed ({category})")]
+    Unavailable { category: &'static str },
+}
+
+impl RefreshError {
+    const fn category(self) -> &'static str {
+        match self {
+            Self::ReauthorizationRequired => "reauthorization-required",
+            Self::Unavailable { category } => category,
+        }
+    }
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 enum SecretMapApiVersion {
     #[serde(rename = "dekopon.dev/secret-map/v1alpha1")]
     V1Alpha1,
-}
-
-#[derive(Deserialize)]
-struct SecretNames {
-    #[serde(rename = "apiVersion")]
-    _api_version: SecretMapApiVersion,
-    secrets: Vec<SecretName>,
-}
-
-#[derive(Deserialize)]
-struct SecretName {
-    drn: SecretDrn,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -89,6 +109,8 @@ struct SecretMapFile {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SecretEntry {
     drn: SecretDrn,
+    #[serde(default)]
+    destinations: Vec<String>,
     source: SecretSource,
     #[serde(default)]
     projection: Projection,
@@ -227,6 +249,18 @@ enum SecretSource {
         #[serde(default = "default_timeout_ms")]
         timeout_ms: u64,
     },
+    ChatgptSubscription {
+        auth_file: PathBuf,
+    },
+    GithubApp {
+        app_id: NonZeroU64,
+        installation_id: NonZeroU64,
+        private_key: PathBuf,
+        #[serde(default)]
+        repositories: Option<Vec<String>>,
+        #[serde(default)]
+        permissions: Option<BTreeMap<String, String>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -277,7 +311,7 @@ enum DocumentFormat {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Binding {
     id: String,
-    capability: CapabilityId,
+    capabilities: BTreeSet<CapabilityId>,
     sink: SecretSinkKind,
     #[serde(default)]
     basic_username: Option<String>,
@@ -303,6 +337,24 @@ struct ResolvedEntry {
     source: SecretSource,
     projection: Projection,
     client: reqwest::Client,
+    minted: Option<Arc<Minted>>,
+}
+
+enum Minted {
+    Chatgpt(chatgpt::ChatGptSubscription),
+    GithubApp(Box<GithubAppCredential>),
+}
+
+impl Minted {
+    async fn resolve(&self) -> Result<SecretMaterial, RefreshError> {
+        match self {
+            Self::Chatgpt(source) => source.resolve().await,
+            Self::GithubApp(source) => source
+                .resolve()
+                .await
+                .map(|token| SecretMaterial::new(token.into_inner().into_bytes())),
+        }
+    }
 }
 
 struct MapResolver {
@@ -378,7 +430,9 @@ impl ScheduledCatalog {
                 | SecretSource::GcpSecretManager { .. }
                 | SecretSource::AzureKeyVault { .. }
                 | SecretSource::KubernetesTokenRequest { .. }
-                | SecretSource::KubernetesApi { .. } => None,
+                | SecretSource::KubernetesApi { .. }
+                | SecretSource::ChatgptSubscription { .. }
+                | SecretSource::GithubApp { .. } => None,
             })
         {
             records.entry(path).or_insert((drn, has_seed));
@@ -481,8 +535,23 @@ impl SecretResolver for MapResolver {
             | SecretSource::GcpSecretManager { .. }
             | SecretSource::AzureKeyVault { .. }
             | SecretSource::KubernetesTokenRequest { .. }
-            | SecretSource::KubernetesApi { .. } => tracing::Span::none(),
+            | SecretSource::KubernetesApi { .. }
+            | SecretSource::ChatgptSubscription { .. }
+            | SecretSource::GithubApp { .. } => tracing::Span::none(),
         };
+        if let Some(minted) = &entry.minted {
+            return minted.resolve().await.map_err(|error| {
+                tracing::warn!(
+                    event = "secret_source_resolution_failed",
+                    source_kind = entry.source.kind(),
+                    category = error.category(),
+                    "secret.source.resolution.failed"
+                );
+                SecretResolutionError {
+                    category: error.category(),
+                }
+            });
+        }
         let bytes = self
             .resolve_source_for(Some(secret), &entry.source, &entry.client)
             .instrument(span)
@@ -535,6 +604,9 @@ impl MapResolver {
         client: &reqwest::Client,
     ) -> Result<Vec<u8>, SourceError> {
         match source {
+            SecretSource::ChatgptSubscription { .. } | SecretSource::GithubApp { .. } => {
+                Err(SourceError::Config)
+            }
             SecretSource::SecureFile { path } => {
                 read_private_file(path, self.expected_uid, HARD_MAX_SOURCE_RESPONSE_BYTES).await
             }
@@ -1151,6 +1223,8 @@ impl SecretSource {
                 credentials_file, ..
             } => Some(credentials_file.clone()),
             Self::OAuth2Refresh { seed_path, .. } => seed_path.clone(),
+            Self::GithubApp { private_key, .. } => Some(private_key.clone()),
+            Self::ChatgptSubscription { auth_file } => Some(auth_file.clone()),
             Self::SecureFile { .. } | Self::KubernetesProjection { .. } => None,
         }
     }
@@ -1182,6 +1256,8 @@ impl SecretSource {
             Self::KubernetesApi { .. } => "kubernetes-api",
             Self::KubernetesTokenRequest { .. } => "kubernetes-token-request",
             Self::OAuth2Refresh { .. } => "oauth2-refresh",
+            Self::ChatgptSubscription { .. } => "chatgpt-subscription",
+            Self::GithubApp { .. } => "github-app",
         }
     }
 
@@ -1191,7 +1267,26 @@ impl SecretSource {
     )]
     fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Self::SecureFile { path } => validate_absolute(path),
+            Self::SecureFile { path } | Self::ChatgptSubscription { auth_file: path } => {
+                validate_absolute(path)
+            }
+            Self::GithubApp {
+                private_key,
+                repositories,
+                permissions,
+                ..
+            } => {
+                validate_absolute(private_key)?;
+                if repositories.as_ref().is_some_and(Vec::is_empty)
+                    || permissions.as_ref().is_some_and(BTreeMap::is_empty)
+                {
+                    return Err(
+                        "an empty repositories or permissions downscope; omit it to keep \
+                                the installation's full grant",
+                    );
+                }
+                Ok(())
+            }
             Self::OAuth2Refresh {
                 record_path,
                 token_endpoint,
@@ -1485,24 +1580,100 @@ fn sanitized_yaml_diagnostic(error: &serde_yaml::Error, bytes: &[u8]) -> String 
 async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, SecretMapError> {
     load_with_bytes(path, expected_uid)
         .await
-        .map(|(catalog, _, _)| catalog)
+        .map(|loaded| loaded.catalog)
+}
+
+pub(crate) struct LoadedMap {
+    pub(crate) catalog: SecretCatalog,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) scheduled: ScheduledCatalog,
+    pub(crate) chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
+    pub(crate) key_digest: [u8; 32],
 }
 
 pub(crate) async fn load_with_bytes(
     path: &Path,
     expected_uid: u32,
-) -> Result<(SecretCatalog, Vec<u8>, ScheduledCatalog), SecretMapError> {
+) -> Result<LoadedMap, SecretMapError> {
     let (file, bytes) = read_map::<SecretMapFile>(path, expected_uid).await?;
-    let (catalog, scheduled) = validate_map(file, path, expected_uid).await?;
-    Ok((catalog, bytes, scheduled))
+    let validated = validate_map(file, path, expected_uid).await?;
+    Ok(LoadedMap {
+        catalog: validated.catalog,
+        bytes,
+        scheduled: validated.scheduled,
+        chatgpt: validated.chatgpt,
+        key_digest: validated.key_digest,
+    })
 }
 
-pub(crate) async fn load_names(
+pub(crate) async fn load_shapes(
     path: &Path,
     expected_uid: u32,
-) -> Result<Vec<SecretDrn>, SecretMapError> {
-    let (file, _) = read_map::<SecretNames>(path, expected_uid).await?;
-    Ok(file.secrets.into_iter().map(|entry| entry.drn).collect())
+) -> Result<SecretCatalog, SecretMapError> {
+    let (file, _) = read_map::<SecretMapFile>(path, expected_uid).await?;
+    let mut problems = Vec::new();
+    let bindings = file
+        .secrets
+        .into_iter()
+        .flat_map(|entry| entry_bindings(entry, &mut problems).1)
+        .collect();
+    if !problems.is_empty() {
+        return Err(SecretMapError::Validation { problems });
+    }
+    SecretCatalog::unresolved(bindings).map_err(|source| SecretMapError::Catalog { source })
+}
+
+fn entry_bindings(
+    entry: SecretEntry,
+    problems: &mut Vec<String>,
+) -> ((SecretDrn, SecretSource, Projection), Vec<SecretUseBinding>) {
+    if entry.destinations.is_empty()
+        || entry
+            .destinations
+            .iter()
+            .any(|destination| !valid_destination(destination))
+    {
+        problems.push(format!(
+            "{} destinations must be a nonempty list of host or host:port authorities",
+            entry.drn
+        ));
+    }
+    let mut bindings = Vec::with_capacity(entry.bindings.len());
+    for (position, binding) in entry.bindings.into_iter().enumerate() {
+        if let Some(host) = binding
+            .allowed_hosts
+            .iter()
+            .find(|host| !dekopon_http_host::destinations_cover(&entry.destinations, host.as_str()))
+        {
+            problems.push(format!(
+                "{} binding #{} allows host {host:?} outside the entry's destinations",
+                entry.drn,
+                position + 1
+            ));
+        }
+        bindings.push(SecretUseBinding {
+            binding_id: binding.id,
+            secret: entry.drn.clone(),
+            capabilities: binding.capabilities,
+            sink: binding.sink,
+            basic_username: binding.basic_username,
+            allowed_hosts: binding.allowed_hosts,
+            allowed_methods: binding.allowed_methods,
+            allowed_paths: binding.allowed_paths,
+            allow_query: binding.allow_query,
+            max_injections: binding.max_injections,
+        });
+    }
+    ((entry.drn, entry.source, entry.projection), bindings)
+}
+
+fn valid_destination(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        && !value.contains(['/', '?', '#', '@', '*'])
 }
 
 async fn read_map<T: serde::de::DeserializeOwned>(
@@ -1530,7 +1701,7 @@ async fn validate_map(
     file: SecretMapFile,
     map_path: &Path,
     expected_uid: u32,
-) -> Result<(SecretCatalog, ScheduledCatalog), SecretMapError> {
+) -> Result<ValidatedMap, SecretMapError> {
     let mut problems = Vec::new();
     if file.map_revision.is_empty()
         || file.map_revision.len() > 128
@@ -1617,19 +1788,20 @@ async fn validate_map(
         {
             problems.push(format!("{} uses an invalid RFC 6901 pointer", entry.drn));
         }
-        for (position, binding) in entry.bindings.into_iter().enumerate() {
-            let resolved = SecretUseBinding {
-                binding_id: binding.id,
-                secret: entry.drn.clone(),
-                capability: binding.capability,
-                sink: binding.sink,
-                basic_username: binding.basic_username,
-                allowed_hosts: binding.allowed_hosts,
-                allowed_methods: binding.allowed_methods,
-                allowed_paths: binding.allowed_paths,
-                allow_query: binding.allow_query,
-                max_injections: binding.max_injections,
-            };
+        if matches!(
+            entry.source,
+            SecretSource::ChatgptSubscription { .. } | SecretSource::GithubApp { .. }
+        ) && (!matches!(entry.projection.format, DocumentFormat::Raw)
+            || entry.projection.pointer.is_some()
+            || entry.projection.decode_base64)
+        {
+            problems.push(format!(
+                "{} mints its own token and takes no projection",
+                entry.drn
+            ));
+        }
+        let ((drn, source, projection), entry_bindings) = entry_bindings(entry, &mut problems);
+        for (position, resolved) in entry_bindings.into_iter().enumerate() {
             if !binding_ids.insert(resolved.binding_id.clone()) {
                 problems.push(format!(
                     "{} binding #{} repeats an earlier binding identifier",
@@ -1637,16 +1809,25 @@ async fn validate_map(
                     position + 1
                 ));
             }
-            if !binding_keys.insert((
-                resolved.secret.clone(),
-                resolved.capability.clone(),
-                resolved.sink,
-                resolved.basic_username.clone(),
-            )) {
+            if resolved.capabilities.is_empty() {
                 problems.push(format!(
-                    "{} has conflicting bindings for capability {}",
-                    resolved.secret, resolved.capability
+                    "{} binding #{} names no capabilities",
+                    resolved.secret,
+                    position + 1
                 ));
+            }
+            for capability in &resolved.capabilities {
+                if !binding_keys.insert((
+                    resolved.secret.clone(),
+                    capability.clone(),
+                    resolved.sink,
+                    resolved.basic_username.clone(),
+                )) {
+                    problems.push(format!(
+                        "{} has conflicting bindings for capability {capability}",
+                        resolved.secret
+                    ));
+                }
             }
             if let Err(error) = resolved.validate() {
                 let reason = match error {
@@ -1663,7 +1844,7 @@ async fn validate_map(
             }
             bindings.push(resolved);
         }
-        entries.insert(entry.drn, (entry.source, entry.projection));
+        entries.insert(drn, (source, projection));
     }
     if bootstrap_paths.contains(map_path) {
         problems
@@ -1706,6 +1887,24 @@ async fn validate_map(
     if !problems.is_empty() {
         return Err(SecretMapError::Validation { problems });
     }
+    let minting = entries
+        .iter()
+        .filter(|(_, (source, _))| {
+            matches!(
+                source,
+                SecretSource::ChatgptSubscription { .. } | SecretSource::GithubApp { .. }
+            )
+        })
+        .map(|(drn, (source, _))| (drn.clone(), source.clone()))
+        .collect::<Vec<_>>();
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let mut minted = tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || mint_sources(minting, expected_uid))
+    })
+    .await
+    .map_err(|_join| SecretMapError::Validation {
+        problems: vec!["minted secret sources could not be opened".to_owned()],
+    })??;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -1713,6 +1912,7 @@ async fn validate_map(
         .map_err(|source| SecretMapError::Client { source })?;
     let mut resolved_entries = BTreeMap::new();
     for (drn, (source, projection)) in entries {
+        let minted_source = minted.sources.remove(&drn);
         let client = match &source {
             SecretSource::KubernetesTokenRequest {
                 bootstrap_root,
@@ -1729,6 +1929,7 @@ async fn validate_map(
                 source,
                 projection,
                 client,
+                minted: minted_source,
             },
         );
     }
@@ -1740,12 +1941,127 @@ async fn validate_map(
     let catalog = SecretCatalog::new(bindings, dyn_resolver)
         .and_then(|catalog| catalog.with_authority_revision(file.map_revision))
         .map_err(|source| SecretMapError::Catalog { source })?;
-    Ok((
+    Ok(ValidatedMap {
         catalog,
-        ScheduledCatalog {
+        scheduled: ScheduledCatalog {
             resolver: Some(resolver),
         },
-    ))
+        chatgpt: minted.chatgpt,
+        key_digest: minted.key_digest,
+    })
+}
+
+struct ValidatedMap {
+    catalog: SecretCatalog,
+    scheduled: ScheduledCatalog,
+    chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
+    key_digest: [u8; 32],
+}
+
+struct MintedSources {
+    sources: BTreeMap<SecretDrn, Arc<Minted>>,
+    chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
+    key_digest: [u8; 32],
+}
+
+fn mint_sources(
+    minting: Vec<(SecretDrn, SecretSource)>,
+    expected_uid: u32,
+) -> Result<MintedSources, SecretMapError> {
+    let mut problems = Vec::new();
+    let mut sources = BTreeMap::new();
+    let mut chatgpt = Vec::new();
+    let mut keys = Sha256::new();
+    for (drn, source) in minting {
+        let opened = match source {
+            SecretSource::ChatgptSubscription { auth_file } => {
+                chatgpt::ChatGptSubscription::open(&drn, &auth_file, expected_uid).map(|source| {
+                    chatgpt.push(source.file());
+                    Minted::Chatgpt(source)
+                })
+            }
+            SecretSource::GithubApp {
+                app_id,
+                installation_id,
+                private_key,
+                repositories,
+                permissions,
+            } => open_github_app(
+                &drn,
+                &private_key,
+                expected_uid,
+                &mut keys,
+                Installation {
+                    app_id,
+                    installation_id,
+                    downscope: (repositories.is_some() || permissions.is_some()).then_some(
+                        Downscope {
+                            repositories,
+                            permissions,
+                        },
+                    ),
+                },
+            )
+            .map(|credential| Minted::GithubApp(Box::new(credential))),
+            SecretSource::SecureFile { .. }
+            | SecretSource::KubernetesProjection { .. }
+            | SecretSource::OnePasswordConnect { .. }
+            | SecretSource::VaultKv1 { .. }
+            | SecretSource::VaultKv2 { .. }
+            | SecretSource::AwsSecretsManager { .. }
+            | SecretSource::AwsSsmParameter { .. }
+            | SecretSource::GcpSecretManager { .. }
+            | SecretSource::AzureKeyVault { .. }
+            | SecretSource::OAuth2Refresh { .. }
+            | SecretSource::KubernetesTokenRequest { .. }
+            | SecretSource::KubernetesApi { .. } => continue,
+        };
+        match opened {
+            Ok(minted) => {
+                sources.insert(drn, Arc::new(minted));
+            }
+            Err(problem) => problems.push(problem),
+        }
+    }
+    if !problems.is_empty() {
+        return Err(SecretMapError::Validation { problems });
+    }
+    Ok(MintedSources {
+        sources,
+        chatgpt,
+        key_digest: keys.finalize().into(),
+    })
+}
+
+fn open_github_app(
+    drn: &SecretDrn,
+    private_key: &Path,
+    expected_uid: u32,
+    keys: &mut Sha256,
+    installation: Installation,
+) -> Result<GithubAppCredential, String> {
+    let pem = read_trusted_file(
+        private_key,
+        expected_uid,
+        FileTier::Private,
+        HARD_MAX_GITHUB_APP_KEY_BYTES,
+    );
+    #[cfg(test)]
+    crate::private_read_witness::record(private_key, &pem);
+    let pem = pem.map_err(|source| {
+        format!(
+            "{drn} privateKey {} is not trusted input ({}): {}",
+            private_key.display(),
+            source.category(),
+            dekopon_core::error_chain(&source)
+        )
+    })?;
+    keys.update(pem.len().to_le_bytes());
+    keys.update(&pem);
+    let key = GithubAppKey::from_pem(&pem)
+        .map_err(|source| format!("{drn} privateKey {}: {source}", private_key.display()))?;
+    GithubAppCredential::new(drn.to_string(), installation, key)
+        .map_err(|source| format!("{drn} could not be built: {source}"))
 }
 
 async fn kubernetes_client(root: &Path, ca_key: &str) -> Result<reqwest::Client, SourceError> {
@@ -2624,35 +2940,35 @@ mod tests {
 apiVersion: dekopon.dev/secret-map/v1alpha1
 mapRevision: all-sources
 secrets:
-  - { drn: drn:com.xrl:secret:test:file/value, source: { kind: secureFile, path: /run/value }, bindings: [] }
-  - drn: drn:com.xrl:secret:test:projection/value
+  - { drn: drn:secret:file/value, source: { kind: secureFile, path: /run/value }, bindings: [] }
+  - drn: drn:secret:projection/value
     source: { kind: kubernetesProjection, root: /run/projected, key: value, declaredOrigin: configMap, acknowledgeNonSecretSource: true }
     bindings: []
-  - drn: drn:com.xrl:secret:test:op/value
+  - drn: drn:secret:op/value
     source: { kind: onePasswordConnect, endpoint: https://op.example, tokenFile: /run/op, vault: v, item: i, field: f, timeoutMs: 1000 }
     bindings: []
-  - drn: drn:com.xrl:secret:test:vault1/value
+  - drn: drn:secret:vault1/value
     source: { kind: vaultKv1, endpoint: https://vault.example, tokenFile: /run/vault, mount: secret, path: app, key: value }
     bindings: []
-  - drn: drn:com.xrl:secret:test:vault2/value
+  - drn: drn:secret:vault2/value
     source: { kind: vaultKv2, endpoint: https://vault.example, tokenFile: /run/vault, namespace: team, mount: secret, path: app, key: value, version: 2 }
     bindings: []
-  - drn: drn:com.xrl:secret:test:aws/value
+  - drn: drn:secret:aws/value
     source: { kind: awsSecretsManager, region: us-east-1, credentialsFile: /run/aws, secretId: arn:example, versionStage: AWSCURRENT }
     bindings: []
-  - drn: drn:com.xrl:secret:test:ssm/value
+  - drn: drn:secret:ssm/value
     source: { kind: awsSsmParameter, region: us-east-1, credentialsFile: /run/aws, name: /app/value, selector: CURRENT }
     bindings: []
-  - drn: drn:com.xrl:secret:test:gcp/value
+  - drn: drn:secret:gcp/value
     source: { kind: gcpSecretManager, endpoint: https://secretmanager.googleapis.com, tokenFile: /run/gcp, project: p, location: us-central1, secret: app, version: latest }
     bindings: []
-  - drn: drn:com.xrl:secret:test:azure/value
+  - drn: drn:secret:azure/value
     source: { kind: azureKeyVault, vaultUrl: https://vault.azure.net, tokenFile: /run/azure, secret: app, version: v1 }
     bindings: []
-  - drn: drn:com.xrl:secret:test:token-request/value
+  - drn: drn:secret:token-request/value
     source: { kind: kubernetesTokenRequest, endpoint: https://kubernetes.default.svc, bootstrapRoot: /run/kube, tokenKey: token, caKey: ca.crt, namespace: dekopon, serviceAccount: gylmar-vm, audience: vm-runner, expirationSeconds: 600 }
     bindings: []
-  - drn: drn:com.xrl:secret:test:kube/value
+  - drn: drn:secret:kube/value
     source: { kind: kubernetesApi, endpoint: https://kubernetes.default.svc, tokenFile: /run/kube, namespace: default, objectKind: configMap, name: app, key: value, acknowledgeNonSecretSource: true }
     bindings: []
 "#;
@@ -2684,11 +3000,12 @@ secrets:
 apiVersion: dekopon.dev/secret-map/v1alpha1
 mapRevision: test
 secrets:
-  - drn: drn:com.xrl:secret:test:projection/value
+  - drn: drn:secret:projection/value
     source: { kind: kubernetesProjection, root: /run/projected, key: value, declaredOrigin: configMap }
+    destinations: [api.example.test]
     bindings:
       - id: api-token
-        capability: http-probe.fetch
+        capabilities: [http-probe.fetch]
         sink: httpBearer
         allowedHosts: [api.example.test]
         allowedMethods: [GET]
@@ -2718,7 +3035,7 @@ secrets:
         write(&secret, b"fixture-token").await;
         let map = directory.path().join("map.yaml");
         let document = format!(
-            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:com.xrl:secret:test:api/token\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: api-token\n        capability: http-probe.fetch\n        sink: httpBearer\n        allowedHosts: [api.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:secret:api/token\n    source: {{ kind: secureFile, path: {} }}\n    destinations: [api.example.test]\n    bindings:\n      - id: api-token\n        capabilities: [http-probe.fetch]\n        sink: httpBearer\n        allowedHosts: [api.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
             secret.display()
         );
         write(&map, document.as_bytes()).await;
@@ -2910,6 +3227,175 @@ secrets:
         server.join().expect("server");
     }
 
+    fn chatgpt_auth_document() -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": "acct-fixture"}
+            }))
+            .expect("serialize JWT fixture"),
+        );
+        serde_json::json!({
+            "version": 1,
+            "access": format!("header.{payload}.signature"),
+            "refresh": "fixture-refresh-token",
+            "expiresAt": 4_102_444_800_000_u64,
+            "accountId": "acct-fixture",
+        })
+        .to_string()
+    }
+
+    fn minted_map(entry: &str) -> String {
+        format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n{entry}    bindings:\n      - id: minted\n        capabilities: [http-probe.fetch]\n        sink: httpBearer\n        allowedHosts: [chatgpt.com]\n        allowedMethods: [POST]\n        allowedPaths: [{{ match: exact, path: /backend-api/codex/responses }}]\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn an_entry_needs_destinations_that_cover_every_binding_host() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let map = directory.path().join("map.yaml");
+        for (entry, expected) in [
+            (
+                "  - drn: drn:secret:chatgpt/image\n    source: { kind: secureFile, path: /run/token }\n",
+                "destinations must be a nonempty list",
+            ),
+            (
+                "  - drn: drn:secret:chatgpt/image\n    destinations: [api.openai.com]\n    source: { kind: secureFile, path: /run/token }\n",
+                "allows host \"chatgpt.com\" outside the entry's destinations",
+            ),
+        ] {
+            write(&map, minted_map(entry).as_bytes()).await;
+            let Err(SecretMapError::Validation { problems }) = load(&map, uid()).await else {
+                panic!("an unpinned entry must be refused");
+            };
+            assert!(
+                problems.iter().any(|problem| problem.contains(expected)),
+                "{problems:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_http_bot_binding_loads_without_a_username_and_refuses_one() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let map = directory.path().join("map.yaml");
+        let entry = |username: &str| {
+            format!(
+                "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:secret:discord/dekopon\n    destinations: [discord.com]\n    source: {{ kind: secureFile, path: /run/discord-token }}\n    bindings:\n      - id: discord-bot\n        capabilities: [http-probe.fetch]\n        sink: httpBot\n{username}        allowedHosts: [discord.com]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: segmentPrefix, path: /api }}]\n"
+            )
+        };
+        write(&map, entry("").as_bytes()).await;
+        load(&map, uid())
+            .await
+            .expect("a Bot binding takes no username");
+        write(&map, entry("        basicUsername: bot\n").as_bytes()).await;
+        let Err(SecretMapError::Validation { problems }) = load(&map, uid()).await else {
+            panic!("a Bot binding with a username must be refused");
+        };
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("binding #1 is invalid")),
+            "{problems:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chatgpt_auth_file_cannot_become_another_entrys_secret_material() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+        let auth = directory.path().join("auth.json");
+        write(&auth, chatgpt_auth_document().as_bytes()).await;
+        let map = directory.path().join("map.yaml");
+        let chatgpt = format!(
+            "  - drn: drn:secret:chatgpt/image\n    destinations: [chatgpt.com]\n    source: {{ kind: chatgptSubscription, authFile: {} }}\n",
+            auth.display()
+        );
+        let projected = format!(
+            "  - drn: drn:secret:chatgpt/refresh\n    destinations: [chatgpt.com]\n    source: {{ kind: secureFile, path: {} }}\n    projection: {{ format: json, pointer: /refresh }}\n",
+            auth.display()
+        );
+        let both = format!(
+            "{}{}",
+            minted_map(&chatgpt),
+            minted_map(&projected)
+                .split_once("secrets:\n")
+                .expect("one entry")
+                .1
+                .replace("id: minted", "id: projected")
+        );
+        write(&map, both.as_bytes()).await;
+        let Err(SecretMapError::Validation { problems }) = load(&map, uid()).await else {
+            panic!("the auth file must stay bootstrap, never material");
+        };
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("is also a backend bootstrap credential")),
+            "{problems:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chatgpt_and_github_app_entries_open_their_locators_and_take_no_projection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+        let auth = directory.path().join("auth.json");
+        write(&auth, chatgpt_auth_document().as_bytes()).await;
+        let key = directory.path().join("github-app.pem");
+        write(
+            &key,
+            include_bytes!("../tests/fixture/github-app-test-only.pem"),
+        )
+        .await;
+        let map = directory.path().join("map.yaml");
+        let chatgpt = format!(
+            "  - drn: drn:secret:chatgpt/image\n    destinations: [chatgpt.com]\n    source: {{ kind: chatgptSubscription, authFile: {} }}\n",
+            auth.display()
+        );
+        let github = format!(
+            "  - drn: drn:secret:github/app\n    destinations: [chatgpt.com]\n    source: {{ kind: githubApp, appId: 1000001, installationId: 2000002, privateKey: {} }}\n",
+            key.display()
+        );
+        let both = format!(
+            "{}{}",
+            minted_map(&chatgpt),
+            minted_map(&github)
+                .split_once("secrets:\n")
+                .expect("one entry")
+                .1
+                .replace("id: minted", "id: minted-app")
+        );
+        write(&map, both.as_bytes()).await;
+        let loaded = super::load_with_bytes(&map, uid())
+            .await
+            .expect("both minted sources open");
+        assert_eq!(loaded.chatgpt.len(), 1);
+        assert_eq!(loaded.catalog.drns().count(), 2);
+
+        write(
+            &map,
+            minted_map(&format!(
+                "{chatgpt}    projection: {{ format: json, pointer: /token }}\n"
+            ))
+            .as_bytes(),
+        )
+        .await;
+        let Err(SecretMapError::Validation { problems }) = load(&map, uid()).await else {
+            panic!("a minted source refuses a projection");
+        };
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("mints its own token and takes no projection")),
+            "{problems:?}"
+        );
+    }
+
     #[test]
     fn crc32c_matches_the_standard_check_vector() {
         assert_eq!(super::crc32c(b"123456789"), 0xe306_9283);
@@ -3006,7 +3492,7 @@ secrets:
         let token = directory.path().join("bootstrap-token");
         write(&token, b"bootstrap").await;
         let document = format!(
-            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:com.xrl:secret:test:map/value\n    source: {{ kind: secureFile, path: {} }}\n    bindings: []\n  - drn: drn:com.xrl:secret:test:bootstrap/value\n    source: {{ kind: secureFile, path: {} }}\n    bindings: []\n  - drn: drn:com.xrl:secret:test:remote/value\n    source:\n      kind: onePasswordConnect\n      endpoint: https://connect.example.test\n      tokenFile: {}\n      vault: vault\n      item: item\n      field: password\n    bindings: []\n",
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:secret:map/value\n    source: {{ kind: secureFile, path: {} }}\n    bindings: []\n  - drn: drn:secret:bootstrap/value\n    source: {{ kind: secureFile, path: {} }}\n    bindings: []\n  - drn: drn:secret:remote/value\n    source:\n      kind: onePasswordConnect\n      endpoint: https://connect.example.test\n      tokenFile: {}\n      vault: vault\n      item: item\n      field: password\n    bindings: []\n",
             map.display(),
             token.display(),
             token.display()
@@ -3056,7 +3542,7 @@ secrets:
     async fn validation_reports_multiple_conflicts_together() {
         let directory = tempfile::tempdir().expect("tempdir");
         let map = directory.path().join("map.yaml");
-        let document = "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: ''\nsecrets:\n  - drn: drn:com.xrl:secret:test:a/value\n    source: { kind: secureFile, path: relative }\n    bindings: []\n  - drn: drn:com.xrl:secret:test:a/value\n    source: { kind: secureFile, path: also-relative }\n    bindings: []\n";
+        let document = "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: ''\nsecrets:\n  - drn: drn:secret:a/value\n    source: { kind: secureFile, path: relative }\n    bindings: []\n  - drn: drn:secret:a/value\n    source: { kind: secureFile, path: also-relative }\n    bindings: []\n";
         write(&map, document.as_bytes()).await;
         let error = load(&map, uid()).await.expect_err("conflicts refuse");
         let SecretMapError::Validation { problems } = error else {

@@ -149,8 +149,6 @@ def test_existing_gateway_secret_and_broker_restart_sources():
     original = render(*gateway_args)
     changed = render(*gateway_args, "--set", "broker.config.inline=apiVersion: dekopon.dev/brokerd/v1alpha1\nidentities: [{uid: 65532}]")
     assert original[2]["metadata"]["annotations"]["checksum/config"] != changed[2]["metadata"]["annotations"]["checksum/config"]
-    credentials = render(*gateway_args, "--set", "broker.credentials.inline=credentials: []")
-    assert "checksum/credentials" in credentials[2]["metadata"]["annotations"]
     directory = render("-f", str(DIRECTORY), "--set-json", 'deploymentAnnotations={"reloader.stakater.com/search":"true"}')
     assert directory[1]["metadata"]["annotations"]["reloader.stakater.com/search"] == "true"
     assert "checksum/config" not in (directory[2]["metadata"].get("annotations") or {})

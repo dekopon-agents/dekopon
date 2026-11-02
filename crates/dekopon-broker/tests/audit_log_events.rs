@@ -2,16 +2,21 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use dekopon_broker::{
     AssetInvocationResult, Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerError,
-    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore,
-    IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
+    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, DefaultSecretSink,
+    DefaultSecretUse, IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld,
+    SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding,
+    TraceOnlyAuditLog,
 };
-use dekopon_broker_host::{BoundCredential, BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, InvocationOutcome};
+use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
+use dekopon_capability::{
+    EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule, InvocationOutcome,
+};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, Redacted, RiskLevel,
-    Subject,
+    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, SecretDrn,
+    SecretSinkKind, Subject,
 };
 use dekopon_test_support::{CaptureLayer, LoopbackServer, Record, provider_fixture};
 use sha2::{Digest, Sha256};
@@ -20,6 +25,18 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 const SECRET: &str = "audit-log-record-must-never-see-this";
 
 const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
+
+const SECRET_DRN: &str = "drn:secret:fetch/token";
+
+#[derive(Debug)]
+struct StaticSecretResolver;
+
+#[async_trait]
+impl SecretResolver for StaticSecretResolver {
+    async fn resolve(&self, _secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError> {
+        Ok(SecretMaterial::new(SECRET.as_bytes().to_vec()))
+    }
+}
 
 const POLICY: &str = r#"
 @id("http-fetch")
@@ -116,6 +133,27 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     }
 }
 
+fn fetch_token_catalog(authority: &str) -> SecretCatalog {
+    SecretCatalog::new(
+        vec![SecretUseBinding {
+            binding_id: "fetch-token".to_owned(),
+            secret: SECRET_DRN.parse().expect("secret DRN"),
+            capabilities: ["http-probe.fetch".parse().expect("capability")].into(),
+            sink: SecretSinkKind::HttpBearer,
+            basic_username: None,
+            allowed_hosts: vec![authority.to_owned()],
+            allowed_methods: vec!["GET".to_owned()],
+            allowed_paths: vec![HttpPathRule::SegmentPrefix {
+                path: "/pulls".to_owned(),
+            }],
+            allow_query: false,
+            max_injections: 1,
+        }],
+        Arc::new(StaticSecretResolver),
+    )
+    .expect("one binding builds a catalog")
+}
+
 fn only(captured: &CaptureLayer, fields: &[(&str, &str)]) -> Record {
     let matching = captured.events_where("dekopon_broker::audit", fields);
     let [record] = <[Record; 1]>::try_from(matching).unwrap_or_else(|matching| {
@@ -141,7 +179,7 @@ fn assert_loaded_execution(captured: &CaptureLayer, expected_digest: &str) {
         ("outcome", "Succeeded"),
         ("effect", "ReadOnly"),
         ("risk", "Low"),
-        ("credential", "fetch-token"),
+        ("secret", SECRET_DRN),
     ] {
         assert_eq!(execution.field(name), Some(value), "{name}: {execution:?}");
     }
@@ -191,26 +229,18 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
                 .parse::<CapabilityId>()
                 .expect("capability"),
             ConstraintSet {
-                default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider: "http-probe".parse::<ProviderId>().expect("provider"),
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
-                credential: Some("fetch-token".to_owned()),
+                default_secret_use: Some(DefaultSecretUse {
+                    drn: SECRET_DRN.parse().expect("secret DRN"),
+                    sink: DefaultSecretSink::HttpBearer,
+                }),
                 constraints: loopback_constraints(&authority),
             },
         )])
         .expect("one capability builds a catalog"),
-        CredentialStore::new([(
-            "fetch-token".to_owned(),
-            BoundCredential::bearer(
-                "Bearer",
-                Redacted::new(SECRET.to_owned()),
-                vec![authority.clone()],
-            )
-            .expect("valid credential fixture"),
-        )])
-        .expect("credential store builds"),
         IdentityDirectory::new([(
             SUBJECT.parse::<Subject>().expect("canonical subject"),
             principal("caller"),
@@ -219,7 +249,9 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         Arc::new(TraceOnlyAuditLog),
         BrokerLimits::default(),
     )
-    .expect("the credentialed constraint set matches store and destinations");
+    .expect("the defaulted constraint set builds")
+    .with_secret_catalog(fetch_token_catalog(&authority))
+    .expect("the default has exactly one binding");
 
     let allowed = invoke_as_caller(
         &broker,
@@ -265,7 +297,7 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         ("actor.kind", "agent"),
         ("actor.id", "provider-test"),
         ("provider", "http-probe"),
-        ("policy.ids", "http-fetch"),
+        ("policy.ids", "dekopon-broker-default-secret-use,http-fetch"),
     ] {
         assert_eq!(decision.field(name), Some(value), "{name}: {decision:?}");
     }
@@ -298,7 +330,7 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
     let everything = captured.events_text() + &captured.spans_text();
     assert!(!everything.contains(SECRET), "a record leaked the secret");
     assert!(
-        !everything.contains("Bearer"),
-        "a record leaked the credential scheme"
+        !everything.contains("Bearer "),
+        "a record leaked the rendered authorization header"
     );
 }

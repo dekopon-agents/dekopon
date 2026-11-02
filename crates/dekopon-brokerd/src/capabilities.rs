@@ -12,7 +12,8 @@ use thiserror::Error;
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderCapabilities {
-    pub credential: Option<String>,
+    #[serde(deserialize_with = "deserialize_default_secret_use")]
+    pub default_secret_use: Option<DefaultSecretUse>,
     pub constraints: Option<ConstraintsPatch>,
     pub capabilities: BTreeMap<CapabilityId, CapabilityConfig>,
 }
@@ -23,7 +24,6 @@ pub struct CapabilityConfig {
     pub route: CapabilityRoute,
     #[serde(deserialize_with = "deserialize_default_secret_use")]
     pub default_secret_use: Option<DefaultSecretUse>,
-    pub credential: Option<String>,
     pub constraints: ConstraintsPatch,
 }
 
@@ -212,15 +212,14 @@ pub fn constraint_sets<'a>(
                     sets.insert(
                         capability.id.clone(),
                         ConstraintSet {
-                            default_secret_use: listed.default_secret_use.clone(),
+                            default_secret_use: listed
+                                .default_secret_use
+                                .clone()
+                                .or_else(|| block.default_secret_use.clone()),
                             route: listed.route,
                             provider: provider.clone(),
                             effect: capability.effect,
                             risk: capability.risk,
-                            credential: listed
-                                .credential
-                                .clone()
-                                .or_else(|| block.credential.clone()),
                             constraints,
                         },
                     );
@@ -245,14 +244,16 @@ mod tests {
     };
 
     #[test]
-    fn default_secret_use_requires_a_canonical_bearer_drn_and_rejects_null() {
-        let valid = serde_json::json!({"defaultSecretUse":{"drn":"drn:com.xrl:secret:test:skylight/token", "sink":"httpBearer"}});
-        assert!(
-            serde_json::from_value::<CapabilityConfig>(valid)
-                .unwrap()
-                .default_secret_use
-                .is_some()
-        );
+    fn default_secret_use_requires_a_secret_drn_and_a_closed_sink_and_rejects_null() {
+        for sink in ["httpBearer", "httpBasic", "httpBot"] {
+            let valid = serde_json::json!({"defaultSecretUse":{"drn":"drn:secret:skylight/token", "sink":sink}});
+            assert!(
+                serde_json::from_value::<CapabilityConfig>(valid)
+                    .unwrap()
+                    .default_secret_use
+                    .is_some()
+            );
+        }
         assert!(
             serde_json::from_value::<CapabilityConfig>(serde_json::json!({}))
                 .unwrap()
@@ -262,7 +263,8 @@ mod tests {
         for invalid in [
             serde_json::json!({"defaultSecretUse":null}),
             serde_json::json!({"defaultSecretUse":{"drn":"bad", "sink":"httpBearer"}}),
-            serde_json::json!({"defaultSecretUse":{"drn":"drn:com.xrl:secret:test:skylight/token", "sink":"httpBasic"}}),
+            serde_json::json!({"defaultSecretUse":{"drn":"drn:com.xrl:secret:test:skylight/token", "sink":"httpBearer"}}),
+            serde_json::json!({"defaultSecretUse":{"drn":"drn:secret:skylight/token", "sink":"httpDigest"}}),
         ] {
             assert!(serde_json::from_value::<CapabilityConfig>(invalid).is_err());
         }
@@ -299,9 +301,9 @@ mod tests {
         })
     }
 
-    const DEFAULTS: &str = r"
+    const DEFAULTS: &str = r#"
 gh:
-  credential: github-pat
+  defaultSecretUse: { drn: "drn:secret:github/pat", sink: httpBearer }
   constraints:
     timeoutMs: 10000
     http:
@@ -310,7 +312,7 @@ gh:
       maxRequests: 1
       maxRequestBytes: 1024
       maxResponseBytes: 4096
-";
+"#;
 
     #[test]
     fn only_listed_capabilities_run_and_each_inherits_its_providers_bounds() {
@@ -324,7 +326,12 @@ gh:
         assert!(problems.is_empty());
         let read = &sets[&id("gh.repo.read")];
         assert_eq!(read.effect, EffectKind::ReadOnly);
-        assert_eq!(read.credential.as_deref(), Some("github-pat"));
+        assert_eq!(
+            read.default_secret_use
+                .as_ref()
+                .map(|default| default.drn.as_str()),
+            Some("drn:secret:github/pat")
+        );
         let write = &sets[&id("gh.issue.comment")];
         let http = write.constraints.http.as_ref().expect("inherited http");
         assert_eq!(write.effect, EffectKind::ExternalWrite);

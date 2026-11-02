@@ -1334,8 +1334,8 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     use std::sync::Arc;
 
     use dekopon_broker::{
-        AuthenticatedContext, Broker, BrokerLimits, ConstraintCatalog, CredentialStore,
-        IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
+        AuthenticatedContext, Broker, BrokerLimits, ConstraintCatalog, IdentityDirectory,
+        InMemoryAuditLog, PolicyEngine, PolicyWorld,
     };
     use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
     use dekopon_broker_protocol::ResponseEnvelope;
@@ -1368,7 +1368,6 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
             provider: "cli-probe".parse().expect("valid provider fixture"),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            credential: None,
             constraints: ExecutionConstraints::default(),
         },
     )])
@@ -1384,7 +1383,6 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         )
         .expect("fixture policy validates"),
         catalog,
-        CredentialStore::empty(),
         IdentityDirectory::new([
             (
                 "drn:slack:user:t0123abc:u9xyz".parse().expect("canonical subject"),
@@ -1752,7 +1750,7 @@ fn example_path(name: &str) -> std::path::PathBuf {
 #[test]
 fn broker_categories_refuse_resident_changes_and_allow_authority_references() {
     let original = serde_yaml::from_str::<serde_yaml::Mapping>(
-        "socketPath: broker.sock\ncredentialsPath: a\nproviders: [provider.wasm]\n",
+        "socketPath: broker.sock\nsecretMapPath: a\nproviders: [provider.wasm]\n",
     )
     .unwrap();
     let active = config::ConfigSnapshot::from_mapping(&original);
@@ -1803,7 +1801,6 @@ fn broker_categories_refuse_resident_changes_and_allow_authority_references() {
         assert_eq!(active.restart_required(&next), [key], "{key}");
     }
     for key in [
-        "credentialsPath",
         "secretMapPath",
         "strict",
         "identities",
@@ -2220,40 +2217,6 @@ fn private_map_and_capability_aggregates_flatten_before_the_record_bound() {
 }
 
 #[tokio::test]
-async fn twelve_invalid_credentials_render_eight_individual_refusal_reasons() {
-    use dekopon_broker_protocol::GenerationOutcome;
-    use tracing::instrument::WithSubscriber as _;
-    use tracing_subscriber::prelude::*;
-
-    let (_broker, credential, owner) = generation_with_private_credential().await;
-    let source = (0..12).map(|index| format!(
-        "  - name: 'invalid name {index}'\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-secret-value\n"
-    )).collect::<String>();
-    write_owner_only(
-        &credential,
-        format!("apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n{source}")
-            .as_bytes(),
-    );
-    let old = owner.active().digest.clone();
-    let capture = dekopon_test_support::CaptureLayer::new();
-    async {
-        assert_eq!(
-            owner.prepare(&old, current_uid()).await,
-            (old.clone(), GenerationOutcome::Refused)
-        );
-    }
-    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-    .await;
-    let refused = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
-    assert_eq!(refused.len(), 1);
-    assert_eq!(refused[0].field("problems"), Some("12"));
-    let reason = refused[0].field("error").unwrap();
-    assert_eq!(reason.matches("credential #").count(), 8, "{reason}");
-    assert!(reason.ends_with("and 4 more"), "{reason}");
-    assert!(!reason.contains("invalid name"));
-}
-
-#[tokio::test]
 async fn broker_refusal_repeats_only_after_a_distinct_edit_or_repair() {
     use dekopon_broker_protocol::GenerationOutcome;
     use tracing::instrument::WithSubscriber as _;
@@ -2298,71 +2261,37 @@ async fn broker_refusal_repeats_only_after_a_distinct_edit_or_repair() {
     assert_eq!(owner.active().digest, old);
 }
 
-#[tokio::test]
-async fn invalid_credential_name_never_enters_reload_or_boot_diagnostics() {
-    use dekopon_broker_protocol::GenerationOutcome;
-    use tracing::instrument::WithSubscriber as _;
-    use tracing_subscriber::prelude::*;
+const GITHUB_APP_KEY: &[u8] = include_bytes!("../tests/fixture/github-app-test-only.pem");
 
-    const SENTINEL: &str = "sentinel invalid secret name";
-    let (broker, credential, owner) = generation_with_private_credential().await;
-    let old = owner.active().digest.clone();
-    let invalid = format!(
-        "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: '{SENTINEL}'\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-second-long-enough\n"
-    );
-    write_owner_only(&credential, invalid.as_bytes());
-    let (candidate, report) =
-        candidate_or_refusal(&broker.config(), super::Mode::Reload(&owner.active())).await;
-    assert!(candidate.is_none());
-    assert!(report.problems.iter().any(|problem| matches!(
-        problem,
-        super::BrokerdError::Credentials(super::credentials::CredentialsError::Invalid { .. })
-    )));
-    let error = dekopon_core::error_chain(&super::BrokerdError::from_problems(report.problems));
-    assert!(error.contains("credential #1"), "{error}");
-    assert!(!error.contains(SENTINEL));
-    let capture = dekopon_test_support::CaptureLayer::new();
-    async {
-        assert_eq!(
-            owner.prepare(&old, current_uid()).await,
-            (old.clone(), GenerationOutcome::Refused)
-        );
-    }
-    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-    .await;
-    let refused = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
-    assert_eq!(refused.len(), 1);
-    let reason = refused[0].field("error").unwrap();
-    assert!(reason.contains("credential #1"), "{reason}");
-    assert!(!reason.contains(SENTINEL));
-}
-
-async fn generation_with_private_credential()
--> (ManagedBroker, std::path::PathBuf, super::Coordination) {
-    generation_with_credentials(|_| {
-        "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-first-long-enough\n".to_owned()
-    })
-    .await
-}
-
-async fn generation_with_credentials(
-    credentials: impl FnOnce(&Path) -> String,
-) -> (ManagedBroker, std::path::PathBuf, super::Coordination) {
+async fn generation_with_github_app_map() -> (ManagedBroker, std::path::PathBuf, super::Coordination)
+{
     let broker = ManagedBroker::gateway();
     broker.publish_lock('1');
-    let credential = broker.directory.path().join("credentials.yaml");
+    let directory = broker.directory.path().canonicalize().unwrap();
+    let key = directory.join("github-app.pem");
+    write_owner_only(&key, GITHUB_APP_KEY);
+    let map = directory.join("secret-map.yaml");
     let mut document: serde_json::Value =
         serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
-    document["credentialsPath"] = json!("credentials.yaml");
+    document["secretMapPath"] = json!("secret-map.yaml");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["api.github.com"],
+        "allowedMethods": ["GET"], "maxRequests": 1,
+        "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
     write_config(&broker.config(), &document);
     write_owner_only(
-        &credential,
-        credentials(&broker.directory.path().canonicalize().unwrap()).as_bytes(),
+        &map,
+        format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: one\nsecrets:\n  - drn: drn:secret:github/app\n    destinations: [api.github.com]\n    source: {{ kind: githubApp, appId: 1000001, installationId: 2000002, privateKey: {} }}\n    bindings:\n      - id: github-app\n        capabilities: [cli-probe.upper]\n        sink: httpBearer\n        allowedHosts: [api.github.com]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            key.display()
+        )
+        .as_bytes(),
     );
     let (candidate, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let owner = super::Coordination::new(broker.config(), candidate.expect("boot generation"));
-    (broker, credential, owner)
+    (broker, key, owner)
 }
 
 #[tokio::test]
@@ -2371,7 +2300,7 @@ async fn unchanged_private_inputs_do_not_stage_or_emit_a_broker_activation() {
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::prelude::*;
 
-    let (_broker, _credentials, owner) = generation_with_private_credential().await;
+    let (_broker, _key, owner) = generation_with_github_app_map().await;
     let digest = owner.active().digest.clone();
     let capture = dekopon_test_support::CaptureLayer::new();
     async {
@@ -2394,56 +2323,12 @@ async fn unchanged_private_inputs_do_not_stage_or_emit_a_broker_activation() {
 }
 
 #[tokio::test]
-async fn same_digest_credential_rotation_commits_once_and_next_poll_is_active() {
-    use dekopon_broker_protocol::GenerationOutcome;
-    use tracing::instrument::WithSubscriber as _;
-    use tracing_subscriber::prelude::*;
-
-    let (_broker, credential, owner) = generation_with_private_credential().await;
-    let digest = owner.active().digest.clone();
-    write_owner_only(
-        &credential,
-        b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-after-long-enough\n",
-    );
-    let capture = dekopon_test_support::CaptureLayer::new();
-    async {
-        let uid = current_uid();
-        assert_eq!(
-            owner.prepare(&digest, uid).await,
-            (digest.clone(), GenerationOutcome::Prepared)
-        );
-        assert_eq!(owner.commit(&digest, uid), GenerationOutcome::Applied);
-        assert_eq!(owner.active().digest, digest);
-        assert_eq!(
-            owner.prepare(&digest, uid).await,
-            (digest.clone(), GenerationOutcome::Active)
-        );
-        assert!(owner.state.lock().prepared.is_none());
-    }
-    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-    .await;
-    let applied = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_applied")]);
-    assert_eq!(applied.len(), 1);
-    assert_eq!(applied[0].field("generation.digest"), Some(digest.as_str()));
-}
-
-#[tokio::test]
 async fn rotating_only_a_github_app_key_prepares_commits_once_and_reads_it_once_per_poll() {
     use dekopon_broker_protocol::GenerationOutcome;
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::prelude::*;
 
-    const KEY: &[u8] = include_bytes!("../tests/fixture/github-app-test-only.pem");
-    let (broker, _credentials, owner) = generation_with_credentials(|directory| {
-        let key = directory.join("github-app.pem");
-        write_owner_only(&key, KEY);
-        format!(
-            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: app\n    kind: githubApp\n    appId: 1000001\n    installationId: 2000002\n    privateKey: {}\n    destinations: [api.github.com]\n",
-            key.display()
-        )
-    })
-    .await;
-    let key = broker.directory.path().join("github-app.pem");
+    let (_broker, key, owner) = generation_with_github_app_map().await;
     let reads = super::private_read_witness::TrackedRead::new(&key);
     let digest = owner.active().digest.clone();
     let uid = current_uid();
@@ -2452,7 +2337,7 @@ async fn rotating_only_a_github_app_key_prepares_commits_once_and_reads_it_once_
         (digest.clone(), GenerationOutcome::Active)
     );
     assert_eq!(reads.count(), 1, "one key read per prepare");
-    write_owner_only(&key, &[b"\n".as_slice(), KEY].concat());
+    write_owner_only(&key, &[b"\n".as_slice(), GITHUB_APP_KEY].concat());
     let capture = dekopon_test_support::CaptureLayer::new();
     async {
         assert_eq!(
@@ -2480,22 +2365,7 @@ async fn a_refused_reload_records_why_and_keeps_the_old_key_signing() {
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::prelude::*;
 
-    const KEY: &[u8] = include_bytes!("../tests/fixture/github-app-test-only.pem");
-    let (broker, _credentials, owner) = generation_with_credentials(|directory| {
-        let key = directory.join("github-app.pem");
-        write_owner_only(&key, KEY);
-        format!(
-            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: app\n    kind: githubApp\n    appId: 1000001\n    installationId: 2000002\n    privateKey: {}\n    destinations: [api.github.com]\n",
-            key.display()
-        )
-    })
-    .await;
-    let key = broker
-        .directory
-        .path()
-        .canonicalize()
-        .unwrap()
-        .join("github-app.pem");
+    let (_broker, key, owner) = generation_with_github_app_map().await;
     fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
     let digest = owner.active().digest.clone();
     let capture = dekopon_test_support::CaptureLayer::new();
@@ -2513,7 +2383,7 @@ async fn a_refused_reload_records_why_and_keeps_the_old_key_signing() {
     let error = refused[0].field("error").expect("refusal reason");
     assert!(
         error.contains(&format!(
-            "credential \"app\" privateKey {} is not trusted input (insecure-mode)",
+            "drn:secret:github/app privateKey {} is not trusted input (insecure-mode)",
             key.display()
         )),
         "{error}"
@@ -2540,7 +2410,7 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
     let bindings = broker.directory.path().join("bindings.yaml");
     let map = |revision: &str| {
         format!(
-            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: {revision}\nsecrets:\n  - drn: drn:com.xrl:secret:test:oauth/one\n    source: {{ kind: oauth2Refresh, recordPath: {}, tokenEndpoint: https://auth.example.test/token, clientId: public-client-id }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [a.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: {revision}\nsecrets:\n  - drn: drn:secret:oauth/one\n    source: {{ kind: oauth2Refresh, recordPath: {}, tokenEndpoint: https://auth.example.test/token, clientId: public-client-id }}\n    destinations: [a.example.test]\n    bindings:\n      - id: api-token\n        capabilities: [cli-probe.upper]\n        sink: httpBearer\n        allowedHosts: [a.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
             record.display()
         )
     };
@@ -2600,8 +2470,8 @@ async fn an_unchanged_poll_keeps_the_active_generation_without_preparing_a_broke
 
     use dekopon_broker_protocol::GenerationOutcome;
 
-    let (_broker, credential, owner) = generation_with_private_credential().await;
-    let reads = super::private_read_witness::TrackedRead::new(&credential);
+    let (_broker, key, owner) = generation_with_github_app_map().await;
+    let reads = super::private_read_witness::TrackedRead::new(&key);
     let prepares = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&prepares);
     let active = owner.active();
@@ -2623,10 +2493,7 @@ async fn an_unchanged_poll_keeps_the_active_generation_without_preparing_a_broke
                 assert_eq!(reads.count(), 2, "one trusted private read per poll");
                 assert!(Arc::ptr_eq(&owner.active(), &active));
                 assert!(owner.state.lock().prepared.is_none());
-                write_owner_only(
-                    &credential,
-                    b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    secret: fixture-after-long-enough\n",
-                );
+                write_owner_only(&key, &[b"\n".as_slice(), GITHUB_APP_KEY].concat());
                 assert_eq!(
                     owner.prepare(&digest, uid).await,
                     (digest.clone(), GenerationOutcome::Prepared)
@@ -2734,8 +2601,8 @@ async fn a_fragment_edit_after_unchanged_polls_prepares_and_commits() {
 async fn unchanged_poll_reads_the_private_file_once_before_answering_active() {
     use dekopon_broker_protocol::GenerationOutcome;
 
-    let (_broker, credential, owner) = generation_with_private_credential().await;
-    let tracked = super::private_read_witness::TrackedRead::new(&credential);
+    let (_broker, key, owner) = generation_with_github_app_map().await;
+    let tracked = super::private_read_witness::TrackedRead::new(&key);
     let digest = owner.active().digest.clone();
     let prepared = owner.prepare(&digest, current_uid()).await;
     assert_eq!(tracked.count(), 1, "one validated private read per prepare");
@@ -2850,24 +2717,17 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
     use dekopon_broker_protocol::GenerationOutcome;
     let broker = ManagedBroker::gateway();
     broker.publish_lock('1');
-    let credentials = broker.directory.path().join("credentials.yaml");
     let bindings = broker.directory.path().join("bindings.yaml");
     let secret = broker.directory.path().join("token");
     write_owner_only(&secret, b"fixture-token");
-    let credential = |host: &str| {
-        format!(
-            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [{host}]\n    secret: fixture-value-long-enough\n"
-        )
-    };
     let map = |host: &str| {
         format!(
-            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:com.xrl:secret:test:api/token\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [{host}]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:secret:api/token\n    source: {{ kind: secureFile, path: {} }}\n    destinations: [{host}]\n    bindings:\n      - id: api-token\n        capabilities: [cli-probe.upper]\n        sink: httpBearer\n        allowedHosts: [{host}]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
             secret.display()
         )
     };
     let mut document: serde_json::Value =
         serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
-    document["credentialsPath"] = json!("credentials.yaml");
     document["secretMapPath"] = json!("bindings.yaml");
     document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
         "allowedHosts": ["a.example.test", "b.example.test"],
@@ -2875,39 +2735,28 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
         "maxRequestBytes": 1024, "maxResponseBytes": 1024
     });
     write_config(&broker.config(), &document);
-    write_owner_only(&credentials, credential("a.example.test").as_bytes());
     write_owner_only(&bindings, map("a.example.test").as_bytes());
-    let credential_reads = super::private_read_witness::TrackedRead::new(&credentials);
     let binding_reads = super::private_read_witness::TrackedRead::new(&bindings);
     let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
-    assert_eq!(credential_reads.count(), 1, "boot credentials read once");
     assert_eq!(binding_reads.count(), 1, "boot secret map read once");
     let active = active.unwrap();
     let mut observed = active.snapshot.clone();
     observed
-        .record_authority_references(
-            Some(&super::credentials::references_from_bytes(
-                &credential_reads.last_bytes(),
-            )),
-            Some(&binding_reads.last_bytes()),
-        )
+        .record_authority_references(Some(&binding_reads.last_bytes()))
         .unwrap();
     assert_eq!(
         active.digest,
         observed.digest().unwrap(),
         "boot reference digest comes from runtime input"
     );
-    credential_reads.reset();
     binding_reads.reset();
     let owner = super::Coordination::new(broker.config(), active);
     let old = owner.active().digest.clone();
-    write_owner_only(&credentials, credential("b.example.test").as_bytes());
     write_owner_only(&bindings, map("b.example.test").as_bytes());
     let uid = current_uid();
     let (digest, outcome) = owner.prepare(&old, uid).await;
     assert_eq!(outcome, GenerationOutcome::Prepared);
-    assert_eq!(credential_reads.count(), 1, "prepare credentials read once");
     assert_eq!(binding_reads.count(), 1, "prepare secret map read once");
     let mut observed = owner
         .state
@@ -2919,12 +2768,7 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
         .snapshot
         .clone();
     observed
-        .record_authority_references(
-            Some(&super::credentials::references_from_bytes(
-                &credential_reads.last_bytes(),
-            )),
-            Some(&binding_reads.last_bytes()),
-        )
+        .record_authority_references(Some(&binding_reads.last_bytes()))
         .unwrap();
     assert_eq!(
         digest,
@@ -2934,7 +2778,6 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
     assert_ne!(digest, old);
     assert_eq!(owner.abort(&digest, uid), GenerationOutcome::Aborted);
     let hook: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-        write_owner_only(&credentials, b"not-a-credential-map");
         write_owner_only(&bindings, b"not-a-secret-map");
     });
     let (prepared, outcome) = super::AFTER_PRIVATE_READ
@@ -2953,79 +2796,24 @@ async fn preparation_uses_the_validated_private_read_for_runtime_and_digest() {
 }
 
 #[tokio::test]
-async fn boot_digest_ignores_core_tags_secret_values_and_tagged_secret_keys() {
-    let broker = ManagedBroker::gateway();
-    broker.publish_lock('1');
-    let credentials = broker.directory.path().join("credentials.yaml");
-    let mut document: serde_json::Value =
-        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
-    document["credentialsPath"] = json!("credentials.yaml");
-    write_config(&broker.config(), &document);
-    let mut digests = Vec::new();
-    for secret in [
-        "secret: !!bool fixture-secret-aaaa-0001",
-        "secret: fixture-secret-bbbb-0002",
-        "!x secret: fixture-secret-aaaa-0001",
-    ] {
-        write_owner_only(
-            &credentials,
-            format!("apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.test]\n    {secret}\n").as_bytes(),
-        );
-        let (candidate, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
-        assert!(report.problems.is_empty(), "{report:?}");
-        digests.push(candidate.expect("validated boot candidate").digest);
-    }
-    assert_eq!(
-        digests[0], digests[1],
-        "secret values and scalar tags cannot change digest"
-    );
-    assert_eq!(
-        digests[0], digests[2],
-        "tagged secret keys cannot change digest"
-    );
-}
-
-#[tokio::test]
-async fn authority_reference_edits_change_digest_but_secret_material_does_not() {
+async fn secret_map_reference_edits_change_digest_but_reordering_does_not() {
     let root = tempfile::tempdir().unwrap();
-    let credentials = root.path().join("credentials.yaml");
     let bindings = root.path().join("bindings.yaml");
-    let credential = |destination: &str, secret: &str| {
-        format!(
-            "apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: key\n    kind: bearerToken\n    destinations: [{destination}]\n    secret: {secret}\n"
-        )
-    };
     let map = |destination: &str| {
         format!("secrets:\n  - drn: example\n    bindings:\n      - destination: {destination}\n")
     };
-    write_owner_only(&credentials, credential("first", "one").as_bytes());
     write_owner_only(&bindings, map("first").as_bytes());
     let snapshot = || {
         let mut snapshot = super::config::ConfigSnapshot::default();
         snapshot
-            .record_authority_references(
-                Some(&super::credentials::references_from_bytes(
-                    &std::fs::read(&credentials).unwrap(),
-                )),
-                Some(&std::fs::read(&bindings).unwrap()),
-            )
+            .record_authority_references(Some(&std::fs::read(&bindings).unwrap()))
             .unwrap();
         snapshot.digest().unwrap()
     };
     let initial = snapshot();
-    write_owner_only(&credentials, credential("second", "one").as_bytes());
-    let destination = snapshot();
-    assert_ne!(initial, destination);
     write_owner_only(&bindings, map("second").as_bytes());
     let binding = snapshot();
-    assert_ne!(destination, binding);
-    write_owner_only(&credentials, credential("second", "two").as_bytes());
-    assert_eq!(binding, snapshot());
-    write_owner_only(
-        &credentials,
-        b"credentials:\n  - secret: two\n    destinations: [second]\n    kind: bearerToken\n    name: key\napiVersion: dekopon.dev/broker-credentials/v1alpha1\n",
-    );
-    assert_eq!(binding, snapshot());
+    assert_ne!(initial, binding);
     write_owner_only(
         &bindings,
         b"secrets:\n  - bindings:\n      - destination: second\n    drn: example\n",
@@ -3338,7 +3126,7 @@ async fn changed_storage_refuses_without_creating_the_candidate_root() {
 #[tokio::test]
 async fn check_distinguishes_an_unreadable_secret_map_from_an_unset_key() {
     let mut fixture = ResidentFixture::boot().await;
-    let secret = "drn:com.xrl:secret:test:api/token";
+    let secret = "drn:secret:api/token";
     write_owner_only(&fixture.cedar, format!(
         r#"{POLICIES}
         @id("checkout-secret") permit(principal, action == Dekopon::Action::"secret.use", resource == Dekopon::Secret::"{secret}");"#
@@ -3401,7 +3189,7 @@ async fn check_and_boot_have_equal_digests_for_private_map_names_absent_from_pol
         });
         write_owner_only(&root.join("token"), b"private-map-equality-fixture");
         write_owner_only(&root.join("bindings.yaml"), format!(
-            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:com.xrl:secret:test:api/token\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: api-token\n        capability: cli-probe.upper\n        sink: httpBearer\n        allowedHosts: [api.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:secret:api/token\n    source: {{ kind: secureFile, path: {} }}\n    destinations: [api.example.test]\n    bindings:\n      - id: api-token\n        capabilities: [cli-probe.upper]\n        sink: httpBearer\n        allowedHosts: [api.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
             root.join("token").display()
         ).as_bytes());
     }).await;
@@ -3420,7 +3208,7 @@ async fn check_and_boot_have_equal_digests_for_private_map_names_absent_from_pol
 }
 
 #[tokio::test]
-async fn check_reads_secret_names_but_boot_and_reload_validate_private_sources() {
+async fn check_reads_binding_shapes_and_refuses_a_swap_target_without_one_binding() {
     use super::{BrokerdError, Mode};
     let root = tempfile::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -3434,12 +3222,7 @@ async fn check_reads_secret_names_but_boot_and_reload_validate_private_sources()
     let (active, report) = candidate_or_refusal(&path, Mode::Boot).await;
     assert!(report.problems.is_empty(), "{report:?}");
     let active = active.unwrap();
-    write_owner_only(
-        &root.path().join("bad-credentials.yaml"),
-        b"not-a-credential-map",
-    );
     write_owner_only(&root.path().join("bad-secrets.yaml"), b"not-a-secret-map");
-    document["credentialsPath"] = json!("bad-credentials.yaml");
     document["secretMapPath"] = json!("bad-secrets.yaml");
     write_config(&path, &document);
     let checked = super::check(&path, None, None).await;
@@ -3455,45 +3238,46 @@ async fn check_reads_secret_names_but_boot_and_reload_validate_private_sources()
             report
                 .problems
                 .iter()
-                .any(|problem| matches!(problem, BrokerdError::Credentials(_)))
-        );
-        assert!(
-            report
-                .problems
-                .iter()
                 .any(|problem| matches!(problem, BrokerdError::Secrets(_)))
         );
     }
 
-    write_config(
-        &root.path().join("valid-credentials.yaml"),
-        &json!({
-            "apiVersion": super::CREDENTIALS_API_VERSION,
-            "credentials": [{
-                "name": "present", "kind": "bearerToken", "scheme": "Bearer",
-                "destinations": ["api.example.com"], "secret": "fixture-value-long-enough"
-            }]
-        }),
+    write_owner_only(
+        &root.path().join("valid-secrets.yaml"),
+        format!(
+            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:secret:present\n    destinations: [api.example.com]\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: present\n        capabilities: [cli-probe.upper]\n        sink: httpBearer\n        allowedHosts: [api.example.com]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+            root.path().join("token").display()
+        )
+        .as_bytes(),
     );
-    document["credentialsPath"] = json!("valid-credentials.yaml");
-    document.as_object_mut().unwrap().remove("secretMapPath");
-    document["capabilities"]["cli-probe"]["credential"] = json!("present");
+    document["secretMapPath"] = json!("valid-secrets.yaml");
+    document["capabilities"]["cli-probe"]["defaultSecretUse"] =
+        json!({"drn": "drn:secret:present", "sink": "httpBearer"});
     document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
         "allowedHosts": ["api.example.com"], "allowedMethods": ["GET"],
         "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
     });
-    document["agents"] = json!({"chat-agent": {"credentials": {"present": "absent"}}});
+    document["agents"] =
+        json!({"chat-agent": {"secrets": {"drn:secret:present": "drn:secret:absent"}}});
+    write_config(&path, &document);
+    let unbound = |problems: &[BrokerdError]| {
+        problems.iter().any(|problem| {
+            matches!(problem,
+                BrokerdError::Broker(dekopon_broker::BrokerBuildError::DefaultSecretBindings {
+                    secret, count: 0, ..
+                }) if secret.as_str() == "drn:secret:absent")
+        })
+    };
+    let checked = super::check(&path, None, None).await;
+    assert!(unbound(&checked.problems), "{checked:?}");
+    let (rejected, report) = candidate_or_refusal(&path, Mode::Reload(&active)).await;
+    assert!(rejected.is_none());
+    assert!(unbound(&report.problems), "{report:?}");
+
+    document.as_object_mut().unwrap().remove("agents");
     write_config(&path, &document);
     let checked = super::check(&path, None, None).await;
     assert!(checked.problems.is_empty(), "{checked:?}");
-    let (rejected, report) = candidate_or_refusal(&path, Mode::Reload(&active)).await;
-    assert!(rejected.is_none());
-    assert!(
-        report.problems.iter().any(|problem| matches!(problem,
-        BrokerdError::Broker(dekopon_broker::BrokerBuildError::UnknownCredential { name, .. })
-            if name == "absent")),
-        "{report:?}"
-    );
 }
 
 #[tokio::test]
@@ -3657,7 +3441,13 @@ async fn check_passes_the_conditional_write_example_in_place() {
         None,
     )
     .await;
-    assert!(report.policy_digest.is_some());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, super::StartupWarning::DefaultSecretsUnchecked)),
+        "the copied secret map is not in the checkout: {report:?}"
+    );
     assert!(report.identity_digest.is_some());
     assert!(
         report.problems.is_empty(),
@@ -3784,7 +3574,7 @@ async fn check_keeps_going_past_a_collision_and_names_the_stage_it_could_not_run
 }
 
 #[tokio::test]
-async fn check_binds_no_socket_and_reads_no_credentials_file() {
+async fn check_binds_no_socket_and_reports_the_digests_boot_serves() {
     use super::StartupWarning;
 
     let directory = tempfile::tempdir().expect("create configuration fixture");
@@ -3794,10 +3584,10 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
     )
     .expect("example decodes");
     let socket = directory.path().join("run/broker.sock");
-    let credentials = directory.path().join("broker-credentials.yaml");
+    let secret_map = directory.path().join("secret-map.yaml");
     document["identities"][0]["uid"] = json!(current_uid());
     document["socketPath"] = json!(socket);
-    document["credentialsPath"] = json!(credentials);
+    document["secretMapPath"] = json!(secret_map);
     document["providers"] =
         json!([
             fs::canonicalize(example_path("examples/providers/http-probe-provider.wasm"))
@@ -3810,22 +3600,43 @@ async fn check_binds_no_socket_and_reads_no_credentials_file() {
         &fs::read(example.join("policies.cedar")).expect("example policies"),
     );
 
+    let unread = super::check(&path, None, None).await;
+    assert!(unread.problems.is_empty(), "{:?}", unread.problems);
+    assert!(
+        unread
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, StartupWarning::DefaultSecretsUnchecked))
+    );
+    write_owner_only(
+        &secret_map,
+        fs::read_to_string(example.join("secret-map.yaml.example"))
+            .expect("example secret map")
+            .replace(
+                "/home/xavier/.config/dekopon/api-token",
+                &directory.path().join("api-token").display().to_string(),
+            )
+            .as_bytes(),
+    );
+
     let report = super::check(&path, None, None).await;
 
     assert!(report.problems.is_empty(), "{:?}", report.problems);
-    assert!(report.warnings.iter().any(|warning| matches!(
-        warning,
-        StartupWarning::CredentialRequired { name } if name == "api-token"
-    )));
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, StartupWarning::DefaultSecretsUnchecked)),
+        "{:?}",
+        report.warnings
+    );
     assert!(!socket.parent().expect("socket parent").exists());
-    assert!(!credentials.exists());
     fs::create_dir(socket.parent().expect("socket parent")).expect("private socket parent");
     fs::set_permissions(
         socket.parent().expect("socket parent"),
         fs::Permissions::from_mode(0o700),
     )
     .expect("restrict socket parent");
-    write_owner_only(&credentials, b"apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials:\n  - name: api-token\n    kind: bearerToken\n    scheme: Bearer\n    destinations: [api.example.com]\n    secret: conditional-write-fixture-only\n");
     let (candidate, boot_report) = candidate_or_refusal(&path, super::Mode::Boot).await;
     assert!(boot_report.problems.is_empty(), "{boot_report:?}");
     let candidate = candidate.expect("serving conditional-write configuration");

@@ -1493,7 +1493,7 @@ mod tests {
     #[test]
     fn a_secret_use_proposal_reaches_only_a_broker_backed_capability() {
         let proposal = dekopon_core::SecretUseProposal::HttpBearer {
-            secret: "drn:com.xrl:secret:prod:api/token"
+            secret: "drn:secret:api/token"
                 .parse::<dekopon_core::SecretDrn>()
                 .expect("canonical DRN"),
         };
@@ -3170,7 +3170,7 @@ mod tests {
             .await;
             let leg = leg.with_cancel_signal(CancelSignal::pair().1);
             let proposal = SecretUseProposal::HttpBearer {
-                secret: "drn:com.xrl:secret:prod:api/token"
+                secret: "drn:secret:api/token"
                     .parse::<SecretDrn>()
                     .expect("canonical DRN fixture"),
             };

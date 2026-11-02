@@ -3,8 +3,8 @@
 use dekopon_broker::{
     Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits,
     CapabilityRoute, ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
-    Conversation, ConversationKind, CredentialStore, DeliveryIdentity, IdentityDirectory,
-    InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld, Trigger,
+    Conversation, ConversationKind, DeliveryIdentity, IdentityDirectory, InMemoryAuditLog,
+    InvocationRequest, PolicyEngine, PolicyWorld, Trigger,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints};
@@ -74,12 +74,10 @@ async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
                 provider: "cli-probe".parse().expect("provider"),
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
-                credential: None,
                 constraints: ExecutionConstraints::default(),
             },
         )])
         .expect("catalog"),
-        CredentialStore::empty(),
         IdentityDirectory::new(mappings).expect("directory"),
         Arc::clone(&audit),
         BrokerLimits::default(),

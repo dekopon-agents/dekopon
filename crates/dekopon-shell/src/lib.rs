@@ -1030,7 +1030,7 @@ mod tests {
 
     fn proposal() -> SecretUseProposal {
         SecretUseProposal::HttpBearer {
-            secret: "drn:com.xrl:secret:prod:api/token"
+            secret: "drn:secret:api/token"
                 .parse::<SecretDrn>()
                 .expect("canonical DRN"),
         }

@@ -281,15 +281,15 @@ impl FromStr for SecretDrn {
     type Err = SecretDrnError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        validate_secret_drn(value)?;
-        Ok(Self(value.to_owned()))
+        Self::try_from(value.to_owned())
     }
 }
 
 impl TryFrom<String> for SecretDrn {
     type Error = SecretDrnError;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> {
+    fn try_from(mut value: String) -> Result<Self, Self::Error> {
+        value.make_ascii_lowercase();
         validate_secret_drn(&value)?;
         Ok(Self(value))
     }
@@ -311,37 +311,16 @@ fn validate_secret_drn(value: &str) -> Result<(), SecretDrnError> {
             maximum: MAX_SECRET_DRN_LENGTH,
         });
     }
-    let mut parts = value.splitn(5, ':');
-    if parts.next() != Some("drn")
-        || parts.next().is_none_or(|part| !valid_drn_authority(part))
-        || parts.next() != Some("secret")
-        || parts.next().is_none_or(|part| !valid_drn_component(part))
-    {
-        return Err(SecretDrnError::Malformed);
-    }
-    let path = parts.next().ok_or(SecretDrnError::Malformed)?;
-    if path.is_empty()
-        || path.bytes().any(|byte| {
-            byte.is_ascii_uppercase()
-                || byte.is_ascii_control()
-                || byte.is_ascii_whitespace()
-                || matches!(byte, b'%' | b'?' | b'#' | b'\\')
-        })
-        || path
-            .split('/')
-            .any(|segment| !valid_drn_component(segment) || matches!(segment, "." | ".."))
+    let path = value
+        .strip_prefix("drn:secret:")
+        .ok_or(SecretDrnError::Malformed)?;
+    if path
+        .split('/')
+        .any(|segment| !valid_drn_component(segment) || matches!(segment, "." | ".."))
     {
         return Err(SecretDrnError::Malformed);
     }
     Ok(())
-}
-
-fn valid_drn_authority(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_IDENTIFIER_LENGTH
-        && value
-            .split('.')
-            .all(|segment| valid_drn_component(segment) && !segment.as_bytes().contains(&b'_'))
 }
 
 fn valid_drn_component(value: &str) -> bool {
@@ -362,7 +341,7 @@ fn valid_drn_component(value: &str) -> bool {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SecretDrnError {
-    #[error("secret DRN must be canonical `drn:<authority>:secret:<realm>:<logical-path>`")]
+    #[error("secret DRN must be `drn:secret:<path>`")]
     Malformed,
     #[error("secret DRN is {length} bytes; maximum is {maximum}")]
     TooLong { length: usize, maximum: usize },
@@ -394,6 +373,7 @@ impl fmt::Debug for SecretBytes {
 pub enum SecretSinkKind {
     HttpBearer,
     HttpBasic,
+    HttpBot,
 }
 
 impl fmt::Display for SecretSinkKind {
@@ -401,6 +381,7 @@ impl fmt::Display for SecretSinkKind {
         formatter.write_str(match self {
             Self::HttpBearer => "httpBearer",
             Self::HttpBasic => "httpBasic",
+            Self::HttpBot => "httpBot",
         })
     }
 }
@@ -416,13 +397,18 @@ pub enum SecretUseProposal {
         #[serde(deserialize_with = "deserialize_secret_username")]
         username: String,
     },
+    HttpBot {
+        secret: SecretDrn,
+    },
 }
 
 impl SecretUseProposal {
     #[must_use]
     pub const fn secret(&self) -> &SecretDrn {
         match self {
-            Self::HttpBearer { secret } | Self::HttpBasic { secret, .. } => secret,
+            Self::HttpBearer { secret }
+            | Self::HttpBasic { secret, .. }
+            | Self::HttpBot { secret } => secret,
         }
     }
 
@@ -431,6 +417,7 @@ impl SecretUseProposal {
         match self {
             Self::HttpBearer { .. } => SecretSinkKind::HttpBearer,
             Self::HttpBasic { .. } => SecretSinkKind::HttpBasic,
+            Self::HttpBot { .. } => SecretSinkKind::HttpBot,
         }
     }
 
@@ -438,7 +425,7 @@ impl SecretUseProposal {
     pub fn username(&self) -> Option<&str> {
         match self {
             Self::HttpBasic { username, .. } => Some(username),
-            Self::HttpBearer { .. } => None,
+            Self::HttpBearer { .. } | Self::HttpBot { .. } => None,
         }
     }
 }
@@ -547,10 +534,11 @@ mod tests {
     }
 
     #[test]
-    fn secret_drns_have_one_logical_backend_independent_spelling() {
-        let value = "drn:com.xrl:secret:prod:payments/blah-api-basic";
-        let parsed = value.parse::<SecretDrn>().expect("canonical DRN");
-        assert_eq!(parsed.to_string(), value);
+    fn secret_drns_fold_to_one_lowercase_spelling() {
+        let parsed = "DRN:Secret:Payments/Blah-API-basic"
+            .parse::<SecretDrn>()
+            .expect("mixed case folds");
+        assert_eq!(parsed.as_str(), "drn:secret:payments/blah-api-basic");
         let round_trip = serde_json::from_str::<SecretDrn>(
             &serde_json::to_string(&parsed).expect("serialize DRN"),
         )
@@ -559,17 +547,18 @@ mod tests {
     }
 
     #[test]
-    fn secret_drns_reject_physical_or_ambiguous_spellings() {
+    fn secret_drns_reject_physical_ambiguous_or_legacy_spellings() {
         for value in [
-            "drn::secret:prod:name",
-            "drn:com.xrl:secret:Prod:name",
-            "drn:com.xrl:secret:prod:",
-            "drn:com.xrl:secret:prod:a//b",
-            "drn:com.xrl:secret:prod:a/../b",
-            "drn:com.xrl:secret:prod:a%2fb",
-            "drn:com.xrl:secret:prod:a?version=2",
-            "drn:com..xrl:secret:prod:name",
-            "drn:com_xrl:secret:prod:name",
+            "drn:secret:",
+            "drn:secret:a//b",
+            "drn:secret:a/../b",
+            "drn:secret:a/./b",
+            "drn:secret:a%2fb",
+            "drn:secret:a?version=2",
+            "drn:secret:a:b",
+            "drn:secret:-a",
+            "drn:com.xrl:secret:prod:name",
+            "drn:slack:user:t1:u1",
         ] {
             assert!(value.parse::<SecretDrn>().is_err(), "accepted {value}");
         }
@@ -578,7 +567,7 @@ mod tests {
     #[test]
     fn typed_secret_use_rejects_basic_username_confusion() {
         let valid = serde_json::from_str::<SecretUseProposal>(
-            r#"{"kind":"httpBasic","secret":"drn:com.xrl:secret:prod:api/basic","username":"user-a"}"#,
+            r#"{"kind":"httpBasic","secret":"drn:secret:api/basic","username":"user-a"}"#,
         )
         .expect("valid Basic proposal");
         assert_eq!(valid.sink(), SecretSinkKind::HttpBasic);
@@ -586,7 +575,7 @@ mod tests {
 
         for username in ["", "user:password", "line\nbreak"] {
             let document = format!(
-                r#"{{"kind":"httpBasic","secret":"drn:com.xrl:secret:prod:api/basic","username":{}}}"#,
+                r#"{{"kind":"httpBasic","secret":"drn:secret:api/basic","username":{}}}"#,
                 serde_json::to_string(username).expect("username JSON")
             );
             assert!(

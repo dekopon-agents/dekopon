@@ -6,8 +6,8 @@ use std::sync::Arc;
 use dekopon_broker::{
     Attestation, AttestorGrant, AuditEvent, Broker, BrokerBuildError, BrokerLimits,
     CapabilityRoute, ChatMemoryConfig, ChatTransportKind, ConstraintCatalog, ConstraintSet,
-    Conversation, ConversationKind, CredentialStore, IdentityDirectory, InMemoryAuditLog,
-    PolicyEngine, PolicyWorld, RouteConflict,
+    Conversation, ConversationKind, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
+    RouteConflict,
 };
 
 use dekopon_broker_host::{BrokerHostError, BrokerHostLimits, BrokerProviderRegistry};
@@ -15,8 +15,8 @@ use dekopon_broker_protocol::{
     ChatScopeClaim, DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity, InvocationRequest,
 };
 use dekopon_capability::{
-    EffectKind, HttpConstraints, InvocationOutcome, StorageAccess, StorageConstraints,
-    StorageInterface, StorageScope,
+    EffectKind, InvocationOutcome, StorageAccess, StorageConstraints, StorageInterface,
+    StorageScope,
 };
 use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, RiskLevel, Subject, TransportId};
 use dekopon_storage_host::{ContinuityPolicy, StorageHost, StorageLimits};
@@ -62,7 +62,7 @@ fn memory_config() -> ChatMemoryConfig {
     }
 }
 
-fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatalog {
+fn memory_constraints() -> ConstraintCatalog {
     let mut entries = [
         (
             "memory.chat.record",
@@ -102,7 +102,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
             provider: "storage-probe".parse().expect("provider"),
             effect: EffectKind::LocalWrite,
             risk: RiskLevel::Medium,
-            credential: None,
             constraints: dekopon_capability::ExecutionConstraints {
                 asset: None,
                 timeout_ms: 10_000,
@@ -118,36 +117,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
             },
         },
     ));
-    if let Some(credential) = credential {
-        entries.push((
-            "http-probe.fetch".parse().expect("capability"),
-            ConstraintSet {
-                default_secret_use: None,
-                route: CapabilityRoute::Generic,
-                provider: "http-probe".parse().expect("provider"),
-                effect: EffectKind::ReadOnly,
-                risk: RiskLevel::Low,
-                credential: Some(credential.to_owned()),
-                constraints: dekopon_capability::ExecutionConstraints {
-                    asset: None,
-                    timeout_ms: 10_000,
-                    http: Some(HttpConstraints {
-                        allowed_hosts: vec!["127.0.0.1:1".to_owned()],
-                        allowed_methods: vec!["GET".to_owned()],
-                        max_requests: 1,
-                        max_request_bytes: 4_096,
-                        max_response_bytes: 4_096,
-                        allow_plaintext_loopback: true,
-                        propagate_trace: false,
-                        request_templates: Vec::new(),
-                        signed_download: None,
-                    }),
-                    storage: None,
-                    secret_use: None,
-                },
-            },
-        ));
-    }
     ConstraintCatalog::new(entries).expect("constraints")
 }
 
@@ -304,7 +273,6 @@ async fn smoke_memory_broker(root: &std::path::Path) -> Broker<InMemoryAuditLog>
         "broker".parse().expect("broker"),
         policy,
         constraints,
-        CredentialStore::empty(),
         IdentityDirectory::new([(
             "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
             "maintainer".parse().expect("principal"),
@@ -561,7 +529,6 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
             provider: "storage-probe".parse().expect("provider"),
             effect: EffectKind::LocalWrite,
             risk: RiskLevel::Medium,
-            credential: None,
             constraints: dekopon_capability::ExecutionConstraints {
                 storage: Some(StorageConstraints {
                     interface: StorageInterface::DurableFiles,
@@ -581,7 +548,6 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
         "broker".parse().expect("broker"),
         policy,
         constraints,
-        CredentialStore::empty(),
         IdentityDirectory::new([(
             "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
             "maintainer".parse().expect("principal"),
@@ -683,7 +649,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         "broker".parse().expect("broker"),
         policy,
         constraints,
-        CredentialStore::empty(),
         IdentityDirectory::new([(
             "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
             "maintainer".parse().expect("principal"),
@@ -804,7 +769,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     )
     .expect("world");
     let policy = PolicyEngine::new("", &world).expect("empty policy");
-    let catalog = constraints_with_http_credential(None);
+    let catalog = memory_constraints();
     let constraints = ConstraintCatalog::new(
         catalog
             .iter()
@@ -821,7 +786,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         "broker".parse().expect("broker"),
         policy,
         constraints,
-        CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::new(InMemoryAuditLog::new(8).expect("audit")),
         BrokerLimits::default(),
@@ -914,7 +878,6 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
             "broker".parse().expect("broker"),
             policy,
             constraints,
-            CredentialStore::empty(),
             IdentityDirectory::new([(
                 "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
                 "maintainer".parse().expect("principal"),
@@ -1056,7 +1019,6 @@ fn memory_constraint(
         provider: "memory-chat".parse().expect("provider"),
         effect,
         risk,
-        credential: None,
         constraints: dekopon_capability::ExecutionConstraints {
             asset: None,
             timeout_ms: 10_000,
@@ -1080,7 +1042,6 @@ fn reserved_read_constraint() -> ConstraintSet {
         provider: "memory-chat".parse().expect("provider"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        credential: None,
         constraints: dekopon_capability::ExecutionConstraints::default(),
     }
 }
@@ -1113,7 +1074,6 @@ async fn chat_memory_without_routes_names_every_missing_role() {
             provider: "storage-probe".parse().expect("provider"),
             effect: EffectKind::LocalWrite,
             risk: RiskLevel::Medium,
-            credential: None,
             constraints: dekopon_capability::ExecutionConstraints {
                 storage: Some(StorageConstraints {
                     interface: StorageInterface::DurableFiles,
@@ -1132,7 +1092,6 @@ async fn chat_memory_without_routes_names_every_missing_role() {
         "broker".parse().expect("broker"),
         PolicyEngine::new("", &world).expect("empty policy"),
         constraints,
-        CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::new(InMemoryAuditLog::new(8).expect("audit")),
         BrokerLimits::default(),
@@ -1189,7 +1148,6 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
         provider: provider.parse().expect("provider"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        credential: None,
         constraints: dekopon_capability::ExecutionConstraints {
             asset: None,
             timeout_ms: 10_000,
@@ -1229,7 +1187,6 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
         "broker".parse().expect("broker"),
         PolicyEngine::new("", &world).expect("empty policy"),
         constraints,
-        CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::new(InMemoryAuditLog::new(8).expect("audit")),
         BrokerLimits::default(),

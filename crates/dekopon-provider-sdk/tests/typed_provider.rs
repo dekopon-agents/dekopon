@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-const DRN: &str = "drn:com.example:secret:prod:api/token";
+const DRN: &str = "drn:secret:api/token";
 
 struct Fixture;
 

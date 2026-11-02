@@ -170,12 +170,12 @@ fn nestedset_and_gylmar() -> [Recipe; 5] {
         },
         Recipe {
             name: "R3 gylmar browse here-doc",
-            script: "ssh --secret drn:com.xrl:secret:rpi:vm-runner/gylmar-token travel -- browse <<'BROWSE'\nopen https://www.google.com/travel/flights\nsnapshot\nBROWSE",
+            script: "ssh --secret drn:secret:vm-runner/gylmar-token travel -- browse <<'BROWSE'\nopen https://www.google.com/travel/flights\nsnapshot\nBROWSE",
             calls: vec![call(
                 "ssh",
                 &[
                     "--secret",
-                    "drn:com.xrl:secret:rpi:vm-runner/gylmar-token",
+                    "drn:secret:vm-runner/gylmar-token",
                     "travel",
                     "--",
                     "browse",
@@ -207,12 +207,12 @@ fn ville_and_whatsapp() -> [Recipe; 5] {
     [
         Recipe {
             name: "R6 ville node stdin",
-            script: "printf 'console.log(1)\\n' | ssh --secret drn:com.xrl:secret:rpi:vm-runner/caller-token travel -- node -",
+            script: "printf 'console.log(1)\\n' | ssh --secret drn:secret:vm-runner/caller-token travel -- node -",
             calls: vec![call(
                 "ssh",
                 &[
                     "--secret",
-                    "drn:com.xrl:secret:rpi:vm-runner/caller-token",
+                    "drn:secret:vm-runner/caller-token",
                     "travel",
                     "--",
                     "node",
@@ -265,12 +265,12 @@ fn xavier_and_jobs() -> [Recipe; 6] {
     [
         Recipe {
             name: "R11 xavier browse",
-            script: "ssh --secret drn:com.xrl:secret:rpi:vm-runner/xavier-whatsapp-token travel -- browse <<'BROWSE'\nopen https://www.google.com/travel/flights\nsnapshot\nBROWSE",
+            script: "ssh --secret drn:secret:vm-runner/xavier-whatsapp-token travel -- browse <<'BROWSE'\nopen https://www.google.com/travel/flights\nsnapshot\nBROWSE",
             calls: vec![call(
                 "ssh",
                 &[
                     "--secret",
-                    "drn:com.xrl:secret:rpi:vm-runner/xavier-whatsapp-token",
+                    "drn:secret:vm-runner/xavier-whatsapp-token",
                     "travel",
                     "--",
                     "browse",
@@ -319,14 +319,14 @@ fn xavier_and_jobs() -> [Recipe; 6] {
         },
         Recipe {
             name: "R16 xavier same-script polling",
-            script: "job=$(ssh --run); ssh --secret drn:com.xrl:secret:rpi:vm-runner/xavier-whatsapp-token --job \"${job[jobId]}\"",
+            script: "job=$(ssh --run); ssh --secret drn:secret:vm-runner/xavier-whatsapp-token --job \"${job[jobId]}\"",
             calls: vec![
                 call("ssh", &["--run"], None),
                 call(
                     "ssh",
                     &[
                         "--secret",
-                        "drn:com.xrl:secret:rpi:vm-runner/xavier-whatsapp-token",
+                        "drn:secret:vm-runner/xavier-whatsapp-token",
                         "--job",
                         "job-7",
                     ],

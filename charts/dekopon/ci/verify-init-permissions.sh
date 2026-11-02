@@ -247,13 +247,13 @@ stamp=..2026_08_18_00_00_00.000000000
 mkdir -p "$stamp"
 printf 'apiVersion: dekopon.dev/brokerd/v1alpha1\n' > "$stamp/broker.yaml"
 printf '@id("x") permit(principal, action, resource);\n' > "$stamp/policies.cedar"
-printf 'apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials: []\n' > "$stamp/broker-credentials.yaml"
+printf 'apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: ci\nsecrets: []\n' > "$stamp/secret-map.yaml"
 printf '{"refresh":"SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/chatgpt-auth.json"
 printf '{"refresh":"BROKER-SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/broker-chatgpt-auth.json"
 printf 'PRIVATE-APP-KEY\n' > "$stamp/private-app-key.pem"
 chmod 0400 "$stamp"/*
 ln -sfn "$stamp" ..data
-for k in broker.yaml policies.cedar broker-credentials.yaml chatgpt-auth.json broker-chatgpt-auth.json private-app-key.pem; do
+for k in broker.yaml policies.cedar secret-map.yaml chatgpt-auth.json broker-chatgpt-auth.json private-app-key.pem; do
   ln -sfn "..data/$k" "$k"
 done
 chmod 0755 /dekopon-source
@@ -350,8 +350,8 @@ def ancestors(d):
             break
         p = os.path.dirname(p) or "/"
 
-print("== Tier A: credentials (mode & 0o077) ==")
-owned_file("/etc/dekopon/broker-credentials.yaml", 0o077, "credentials")
+print("== Tier A: secret map (mode & 0o077) ==")
+owned_file("/etc/dekopon/secret-map.yaml", 0o077, "secret map")
 print("== Tier B: broker.yaml, policies.cedar (mode & 0o022) ==")
 for f in ("broker.yaml", "policies.cedar"):
     owned_file(f"/etc/dekopon/{f}", 0o022, "config")

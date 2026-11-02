@@ -77,7 +77,7 @@ def spawn(uid, action):
 
 
 def broker():
-    for file in ("broker.yaml", "policies.cedar", "broker-credentials.yaml"):
+    for file in ("broker.yaml", "policies.cedar", "secret-map.yaml"):
         owned_file("/etc/dekopon/" + file, 0o077)
     write("/var/lib/dekopon-provider-storage/private")
     write("/var/lib/dekopon-assets/private")
@@ -112,7 +112,7 @@ def gateway():
            (errno.EACCES, errno.EPERM, errno.EROFS))
     owned_file("/gateway-state/chatgpt-auth.json", 0o077)
     for file in ("/etc/dekopon/broker.yaml", "/etc/dekopon/policies.cedar",
-                 "/etc/dekopon/broker-credentials.yaml",
+                 "/etc/dekopon/secret-map.yaml",
                  "/var/lib/dekopon-provider-storage/private",
                  "/var/lib/dekopon-assets/private"):
         denied(lambda: read(file), "gateway reading " + file)

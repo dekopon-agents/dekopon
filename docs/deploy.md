@@ -75,8 +75,8 @@ Dekopon creates no accounts or services. As an administrator:
    `/usr/local` often leaves `/usr/local/etc` or `/usr/local/var` writable by your login.
 3. Create each credential file empty, `0600`, owned by its daemon, then edit it with
    `sudo -u <account> -e`: chat and model tokens in the gateway's `--env-file`, provider
-   credentials in the broker's `credentialsPath`. The broker reads no credential from its
-   environment and, while the gateway is connected, reloads an edited file without a restart.
+   secrets in the files the broker's secret map names. The broker reads no credential from its
+   environment and, while the gateway is connected, reloads an edited secret map without a restart.
 4. Map both UIDs in the broker's `identities`, the gateway's and its own for `probe`, and set the
    gateway's `broker.serverUid`.
 5. Run each daemon's `check` as its account, then both once in the foreground.

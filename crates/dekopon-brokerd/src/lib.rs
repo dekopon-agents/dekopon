@@ -15,7 +15,6 @@ pub mod capabilities;
 const BROKER_PRINCIPAL: &str = "dekopon-broker";
 const RECONCILIATION_OWNER: &str = "dekopon-gatewayd";
 mod config;
-mod credentials;
 mod github_app;
 mod lock_watch;
 #[cfg(test)]
@@ -38,25 +37,20 @@ use std::{
 
 use config::{LoadMode, Resident};
 use dekopon_broker::{
-    AuditLog, Broker, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
-    Leniency, PolicyBuildError, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
+    AuditLog, Broker, ConstraintCatalog, IdentityDirectory, Leniency, PolicyBuildError,
+    PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
 use dekopon_broker_host::BrokerProviderRegistry;
 pub use dekopon_broker_host::enable_test_component_memoization;
 use dekopon_broker_protocol::ResponseEnvelope;
 use dekopon_capability::EffectKind;
-use dekopon_core::{AgentId, CapabilityId, Redacted, SecretDrn, bounded_problems, error_chain};
-use dekopon_http_host::BoundCredential;
+use dekopon_core::{SecretDrn, bounded_problems, error_chain};
 use thiserror::Error;
 
 pub use config::{
     AgentBindingConfig, AssetsConfig, BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion,
     ConfigError, HostLimitsConfig, ManagedProviderSetConfig, PeerIdentity, PrincipalConfig,
     ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig, StorageConfig, TelemetryConfig,
-};
-pub use credentials::{
-    CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CHATGPT_AUTH_BYTES, HARD_MAX_CREDENTIALS,
-    HARD_MAX_CREDENTIALS_BYTES,
 };
 pub use dekopon_broker::MAX_SECRET_BINDINGS as HARD_MAX_SECRET_BINDINGS;
 pub use provider_manager::{
@@ -537,14 +531,10 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
         Ok((config, refusal)) => {
             report.problems.extend(refusal.map(BrokerdError::from));
             report.private_sources.extend(
-                [
-                    &config.credentials_path,
-                    &config.secret_map_path,
-                    &config.policies_path,
-                ]
-                .into_iter()
-                .flatten()
-                .cloned(),
+                [&config.secret_map_path, &config.policies_path]
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
             );
             Some(config)
         }
@@ -641,8 +631,8 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
         }
         Residents::Scratch => {
             let secrets = match config.secret_map_path.as_deref() {
-                Some(path) => match secrets::load_names(path, uid).await {
-                    Ok(names) => Some(Secrets::Names(names)),
+                Some(path) => match secrets::load_shapes(path, uid).await {
+                    Ok(catalog) => Some(Secrets::Shapes(catalog)),
                     Err(secrets::SecretMapError::Read { .. }) => Some(Secrets::Unchecked),
                     Err(
                         error @ (secrets::SecretMapError::Decode { .. }
@@ -655,15 +645,11 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                         None
                     }
                 },
-                None => Some(Secrets::Names(Vec::new())),
+                None => Some(Secrets::Shapes(dekopon_broker::SecretCatalog::empty())),
             };
             keep(&mut report.problems, scratch_host(&config, &mut scratch))
                 .zip(secrets)
                 .map(|(storage, secrets)| Runtime {
-                    credentials: match config.credentials_path {
-                        Some(_) => Credentials::Unchecked,
-                        None => Credentials::Loaded(CredentialStore::empty()),
-                    },
                     secrets,
                     chatgpt: Vec::new(),
                     fingerprint: None,
@@ -827,7 +813,6 @@ async fn boot_runtime(
     };
     let (private, storage, assets) = (private?, storage?, assets?);
     Some(Runtime {
-        credentials: Credentials::Loaded(private.credentials),
         chatgpt: private.chatgpt,
         secrets: Secrets::Loaded(private.secrets, private.scheduled),
         fingerprint: Some(private.fingerprint),
@@ -856,7 +841,6 @@ async fn reload_runtime(
     };
     let private = private?;
     Some(Runtime {
-        credentials: Credentials::Loaded(private.credentials),
         chatgpt: private.chatgpt,
         secrets: Secrets::Loaded(private.secrets, private.scheduled),
         fingerprint: Some(private.fingerprint),
@@ -904,16 +888,6 @@ async fn private_inputs(
     {
         problems.push(error.into());
     }
-    let credentials = match &config.credentials_path {
-        Some(path) => keep(
-            problems,
-            credentials::load_with_bytes(path, uid)
-                .await
-                .map(Some)
-                .map_err(BrokerdError::from),
-        ),
-        None => Some(None),
-    };
     let secrets = match &config.secret_map_path {
         Some(path) => keep(
             problems,
@@ -926,43 +900,35 @@ async fn private_inputs(
     };
     #[cfg(test)]
     let _hook_ran = AFTER_PRIVATE_READ.try_with(|hook| hook()).is_ok();
-    let (Some(credentials), Some(secrets)) = (credentials, secrets) else {
-        return None;
-    };
-    if let Err(error) = config.snapshot.record_authority_references(
-        credentials.as_ref().map(|loaded| &loaded.references),
-        secrets.as_ref().map(|(_, bytes, _)| bytes.as_slice()),
-    ) {
+    let secrets = secrets?;
+    if let Err(error) = config
+        .snapshot
+        .record_authority_references(secrets.as_ref().map(|loaded| loaded.bytes.as_slice()))
+    {
         problems.push(error.into());
     }
     let fingerprint = PrivateFingerprint::of(
-        credentials.as_ref().map(|loaded| &loaded.private_digest),
-        secrets.as_ref().map(|(_, bytes, _)| bytes.as_slice()),
+        secrets
+            .as_ref()
+            .map(|loaded| (loaded.bytes.as_slice(), &loaded.key_digest)),
     );
-    let (catalog, scheduled) = secrets.map_or_else(
-        || {
-            (
-                dekopon_broker::SecretCatalog::empty(),
-                secrets::ScheduledCatalog::default(),
-            )
+    Some(match secrets {
+        Some(loaded) => PrivateInputs {
+            chatgpt: loaded.chatgpt,
+            secrets: loaded.catalog,
+            scheduled: loaded.scheduled,
+            fingerprint,
         },
-        |(catalog, _, scheduled)| (catalog, scheduled),
-    );
-    let (credentials, chatgpt) = credentials.map_or_else(
-        || (CredentialStore::empty(), Vec::new()),
-        |loaded| (loaded.store, loaded.chatgpt),
-    );
-    Some(PrivateInputs {
-        credentials,
-        chatgpt,
-        secrets: catalog,
-        scheduled,
-        fingerprint,
+        None => PrivateInputs {
+            chatgpt: Vec::new(),
+            secrets: dekopon_broker::SecretCatalog::empty(),
+            scheduled: secrets::ScheduledCatalog::default(),
+            fingerprint,
+        },
     })
 }
 
 struct PrivateInputs {
-    credentials: CredentialStore,
     chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
     secrets: dekopon_broker::SecretCatalog,
     scheduled: secrets::ScheduledCatalog,
@@ -973,20 +939,14 @@ struct PrivateInputs {
 struct PrivateFingerprint([u8; 32]);
 
 impl PrivateFingerprint {
-    fn of(credentials: Option<&[u8; 32]>, secret_map: Option<&[u8]>) -> Self {
+    fn of(secret_map: Option<(&[u8], &[u8; 32])>) -> Self {
         use sha2::{Digest as _, Sha256};
         let mut hasher = Sha256::new();
-        match credentials {
-            Some(digest) => {
-                hasher.update([1]);
-                hasher.update(digest);
-            }
-            None => hasher.update([0]),
-        }
         match secret_map {
-            Some(bytes) => {
+            Some((bytes, keys)) => {
                 hasher.update([1]);
                 hasher.update(bytes);
+                hasher.update(keys);
             }
             None => hasher.update([0]),
         }
@@ -1112,19 +1072,13 @@ fn scratch_storage(
     Ok((scratch, host))
 }
 
-enum Credentials {
-    Loaded(CredentialStore),
-    Unchecked,
-}
-
 enum Secrets {
     Loaded(dekopon_broker::SecretCatalog, secrets::ScheduledCatalog),
-    Names(Vec<SecretDrn>),
+    Shapes(dekopon_broker::SecretCatalog),
     Unchecked,
 }
 
 struct Runtime {
-    credentials: Credentials,
     chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
     secrets: Secrets,
     fingerprint: Option<PrivateFingerprint>,
@@ -1264,17 +1218,19 @@ async fn prepare(
         .map_err(|source| BrokerdError::Policy { source }),
     );
     let world = world.map(|world| match &runtime.secrets {
-        Secrets::Loaded(catalog, _) => world.with_secrets(catalog.drns().cloned()),
-        Secrets::Names(names) => world.with_secrets(names.iter().cloned()),
+        Secrets::Loaded(catalog, _) | Secrets::Shapes(catalog) => {
+            world.with_secrets(catalog.drns().cloned())
+        }
         Secrets::Unchecked => world,
     });
     let secrets_unchecked = match &runtime.secrets {
-        Secrets::Loaded(_, _) | Secrets::Names(_) => false,
+        Secrets::Loaded(_, _) | Secrets::Shapes(_) => false,
         Secrets::Unchecked => true,
     };
     let (secret_catalog, scheduled) = match runtime.secrets {
         Secrets::Loaded(catalog, scheduled) => (Some(catalog), Some(scheduled)),
-        Secrets::Names(_) | Secrets::Unchecked => (None, None),
+        Secrets::Shapes(catalog) => (Some(catalog), None),
+        Secrets::Unchecked => (None, None),
     };
     let identity_digest = world.as_ref().map(PolicyWorld::identity_digest);
     let policy = world.and_then(|world| {
@@ -1323,18 +1279,20 @@ async fn prepare(
     else {
         return Err(problems);
     };
-    let credential_store = match runtime.credentials {
-        Credentials::Loaded(store) => store,
-        Credentials::Unchecked => unchecked_credentials(&constraint_sets, &config.agents, warnings)
-            .map_err(|error| vec![error])?,
-    };
+    if secret_catalog.is_none()
+        && constraint_sets
+            .values()
+            .any(|set| set.default_secret_use.is_some())
+    {
+        warnings.push(StartupWarning::DefaultSecretsUnchecked);
+    }
     let constraints = ConstraintCatalog::new(constraint_sets)
         .map_err(|error| vec![BrokerdError::Broker(error)])?
-        .with_agent_credentials(
+        .with_agent_secrets(
             config
                 .agents
                 .into_iter()
-                .map(|(agent, binding)| (agent, binding.credentials))
+                .map(|(agent, binding)| (agent, binding.secrets))
                 .collect(),
         );
     let leniency = if config.strict {
@@ -1350,7 +1308,6 @@ async fn prepare(
             .expect("the broker principal is a valid identifier"),
         policy,
         constraints,
-        credential_store,
         identity_directory,
         Arc::new(TraceOnlyAuditLog),
         config.broker_limits,
@@ -1440,54 +1397,6 @@ fn build_policy(
     }
 }
 
-const UNCHECKED_CREDENTIAL: &str = "dekopon-check-placeholder";
-const UNCHECKED_DESTINATION: &str = "credential.check.invalid";
-
-fn unchecked_credentials(
-    sets: &BTreeMap<CapabilityId, ConstraintSet>,
-    agents: &BTreeMap<AgentId, AgentBindingConfig>,
-    warnings: &mut Vec<StartupWarning>,
-) -> Result<CredentialStore, BrokerdError> {
-    let mut destinations = BTreeMap::<&str, BTreeSet<&str>>::new();
-    for set in sets.values() {
-        let Some(name) = set.credential.as_deref() else {
-            continue;
-        };
-        let hosts = set
-            .constraints
-            .http
-            .iter()
-            .flat_map(|http| http.allowed_hosts.iter().map(String::as_str));
-        let rebound = agents
-            .values()
-            .filter_map(|binding| binding.credentials.get(name).map(String::as_str));
-        for selectable in std::iter::once(name).chain(rebound) {
-            destinations
-                .entry(selectable)
-                .or_default()
-                .extend(hosts.clone());
-        }
-    }
-    let mut entries = Vec::with_capacity(destinations.len());
-    for (name, hosts) in destinations {
-        warnings.push(StartupWarning::CredentialRequired {
-            name: name.to_owned(),
-        });
-        let placeholder = |hosts: Vec<String>| {
-            BoundCredential::bearer(
-                "Bearer",
-                Redacted::new(UNCHECKED_CREDENTIAL.to_owned()),
-                hosts,
-            )
-        };
-        let credential = placeholder(hosts.into_iter().map(str::to_owned).collect())
-            .or_else(|_| placeholder(vec![UNCHECKED_DESTINATION.to_owned()]))
-            .map_err(BrokerdError::UncheckedCredential)?;
-        entries.push((name.to_owned(), credential));
-    }
-    CredentialStore::new(entries).map_err(BrokerdError::Broker)
-}
-
 #[derive(Debug, Error)]
 pub enum StartupWarning {
     #[error(
@@ -1502,8 +1411,11 @@ pub enum StartupWarning {
     UnloadedCapability(capabilities::CapabilityProblem),
     #[error("{0}")]
     Broker(dekopon_broker::StartupWarning),
-    #[error("credential {name} is selected by a capability; boot requires it in credentialsPath")]
-    CredentialRequired { name: String },
+    #[error(
+        "the secret map is unreadable here, so no default secret was checked against its bindings; \
+         boot refuses a default without exactly one"
+    )]
+    DefaultSecretsUnchecked,
     #[error("policy {policy} names secret {secret}; boot requires it in secretMapPath")]
     SecretRequired { policy: String, secret: String },
     #[error("no identities; boot requires them, from a fragment or the chart's peers.yaml")]
@@ -1551,7 +1463,7 @@ impl StartupWarning {
                 { audit.event = "config.startup.warning", reason = "wildcard-kind-scope" },
                 "{self}"
             ),
-            Self::CredentialRequired { .. }
+            Self::DefaultSecretsUnchecked
             | Self::SecretRequired { .. }
             | Self::IdentitiesRequired => tracing::warn!(
                 target: "dekopon_brokerd::audit",
@@ -1638,8 +1550,6 @@ pub enum BrokerdError {
     Capabilities {
         problems: Vec<capabilities::CapabilityProblem>,
     },
-    #[error("broker credentials are unavailable or invalid")]
-    Credentials(#[from] CredentialsError),
     #[error("broker private secret map is unavailable or invalid")]
     Secrets(#[from] SecretMapError),
     #[error("broker provider storage could not start")]
@@ -1709,8 +1619,6 @@ pub enum BrokerdError {
         #[source]
         source: std::io::Error,
     },
-    #[error("check could not stand in for a configured credential")]
-    UncheckedCredential(#[source] dekopon_http_host::ConfigurationError),
     #[error("essential workflows could not be loaded")]
     WorkflowFile(#[from] workflows::WorkflowFileError),
     #[error("would break essential workflows")]
@@ -1731,12 +1639,7 @@ impl BrokerdError {
 }
 
 fn reload_entries(problem: &BrokerdError) -> Vec<String> {
-    if let BrokerdError::Credentials(CredentialsError::Invalid { problems }) = problem {
-        problems
-            .iter()
-            .map(|item| format!("broker credentials are invalid: {item}"))
-            .collect()
-    } else if let BrokerdError::Secrets(SecretMapError::Validation { problems }) = problem {
+    if let BrokerdError::Secrets(SecretMapError::Validation { problems }) = problem {
         problems
             .iter()
             .map(|item| format!("private secret map has conflicts: {item}"))
@@ -1747,8 +1650,6 @@ fn reload_entries(problem: &BrokerdError) -> Vec<String> {
             .map(|item| format!("capability configuration is invalid: {item}"))
             .collect()
     } else if let BrokerdError::Config(error) = problem {
-        vec![format!("{problem}: {error}")]
-    } else if let BrokerdError::Credentials(error) = problem {
         vec![format!("{problem}: {error}")]
     } else if let BrokerdError::Secrets(error) = problem {
         vec![format!("{problem}: {error}")]

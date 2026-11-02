@@ -136,17 +136,3 @@ chart guarantees by never running two pods at once.
   every provider links against; compute shipped inside a provider versions with that provider.
 - **No native runtime plugins.** Broker host services are statically linked, so nothing a provider
   imports can load native code into the process that holds the credentials.
-
-### Credential bindings
-
-Besides [public DRNs](authorization.md#secretuse-and-public-drns), a constraint set may name one
-symbolic credential from the broker's owner-only credentials file, and a per-agent binding may swap
-in a different one when that agent acts (`ConstraintCatalog::credential_for` in
-`crates/dekopon-broker/src/lib.rs`). The credential belongs to the operation, not the provider,
-because the confused deputy is the same component doing a different operation. Keying the override
-on the agent reuses the partition routes already make, so two organizations reach one capability
-with two tokens. An entry is a fixed bearer token or a credential the broker renews itself: a
-ChatGPT subscription or a GitHub App installation token.
-
-Bindings and DRNs end in the same broker-side injection: a proposed or default DRN wins, otherwise
-the binding applies. Only bindings carry a ChatGPT subscription or a GitHub App token today.

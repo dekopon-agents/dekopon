@@ -446,7 +446,7 @@ impl SecretUseGrant {
                     && username.len() <= dekopon_core::MAX_SECRET_USERNAME_LENGTH
                     && !username.contains(':')
                     && !username.bytes().any(|byte| byte.is_ascii_control()) => {}
-            (SecretSinkKind::HttpBearer, None) => {}
+            (SecretSinkKind::HttpBearer | SecretSinkKind::HttpBot, None) => {}
             _ => return Err(SecretUseGrantError::InvalidUsername),
         }
         Ok(())

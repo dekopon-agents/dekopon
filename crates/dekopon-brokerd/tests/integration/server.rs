@@ -14,8 +14,7 @@ use dekopon_agent::BrokerLeg;
 use dekopon_broker::{
     AttestorGrant, AuditError, AuditEvent, AuditLog, AuthenticatedContext, Broker,
     BrokerBuildError, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
-    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
-    PolicyWorld,
+    IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
@@ -89,7 +88,6 @@ fn probe_constraint_set() -> ConstraintSet {
             .expect("valid provider fixture"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        credential: None,
         constraints: ExecutionConstraints::default(),
     }
 }
@@ -232,7 +230,6 @@ async fn broker_over_mapped<'a, A: AuditLog>(
                 .expect("valid broker principal"),
             probe_engine(policies, principals),
             probe_catalog(),
-            CredentialStore::empty(),
             mappings,
             audit,
             BrokerLimits::default(),
@@ -503,15 +500,16 @@ when { context.agent == "chat-agent" };
 @id("cpetersen-secret")
 permit(principal == Dekopon::Principal::"cpetersen",
        action == Dekopon::Action::"secret.use",
-       resource == Dekopon::Secret::"drn:com.xrl:secret:test:api/token")
+       resource == Dekopon::Secret::"drn:secret:api/token")
 when { context.capability == "http-probe.fetch"
     && context.provider == "http-probe"
     && context.sink == "httpBearer" };
 "#;
     write_owner_only(&policies_path, policies.as_bytes());
     let secret_map = format!(
-        "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: service-test\nsecrets:\n  - drn: drn:com.xrl:secret:test:api/token\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: service-token\n        capability: http-probe.fetch\n        sink: httpBearer\n        allowedHosts: [{}]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /api/v1/thing }}]\n",
+        "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: service-test\nsecrets:\n  - drn: drn:secret:api/token\n    source: {{ kind: secureFile, path: {} }}\n    destinations: [{}]\n    bindings:\n      - id: service-token\n        capabilities: [http-probe.fetch]\n        sink: httpBearer\n        allowedHosts: [{}]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /api/v1/thing }}]\n",
         secret_value_path.display(),
+        authority,
         authority
     );
     write_owner_only(&secret_map_path, secret_map.as_bytes());
@@ -573,7 +571,7 @@ when { context.capability == "http-probe.fetch"
         capability: "http-probe.fetch".parse().expect("capability"),
         trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
         secret_use: Some(SecretUseProposal::HttpBearer {
-            secret: "drn:com.xrl:secret:test:api/token".parse().expect("DRN"),
+            secret: "drn:secret:api/token".parse().expect("DRN"),
         }),
         input: json!({
             "uri": format!("http://{authority}/api/v1/thing"),
@@ -834,7 +832,6 @@ async fn a_peer_hangup_during_parked_invoke_still_audits_and_closes_streams() {
             "broker-test".parse().unwrap(),
             probe_engine(POLICY, ["caller", "cpetersen"]),
             probe_catalog(),
-            CredentialStore::empty(),
             identities(),
             Arc::clone(&audit),
             BrokerLimits::default(),
@@ -1543,7 +1540,6 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
             provider,
             effect: EffectKind::ExternalWrite,
             risk: RiskLevel::High,
-            credential: None,
             constraints: ExecutionConstraints {
                 asset: Some(AssetConstraints {
                     attach: true,
@@ -1562,7 +1558,6 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
             "broker-test".parse().unwrap(),
             engine,
             catalog,
-            CredentialStore::empty(),
             identities(),
             Arc::clone(&audit),
             BrokerLimits::default(),
@@ -1817,7 +1812,6 @@ impl SpawnBroker {
                 "broker-test".parse().unwrap(),
                 spawn_policy(),
                 spawn_catalog(),
-                CredentialStore::empty(),
                 identities(),
                 Arc::clone(&audit),
                 BrokerLimits::default(),
@@ -2406,7 +2400,6 @@ impl RunHarness {
                 "broker-test".parse().unwrap(),
                 probe_engine(POLICY, ["caller", "cpetersen"]),
                 ConstraintCatalog::new([("cli-probe.upper".parse().unwrap(), set)]).unwrap(),
-                CredentialStore::empty(),
                 identities(),
                 Arc::clone(&audit),
                 BrokerLimits::default(),

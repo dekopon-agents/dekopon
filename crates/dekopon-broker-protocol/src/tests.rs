@@ -605,16 +605,11 @@ fn wire_invocation_contains_no_identity_or_authority_fields() {
 fn public_drn_is_typed_optional_proposal_data_and_never_provider_input() {
     let mut request = invocation();
     request.secret_use = Some(SecretUseProposal::HttpBasic {
-        secret: "drn:com.xrl:secret:test:api/password"
-            .parse()
-            .expect("canonical DRN"),
+        secret: "drn:secret:api/password".parse().expect("canonical DRN"),
         username: "userA".to_owned(),
     });
     let value = serde_json::to_value(&request).expect("request serializes");
-    assert_eq!(
-        value["secretUse"]["secret"],
-        "drn:com.xrl:secret:test:api/password"
-    );
+    assert_eq!(value["secretUse"]["secret"], "drn:secret:api/password");
     assert_eq!(value["secretUse"]["kind"], "httpBasic");
     assert_eq!(value["input"], json!({"text": "hello"}));
     assert!(!value["input"].to_string().contains("drn:"));
@@ -2221,9 +2216,7 @@ fn a_command_run_response_round_trips_each_outcome() {
                     .expect("valid capability fixture"),
                 input: json!({"text": "hello"}),
                 secret_use: Some(SecretUseProposal::HttpBasic {
-                    secret: "drn:com.xrl:secret:test:api/password"
-                        .parse()
-                        .expect("canonical DRN"),
+                    secret: "drn:secret:api/password".parse().expect("canonical DRN"),
                     username: "userA".to_owned(),
                 }),
             },
@@ -2267,7 +2260,7 @@ fn a_command_run_response_round_trips_each_outcome() {
                 encoded["response"]["result"]["secretUse"],
                 json!({
                     "kind": "httpBasic",
-                    "secret": "drn:com.xrl:secret:test:api/password",
+                    "secret": "drn:secret:api/password",
                     "username": "userA",
                 }),
                 "{encoded}"

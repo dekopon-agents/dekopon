@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use dekopon_broker::{
     AssetInvocationResult, Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerError,
-    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore,
-    IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
+    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, IdentityDirectory,
+    InvocationRequest, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints};
@@ -134,12 +134,10 @@ pub(crate) async fn http_probe_broker(authority: &str) -> Broker<TraceOnlyAuditL
                 provider: "http-probe".parse().expect("provider"),
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
-                credential: None,
                 constraints: loopback_constraints(authority),
             },
         )])
         .expect("catalog"),
-        CredentialStore::empty(),
         IdentityDirectory::new([(SUBJECT.parse().expect("subject"), principal("caller"))])
             .expect("directory"),
         Arc::new(TraceOnlyAuditLog),

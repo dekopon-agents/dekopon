@@ -4,8 +4,8 @@
 use dekopon_broker::{
     Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
     ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation,
-    ConversationKind, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
-    PolicyEngine, PolicyWorld, Trigger,
+    ConversationKind, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    PolicyWorld, Trigger,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{
@@ -92,7 +92,6 @@ when { context.via == "gateway" && context.agent == "reviewer" };
                 provider,
                 effect: EffectKind::LocalWrite,
                 risk: dekopon_core::RiskLevel::Medium,
-                credential: None,
                 constraints: ExecutionConstraints {
                     storage: Some(StorageConstraints {
                         interface: StorageInterface::DurableFiles,
@@ -106,7 +105,6 @@ when { context.via == "gateway" && context.agent == "reviewer" };
             },
         )])
         .unwrap(),
-        CredentialStore::empty(),
         IdentityDirectory::new([
             (alice.clone(), "alice".parse().unwrap()),
             (

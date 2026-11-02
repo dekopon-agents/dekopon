@@ -48,9 +48,6 @@ spec:
         {{- if include "dekopon.hasInlineConfig" . }}
         checksum/config: {{ include (print $.Template.BasePath "/secret-config.yaml") . | sha256sum }}
         {{- end }}
-        {{- if .Values.broker.credentials.inline }}
-        checksum/credentials: {{ include (print $.Template.BasePath "/secret-credentials.yaml") . | sha256sum }}
-        {{- end }}
         {{- /*
           There is deliberately no checksum for either ChatGPT credential Secret. Every other
           checksum here exists to push a changed file into a pod that only reads at startup; a
@@ -253,8 +250,8 @@ spec:
               # 0700 on the directory is load-bearing, not hygiene: save_credentials creates a
               # sibling temporary file here — chatgpt-auth.json becomes chatgpt-auth.tmp-<pid>,
               # the extension is replaced rather than appended — and renames it over the target.
-              # dekopon-brokerd additionally refuses to start when a credentialsPath authFile sits
-              # in a directory it cannot write.
+              # dekopon-brokerd additionally refuses to start when a chatgptSubscription authFile
+              # sits in a directory it cannot write.
               chmod 0700 "{{ .dir }}"
               chown "{{ $seedUid }}:{{ $seedGid }}" "{{ .dir }}"
               got=$(stat -c '%u:%a:%F' "{{ .dir }}")
@@ -590,7 +587,7 @@ spec:
             name: {{ .configMap }}
             defaultMode: 0400
 {{- end }}
-        # Memory-backed, so broker-credentials.yaml never reaches the node's disk.
+        # Memory-backed, so the broker's private files never reach the node's disk.
         - name: config
           emptyDir:
             medium: Memory

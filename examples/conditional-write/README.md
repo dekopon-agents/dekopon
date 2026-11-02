@@ -9,11 +9,11 @@ never see it.
 
 1. Create a Slack app from [`manifest-agent.yaml`](../slack/manifest-agent.yaml). Note both
    tokens, the team ID and your member ID.
-2. Copy `broker-credentials.yaml.example` to `broker-credentials.yaml`, `chmod 600` it, and paste
-   your API's bearer token over `replace-me_…`.
+2. Copy `secret-map.yaml.example` to `secret-map.yaml`, `chmod 600` it, and write your API's bearer
+   token to the `0600` file its `path` names.
 3. In `broker.yaml` and `gatewayd.yaml`, set your socket path, your UID for `501`, and your
    lowercased team and member IDs for `t0123abcd` and `u0123abcd`. Set your API's host for
-   `api.example.com` in `broker.yaml` and the credentials file.
+   `api.example.com` in `broker.yaml` and the secret map.
 4. Make the socket directory `0700`, and both configurations and `policies.cedar` `0600`.
 5. Serve the model `gatewayd.yaml` names; start each daemon in its own terminal:
 

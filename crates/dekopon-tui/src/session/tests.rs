@@ -165,7 +165,7 @@ fn the_empty_local_leg_claims_nothing() {
         dekopon_shell::CapabilityCallResult::NotFound
     ));
     let drn = dekopon_core::SecretUseProposal::HttpBearer {
-        secret: "drn:com.xrl:secret:prod:api/token".parse().unwrap(),
+        secret: "drn:secret:api/token".parse().unwrap(),
     };
     assert!(matches!(
         direct.invoke(

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use dekopon_broker::{
     AuditError, AuditEvent, AuditLog, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
     ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation,
-    ConversationKind, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
-    PolicyEngine, PolicyWorld, Trigger,
+    ConversationKind, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    PolicyWorld, Trigger,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
@@ -66,7 +66,6 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
                 .expect("valid provider fixture"),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            credential: None,
             constraints: ExecutionConstraints::default(),
         },
     )
@@ -94,7 +93,6 @@ async fn broker(audit: Arc<GatedAudit>) -> Broker<GatedAudit> {
         principal("broker-test"),
         PolicyEngine::new(POLICIES, &world).expect("the policy set validates"),
         ConstraintCatalog::new([constraint_set()]).expect("one capability builds a catalog"),
-        CredentialStore::empty(),
         IdentityDirectory::empty(),
         audit,
         BrokerLimits::default(),

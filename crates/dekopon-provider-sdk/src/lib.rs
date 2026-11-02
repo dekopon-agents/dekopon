@@ -199,7 +199,7 @@ mod tests {
     };
     use serde_json::json;
     const UPPER: &str = "cli-probe.upper";
-    const DRN: &str = "drn:com.example:secret:prod:api/token";
+    const DRN: &str = "drn:secret:api/token";
     fn upper() -> super::CapabilityId {
         UPPER.parse().expect("valid capability fixture")
     }
@@ -236,7 +236,7 @@ mod tests {
         let encoded = serde_json::to_string(&with).expect("a proposal serializes");
         assert_eq!(
             encoded,
-            r#"{"outcome":"proposed","capability":"cli-probe.upper","input":{"text":"hello"},"secretUse":{"kind":"httpBasic","secret":"drn:com.example:secret:prod:api/token","username":"user-a"}}"#
+            r#"{"outcome":"proposed","capability":"cli-probe.upper","input":{"text":"hello"},"secretUse":{"kind":"httpBasic","secret":"drn:secret:api/token","username":"user-a"}}"#
         );
         assert_eq!(
             serde_json::from_str::<CommandRunOutcome>(&encoded).expect("the proposal decodes"),

@@ -76,6 +76,11 @@ pub const SECRET_USE_ACTION: &str = "secret.use";
 pub const MAX_POLICY_BYTES: usize = 1024 * 1024;
 pub const MAX_POLICIES: usize = 1_024;
 pub const MAX_POLICY_ID_BYTES: usize = 128;
+pub const RESERVED_POLICY_ID_PREFIX: &str = "dekopon-broker-";
+pub const DEFAULT_SECRET_USE_POLICY_ID: &str = "dekopon-broker-default-secret-use";
+const DEFAULT_SECRET_USE_POLICY: &str = r#"@id("dekopon-broker-default-secret-use")
+permit(principal, action == Dekopon::Action::"secret.use", resource)
+when { context.selection == "default" };"#;
 
 const PRINCIPAL_TYPE: &str = "Dekopon::Principal";
 const PROVIDER_TYPE: &str = "Dekopon::Provider";
@@ -316,7 +321,7 @@ impl PolicyWorld {
         let prompt_context = context(&[]);
         // Capability, provider and sink are required together on secret.use so a request cannot
         // satisfy policy via a binding different from the one it is actually trusted for.
-        let secret_context = context(&["capability", "provider", "sink"]);
+        let secret_context = context(&["capability", "provider", "sink", "selection"]);
 
         let mut actions = serde_json::Map::new();
         for (capability, groups) in self
@@ -367,22 +372,20 @@ impl PolicyWorld {
             ("Provider".to_owned(), entity_shape.clone()),
             ("Agent".to_owned(), entity_shape),
         ]);
-        if !self.secrets.is_empty() {
-            actions.insert(
-                SECRET_USE_ACTION.to_owned(),
-                json!({
-                    "appliesTo": {
-                        "principalTypes": ["Principal"],
-                        "resourceTypes": ["Secret"],
-                        "context": secret_context,
-                    }
-                }),
-            );
-            entity_types.insert(
-                "Secret".to_owned(),
-                json!({ "shape": { "type": "Record", "attributes": {} } }),
-            );
-        }
+        actions.insert(
+            SECRET_USE_ACTION.to_owned(),
+            json!({
+                "appliesTo": {
+                    "principalTypes": ["Principal"],
+                    "resourceTypes": ["Secret"],
+                    "context": secret_context,
+                }
+            }),
+        );
+        entity_types.insert(
+            "Secret".to_owned(),
+            json!({ "shape": { "type": "Record", "attributes": {} } }),
+        );
 
         json!({
             NAMESPACE: {
@@ -409,7 +412,24 @@ pub enum PolicyTarget {
         capability: CapabilityId,
         provider: ProviderId,
         sink: SecretSinkKind,
+        selection: SecretSelection,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretSelection {
+    Default,
+    Proposed,
+}
+
+impl SecretSelection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Proposed => "proposed",
+        }
+    }
 }
 
 impl PolicyTarget {
@@ -601,8 +621,10 @@ impl PolicyEngine {
                 maximum: MAX_POLICIES,
             });
         }
-        let policies = apply_annotated_ids(&policies)?;
+        let mut policies = apply_annotated_ids(&policies)?;
         refuse_non_canonical_literals(&policies)?;
+        let policy_count = policies.num_of_policies();
+        add_default_secret_use_permit(&mut policies)?;
         let (ordinary_policies, invalid_request_shapes) = inspect_request_shapes(&policies)?;
         if !invalid_request_shapes.is_empty() {
             return Err(PolicyBuildError::InvalidRequestShapes {
@@ -637,7 +659,7 @@ impl PolicyEngine {
 
         Ok((
             Self {
-                policy_count: policies.num_of_policies(),
+                policy_count,
                 policies,
                 schema,
                 entities,
@@ -763,12 +785,14 @@ impl PolicyEngine {
                 capability,
                 provider,
                 sink,
+                selection,
             } => (
                 entity_uid(&self.entity_types.secret, secret.as_str()),
                 serde_json::Map::from_iter([
                     ("capability".to_owned(), json!(capability.to_string())),
                     ("provider".to_owned(), json!(provider.to_string())),
                     ("sink".to_owned(), json!(sink.to_string())),
+                    ("selection".to_owned(), json!(selection.as_str())),
                 ]),
             ),
         };
@@ -878,6 +902,28 @@ fn apply_annotated_ids(policies: &PolicySet) -> Result<PolicySet, PolicyBuildErr
             })?;
     }
     Ok(renamed)
+}
+
+fn add_default_secret_use_permit(policies: &mut PolicySet) -> Result<(), PolicyBuildError> {
+    if let Some(policy) = policies.policies().find(|policy| {
+        policy
+            .id()
+            .to_string()
+            .starts_with(RESERVED_POLICY_ID_PREFIX)
+    }) {
+        return Err(PolicyBuildError::ReservedPolicyId {
+            policy: policy.id().to_string(),
+        });
+    }
+    let parse = |messages: Vec<String>| PolicyBuildError::Parse { messages };
+    let builtin = PolicySet::from_str(DEFAULT_SECRET_USE_POLICY)
+        .map_err(|source| parse(source.iter().map(ToString::to_string).collect()))?;
+    for policy in apply_annotated_ids(&builtin)?.policies() {
+        policies
+            .add(policy.clone())
+            .map_err(|source| parse(vec![source.to_string()]))?;
+    }
+    Ok(())
 }
 
 fn inspect_request_shapes(
@@ -1044,12 +1090,21 @@ fn subject_literals(
         .and_then(serde_json::Value::as_array)
         .map_or_else(|| std::slice::from_ref(value), Vec::as_slice);
     for element in elements {
-        if let Some(literal) = element.get("Value").and_then(serde_json::Value::as_str)
-            && !literal
-                .parse::<Subject>()
-                .is_ok_and(|subject| subject.canonical() == literal)
-        {
-            return Err(non_canonical_drn(policy, literal));
+        let Some(literal) = element.get("Value").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        match literal.parse::<Subject>() {
+            Ok(subject) if subject.canonical() != literal => {
+                return Err(non_canonical_drn(policy, literal));
+            }
+            Ok(subject) if subject.kind().is_id_form() => {
+                return Err(PolicyBuildError::IdFormSubject {
+                    policy: policy.to_owned(),
+                    value: literal.to_owned(),
+                });
+            }
+            Ok(_) => {}
+            Err(_) => return Err(non_canonical_drn(policy, literal)),
         }
     }
     Ok(())
@@ -1146,6 +1201,12 @@ fn classify_policies(
                             source,
                         }
                     })?;
+                    if secret.as_str() != value {
+                        return Err(PolicyBuildError::NonCanonicalSecret {
+                            policy: id.clone(),
+                            secret: value,
+                        });
+                    }
                     if !world.secrets.contains(&secret) {
                         return Err(PolicyBuildError::UnknownSecret {
                             policy: id.clone(),
@@ -1471,6 +1532,15 @@ pub enum PolicyBuildError {
     NonCanonicalDrn { policy: String, value: String },
     #[error("policy {policy} has a DRN `like` pattern that is not canonical lowercase")]
     NonCanonicalPattern { policy: String },
+    #[error("policy {policy} names secret {secret:?}, which is not canonical lowercase")]
+    NonCanonicalSecret { policy: String, secret: String },
+    #[error(
+        "policy {policy} compares context.subject with the id form {value:?}; context.subject is \
+         always the name form, so the comparison never matches"
+    )]
+    IdFormSubject { policy: String, value: String },
+    #[error("policy identifier {policy:?} uses the prefix reserved for the broker's own policies")]
+    ReservedPolicyId { policy: String },
     #[error("policy {policy} names unknown entity type {entity_type}")]
     UnknownEntityType { policy: String, entity_type: String },
     #[error("policy {policy} has an @id annotation that is not a bounded portable identifier")]

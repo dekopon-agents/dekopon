@@ -16,8 +16,8 @@ use std::{
 
 use dekopon_broker::{
     Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
-    ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog,
-    InvocationRequest, PolicyEngine, PolicyWorld, SecretResolver as _,
+    ConstraintCatalog, ConstraintSet, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
+    PolicyEngine, PolicyWorld, SecretResolver as _,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{
@@ -128,9 +128,7 @@ impl Drop for TokenApi {
 }
 
 fn drn(suffix: &str) -> SecretDrn {
-    format!("drn:com.xrl:secret:test:oauth/{suffix}")
-        .parse()
-        .expect("DRN")
+    format!("drn:secret:oauth/{suffix}").parse().expect("DRN")
 }
 
 fn source(path: &Path, endpoint: &str) -> SecretSource {
@@ -166,6 +164,7 @@ fn resolver(path: &Path, endpoint: &str, suffixes: &[&str]) -> MapResolver {
                         source: source(path, endpoint),
                         projection: Projection::default(),
                         client: client.clone(),
+                        minted: None,
                     },
                 )
             })
@@ -509,15 +508,15 @@ async fn concurrent_resolutions_of_one_record_spend_one_refresh() {
 
 fn map(path: &Path, endpoint: &str, bootstrap: Option<&Path>) -> SecretMapFile {
     let mut secrets = vec![
-        json!({"drn":drn("one"), "source":source_value(path,endpoint),"bindings":[{
-            "id":"first","capability":"vm.session.create","sink":"httpBearer","allowedHosts":["runner.example"],"allowedMethods":["POST"],"allowedPaths":[{"match":"exact","path":"/v1/sessions"}]
+        json!({"drn":drn("one"), "destinations":["runner.example"], "source":source_value(path,endpoint),"bindings":[{
+            "id":"first","capabilities":["vm.session.create"],"sink":"httpBearer","allowedHosts":["runner.example"],"allowedMethods":["POST"],"allowedPaths":[{"match":"exact","path":"/v1/sessions"}]
         }]}),
     ];
     if let Some(bootstrap) = bootstrap {
         secrets.push(json!({"drn":drn("bootstrap"),"source":{"kind":"onePasswordConnect","endpoint":"https://example.org", "tokenFile":bootstrap,"vault":"a","item":"b","field":"c"},"bindings":[]}));
     } else {
-        secrets.push(json!({"drn":drn("two"), "source":source_value(path,endpoint),"bindings":[{
-            "id":"second","capability":"vm.session.create","sink":"httpBearer","allowedHosts":["runner.example"],"allowedMethods":["POST"],"allowedPaths":[{"match":"exact","path":"/v1/sessions"}]
+        secrets.push(json!({"drn":drn("two"), "destinations":["runner.example"], "source":source_value(path,endpoint),"bindings":[{
+            "id":"second","capabilities":["vm.session.create"],"sink":"httpBearer","allowedHosts":["runner.example"],"allowedMethods":["POST"],"allowedPaths":[{"match":"exact","path":"/v1/sessions"}]
         }]}));
     }
     serde_json::from_value(json!({"apiVersion":"dekopon.dev/secret-map/v1alpha1","mapRevision":"test","secrets":secrets})).unwrap()
@@ -682,8 +681,9 @@ async fn two_drns_over_one_record_share_one_refresh() {
     let authority = target.authority().to_owned();
     let mut file = map(&path, &api.endpoint, None);
     for entry in &mut file.secrets {
+        entry.destinations = vec![authority.clone()];
         for binding in &mut entry.bindings {
-            binding.capability = "http-probe.fetch".parse().unwrap();
+            binding.capabilities = ["http-probe.fetch".parse().unwrap()].into();
             binding.allowed_hosts = vec![authority.clone()];
             binding.allowed_methods = vec!["GET".to_owned()];
             binding.allowed_paths = vec![HttpPathRule::Exact {
@@ -691,13 +691,14 @@ async fn two_drns_over_one_record_share_one_refresh() {
             }];
         }
     }
-    let (catalog, _) = validate_map(
+    let catalog = validate_map(
         file,
         &dir.path().join("map.json"),
         rustix::process::geteuid().as_raw(),
     )
     .await
     .unwrap();
+    let catalog = catalog.catalog;
     assert_eq!(catalog.drns().count(), 2);
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
@@ -713,7 +714,6 @@ async fn two_drns_over_one_record_share_one_refresh() {
             provider: "http-probe".parse().unwrap(),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            credential: None,
             constraints: ExecutionConstraints {
                 asset: None,
                 timeout_ms: 5_000,
@@ -740,7 +740,6 @@ async fn two_drns_over_one_record_share_one_refresh() {
             "broker-test".parse().unwrap(),
             oauth_policy(),
             constraints,
-            CredentialStore::empty(),
             IdentityDirectory::new([(
                 "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
                 "caller".parse().unwrap(),
