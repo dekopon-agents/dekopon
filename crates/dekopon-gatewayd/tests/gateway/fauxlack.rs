@@ -557,14 +557,6 @@ async fn a_resident_fauxlack_attachment_answers_after_an_observed_route_reload()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn shutting_down_a_fixture_joins_a_model_with_unconsumed_responses() {
-    let _audit = Audit::exclusive().await;
-    let fixture = boot(vec![final_answer("never requested")]).await;
-    assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 0);
-    let _directory = fixture.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn an_ungranted_provider_word_is_refused_in_a_fauxlack_turn() {
     let _audit = Audit::exclusive().await;
     let chat = Fauxlack::from_manifest(include_str!("team.yaml")).unwrap();
@@ -616,7 +608,6 @@ async fn an_ungranted_provider_word_is_refused_in_a_fauxlack_turn() {
     ]
     .join("\n");
     assert_eq!(result.trim(), expected);
-    println!("fauxlack shell output:\n{result}");
     let _directory = fixture.shutdown().await;
 }
 
@@ -667,9 +658,5 @@ async fn an_answer_names_its_models_and_the_next_prompt_has_no_footer() {
         ["First answer."]
     );
     assert!(prompt.iter().all(|(_, text)| !text.contains(footer)));
-    println!(
-        "posted answer: {:?}; context footer: {:?}; next prompt: {:?}",
-        first.text, footer, prompt
-    );
     let _directory = fixture.shutdown().await;
 }

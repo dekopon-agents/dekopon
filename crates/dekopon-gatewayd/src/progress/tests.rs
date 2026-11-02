@@ -461,6 +461,27 @@ fn start_with(
     min_edit_interval: Duration,
     max_duration: Option<Duration>,
 ) -> Harness {
+    let (recorder, driver) = test_driver(offers, min_edit_interval);
+    let cancellation = SessionCancellation::new();
+    let (policy, sink) = ProgressPolicy::start(inputs(
+        driver,
+        detail,
+        liveness,
+        cancellation.clone(),
+        max_duration,
+    ));
+    Harness {
+        policy,
+        sink,
+        recorder,
+        cancellation,
+    }
+}
+
+fn test_driver(
+    offers: Offers,
+    min_edit_interval: Duration,
+) -> (Arc<Recorder>, Arc<dyn ChatDriver>) {
     let recorder = Arc::new(Recorder::default());
     let driver = Arc::new(TestDriver {
         recorder: Arc::clone(&recorder),
@@ -471,8 +492,17 @@ fn start_with(
         },
         offers,
     });
-    let cancellation = SessionCancellation::new();
-    let (policy, sink) = ProgressPolicy::start(ProgressInputs {
+    (recorder, driver)
+}
+
+fn inputs(
+    driver: Arc<dyn ChatDriver>,
+    detail: ProgressDetail,
+    liveness: Arc<ResolvedLiveness>,
+    cancellation: SessionCancellation,
+    max_duration: Option<Duration>,
+) -> ProgressInputs {
+    ProgressInputs {
         driver,
         target: Some(LivenessTarget::Local { connection: 1 }),
         reply: ReplyTarget::Local { connection: 1 },
@@ -481,15 +511,9 @@ fn start_with(
         settings: liveness.settings,
         keep_alive: liveness.keep_alive.clone(),
         liveness,
-        cancellation: cancellation.clone(),
+        cancellation,
         max_duration,
         silent_until_success: false,
-    });
-    Harness {
-        policy,
-        sink,
-        recorder,
-        cancellation,
     }
 }
 
@@ -874,36 +898,18 @@ async fn every_terminal_clears_status_text_before_delivery_and_native_cleanup() 
     reason = "reshaped by the unit that next rewrites this"
 )]
 async fn a_delivered_answers_idle_write_precedes_the_next_runs_working_status() {
-    let recorder = Arc::new(Recorder::default());
-    let driver: Arc<dyn ChatDriver> = Arc::new(TestDriver {
-        recorder: Arc::clone(&recorder),
-        surfaces: Surfaces {
-            recorder: Arc::clone(&recorder),
-            min_edit_interval: Duration::from_secs(3),
-            min_stream_interval: Duration::from_secs(2),
-        },
-        offers: Offers::default(),
-    });
-    let target = LivenessTarget::Local { connection: 1 };
-    let reply = ReplyTarget::Local { connection: 1 };
-    let liveness = liveness(false);
-    let inputs = |driver: Arc<dyn ChatDriver>| ProgressInputs {
-        driver,
-        target: Some(target.clone()),
-        reply: reply.clone(),
-        transport: "local".to_owned(),
-        detail: ProgressDetail::Plain,
-        settings: liveness.settings,
-        keep_alive: liveness.keep_alive.clone(),
-        liveness: Arc::clone(&liveness),
-        cancellation: SessionCancellation::new(),
-        max_duration: None,
-        silent_until_success: false,
+    let (recorder, driver) = test_driver(Offers::default(), Duration::from_secs(3));
+    let run = || {
+        ProgressPolicy::start(inputs(
+            Arc::clone(&driver),
+            ProgressDetail::Plain,
+            liveness(false),
+            SessionCancellation::new(),
+            None,
+        ))
     };
 
-    // Run A starts and then finishes; its cleanup's Idle write is delayed, standing in for a
-    // real Slack round trip.
-    let (mut run_a, sink_a) = ProgressPolicy::start(inputs(Arc::clone(&driver)));
+    let (mut run_a, sink_a) = run();
     sink_a.emit(started());
     settle().await;
     recorder.stall_status.store(1, Ordering::Relaxed);
@@ -912,8 +918,7 @@ async fn a_delivered_answers_idle_write_precedes_the_next_runs_working_status() 
         .await;
     assert!(delivered, "the answer still reaches the person");
 
-    // Run B is the next turn admitted in the same thread, right after run A's acknowledgment.
-    let (mut run_b, sink_b) = ProgressPolicy::start(inputs(Arc::clone(&driver)));
+    let (mut run_b, sink_b) = run();
     sink_b.emit(started());
     settle().await;
     advance(Duration::from_secs(1)).await;
@@ -1002,74 +1007,62 @@ async fn status_off_suppresses_native_writes_during_note_handover_and_restore() 
 }
 
 #[tokio::test]
-async fn two_status_text_failures_restore_native_working_once_and_stop_showing() {
+async fn two_failures_or_the_last_tick_restore_native_working_once_without_a_refresh_timer() {
     let note = note_event("waiting", None).await;
     let (capture, _guard) = capture();
     tokio::time::pause();
-    let mut harness = status_harness(KeepAlive::default());
-    harness
-        .recorder
-        .refuse_status_text
-        .store(2, Ordering::Relaxed);
-    harness.sink.emit(started());
-    harness.sink.emit(note);
-    settle().await;
-    advance(Duration::from_secs(16)).await;
-    let calls = harness.recorder.calls();
-    assert_eq!(
-        calls,
-        [
-            Call::Status(Status::Working),
-            Call::Status(Status::Idle),
-            Call::StatusText("waiting…".to_owned()),
-            Call::StatusText("waiting…".to_owned()),
-            Call::Status(Status::Working)
-        ]
-    );
-    advance(Duration::from_secs(31)).await;
-    assert_eq!(harness.recorder.calls(), calls);
-    let degraded = events_named(&capture, "gateway_progress_degraded");
-    assert_eq!(degraded.len(), 1);
-    assert!(
-        degraded[0].contains("primitive=\"status_text\"")
-            && degraded[0].contains("category=\"response\"")
-    );
-    harness.policy.terminal(Terminal::Silent).await;
-}
-
-#[tokio::test]
-async fn the_last_status_tick_restores_working_without_adding_a_refresh_timer() {
-    let note = note_event("waiting", None).await;
-    tokio::time::pause();
-    let mut harness = status_harness(KeepAlive {
-        max: 1,
-        ..KeepAlive::default()
-    });
-    harness.sink.emit(started());
-    harness.sink.emit(note.clone());
-    settle().await;
-    advance(Duration::from_secs(16)).await;
-    let calls = harness.recorder.calls();
-    assert_eq!(
-        calls,
-        [
-            Call::Status(Status::Working),
-            Call::Status(Status::Idle),
-            Call::StatusText("waiting…".to_owned()),
-            Call::StatusText("waiting…".to_owned()),
-            Call::Status(Status::Working)
-        ]
-    );
-    advance(Duration::from_secs(120)).await;
-    assert_eq!(harness.recorder.calls(), calls);
-    harness.sink.emit(note);
-    settle().await;
-    assert_eq!(harness.recorder.calls().len(), calls.len() + 1);
-    assert_eq!(
-        harness.recorder.calls().last(),
-        Some(&Call::StatusText("waiting…".to_owned()))
-    );
-    harness.policy.terminal(Terminal::Silent).await;
+    for (failures, keep_alive, quiet) in [
+        (2, KeepAlive::default(), 31),
+        (
+            0,
+            KeepAlive {
+                max: 1,
+                ..KeepAlive::default()
+            },
+            120,
+        ),
+    ] {
+        let mut harness = status_harness(keep_alive);
+        harness
+            .recorder
+            .refuse_status_text
+            .store(failures, Ordering::Relaxed);
+        harness.sink.emit(started());
+        harness.sink.emit(note.clone());
+        settle().await;
+        advance(Duration::from_secs(16)).await;
+        let calls = harness.recorder.calls();
+        assert_eq!(
+            calls,
+            [
+                Call::Status(Status::Working),
+                Call::Status(Status::Idle),
+                Call::StatusText("waiting…".to_owned()),
+                Call::StatusText("waiting…".to_owned()),
+                Call::Status(Status::Working)
+            ],
+            "failures: {failures}"
+        );
+        advance(Duration::from_secs(quiet)).await;
+        assert_eq!(harness.recorder.calls(), calls, "failures: {failures}");
+        if failures > 0 {
+            let degraded = events_named(&capture, "gateway_progress_degraded");
+            assert_eq!(degraded.len(), 1);
+            assert!(
+                degraded[0].contains("primitive=\"status_text\"")
+                    && degraded[0].contains("category=\"response\"")
+            );
+        } else {
+            harness.sink.emit(note.clone());
+            settle().await;
+            assert_eq!(harness.recorder.calls().len(), calls.len() + 1);
+            assert_eq!(
+                harness.recorder.calls().last(),
+                Some(&Call::StatusText("waiting…".to_owned()))
+            );
+        }
+        harness.policy.terminal(Terminal::Silent).await;
+    }
 }
 
 #[tokio::test]
@@ -1347,57 +1340,6 @@ async fn a_one_turn_answer_posts_no_progress_message() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn native_reaction_off_does_not_send_even_with_no_other_indicator() {
-    let mut liveness = liveness(false);
-    Arc::get_mut(&mut liveness)
-        .expect("fresh fixture")
-        .settings
-        .working = crate::config::WorkingReaction::Off;
-    let harness = start(Offers::default(), ProgressDetail::Plain, liveness);
-    harness.sink.emit(started());
-    settle().await;
-    assert!(
-        !harness
-            .recorder
-            .calls()
-            .iter()
-            .any(|call| matches!(call, Call::Reaction(_)))
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn working_auto_reacts_only_without_status_or_typing() {
-    for (offers, reaction) in [
-        (Offers::default(), false),
-        (
-            Offers {
-                status: false,
-                typing: false,
-                ..Offers::default()
-            },
-            true,
-        ),
-    ] {
-        let mut liveness = liveness(false);
-        Arc::get_mut(&mut liveness)
-            .expect("fresh fixture")
-            .settings
-            .progress = ProgressSurface::Auto;
-        let harness = start(offers, ProgressDetail::Plain, liveness);
-        harness.sink.emit(started());
-        settle().await;
-        assert_eq!(
-            harness
-                .recorder
-                .calls()
-                .iter()
-                .any(|call| matches!(call, Call::Reaction(true))),
-            reaction
-        );
-    }
-}
-
-#[tokio::test(start_paused = true)]
 async fn the_ladder_runs_at_started_and_a_tool_call_posts_the_surface() {
     let mut harness = start(
         Offers::default(),
@@ -1514,7 +1456,7 @@ async fn edits_inside_the_interval_coalesce_to_the_latest_state() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn keep_alive_ticks_at_fifteen_forty_five_then_every_sixty_seconds() {
+async fn keep_alive_ticks_at_fifteen_forty_five_then_every_sixty_seconds_up_to_ten() {
     let harness = start(Offers::default(), ProgressDetail::Plain, ticking());
     harness.sink.emit(started());
     settle().await;
@@ -1539,18 +1481,10 @@ async fn keep_alive_ticks_at_fifteen_forty_five_then_every_sixty_seconds() {
         1,
         "a keep-alive is an edit of one message, never a second post"
     );
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_keep_alive_budget_stops_at_ten_ticks() {
-    let harness = start(Offers::default(), ProgressDetail::Plain, ticking());
-    harness.sink.emit(started());
-    settle().await;
 
     for _ in 0..20 {
         advance(Duration::from_secs(60)).await;
     }
-
     assert_eq!(
         harness.recorder.texts().len(),
         10,
@@ -1585,52 +1519,16 @@ async fn the_edit_budget_stops_at_sixty_edits() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_stream_is_the_surface_and_no_progress_message_is_posted() {
-    let offers = Offers {
-        stream: true,
-        ..Offers::default()
-    };
-    let mut harness = start(offers, ProgressDetail::Plain, liveness(true));
-    harness.sink.emit(started());
-    harness.sink.emit(answered_with_tool(1));
-    settle().await;
-    assert!(
-        harness.recorder.texts().is_empty(),
-        "a capability call must not post a second message beside the stream: {:?}",
-        harness.recorder.calls()
-    );
-
-    let text = recorded_delta();
-    harness.sink.emit(ProgressEvent::TextDelta {
-        turn: 1,
-        cumulative_chars: text.as_str().chars().count(),
-        text: text.clone(),
-    });
-    settle().await;
-    assert_eq!(
-        harness.recorder.texts(),
-        vec![text.as_str().to_owned()],
-        "the stream is the one surface: {:?}",
-        harness.recorder.calls()
-    );
-
-    harness.policy.seal();
-    let delivered = harness
-        .policy
-        .terminal(Terminal::Answered(OutboundReply::text("hello there")))
-        .await;
-    assert!(delivered);
-    assert_eq!(
-        harness.recorder.writes().last(),
-        Some(&Call::StreamFinalize("hello there".to_owned())),
-        "the stream becomes the answer in place: {:?}",
-        harness.recorder.calls()
-    );
-}
-
-#[tokio::test(start_paused = true)]
 async fn auto_selects_existing_indicators_and_only_falls_back_to_supported_messages() {
     for (name, status, typing, reaction, progress, expected) in [
+        (
+            "every-indicator",
+            true,
+            true,
+            true,
+            true,
+            Some(Call::Status(Status::Working)),
+        ),
         (
             "slack-agent",
             true,
@@ -1714,12 +1612,14 @@ async fn auto_selects_existing_indicators_and_only_falls_back_to_supported_messa
 }
 
 #[tokio::test(start_paused = true)]
-async fn answer_streaming_is_independent_of_progress_and_detail_off() {
-    for progress in [
-        ProgressSurface::Auto,
-        ProgressSurface::Off,
-        ProgressSurface::Message,
+async fn answer_streaming_is_independent_of_progress_and_detail() {
+    for (progress, detail) in [
+        (ProgressSurface::Auto, ProgressDetail::Off),
+        (ProgressSurface::Off, ProgressDetail::Off),
+        (ProgressSurface::Message, ProgressDetail::Off),
+        (ProgressSurface::Message, ProgressDetail::Plain),
     ] {
+        let case = format!("{progress:?}/{detail:?}");
         let mut config = liveness(true);
         Arc::get_mut(&mut config)
             .expect("unshared fixture")
@@ -1730,13 +1630,13 @@ async fn answer_streaming_is_independent_of_progress_and_detail_off() {
                 stream: true,
                 ..Offers::default()
             },
-            ProgressDetail::Off,
+            detail,
             config,
         );
         harness.sink.emit(started());
         harness.sink.emit(answered_with_tool(1));
         settle().await;
-        assert!(harness.recorder.writes().is_empty());
+        assert!(harness.recorder.writes().is_empty(), "{case}");
         let text = recorded_delta();
         harness.sink.emit(ProgressEvent::TextDelta {
             turn: 1,
@@ -1746,17 +1646,21 @@ async fn answer_streaming_is_independent_of_progress_and_detail_off() {
         settle().await;
         assert_eq!(
             harness.recorder.writes(),
-            vec![Call::Stream(text.as_str().to_owned())]
+            vec![Call::Stream(text.as_str().to_owned())],
+            "{case}"
         );
+        harness.policy.seal();
         assert!(
             harness
                 .policy
                 .terminal(Terminal::Answered(OutboundReply::text("done")))
-                .await
+                .await,
+            "{case}"
         );
         assert_eq!(
             harness.recorder.writes().last(),
-            Some(&Call::StreamFinalize("done".to_owned()))
+            Some(&Call::StreamFinalize("done".to_owned())),
+            "{case}"
         );
     }
 }
@@ -1909,290 +1813,208 @@ async fn a_stream_past_the_surface_ceiling_is_cut_and_marked() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_steer_staged_after_the_progress_post_gets_its_answer_below_it() {
-    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
-    harness.sink.emit(started());
-    harness.sink.emit(answered_with_tool(1));
-    settle().await;
-    assert_eq!(harness.recorder.writes().len(), 1);
-    assert!(matches!(harness.recorder.writes()[0], Call::Post(_)));
-    for _ in 0..EVENT_QUEUE {
-        harness.sink.emit(answered_with_tool(1));
+async fn the_answer_moves_below_the_progress_post_only_when_a_steer_lands_after_it_began() {
+    #[derive(Debug)]
+    enum Steer {
+        Never,
+        BeforePost,
+        AfterPost,
+        DuringPost,
     }
-    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
-    assert!(
-        harness
-            .policy
-            .terminal(Terminal::Answered(OutboundReply::text("done")))
-            .await
-    );
-    let writes = harness.recorder.writes();
-    assert_eq!(&writes[1..], [Call::Delete, Call::Reply("done".to_owned())]);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_steer_staged_while_the_progress_post_is_in_flight_gets_its_answer_below_it() {
-    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
-    harness.recorder.slow_post.store(1, Ordering::Relaxed);
-    harness.sink.emit(started());
-    harness.sink.emit(answered_with_tool(1));
-    settle().await;
-    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
-    advance(Duration::from_millis(500)).await;
-    assert!(
-        harness
-            .policy
-            .terminal(Terminal::Answered(OutboundReply::text("done")))
-            .await
-    );
-    let writes = harness.recorder.writes();
-    assert!(matches!(writes[0], Call::Post(_)));
-    assert_eq!(&writes[1..], [Call::Delete, Call::Reply("done".to_owned())]);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_steer_staged_while_the_stream_post_is_in_flight_gets_its_answer_below_it() {
-    let mut harness = start(
-        Offers {
-            stream: true,
-            typing: false,
-            status: false,
-            reaction: false,
-            ..Offers::default()
-        },
-        ProgressDetail::Off,
-        liveness(true),
-    );
-    harness.recorder.slow_post.store(1, Ordering::Relaxed);
-    harness.sink.emit(started());
-    let text = recorded_delta();
-    harness.sink.emit(ProgressEvent::TextDelta {
-        turn: 1,
-        cumulative_chars: text.as_str().chars().count(),
-        text: text.clone(),
-    });
-    settle().await;
-    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
-    advance(Duration::from_millis(500)).await;
-    assert!(
-        harness
-            .policy
-            .terminal(Terminal::Answered(OutboundReply::text("done")))
-            .await
-    );
-    assert_eq!(
-        harness.recorder.calls(),
-        [
-            Call::Stream(text.as_str().to_owned()),
-            Call::StreamDiscard,
-            Call::Reply("done".to_owned())
-        ]
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn an_unsteered_turn_still_finalizes_in_place() {
-    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
-    harness.sink.emit(started());
-    harness.sink.emit(answered_with_tool(1));
-    settle().await;
-    assert!(
-        harness
-            .policy
-            .terminal(Terminal::Answered(OutboundReply::text("done")))
-            .await
-    );
-    let writes = harness.recorder.writes();
-    assert!(matches!(writes[0], Call::Post(_)));
-    assert_eq!(&writes[1..], [Call::Finalize("done".to_owned())]);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_steer_staged_before_the_progress_post_still_finalizes_in_place() {
-    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
-    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
-    harness.sink.emit(started());
-    harness.sink.emit(answered_with_tool(1));
-    settle().await;
-    assert!(
-        harness
-            .policy
-            .terminal(Terminal::Answered(OutboundReply::text("done")))
-            .await
-    );
-    let writes = harness.recorder.writes();
-    assert!(matches!(writes[0], Call::Post(_)));
-    assert_eq!(&writes[1..], [Call::Finalize("done".to_owned())]);
+    let finalized = || vec![Call::Finalize("done".to_owned())];
+    let below = || vec![Call::Delete, Call::Reply("done".to_owned())];
+    for (steer, tail) in [
+        (Steer::Never, finalized()),
+        (Steer::BeforePost, finalized()),
+        (Steer::AfterPost, below()),
+        (Steer::DuringPost, below()),
+    ] {
+        let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+        match steer {
+            Steer::BeforePost => harness.sink.emit(ProgressEvent::Steered { turn: 1 }),
+            Steer::DuringPost => harness.recorder.slow_post.store(1, Ordering::Relaxed),
+            Steer::Never | Steer::AfterPost => {}
+        }
+        harness.sink.emit(started());
+        harness.sink.emit(answered_with_tool(1));
+        settle().await;
+        match steer {
+            Steer::AfterPost => {
+                assert_eq!(harness.recorder.writes().len(), 1);
+                for _ in 0..EVENT_QUEUE {
+                    harness.sink.emit(answered_with_tool(1));
+                }
+                harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+            }
+            Steer::DuringPost => {
+                harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+                advance(Duration::from_millis(500)).await;
+            }
+            Steer::Never | Steer::BeforePost => {}
+        }
+        assert!(
+            harness
+                .policy
+                .terminal(Terminal::Answered(OutboundReply::text("done")))
+                .await,
+            "{steer:?}"
+        );
+        let writes = harness.recorder.writes();
+        assert!(matches!(writes[0], Call::Post(_)), "{steer:?}: {writes:?}");
+        assert_eq!(&writes[1..], tail, "{steer:?}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_steer_after_the_stream_began_discards_it_before_delivering_the_answer() {
-    let mut harness = start(
-        Offers {
-            stream: true,
-            ..Offers::default()
-        },
-        ProgressDetail::Off,
-        liveness(true),
-    );
-    harness.sink.emit(started());
     let text = recorded_delta();
-    let delta = || ProgressEvent::TextDelta {
-        turn: 1,
-        text: text.clone(),
-        cumulative_chars: text.as_str().chars().count(),
-    };
-    harness.sink.emit(delta());
-    settle().await;
-    harness.sink.emit(ProgressEvent::Steered { turn: 1 });
-    harness.sink.emit(delta());
-    advance(Duration::from_secs(2)).await;
-    assert!(
-        harness
-            .policy
-            .terminal(Terminal::Answered(OutboundReply::text("done")))
-            .await
-    );
-    let calls: Vec<_> = harness
-        .recorder
-        .calls()
-        .into_iter()
-        .filter(|call| !matches!(call, Call::Reaction(_) | Call::Typing | Call::Status(_)))
-        .collect();
-    assert_eq!(
-        calls,
-        [
-            Call::Stream(text.as_str().to_owned()),
-            Call::Stream(text.as_str().to_owned()),
-            Call::StreamDiscard,
-            Call::Reply("done".to_owned())
-        ]
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_refused_finalize_deletes_the_surface_and_replies() {
-    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
-    harness.recorder.refuse_finalize.store(1, Ordering::Relaxed);
-    harness.sink.emit(started());
-    harness.sink.emit(answered_with_tool(1));
-    settle().await;
-
-    let delivered = harness
-        .policy
-        .terminal(Terminal::Answered(OutboundReply::text("the answer")))
-        .await;
-    assert!(delivered, "the fallback is what delivered it");
-    let writes = harness.recorder.writes();
-    assert_eq!(
-        writes[writes.len() - 2..].to_vec(),
-        vec![Call::Delete, Call::Reply("the answer".to_owned())],
-        "delete then reply, in that order: {:?}",
-        harness.recorder.calls()
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn two_consecutive_failures_stop_the_surface_for_the_session() {
-    let (capture, _guard) = capture();
-    let harness = start_with(
-        Offers::default(),
-        ProgressDetail::Plain,
-        liveness(false),
-        Duration::ZERO,
-        None,
-    );
-    harness.recorder.refuse_progress.store(3, Ordering::Relaxed);
-    harness.sink.emit(started());
-    for turn in 1..=3 {
-        harness.sink.emit(answered_with_tool(turn));
+    let streamed = Call::Stream(text.as_str().to_owned());
+    let reply = Call::Reply("done".to_owned());
+    for (in_flight, expected) in [
+        (
+            true,
+            vec![streamed.clone(), Call::StreamDiscard, reply.clone()],
+        ),
+        (
+            false,
+            vec![
+                streamed.clone(),
+                streamed.clone(),
+                Call::StreamDiscard,
+                reply.clone(),
+            ],
+        ),
+    ] {
+        let offers = if in_flight {
+            Offers {
+                stream: true,
+                typing: false,
+                status: false,
+                reaction: false,
+                ..Offers::default()
+            }
+        } else {
+            Offers {
+                stream: true,
+                ..Offers::default()
+            }
+        };
+        let mut harness = start(offers, ProgressDetail::Off, liveness(true));
+        if in_flight {
+            harness.recorder.slow_post.store(1, Ordering::Relaxed);
+        }
+        harness.sink.emit(started());
+        let delta = || ProgressEvent::TextDelta {
+            turn: 1,
+            text: text.clone(),
+            cumulative_chars: text.as_str().chars().count(),
+        };
+        harness.sink.emit(delta());
         settle().await;
+        harness.sink.emit(ProgressEvent::Steered { turn: 1 });
+        if in_flight {
+            advance(Duration::from_millis(500)).await;
+        } else {
+            harness.sink.emit(delta());
+            advance(Duration::from_secs(2)).await;
+        }
+        assert!(
+            harness
+                .policy
+                .terminal(Terminal::Answered(OutboundReply::text("done")))
+                .await,
+            "stream post in flight: {in_flight}"
+        );
+        let calls: Vec<_> = harness
+            .recorder
+            .calls()
+            .into_iter()
+            .filter(|call| !matches!(call, Call::Reaction(_) | Call::Typing | Call::Status(_)))
+            .collect();
+        assert_eq!(calls, expected, "stream post in flight: {in_flight}");
     }
-
-    assert!(
-        harness.recorder.texts().is_empty(),
-        "two refusals trip the rung, so the third call is never made: {:?}",
-        harness.recorder.calls()
-    );
-    assert_eq!(
-        harness.recorder.refuse_progress.load(Ordering::Relaxed),
-        1,
-        "one injected refusal was left unspent, which is the call that was not attempted"
-    );
-    let degraded = events_named(&capture, "gateway_progress_degraded");
-    assert_eq!(
-        degraded.len(),
-        1,
-        "the rung stops once and says so once: {degraded:?}"
-    );
-    assert!(
-        degraded[0].contains("primitive=\"progress\"")
-            && degraded[0].contains("category=\"response\""),
-        "the record names the rung that stopped and the cause that stopped it: {degraded:?}"
-    );
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_creating_post_that_misses_its_deadline_stops_the_surface_at_the_first_failure() {
-    let (capture, _guard) = capture();
-    let harness = start_with(
-        Offers::default(),
-        ProgressDetail::Plain,
-        liveness(false),
-        Duration::ZERO,
-        None,
-    );
-    harness.recorder.stall_progress.store(1, Ordering::Relaxed);
-    harness.sink.emit(started());
-    harness.sink.emit(answered_with_tool(1));
-    settle().await;
-    advance(CALL_DEADLINE + Duration::from_secs(1)).await;
-
-    harness.sink.emit(answered_with_tool(2));
-    settle().await;
-    assert_eq!(
-        harness.recorder.post_attempts.load(Ordering::Relaxed),
-        1,
-        "a second trigger posted beside a message that may already exist: {:?}",
-        harness.recorder.calls()
-    );
-    let degraded = events_named(&capture, "gateway_progress_degraded");
-    assert_eq!(
-        degraded.len(),
-        1,
-        "one miss on a creating call is the whole budget: {degraded:?}"
-    );
-    assert!(
-        degraded[0].contains("primitive=\"progress\"")
-            && degraded[0].contains("category=\"deadline\""),
-        "the record says the deadline stopped it, not a refusal: {degraded:?}"
-    );
+async fn a_refused_finalize_deletes_the_surface_but_one_that_missed_its_deadline_does_not() {
+    let reply = || Call::Reply("the answer".to_owned());
+    for (refused, tail) in [(true, vec![Call::Delete, reply()]), (false, vec![reply()])] {
+        let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+        harness.sink.emit(started());
+        harness.sink.emit(answered_with_tool(1));
+        settle().await;
+        if refused {
+            harness.recorder.refuse_finalize.store(1, Ordering::Relaxed);
+        } else {
+            harness.recorder.stall_finalize.store(1, Ordering::Relaxed);
+        }
+        let delivered = harness
+            .policy
+            .terminal(Terminal::Answered(OutboundReply::text("the answer")))
+            .await;
+        assert!(
+            delivered,
+            "refused: {refused}: the fallback is what delivered it"
+        );
+        let writes = harness.recorder.writes();
+        assert!(
+            matches!(writes[0], Call::Post(_)),
+            "refused: {refused}: {writes:?}"
+        );
+        assert_eq!(&writes[1..], tail, "refused: {refused}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_finalize_that_misses_its_deadline_replies_rather_than_deleting_the_surface() {
-    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
-    harness.sink.emit(started());
-    harness.sink.emit(answered_with_tool(1));
-    settle().await;
-    harness.recorder.stall_finalize.store(1, Ordering::Relaxed);
-
-    let delivered = harness
-        .policy
-        .terminal(Terminal::Answered(OutboundReply::text("the answer")))
-        .await;
-
-    assert!(delivered, "the fallback reply is what delivered it");
-    let writes = harness.recorder.writes();
-    assert!(
-        !writes.contains(&Call::Delete),
-        "a finalize that may have landed must not have its message deleted: {writes:?}"
-    );
-    assert_eq!(
-        writes.last(),
-        Some(&Call::Reply("the answer".to_owned())),
-        "the answer is posted beside the surface instead: {writes:?}"
-    );
+async fn two_refusals_or_one_missed_creating_deadline_stop_the_surface_for_the_session() {
+    for (refused, category) in [(true, "response"), (false, "deadline")] {
+        let (capture, _guard) = capture();
+        let harness = start_with(
+            Offers::default(),
+            ProgressDetail::Plain,
+            liveness(false),
+            Duration::ZERO,
+            None,
+        );
+        harness.sink.emit(started());
+        if refused {
+            harness.recorder.refuse_progress.store(3, Ordering::Relaxed);
+            for turn in 1..=3 {
+                harness.sink.emit(answered_with_tool(turn));
+                settle().await;
+            }
+            assert!(
+                harness.recorder.texts().is_empty(),
+                "two refusals trip the rung, so the third call is never made: {:?}",
+                harness.recorder.calls()
+            );
+            assert_eq!(
+                harness.recorder.refuse_progress.load(Ordering::Relaxed),
+                1,
+                "one injected refusal was left unspent, which is the call that was not attempted"
+            );
+        } else {
+            harness.recorder.stall_progress.store(1, Ordering::Relaxed);
+            harness.sink.emit(answered_with_tool(1));
+            settle().await;
+            advance(CALL_DEADLINE + Duration::from_secs(1)).await;
+            harness.sink.emit(answered_with_tool(2));
+            settle().await;
+            assert_eq!(
+                harness.recorder.post_attempts.load(Ordering::Relaxed),
+                1,
+                "a second trigger posted beside a message that may already exist: {:?}",
+                harness.recorder.calls()
+            );
+        }
+        let degraded = events_named(&capture, "gateway_progress_degraded");
+        assert_eq!(degraded.len(), 1, "{category}: {degraded:?}");
+        assert!(
+            degraded[0].contains("primitive=\"progress\"")
+                && degraded[0].contains(&format!("category=\"{category}\"")),
+            "the record names the rung and the cause that stopped it: {degraded:?}"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -2370,31 +2192,37 @@ async fn a_stop_after_the_loop_sealed_leaves_the_answer_as_the_only_terminal_wri
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_wall_clock_budget_cancels_the_session_from_started() {
-    let harness = start_with(
-        Offers::default(),
-        ProgressDetail::Plain,
-        liveness(false),
-        Duration::from_secs(3),
-        Some(Duration::from_secs(30)),
-    );
-    harness.sink.emit(started());
-    settle().await;
+async fn the_wall_clock_budget_cancels_the_session_from_the_first_started() {
+    for restarted in [false, true] {
+        let harness = start_with(
+            Offers::default(),
+            ProgressDetail::Plain,
+            liveness(false),
+            Duration::from_secs(3),
+            Some(Duration::from_secs(30)),
+        );
+        harness.sink.emit(started());
+        settle().await;
 
-    advance(Duration::from_secs(20)).await;
-    assert!(
-        harness.cancellation.source().is_none(),
-        "the budget must not fire before it is spent"
-    );
+        advance(Duration::from_secs(20)).await;
+        assert!(
+            harness.cancellation.source().is_none(),
+            "restarted: {restarted}: the budget must not fire before it is spent"
+        );
+        if restarted {
+            harness.sink.emit(started());
+            settle().await;
+        }
 
-    advance(Duration::from_secs(11)).await;
-    assert_eq!(
-        harness.cancellation.source(),
-        Some(CancelSource::Budget {
-            limit: BudgetLimit::WallClock
-        }),
-        "the wall-clock budget cancels with its own origin"
-    );
+        advance(Duration::from_secs(11)).await;
+        assert_eq!(
+            harness.cancellation.source(),
+            Some(CancelSource::Budget {
+                limit: BudgetLimit::WallClock
+            }),
+            "restarted: {restarted}: the original deadline has fired by 31 seconds"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -2441,53 +2269,6 @@ async fn an_answer_one_millisecond_before_the_deadline_writes_no_stop() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_second_started_keeps_the_wall_clock_deadline() {
-    let harness = start_with(
-        Offers::default(),
-        ProgressDetail::Plain,
-        liveness(false),
-        Duration::from_secs(3),
-        Some(Duration::from_secs(30)),
-    );
-    harness.sink.emit(started());
-    settle().await;
-
-    advance(Duration::from_secs(20)).await;
-    harness.sink.emit(started());
-    settle().await;
-
-    advance(Duration::from_secs(11)).await;
-    assert_eq!(
-        harness.cancellation.source(),
-        Some(CancelSource::Budget {
-            limit: BudgetLimit::WallClock
-        }),
-        "the original deadline has fired by 31 seconds"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_failed_session_removes_the_surface_and_replies_the_fixed_line() {
-    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
-    harness.sink.emit(started());
-    harness.sink.emit(answered_with_tool(1));
-    settle().await;
-
-    let delivered = harness
-        .policy
-        .terminal(Terminal::Failed(FAILURE_REPLY.to_owned()))
-        .await;
-    assert!(delivered);
-    let writes = harness.recorder.writes();
-    assert_eq!(
-        writes[writes.len() - 2..].to_vec(),
-        vec![Call::Delete, Call::Reply(FAILURE_REPLY.to_owned())],
-        "the surface is removed before the sentence replaces it: {:?}",
-        harness.recorder.calls()
-    );
-}
-
-#[tokio::test(start_paused = true)]
 async fn detail_off_renders_typing_status_and_reaction_and_nothing_else() {
     let harness = start(Offers::default(), ProgressDetail::Off, additive(ticking()));
     harness.sink.emit(started());
@@ -2513,7 +2294,7 @@ async fn detail_off_renders_typing_status_and_reaction_and_nothing_else() {
 }
 
 #[test]
-fn detail_levels_differ_only_by_the_counters_they_append() {
+fn a_tool_line_appends_counters_only_when_detailed_and_shortens_a_long_word() {
     let templates = templates();
     let mut state = RenderState {
         turn: 2,
@@ -2525,27 +2306,31 @@ fn detail_levels_differ_only_by_the_counters_they_append() {
         note: None,
     };
     state.set_word("gpt-image");
-
-    assert_eq!(
-        templates.tool(ProgressDetail::Plain, &state).as_str(),
-        "Running gpt-image…"
-    );
-    assert_eq!(
-        templates.tool(ProgressDetail::Detailed, &state).as_str(),
-        "Running gpt-image… · turn 2 of 8 · 3 of 16 calls · 41 s"
-    );
-}
-
-#[test]
-fn a_long_command_word_is_shortened_before_it_is_rendered() {
-    let mut state = RenderState::default();
-    state.set_word(&"x".repeat(100));
-    let rendered = templates().tool(ProgressDetail::Plain, &state);
-    assert_eq!(
-        rendered.as_str(),
-        format!("Running {}……", "x".repeat(32)),
-        "thirty-two characters and a marker, never the whole word"
-    );
+    let mut long = RenderState::default();
+    long.set_word(&"x".repeat(100));
+    for (detail, state, expected) in [
+        (
+            ProgressDetail::Plain,
+            &state,
+            "Running gpt-image…".to_owned(),
+        ),
+        (
+            ProgressDetail::Detailed,
+            &state,
+            "Running gpt-image… · turn 2 of 8 · 3 of 16 calls · 41 s".to_owned(),
+        ),
+        (
+            ProgressDetail::Plain,
+            &long,
+            format!("Running {}……", "x".repeat(32)),
+        ),
+    ] {
+        assert_eq!(
+            templates.tool(detail, state).as_str(),
+            expected,
+            "{detail:?}"
+        );
+    }
 }
 
 #[test]
@@ -2619,17 +2404,16 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
                 panic!("message")
             };
             let (mut policy, sink) = ProgressPolicy::start(ProgressInputs {
-                driver: transport.driver(),
                 target: inbound.liveness.clone(),
                 reply: inbound.reply.clone(),
                 transport: "dev".to_owned(),
-                detail: ProgressDetail::Plain,
-                settings: config.settings,
-                keep_alive: config.keep_alive.clone(),
-                liveness: config,
-                cancellation: SessionCancellation::new(),
-                max_duration: None,
-                silent_until_success: false,
+                ..inputs(
+                    transport.driver(),
+                    ProgressDetail::Plain,
+                    config,
+                    SessionCancellation::new(),
+                    None,
+                )
             });
             sink.emit(started());
             if stream {

@@ -1844,8 +1844,6 @@ async fn a_stop_word_cancels_the_session_running_in_that_conversation() {
         "the word reached the gateway but stopped no session: {:?}",
         audit.records()
     );
-    // Every stop origin, native, button, operator shutdown, or wall-clock bound, writes the same
-    // record; via is the only field that shows a person typed the word.
     let requested = audit
         .records()
         .into_iter()
