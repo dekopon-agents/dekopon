@@ -351,13 +351,93 @@ async fn probe_registry(limits: BrokerHostLimits) -> BrokerProviderRegistry {
         .expect("cli-probe provider fixture loads")
 }
 
+struct TestBroker {
+    registry: BrokerProviderRegistry,
+    policy: PolicyEngine,
+    constraints: ConstraintCatalog,
+    identities: IdentityDirectory,
+    audit: Arc<InMemoryAuditLog>,
+}
+
+impl TestBroker {
+    fn new(
+        registry: BrokerProviderRegistry,
+        policy: PolicyEngine,
+        constraints: ConstraintCatalog,
+    ) -> Self {
+        Self {
+            registry,
+            policy,
+            constraints,
+            identities: callers(["caller"]),
+            audit: Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
+        }
+    }
+
+    async fn cli_probe_upper<'a>(principals: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::new(
+            probe_registry(BrokerHostLimits::default()).await,
+            probe_engine(
+                &probe_policy("caller", "provider-test", "cli-probe.upper"),
+                principals,
+            ),
+            catalog([(
+                "cli-probe.upper",
+                set("cli-probe", ExecutionConstraints::default()),
+            )]),
+        )
+    }
+
+    fn with_identities(mut self, identities: IdentityDirectory) -> Self {
+        self.identities = identities;
+        self
+    }
+
+    fn with_audit(mut self, audit: &Arc<InMemoryAuditLog>) -> Self {
+        self.audit = Arc::clone(audit);
+        self
+    }
+
+    fn with_audit_capacity(mut self, capacity: usize) -> Self {
+        self.audit = Arc::new(InMemoryAuditLog::new(capacity).expect("valid audit bound"));
+        self
+    }
+
+    fn build(self) -> Result<Broker<InMemoryAuditLog>, BrokerBuildError> {
+        Broker::new(
+            self.registry,
+            principal("broker-test"),
+            self.policy,
+            self.constraints,
+            self.identities,
+            self.audit,
+            BrokerLimits::default(),
+        )
+    }
+
+    fn start(
+        self,
+        leniency: Leniency,
+    ) -> Result<(Broker<InMemoryAuditLog>, Vec<StartupWarning>), BrokerBuildError> {
+        Broker::start(
+            self.registry,
+            principal("broker-test"),
+            self.policy,
+            self.constraints,
+            self.identities,
+            self.audit,
+            BrokerLimits::default(),
+            leniency,
+        )
+    }
+}
+
 async fn attested_broker(
     identities: IdentityDirectory,
     audit: Arc<InMemoryAuditLog>,
 ) -> Broker<InMemoryAuditLog> {
-    Broker::new(
+    TestBroker::new(
         probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
         probe_engine(
             &format!(
                 "{}\n{}\n{}\n{}\n{}",
@@ -380,35 +460,21 @@ async fn attested_broker(
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        identities,
-        audit,
-        BrokerLimits::default(),
     )
+    .with_identities(identities)
+    .with_audit(&audit)
+    .build()
     .expect("attested policy is coherent")
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_authorizes_and_audits_no_payloads() {
-    let registry = probe_registry(BrokerHostLimits::default()).await;
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
-    let broker = Broker::new(
-        registry,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
-        probe_engine(
-            &probe_policy("caller", "provider-test", "cli-probe.upper"),
-            ["caller"],
-        ),
-        catalog([(
-            "cli-probe.upper",
-            set("cli-probe", ExecutionConstraints::default()),
-        )]),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("the policy matches loaded provider metadata");
+    let broker = TestBroker::cli_probe_upper(["caller"])
+        .await
+        .with_audit(&audit)
+        .build()
+        .expect("the policy matches loaded provider metadata");
 
     let result = invoke_as(
         &broker,
@@ -446,11 +512,8 @@ async fn policy_authorizes_and_audits_no_payloads() {
 async fn unmatched_identity_is_denied_before_provider_execution() {
     let registry = probe_registry(BrokerHostLimits::default()).await;
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
         probe_engine(
             &format!(
                 "{}\n{}",
@@ -463,10 +526,10 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        callers(["allowed-caller", "other-caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
     )
+    .with_identities(callers(["allowed-caller", "other-caller"]))
+    .with_audit(&audit)
+    .build()
     .expect("policy is coherent");
 
     let allowed = broker.capabilities(&session("allowed-caller", "provider-test"));
@@ -509,21 +572,15 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
 async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
     dekopon_broker_host::enable_test_component_memoization();
     let registry = probe_registry(BrokerHostLimits::default()).await;
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let error = Broker::new(
+    let error = TestBroker::new(
         registry,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
         probe_engine("", ["caller"]),
         catalog([(
             "cli-probe.upper",
             set("different-provider", ExecutionConstraints::default()),
         )]),
-        callers(["caller"]),
-        audit,
-        BrokerLimits::default(),
     )
+    .build()
     .expect_err("trusted provider mismatch must fail broker construction");
     assert!(matches!(error, BrokerBuildError::ProviderMismatch { .. }));
 
@@ -532,12 +589,8 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
         ..BrokerHostLimits::default()
     })
     .await;
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let error = Broker::new(
+    let error = TestBroker::new(
         registry,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
         probe_engine("", ["caller"]),
         catalog([(
             "cli-probe.upper",
@@ -549,10 +602,8 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
                 },
             ),
         )]),
-        callers(["caller"]),
-        audit,
-        BrokerLimits::default(),
     )
+    .build()
     .expect_err("constraints cannot exceed the independent host timeout");
     assert!(matches!(error, BrokerBuildError::HostConstraint { .. }));
 
@@ -562,12 +613,8 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
     )
     .await
     .expect("checked HTTP provider loads");
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let error = Broker::new(
+    let error = TestBroker::new(
         registry,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
         engine(
             "",
             ["caller"],
@@ -580,10 +627,8 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             "http-probe.conditional-write",
             set("http-probe", ExecutionConstraints::default()),
         )]),
-        callers(["caller"]),
-        audit,
-        BrokerLimits::default(),
     )
+    .build()
     .expect_err("external-write metadata cannot be downgraded to read-only");
     assert!(matches!(
         error,
@@ -660,15 +705,13 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
                 && !(context.request.url has query)
                 && context.request.body.thread_ts == "1" };"#
     );
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        principal("broker-test"),
         http_probe_engine(&policies),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        callers(["caller"]),
-        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
-        BrokerLimits::default(),
     )
+    .with_audit_capacity(32)
+    .build()
     .expect("request forbid loads");
     let capture = CaptureLayer::new();
     for (id, uri, method, content_type, body) in [
@@ -972,15 +1015,13 @@ async fn request_body_fences_read_decide_and_canvas_bodies_and_deny_an_opaque_on
             when { context has request }
             when { context.request.url.path == "/api/blocked" };"#
     );
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        principal("broker-test"),
         http_probe_engine(&policies),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        callers(["caller"]),
-        Arc::new(InMemoryAuditLog::new(64).expect("audit")),
-        BrokerLimits::default(),
     )
+    .with_audit_capacity(64)
+    .build()
     .expect("body fences load");
     let capture = CaptureLayer::new();
     for (id, path, body, admitted) in [
@@ -1153,18 +1194,16 @@ async fn request_audit_sink_failure_is_reported_and_denied_before_dns() {
     )
     .await
     .expect("HTTP provider loads");
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        principal("broker-test"),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([(
             "http-probe.fetch",
             set("http-probe", loopback_constraints("no-such-egress.invalid")),
         )]),
-        callers(["caller"]),
-        Arc::new(InMemoryAuditLog::new(1).expect("one invocation decision")),
-        BrokerLimits::default(),
     )
+    .with_audit_capacity(1)
+    .build()
     .expect("broker loads");
     let capture = CaptureLayer::new();
     let result = invoke_as(
@@ -1242,15 +1281,12 @@ async fn a_response_over_max_response_bytes_tells_the_model_byte_limit() {
         .as_mut()
         .expect("HTTP grant")
         .max_response_bytes = 128;
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        principal("broker-test"),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        callers(["caller"]),
-        Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
-        BrokerLimits::default(),
     )
+    .build()
     .expect("HTTP constraints match the provider and host ceilings");
     let result = invoke_as(
         &broker,
@@ -1313,17 +1349,13 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
         secret_use: None,
     };
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
     )
+    .with_audit(&audit)
+    .build()
     .expect("the HTTP constraint set matches trusted metadata and host ceilings");
 
     let result = invoke_as(
@@ -1401,15 +1433,13 @@ async fn a_request_template_pins_the_attested_conversation_and_needs_a_chat_scop
         .expect("template fixture"),
     ];
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        principal("broker-test"),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
     )
+    .with_audit(&audit)
+    .build()
     .expect("a templated HTTP constraint set is coherent");
     let fetch = |id: &str| {
         request(
@@ -1520,9 +1550,8 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
             .expect("HTTP constraints")
             .allowed_methods = vec!["DELETE".to_owned()];
         let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-        let broker = Broker::new(
+        let broker = TestBroker::new(
             registry,
-            principal("broker-test"),
             engine(
                 &provider_policy("caller", "provider-test", "http-probe", "http-probe.purge"),
                 ["caller"],
@@ -1546,10 +1575,9 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
                     ),
                 ),
             ]),
-            callers(["caller"]),
-            Arc::clone(&audit),
-            BrokerLimits::default(),
         )
+        .with_audit(&audit)
+        .build()
         .expect("the external-write constraint set exactly matches trusted provider metadata");
         if expected == Succeeded {
             let available = broker.capabilities(&session("caller", "provider-test"));
@@ -1711,18 +1739,16 @@ async fn a_chatgpt_default_carries_its_account_header_once_per_invocation_outsid
     let authority = server.authority().to_owned();
     let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        principal("broker-test"),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([(
             "http-probe.fetch",
             defaulted(&authority, "drn:secret:chatgpt/gpt-image"),
         )]),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
     )
+    .with_audit(&audit)
+    .build()
     .expect("broker")
     .with_secret_catalog(
         SecretCatalog::new(
@@ -1802,20 +1828,17 @@ async fn an_http_bot_default_injects_a_bot_authorization_header() {
     if let Some(default) = set.default_secret_use.as_mut() {
         default.sink = dekopon_broker::DefaultSecretSink::HttpBot;
     }
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         BrokerProviderRegistry::load(
             [provider_fixture("http-probe-provider.wasm")],
             BrokerHostLimits::default(),
         )
         .await
         .expect("HTTP provider fixture loads"),
-        principal("broker-test"),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set)]),
-        callers(["caller"]),
-        Arc::new(InMemoryAuditLog::new(4).expect("audit")),
-        BrokerLimits::default(),
     )
+    .build()
     .expect("broker")
     .with_secret_catalog(
         SecretCatalog::new(
@@ -1865,14 +1888,13 @@ async fn a_drn_that_is_not_the_agents_effective_default_needs_an_owner_grant() {
     );
     let authority = server.authority().to_owned();
     let drn = |value: &str| value.parse::<SecretDrn>().expect("secret DRN");
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         BrokerProviderRegistry::load(
             [provider_fixture("http-probe-provider.wasm")],
             BrokerHostLimits::default(),
         )
         .await
         .expect("HTTP provider fixture loads"),
-        principal("broker-test"),
         http_probe_engine(&format!(
             "{}\n{}",
             http_policy("caller", "ville-github", "http-probe.fetch"),
@@ -1884,10 +1906,9 @@ async fn a_drn_that_is_not_the_agents_effective_default_needs_an_owner_grant() {
                 std::collections::BTreeMap::from([(drn(APP_VILLE), drn(PAT_CHAT))]),
             )]),
         ),
-        callers(["caller"]),
-        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
-        BrokerLimits::default(),
     )
+    .with_audit_capacity(16)
+    .build()
     .expect("broker")
     .with_secret_catalog(
         SecretCatalog::new(
@@ -1998,20 +2019,17 @@ async fn a_default_or_swap_target_without_exactly_one_binding_refuses_the_catalo
                 std::collections::BTreeMap::from([(drn(APP_VILLE), drn(PAT_CHAT))]),
             )]));
         }
-        let error = Broker::new(
+        let error = TestBroker::new(
             BrokerProviderRegistry::load(
                 [provider_fixture("http-probe-provider.wasm")],
                 BrokerHostLimits::default(),
             )
             .await
             .expect("HTTP provider fixture loads"),
-            principal("broker-test"),
             http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
             constraints,
-            callers(["caller"]),
-            Arc::new(InMemoryAuditLog::new(4).expect("audit")),
-            BrokerLimits::default(),
         )
+        .build()
         .expect("broker")
         .with_secret_catalog(
             SecretCatalog::new(bindings, Arc::new(StaticSecretResolver(b"unused")))
@@ -2073,15 +2091,12 @@ async fn a_default_or_a_proposal_equal_to_it_needs_no_grant_but_still_needs_the_
                 sink: DefaultSecretSink::HttpBearer,
             });
         }
-        let broker = Broker::new(
+        let broker = TestBroker::new(
             registry,
-            principal("broker-test"),
             http_probe_secret_engine(&format!("{capability_policy}\n{secret_policy}")),
             catalog([("http-probe.fetch", set)]),
-            callers(["caller"]),
-            Arc::new(InMemoryAuditLog::new(4).unwrap()),
-            BrokerLimits::default(),
         )
+        .build()
         .unwrap()
         .with_secret_catalog(
             SecretCatalog::new(
@@ -2190,18 +2205,16 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
                && context.sink == "httpBearer" };"#,
     );
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        principal("broker-test"),
         http_probe_secret_engine(&policy),
         catalog([(
             "http-probe.fetch",
             set("http-probe", loopback_constraints(&authority)),
         )]),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
     )
+    .with_audit(&audit)
+    .build()
     .expect("broker")
     .with_secret_catalog(
         SecretCatalog::new(
@@ -2290,9 +2303,8 @@ async fn secret_policy_denial_and_source_failure_have_distinct_audited_outcomes(
         .await
         .expect("HTTP provider fixture loads");
         let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
-        let broker = Broker::new(
+        let broker = TestBroker::new(
             registry,
-            principal("broker-test"),
             http_probe_secret_engine(&format!(
                 "{}\n{policy}",
                 http_policy("caller", "provider-test", "http-probe.fetch")
@@ -2301,10 +2313,9 @@ async fn secret_policy_denial_and_source_failure_have_distinct_audited_outcomes(
                 "http-probe.fetch",
                 set("http-probe", loopback_constraints("127.0.0.1:9")),
             )]),
-            callers(["caller"]),
-            Arc::clone(&audit),
-            BrokerLimits::default(),
         )
+        .with_audit(&audit)
+        .build()
         .expect("broker")
         .with_secret_catalog(
             SecretCatalog::new(
@@ -2388,18 +2399,16 @@ fn basic_secret_broker(
                && context.provider == "http-probe"
                && context.sink == "httpBasic" };"#,
     );
-    Broker::new(
+    TestBroker::new(
         registry,
-        principal("broker-test"),
         http_probe_secret_engine(&policy),
         catalog([(
             "http-probe.fetch",
             set("http-probe", loopback_constraints(authority)),
         )]),
-        callers(["caller"]),
-        Arc::clone(audit),
-        BrokerLimits::default(),
     )
+    .with_audit(audit)
+    .build()
     .expect("broker")
     .with_secret_catalog(
         SecretCatalog::new(
@@ -2551,9 +2560,8 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
     use tracing_subscriber::layer::SubscriberExt as _;
 
     let audit = Arc::new(InMemoryAuditLog::new(16).expect("valid audit bound"));
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
         probe_engine(
             &format!(
                 "{}\n{}\n{}",
@@ -2573,10 +2581,10 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
                 set("cli-probe", ExecutionConstraints::default()),
             ),
         ]),
-        directory([(SLACK_SUBJECT, "cpetersen")]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
     )
+    .with_identities(directory([(SLACK_SUBJECT, "cpetersen")]))
+    .with_audit(&audit)
+    .build()
     .expect("an unconditional grant and an attested grant coexist in one policy set");
 
     let gateway = service_context(GATEWAY);
@@ -3362,9 +3370,8 @@ fn identity_directory_rejects_duplicates_and_resolves_exactly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
-    let error = Broker::new(
+    let error = TestBroker::new(
         probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.reverse"),
             ["caller"],
@@ -3373,10 +3380,8 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        callers(["caller"]),
-        Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
-        BrokerLimits::default(),
     )
+    .build()
     .expect_err("a grant nothing knows how to execute must refuse startup");
     assert!(matches!(
         error,
@@ -3393,19 +3398,16 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
         ),
     ] {
         let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-        let (broker, warnings) = Broker::start(
+        let (broker, warnings) = TestBroker::new(
             probe_registry(BrokerHostLimits::default()).await,
-            principal("broker-test"),
             probe_engine(&policy, ["caller"]),
             catalog([(
                 "cli-probe.upper",
                 set("cli-probe", ExecutionConstraints::default()),
             )]),
-            callers(["caller"]),
-            Arc::clone(&audit),
-            BrokerLimits::default(),
-            leniency,
         )
+        .with_audit(&audit)
+        .start(leniency)
         .expect("an unnamed or tolerated unexecutable grant starts");
         if leniency == Leniency::Tolerant {
             assert_eq!(warnings.len(), 2, "{warnings:?}");
@@ -3453,9 +3455,8 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
         probe_engine(
             &format!(
                 "{}\n{}",
@@ -3468,10 +3469,10 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        callers(["caller", "other-caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
     )
+    .with_identities(callers(["caller", "other-caller"]))
+    .with_audit(&audit)
+    .build()
     .expect("the named policy validates");
     let digest = broker.policy_digest().to_owned();
     assert!(digest.starts_with("sha256:"));
@@ -3537,18 +3538,15 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
         ),
     ];
 
-    let error = Broker::new(
+    let error = TestBroker::new(
         probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
         catalog(unrouted.clone()),
-        callers(["caller"]),
-        Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
-        BrokerLimits::default(),
     )
+    .build()
     .expect_err("strict startup refuses a set naming no loaded route");
     assert!(matches!(
         error,
@@ -3556,19 +3554,15 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
             if capability.as_str() == "gh.pull-request.read"
     ));
 
-    let (broker, warnings) = Broker::start(
+    let (broker, warnings) = TestBroker::new(
         probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
         catalog(unrouted),
-        callers(["caller"]),
-        Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
-        BrokerLimits::default(),
-        Leniency::Tolerant,
     )
+    .start(Leniency::Tolerant)
     .expect("tolerating an unrouted constraint set starts");
 
     assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -3596,23 +3590,11 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
 #[tokio::test(flavor = "multi_thread")]
 async fn command_words_are_filtered_by_policy_and_unknown_words_are_refused() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let (broker, _) = Broker::start(
-        probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
-        probe_engine(
-            &probe_policy("caller", "provider-test", "cli-probe.upper"),
-            ["caller", "stranger"],
-        ),
-        catalog([(
-            "cli-probe.upper",
-            set("cli-probe", ExecutionConstraints::default()),
-        )]),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-        Leniency::Strict,
-    )
-    .expect("broker starts");
+    let (broker, _) = TestBroker::cli_probe_upper(["caller", "stranger"])
+        .await
+        .with_audit(&audit)
+        .start(Leniency::Strict)
+        .expect("broker starts");
 
     assert_eq!(
         broker.command_words(&session("caller", "provider-test")),
@@ -3652,23 +3634,11 @@ async fn command_words_are_filtered_by_policy_and_unknown_words_are_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_installed_but_ungranted_word_renders_only_its_word_at_exit_127() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let (broker, _) = Broker::start(
-        probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
-        probe_engine(
-            &probe_policy("caller", "provider-test", "cli-probe.upper"),
-            ["caller", "stranger"],
-        ),
-        catalog([(
-            "cli-probe.upper",
-            set("cli-probe", ExecutionConstraints::default()),
-        )]),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-        Leniency::Strict,
-    )
-    .expect("broker starts");
+    let (broker, _) = TestBroker::cli_probe_upper(["caller", "stranger"])
+        .await
+        .with_audit(&audit)
+        .start(Leniency::Strict)
+        .expect("broker starts");
     let stranger = session("stranger", "provider-test");
     for argv in [
         vec!["--help".to_owned()],
@@ -3696,23 +3666,11 @@ async fn an_installed_but_ungranted_word_renders_only_its_word_at_exit_127() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_command_word_is_refused_without_running_anything() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let (broker, _) = Broker::start(
-        probe_registry(BrokerHostLimits::default()).await,
-        principal("broker-test"),
-        probe_engine(
-            &probe_policy("caller", "provider-test", "cli-probe.upper"),
-            ["caller"],
-        ),
-        catalog([(
-            "cli-probe.upper",
-            set("cli-probe", ExecutionConstraints::default()),
-        )]),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-        Leniency::Strict,
-    )
-    .expect("broker starts");
+    let (broker, _) = TestBroker::cli_probe_upper(["caller"])
+        .await
+        .with_audit(&audit)
+        .start(Leniency::Strict)
+        .expect("broker starts");
 
     let error = broker
         .run_command(
@@ -3745,9 +3703,8 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
     .await
     .expect("cli-probe fixture loads");
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    let (broker, _) = Broker::start(
+    let (broker, _) = TestBroker::new(
         registry,
-        principal("broker-test"),
         probe_engine(
             &probe_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
@@ -3756,11 +3713,9 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        callers(["caller"]),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-        Leniency::Strict,
     )
+    .with_audit(&audit)
+    .start(Leniency::Strict)
     .expect("broker starts");
     let caller = session("caller", "provider-test");
 
@@ -3852,18 +3807,17 @@ async fn a_spaces_request_forbid_stops_http_before_the_network() {
     let policy = r#"@id("both") permit(principal, action, resource);
         @id("space-request") forbid(principal == Dekopon::Principal::"space", action == Dekopon::Action::"http-probe.fetch", resource) when { context has request };"#;
     let audit = Arc::new(InMemoryAuditLog::new(32).expect("audit"));
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        principal("broker-test"),
         PolicyEngine::new(policy, &world).expect("policy"),
         catalog([(
             "http-probe.fetch",
             set("http-probe", loopback_constraints(server.authority())),
         )]),
-        IdentityDirectory::new(mappings).expect("directory"),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
     )
+    .with_identities(IdentityDirectory::new(mappings).expect("directory"))
+    .with_audit(&audit)
+    .build()
     .expect("broker");
     let claim = Attestation::for_chat(
         dekopon_core::AttestedSubject::one(subject(SLACK_SUBJECT)).expect("one-form subject"),
@@ -3942,18 +3896,17 @@ async fn a_space_only_policy_error_records_its_id() {
     let policy = r#"@id("both") permit(principal, action, resource);
         @id("space-error") forbid(principal == Dekopon::Principal::"space", action == Dekopon::Action::"http-probe.fetch", resource) when { context has request } when { 9223372036854775807 + 1 > 0 };"#;
     let audit = Arc::new(InMemoryAuditLog::new(32).expect("audit"));
-    let broker = Broker::new(
+    let broker = TestBroker::new(
         registry,
-        principal("broker-test"),
         PolicyEngine::new(policy, &world).expect("policy"),
         catalog([(
             "http-probe.fetch",
             set("http-probe", loopback_constraints(server.authority())),
         )]),
-        IdentityDirectory::new(mappings).expect("directory"),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
     )
+    .with_identities(IdentityDirectory::new(mappings).expect("directory"))
+    .with_audit(&audit)
+    .build()
     .expect("broker");
     let claim = Attestation::for_chat(
         dekopon_core::AttestedSubject::one(subject(SLACK_SUBJECT)).expect("one-form subject"),
