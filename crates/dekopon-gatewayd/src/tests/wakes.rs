@@ -639,15 +639,8 @@ echo "after $PREV""#;
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fired_wake_answers_in_its_conversation_attested_as_a_wake() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
-        directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("cli-probe.upper")],
-            Vec::new(),
-            BTreeMap::new(),
-        )],
-    )
-    .await;
+    let (broker, mut observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let store = wake_store(directory.path());
     let now = SystemTime::now();
     once(&store, "check the PR", now);
