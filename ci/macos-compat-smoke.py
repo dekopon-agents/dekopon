@@ -38,7 +38,7 @@ PR_REPLY = "PR metadata read passed."
 HTTP_DENIED_REPLY = "The broker refused the out-of-scope HTTP request."
 LEGACY_WRAPPER = "legacy-wrapper"
 ENV_FILE = "env-file"
-SECRET_FILES = ("broker-credentials.yaml", "credentials.env", "gateway.env")
+SECRET_FILES = ("broker-credentials.yaml", "secret-map.yaml", "broker-pat", "credentials.env", "gateway.env")
 
 
 def private_json(path, value):
@@ -104,9 +104,11 @@ def subjects(drn):
 subjects(False)
 
 
-def configure(root, port, gateway, slack_endpoint, mode, drn):
-    credentials = root / "broker-credentials.yaml"
-    credentials.write_text(f"""apiVersion: dekopon.dev/broker-credentials/v1alpha1
+def broker_secrets(root, port, drn):
+    """Checkout mode writes the secret map; tap mode feeds the released binary its credentials file."""
+    if not drn:
+        credentials = root / "broker-credentials.yaml"
+        credentials.write_text(f"""apiVersion: dekopon.dev/broker-credentials/v1alpha1
 credentials:
   - name: fixture-pat
     kind: bearerToken
@@ -114,8 +116,37 @@ credentials:
     destinations: ['127.0.0.1:{port}']
     secret: '{BROKER_PAT}'
 """, encoding="utf-8")
-    credentials.chmod(0o600)
-    private_files = [credentials]
+        credentials.chmod(0o600)
+        return [credentials], {"credentialsPath": "broker-credentials.yaml"}, {"credential": "fixture-pat"}
+    token = root / "broker-pat"
+    token.write_text(BROKER_PAT, encoding="utf-8")
+    token.chmod(0o600)
+    secret_map = root / "secret-map.yaml"
+    bindings = "".join(f"""      - id: fixture-pat-{index}
+        capabilities: [{capability}]
+        sink: httpBearer
+        allowedHosts: ['127.0.0.1:{port}']
+        allowedMethods: [GET]
+        allowedPaths: [{{ match: exact, path: {path} }}]
+""" for index, (capability, path) in enumerate((
+        ("jsonplaceholder.posts.get", "/posts/7"),
+        ("gh.pull-request.read", "/repos/fixture-owner/fixture-repo/pulls/7"),
+    )))
+    secret_map.write_text(f"""apiVersion: dekopon.dev/secret-map/v1alpha1
+mapRevision: smoke
+secrets:
+  - drn: drn:secret:fixture/pat
+    destinations: ['127.0.0.1:{port}']
+    source: {{ kind: secureFile, path: {token} }}
+    bindings:
+{bindings}""", encoding="utf-8")
+    secret_map.chmod(0o600)
+    default = {"defaultSecretUse": {"drn": "drn:secret:fixture/pat", "sink": "httpBearer"}}
+    return [token, secret_map], {"secretMapPath": "secret-map.yaml"}, default
+
+
+def configure(root, port, gateway, slack_endpoint, mode, drn):
+    private_files, secret_keys, secret_use = broker_secrets(root, port, drn)
     if mode == LEGACY_WRAPPER:
         environment = root / "credentials.env"
         environment.write_text(
@@ -154,7 +185,7 @@ exec {shlex.quote(str(gateway))} --worker-threads 2 --blocking-threads 8 \\
         "apiVersion": "dekopon.dev/brokerd/v1alpha1",
         "socketPath": str(root / "broker.sock"),
         "policiesPath": "policies.cedar",
-        "credentialsPath": "broker-credentials.yaml",
+        **secret_keys,
         "strict": True,
         "providers": ["provider.wasm", "gh-provider.wasm"],
         "identities": [{
@@ -172,7 +203,7 @@ exec {shlex.quote(str(gateway))} --worker-threads 2 --blocking-threads 8 \\
         "providerSettings": {name: {"baseUrl": f"http://127.0.0.1:{port}"} for name in ("jsonplaceholder", "gh")},
         "http": {"plaintextHosts": ["127.0.0.1"]},
         "capabilities": {"jsonplaceholder": {"capabilities": {
-            "jsonplaceholder.posts.get": {"credential": "fixture-pat", "constraints": {
+            "jsonplaceholder.posts.get": {**secret_use, "constraints": {
                 "timeoutMs": 10000,
                 "http": {
                     "allowedHosts": [f"127.0.0.1:{port}"], "allowedMethods": ["GET"],
@@ -182,7 +213,7 @@ exec {shlex.quote(str(gateway))} --worker-threads 2 --blocking-threads 8 \\
                 },
             }},
         }}, "gh": {"capabilities": {"gh.pull-request.read": {
-            "credential": "fixture-pat",
+            **secret_use,
             "constraints": {
                 "timeoutMs": 10000,
                 "http": {

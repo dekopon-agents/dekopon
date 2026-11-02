@@ -15,8 +15,7 @@ use std::{
 
 use dekopon_broker::{
     AttestorGrant, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
-    CredentialStore, IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld,
-    TraceOnlyAuditLog,
+    IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
@@ -347,12 +346,10 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
                     provider: "cli-probe".parse::<ProviderId>().expect("provider"),
                     effect: EffectKind::ReadOnly,
                     risk: RiskLevel::Low,
-                    credential: None,
                     constraints: ExecutionConstraints::default(),
                 },
             )])
             .expect("one capability builds a catalog"),
-            CredentialStore::empty(),
             IdentityDirectory::new([(
                 SUBJECT
                     .parse::<Subject>()

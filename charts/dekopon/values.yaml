@@ -53,7 +53,7 @@ podSecurityContext:
     # narrow this to a hand-written profile without proving a provider still loads.
     type: RuntimeDefault
   # fsGroup is deliberately absent, and setting it breaks the broker. It makes mounted files
-  # group-readable, and 0o040 trips the credentials file's `mode & 0o077 != 0` refusal.
+  # group-readable, and 0o040 trips the secret map's `mode & 0o077 != 0` refusal.
 
 securityContext:
   allowPrivilegeEscalation: false
@@ -86,7 +86,7 @@ initSecurityContext:
 #
 #   <configDir>/broker.yaml               0600 65532  (Tier B: mode & 0o022, uid, nlink, O_NOFOLLOW)
 #   <configDir>/policies.cedar            0600 65532  (Tier B)
-#   <configDir>/broker-credentials.yaml   0600 65532  (Tier A: mode & 0o077, uid, nlink)
+#   <configDir>/secret-map.yaml           0600 65532  (Tier A: mode & 0o077, uid, nlink)
 #   <gatewayConfigDir>/gatewayd.yaml      root-owned read-only Secret projection (gateway only)
 #   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
 #   <stateDir>/<chatgpt.subdir>/          0700 dir owned by its daemon; seed-once ChatGPT credential
@@ -152,7 +152,7 @@ broker:
   # The alternative to config and policies: a ConfigMap whose every *.yaml and *.cedar key becomes
   # a fragment in <paths.configDir>/broker.d, and the broker starts with --config on that
   # directory. broker.config.inline (clear the default), existingSecret and broker.policies must
-  # all be empty. credentials, secretMap and chatgpt still land as single files beside broker.d;
+  # all be empty. secretMap and chatgpt still land as single files beside broker.d;
   # a fragment names them by path. Nothing rolls the pod when the ConfigMap changes: annotate it
   # for Reloader.
   configDirectory:
@@ -169,18 +169,9 @@ broker:
     existingSecret: ""
     existingSecretKey: policies.cedar
 
-  # Provider credential bindings. This file and broker.privateFiles are broker-only secrets at
-  # rest, with the strictest permission rules. Leave both empty when broker.yaml names no
-  # credentialsPath. Prefer existingSecret: putting a token in a values file puts it in the
-  # release, in `helm get values`, and probably in Git.
-  credentials:
-    inline: ""
-    existingSecret: ""
-    existingSecretKey: broker-credentials.yaml
-
   # Seed a ChatGPT subscription credential for the BROKER once, and never again.
   #
-  # This is the `kind: chatgptSubscription` entry in broker-credentials.yaml: the broker presents a
+  # This is a secret map entry with `source.kind: chatgptSubscription`: the broker presents a
   # ChatGPT access token to an allowed destination and renews it itself, 60 s before expiry, through
   # the same refresh protocol and the same file format the gateway's model credential uses.
   #
@@ -205,7 +196,7 @@ broker:
     inline: ""
     existingSecret: ""
     existingSecretKey: chatgpt-auth.json
-    # File name inside the credential directory, and therefore the leaf your broker-credentials.yaml
+    # File name inside the credential directory, and therefore the leaf your secret map entry's
     # authFile must name. `save_credentials` derives its temporary sibling by REPLACING this
     # extension — chatgpt-auth.json becomes chatgpt-auth.tmp-<pid> — and renames over the target, so
     # the broker needs write access to the directory, not just the file. dekopon-brokerd refuses to

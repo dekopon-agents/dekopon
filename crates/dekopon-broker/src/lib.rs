@@ -47,12 +47,12 @@ use dekopon_capability::{
 };
 use dekopon_core::{
     Actor, AgentId, AttestedSubject, CapabilityId, InvocationId, PrincipalId, PrincipalKind,
-    ProviderFailureDetail, ProviderId, RiskLevel, SecretBytes, SecretDrn, SecretSinkKind,
+    ProviderFailureDetail, ProviderId, Redacted, RiskLevel, SecretBytes, SecretDrn, SecretSinkKind,
     SecretUseProposal, Subject, SubjectKind, SubjectScope, TraceId, error_chain,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{
-    PolicyContext, PolicyConversation, PolicyDecision, PolicyRequest, PolicyTarget,
+    PolicyContext, PolicyConversation, PolicyDecision, PolicyRequest, PolicyTarget, SecretSelection,
 };
 use dekopon_storage_host::{
     ContinuityPolicy, RetentionPolicies, StorageEvidence, StorageGrantPreparation,
@@ -440,8 +440,6 @@ pub struct ConstraintSet {
     pub provider: ProviderId,
     pub effect: EffectKind,
     pub risk: RiskLevel,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential: Option<String>,
     pub constraints: ExecutionConstraints,
 }
 
@@ -456,6 +454,19 @@ pub struct DefaultSecretUse {
 #[serde(rename_all = "camelCase")]
 pub enum DefaultSecretSink {
     HttpBearer,
+    HttpBasic,
+    HttpBot,
+}
+
+impl DefaultSecretSink {
+    #[must_use]
+    pub const fn sink(self) -> SecretSinkKind {
+        match self {
+            Self::HttpBearer => SecretSinkKind::HttpBearer,
+            Self::HttpBasic => SecretSinkKind::HttpBasic,
+            Self::HttpBot => SecretSinkKind::HttpBot,
+        }
+    }
 }
 
 fn deserialize_default_secret_use<'de, D>(
@@ -525,7 +536,7 @@ impl fmt::Display for StartupWarning {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConstraintCatalog {
     sets: BTreeMap<CapabilityId, ConstraintSet>,
-    agent_credentials: BTreeMap<AgentId, BTreeMap<String, String>>,
+    agent_secrets: BTreeMap<AgentId, BTreeMap<SecretDrn, SecretDrn>>,
 }
 
 impl ConstraintCatalog {
@@ -545,43 +556,47 @@ impl ConstraintCatalog {
         }
         Ok(Self {
             sets,
-            agent_credentials: BTreeMap::new(),
+            agent_secrets: BTreeMap::new(),
         })
     }
 
     #[must_use]
-    pub fn with_agent_credentials(
+    pub fn with_agent_secrets(
         mut self,
-        bindings: BTreeMap<AgentId, BTreeMap<String, String>>,
+        swaps: BTreeMap<AgentId, BTreeMap<SecretDrn, SecretDrn>>,
     ) -> Self {
-        self.agent_credentials = bindings;
+        self.agent_secrets = swaps;
         self
     }
 
     #[must_use]
-    pub fn credential_for<'a>(&'a self, set: &'a ConstraintSet, actor: &Actor) -> Option<&'a str> {
-        let name = set.credential.as_deref()?;
-        let rebound = match actor {
+    pub fn effective_default<'a>(
+        &'a self,
+        set: &'a ConstraintSet,
+        actor: &Actor,
+    ) -> Option<(&'a SecretDrn, SecretSinkKind)> {
+        let default = set.default_secret_use.as_ref()?;
+        let swapped = match actor {
             Actor::Agent { agent } => self
-                .agent_credentials
+                .agent_secrets
                 .get(agent)
-                .and_then(|bindings| bindings.get(name)),
+                .and_then(|swaps| swaps.get(&default.drn)),
             Actor::Human { .. } | Actor::Service { .. } => None,
         };
-        Some(rebound.map_or(name, String::as_str))
+        Some((swapped.unwrap_or(&default.drn), default.sink.sink()))
     }
 
-    fn selectable_credentials<'a>(&'a self, set: &'a ConstraintSet) -> Vec<&'a str> {
-        let Some(name) = set.credential.as_deref() else {
-            return Vec::new();
+    fn selectable_defaults<'a>(&'a self, set: &'a ConstraintSet) -> BTreeSet<&'a SecretDrn> {
+        let Some(default) = set.default_secret_use.as_ref() else {
+            return BTreeSet::new();
         };
-        let mut names = vec![name];
-        names.extend(
-            self.agent_credentials
-                .values()
-                .filter_map(|bindings| bindings.get(name).map(String::as_str)),
-        );
-        names
+        std::iter::once(&default.drn)
+            .chain(
+                self.agent_secrets
+                    .values()
+                    .filter_map(|swaps| swaps.get(&default.drn)),
+            )
+            .collect()
     }
 
     pub fn retain_routed(&mut self, registry: &BrokerProviderRegistry) -> Vec<CapabilityId> {
@@ -634,7 +649,6 @@ impl ConstraintCatalog {
     fn validate(
         &self,
         registry: &BrokerProviderRegistry,
-        credentials: &CredentialStore,
         maximum: usize,
     ) -> Result<(), BrokerBuildError> {
         if self.sets.len() > maximum {
@@ -648,12 +662,6 @@ impl ConstraintCatalog {
         self.retention_policies()?;
         for (capability_id, set) in &self.sets {
             validate_set_constraints(set)?;
-            validate_set_credential(
-                capability_id,
-                set,
-                &self.selectable_credentials(set),
-                credentials,
-            )?;
             registry
                 .validate_constraints(&set.constraints)
                 .map_err(|source| BrokerBuildError::HostConstraint { source })?;
@@ -792,105 +800,11 @@ impl ConstraintCatalog {
     }
 }
 
-#[async_trait]
-pub trait RefreshingCredential: Send + Sync + fmt::Debug {
-    fn destinations(&self) -> &[String];
-
-    async fn resolve(&self) -> Result<BoundCredential, CredentialRefreshError>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
-pub enum CredentialRefreshError {
-    #[error("the credential's authorization is gone and must be renewed by an operator")]
-    ReauthorizationRequired,
-    #[error("the credential could not be refreshed ({category})")]
-    Unavailable { category: &'static str },
-}
-
-impl CredentialRefreshError {
-    #[must_use]
-    pub const fn category(self) -> &'static str {
-        match self {
-            Self::ReauthorizationRequired => "reauthorization-required",
-            Self::Unavailable { category } => category,
-        }
-    }
-
-    const fn permanent(self) -> bool {
-        matches!(self, Self::ReauthorizationRequired)
-    }
-
-    const fn reason(self) -> &'static str {
-        if self.permanent() {
-            "credential-unavailable"
-        } else {
-            "credential-refresh-failed"
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum StoredCredential {
-    Fixed(Box<BoundCredential>),
-    Refreshing(Arc<dyn RefreshingCredential>),
-}
-
-impl From<BoundCredential> for StoredCredential {
-    fn from(credential: BoundCredential) -> Self {
-        Self::Fixed(Box::new(credential))
-    }
-}
-
-impl From<Arc<dyn RefreshingCredential>> for StoredCredential {
-    fn from(source: Arc<dyn RefreshingCredential>) -> Self {
-        Self::Refreshing(source)
-    }
-}
-
-impl StoredCredential {
-    fn covers(&self, allowed_host: &str) -> bool {
-        match self {
-            Self::Fixed(credential) => credential.covers(allowed_host),
-            Self::Refreshing(source) => {
-                dekopon_broker_host::destinations_cover(source.destinations(), allowed_host)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct CredentialStore {
-    entries: BTreeMap<String, StoredCredential>,
-}
-
-impl CredentialStore {
-    #[must_use]
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    pub fn new<C: Into<StoredCredential>>(
-        entries: impl IntoIterator<Item = (String, C)>,
-    ) -> Result<Self, BrokerBuildError> {
-        let mut store = BTreeMap::new();
-        for (name, credential) in entries {
-            if store.insert(name.clone(), credential.into()).is_some() {
-                return Err(BrokerBuildError::DuplicateCredential { name });
-            }
-        }
-        Ok(Self { entries: store })
-    }
-
-    fn get(&self, name: &str) -> Option<&StoredCredential> {
-        self.entries.get(name)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretUseBinding {
     pub binding_id: String,
     pub secret: SecretDrn,
-    pub capability: CapabilityId,
+    pub capabilities: BTreeSet<CapabilityId>,
     pub sink: SecretSinkKind,
     pub basic_username: Option<String>,
     pub allowed_hosts: Vec<String>,
@@ -932,11 +846,14 @@ impl SecretUseBinding {
                     .clone()
                     .expect("validated Basic binding always carries a username"),
             },
+            SecretSinkKind::HttpBot => SecretUseProposal::HttpBot {
+                secret: self.secret.clone(),
+            },
         }
     }
 
     fn matches(&self, capability: &CapabilityId, proposal: &SecretUseProposal) -> bool {
-        &self.capability == capability
+        self.capabilities.contains(capability)
             && &self.secret == proposal.secret()
             && self.sink == proposal.sink()
             && self.basic_username.as_deref() == proposal.username()
@@ -944,16 +861,24 @@ impl SecretUseBinding {
 }
 
 #[derive(Clone)]
-pub struct SecretMaterial(SecretBytes);
+pub struct SecretMaterial {
+    bytes: SecretBytes,
+    chatgpt_account: Option<Redacted<String>>,
+}
 
 impl SecretMaterial {
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(SecretBytes::new(bytes))
+        Self {
+            bytes: SecretBytes::new(bytes),
+            chatgpt_account: None,
+        }
     }
 
-    fn into_secret_bytes(self) -> SecretBytes {
-        self.0
+    #[must_use]
+    pub fn with_chatgpt_account(mut self, account: Redacted<String>) -> Self {
+        self.chatgpt_account = Some(account);
+        self
     }
 }
 
@@ -1032,6 +957,11 @@ impl SecretCatalog {
         let mut ids = BTreeSet::new();
         let mut tuples = BTreeSet::new();
         for binding in &bindings {
+            if binding.capabilities.is_empty() {
+                return Err(BrokerBuildError::SecretBindingWithoutCapability {
+                    binding: binding.binding_id.clone(),
+                });
+            }
             binding.grant().validate().map_err(|source| {
                 BrokerBuildError::InvalidSecretBinding {
                     binding: binding.binding_id.clone(),
@@ -1043,17 +973,19 @@ impl SecretCatalog {
                     binding: binding.binding_id.clone(),
                 });
             }
-            let tuple = (
-                binding.secret.clone(),
-                binding.capability.clone(),
-                binding.sink,
-                binding.basic_username.clone(),
-            );
-            if !tuples.insert(tuple) {
-                return Err(BrokerBuildError::ConflictingSecretBinding {
-                    secret: binding.secret.clone(),
-                    capability: binding.capability.clone(),
-                });
+            for capability in &binding.capabilities {
+                let tuple = (
+                    binding.secret.clone(),
+                    capability.clone(),
+                    binding.sink,
+                    binding.basic_username.clone(),
+                );
+                if !tuples.insert(tuple) {
+                    return Err(BrokerBuildError::ConflictingSecretBinding {
+                        secret: binding.secret.clone(),
+                        capability: capability.clone(),
+                    });
+                }
             }
         }
         Ok(Self {
@@ -1061,6 +993,10 @@ impl SecretCatalog {
             resolver,
             authority_revision: None,
         })
+    }
+
+    pub fn unresolved(bindings: Vec<SecretUseBinding>) -> Result<Self, BrokerBuildError> {
+        Self::new(bindings, Arc::new(EmptySecretResolver))
     }
 
     pub fn drns(&self) -> impl Iterator<Item = &SecretDrn> {
@@ -1097,33 +1033,72 @@ impl SecretCatalog {
 
     fn validate(&self, constraints: &ConstraintCatalog) -> Result<(), BrokerBuildError> {
         for binding in &self.bindings {
-            let set = constraints.get(&binding.capability).ok_or_else(|| {
-                BrokerBuildError::SecretBindingUnknownCapability {
-                    binding: binding.binding_id.clone(),
-                    capability: binding.capability.clone(),
+            for capability in &binding.capabilities {
+                let set = constraints.get(capability).ok_or_else(|| {
+                    BrokerBuildError::SecretBindingUnknownCapability {
+                        binding: binding.binding_id.clone(),
+                        capability: capability.clone(),
+                    }
+                })?;
+                let http = set.constraints.http.as_ref().ok_or_else(|| {
+                    BrokerBuildError::SecretBindingWithoutHttp {
+                        binding: binding.binding_id.clone(),
+                    }
+                })?;
+                if binding.max_injections > http.max_requests
+                    || binding
+                        .allowed_hosts
+                        .iter()
+                        .any(|host| !http.allowed_hosts.contains(host))
+                    || binding
+                        .allowed_methods
+                        .iter()
+                        .any(|method| !http.allowed_methods.contains(method))
+                {
+                    return Err(BrokerBuildError::SecretBindingExceedsCapability {
+                        binding: binding.binding_id.clone(),
+                    });
                 }
-            })?;
-            let http = set.constraints.http.as_ref().ok_or_else(|| {
-                BrokerBuildError::SecretBindingWithoutHttp {
-                    binding: binding.binding_id.clone(),
+            }
+        }
+        for (capability, set) in constraints.iter() {
+            let Some(default) = &set.default_secret_use else {
+                continue;
+            };
+            for secret in constraints.selectable_defaults(set) {
+                let count = self
+                    .bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding.capabilities.contains(capability)
+                            && &binding.secret == secret
+                            && binding.sink == default.sink.sink()
+                    })
+                    .count();
+                if count != 1 {
+                    return Err(BrokerBuildError::DefaultSecretBindings {
+                        capability: capability.clone(),
+                        secret: secret.clone(),
+                        sink: default.sink.sink(),
+                        count,
+                    });
                 }
-            })?;
-            if binding.max_injections > http.max_requests
-                || binding
-                    .allowed_hosts
-                    .iter()
-                    .any(|host| !http.allowed_hosts.contains(host))
-                || binding
-                    .allowed_methods
-                    .iter()
-                    .any(|method| !http.allowed_methods.contains(method))
-            {
-                return Err(BrokerBuildError::SecretBindingExceedsCapability {
-                    binding: binding.binding_id.clone(),
-                });
             }
         }
         Ok(())
+    }
+
+    fn default_binding(
+        &self,
+        capability: &CapabilityId,
+        secret: &SecretDrn,
+        sink: SecretSinkKind,
+    ) -> Option<&SecretUseBinding> {
+        self.bindings.iter().find(|binding| {
+            binding.capabilities.contains(capability)
+                && &binding.secret == secret
+                && binding.sink == sink
+        })
     }
 
     fn binding(
@@ -1366,43 +1341,6 @@ fn validate_trusted_metadata(
     Ok(())
 }
 
-fn validate_set_credential(
-    capability_id: &CapabilityId,
-    set: &ConstraintSet,
-    names: &[&str],
-    credentials: &CredentialStore,
-) -> Result<(), BrokerBuildError> {
-    if names.is_empty() {
-        return Ok(());
-    }
-    let Some(http) = &set.constraints.http else {
-        return Err(BrokerBuildError::CredentialWithoutHttp {
-            capability: capability_id.clone(),
-        });
-    };
-    for &name in names {
-        let credential =
-            credentials
-                .get(name)
-                .ok_or_else(|| BrokerBuildError::UnknownCredential {
-                    capability: capability_id.clone(),
-                    name: name.to_owned(),
-                })?;
-        // Coverage must be checked from declared destinations only; resolving a refreshing
-        // credential would make startup depend on a live token endpoint.
-        for host in &http.allowed_hosts {
-            if !credential.covers(host) {
-                return Err(BrokerBuildError::CredentialDestinationMismatch {
-                    capability: capability_id.clone(),
-                    name: name.to_owned(),
-                    host: host.clone(),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_set_constraints(set: &ConstraintSet) -> Result<(), BrokerBuildError> {
     let constraints = &set.constraints;
     if constraints.timeout_ms == 0
@@ -1581,24 +1519,18 @@ pub enum BrokerBuildError {
         #[source]
         source: BrokerHostError,
     },
-    #[error("constraint set for {capability} names unknown credential {name:?}")]
-    UnknownCredential {
-        capability: CapabilityId,
-        name: String,
-    },
-    #[error("constraint set for {capability} binds a credential but grants no HTTP authority")]
-    CredentialWithoutHttp { capability: CapabilityId },
     #[error(
-        "constraint set for {capability} allows host {host:?} outside credential {name:?} \
-         destinations"
+        "capability {capability} defaults to {secret} ({sink}), which needs exactly one binding \
+         for that capability and sink; the map has {count}"
     )]
-    CredentialDestinationMismatch {
+    DefaultSecretBindings {
         capability: CapabilityId,
-        name: String,
-        host: String,
+        secret: SecretDrn,
+        sink: SecretSinkKind,
+        count: usize,
     },
-    #[error("credential store duplicates name {name:?}")]
-    DuplicateCredential { name: String },
+    #[error("secret binding {binding} names no capability")]
+    SecretBindingWithoutCapability { binding: String },
     #[error("configuration contains {count} secret bindings; broker maximum is {maximum}")]
     TooManySecretBindings { count: usize, maximum: usize },
     #[error("private secret map revision is invalid")]
@@ -1719,8 +1651,6 @@ pub enum AuditEvent {
         provider_artifact_sha256: Option<String>,
         effect: EffectKind,
         risk: RiskLevel,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        credential: Option<String>,
         outcome: InvocationOutcome,
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_status: Option<std::num::NonZeroU8>,
@@ -1813,7 +1743,6 @@ pub struct Broker<A> {
     policy: Arc<PolicyEngine>,
     policy_digest: String,
     constraints: ConstraintCatalog,
-    credentials: CredentialStore,
     secrets: SecretCatalog,
     identities: IdentityDirectory,
     broker_principal: PrincipalId,
@@ -1830,7 +1759,7 @@ where
     #[allow(
         clippy::too_many_arguments,
         reason = "each trusted input is a separate owner-controlled store; bundling them into one \
-                  struct would let a caller assemble policy, constraints, credentials, and identity \
+                  struct would let a caller assemble policy, constraints and identity \
                   mapping from mismatched sources without the type system noticing"
     )]
     pub fn new(
@@ -1838,7 +1767,6 @@ where
         broker_principal: PrincipalId,
         policy: PolicyEngine,
         constraints: ConstraintCatalog,
-        credentials: CredentialStore,
         identities: IdentityDirectory,
         audit: Arc<A>,
         limits: BrokerLimits,
@@ -1848,7 +1776,6 @@ where
             broker_principal,
             policy,
             constraints,
-            credentials,
             identities,
             audit,
             limits,
@@ -1860,7 +1787,7 @@ where
     #[allow(
         clippy::too_many_arguments,
         reason = "each trusted input is a separate owner-controlled store; bundling them into one \
-                  struct would let a caller assemble policy, constraints, credentials, and identity \
+                  struct would let a caller assemble policy, constraints and identity \
                   mapping from mismatched sources without the type system noticing"
     )]
     pub fn start(
@@ -1868,7 +1795,6 @@ where
         broker_principal: PrincipalId,
         policy: PolicyEngine,
         constraints: ConstraintCatalog,
-        credentials: CredentialStore,
         identities: IdentityDirectory,
         audit: Arc<A>,
         limits: BrokerLimits,
@@ -1888,7 +1814,7 @@ where
                 warnings.push(StartupWarning::UnroutedConstraintSet { capability });
             }
         }
-        constraints.validate(&registry, &credentials, limits.max_constraint_sets)?;
+        constraints.validate(&registry, limits.max_constraint_sets)?;
         for capability in constraints.sets.keys() {
             if !policy.names_in_a_permit(capability) {
                 warnings.push(StartupWarning::UnreachableCapability {
@@ -1924,7 +1850,6 @@ where
                 policy_digest: policy.digest().to_owned(),
                 policy: Arc::new(policy),
                 constraints,
-                credentials,
                 secrets: SecretCatalog::empty(),
                 identities,
                 broker_principal,
@@ -1998,7 +1923,7 @@ where
             routed.insert(capability.as_str());
             if set.effect != effect
                 || set.risk != risk
-                || set.credential.is_some()
+                || set.default_secret_use.is_some()
                 || set.constraints.http.is_some()
             {
                 return Err(BrokerBuildError::InvalidChatMemory);
@@ -2078,24 +2003,50 @@ where
         })
     }
 
-    #[must_use]
     pub fn secret_use_or_default(
         &self,
+        actor: &Actor,
         capability: &CapabilityId,
         proposed: Option<SecretUseProposal>,
+    ) -> Result<Option<SecretUseProposal>, Refusal> {
+        if proposed.is_some() {
+            return Ok(proposed);
+        }
+        let Some(set) = self.constraints.get(capability) else {
+            return Ok(None);
+        };
+        let Some((secret, sink)) = self.constraints.effective_default(set, actor) else {
+            return Ok(None);
+        };
+        self.secrets
+            .default_binding(capability, secret, sink)
+            .map(|binding| Some(binding.proposal()))
+            .ok_or_else(|| unevaluated_refusal("secret-denied"))
+    }
+
+    fn effective_default_proposal(
+        &self,
+        actor: &Actor,
+        capability: &CapabilityId,
     ) -> Option<SecretUseProposal> {
-        proposed.or_else(|| {
-            let default = self
-                .constraints
-                .get(capability)?
-                .default_secret_use
-                .as_ref()?;
-            Some(match default.sink {
-                DefaultSecretSink::HttpBearer => SecretUseProposal::HttpBearer {
-                    secret: default.drn.clone(),
-                },
-            })
-        })
+        let set = self.constraints.get(capability)?;
+        let (secret, sink) = self.constraints.effective_default(set, actor)?;
+        self.secrets
+            .default_binding(capability, secret, sink)
+            .map(SecretUseBinding::proposal)
+    }
+
+    fn selection(
+        &self,
+        actor: &Actor,
+        capability: &CapabilityId,
+        proposal: &SecretUseProposal,
+    ) -> SecretSelection {
+        if self.effective_default_proposal(actor, capability).as_ref() == Some(proposal) {
+            SecretSelection::Default
+        } else {
+            SecretSelection::Proposed
+        }
     }
 
     pub fn bind_secret_use(
@@ -2115,8 +2066,12 @@ where
                 decision.policy_ids.clone(),
             ));
         };
+        let selection = self.selection(context.actor(), capability, secret_use);
+        let span = tracing::Span::current();
+        span.record("secret", secret_use.secret().as_str());
+        span.record("secret.selection", selection.as_str());
         let secret_decision =
-            self.authorize_secret_use(context, capability, &decision.set, secret_use);
+            self.authorize_secret_use(context, capability, &decision.set, secret_use, selection);
         let secret_allowed = secret_decision.allowed;
         let secret_errors = secret_decision.errors_present;
         decision.errors_present |= secret_errors;
@@ -2280,6 +2235,7 @@ where
         capability: &CapabilityId,
         set: &ConstraintSet,
         proposal: &SecretUseProposal,
+        selection: SecretSelection,
     ) -> EvaluatedDecision {
         Self::evaluate(
             &self.policy,
@@ -2290,6 +2246,7 @@ where
                     capability: capability.clone(),
                     provider: set.provider.clone(),
                     sink: proposal.sink(),
+                    selection,
                 },
                 context: policy_context(context),
             },
@@ -3099,7 +3056,8 @@ where
                 &mut encoded,
                 capability,
                 set,
-                self.constraints.credential_for(set, context.actor()),
+                self.effective_default_proposal(context.actor(), capability)
+                    .as_ref(),
                 digest,
             );
         }
@@ -3108,30 +3066,35 @@ where
             .secrets
             .authority_bindings()
             .into_iter()
-            .filter(|binding| {
-                effective_capabilities.contains(&binding.capability)
-                    && self
-                        .constraints
-                        .get(&binding.capability)
-                        .is_some_and(|set| {
-                            self.authorize_secret_use(
-                                context,
-                                &binding.capability,
-                                set,
-                                &binding.proposal(),
-                            )
-                            .allowed
-                        })
+            .flat_map(|binding| {
+                binding
+                    .capabilities
+                    .iter()
+                    .map(move |capability| (binding, capability))
+            })
+            .filter(|(binding, capability)| {
+                let proposal = binding.proposal();
+                effective_capabilities.contains(*capability)
+                    && self.constraints.get(capability).is_some_and(|set| {
+                        self.authorize_secret_use(
+                            context,
+                            capability,
+                            set,
+                            &proposal,
+                            self.selection(context.actor(), capability, &proposal),
+                        )
+                        .allowed
+                    })
             })
             .collect::<Vec<_>>();
         if !secret_bindings.is_empty() {
             encoded.number("secretBindingCount", secret_bindings.len() as u128);
             encoded.optional_text("secretMapRevision", self.secrets.authority_revision());
         }
-        for binding in secret_bindings {
+        for (binding, capability) in secret_bindings {
             encoded.text("secretBinding", &binding.binding_id);
             encoded.text("secretDrn", binding.secret.as_str());
-            encoded.text("secretCapability", binding.capability.as_str());
+            encoded.text("secretCapability", capability.as_str());
             encoded.text("secretSink", &binding.sink.to_string());
             encoded.optional_text("secretBasicUsername", binding.basic_username.as_deref());
             let mut hosts = binding.allowed_hosts.clone();
@@ -3307,6 +3270,8 @@ where
             trigger = tracing::field::Empty,
             outcome = tracing::field::Empty,
             policy.errors_present = tracing::field::Empty,
+            secret = tracing::field::Empty,
+            secret.selection = tracing::field::Empty,
             input = tracing::field::Empty,
             input.bytes = tracing::field::Empty,
         );
@@ -3334,8 +3299,20 @@ where
                     .map(ControlFlow::Break);
             }
             // Before the decision: a denial still records the defaulted secret it refused.
-            request.secret_use =
-                self.secret_use_or_default(&request.capability, request.secret_use.take());
+            match self.secret_use_or_default(
+                context.actor(),
+                &request.capability,
+                request.secret_use.take(),
+            ) {
+                Ok(secret_use) => request.secret_use = secret_use,
+                Err(refusal) => {
+                    authorize.record("outcome", refusal.reason);
+                    return self
+                        .deny(context, &request, refusal)
+                        .await
+                        .map(ControlFlow::Break);
+                }
+            }
             let mut decision = match self.authorize_invocation(context, &request.capability) {
                 Ok(authorized) => authorized,
                 Err(refusal) => {
@@ -3416,7 +3393,6 @@ where
         let execute = tracing::info_span!(
             "broker.execute",
             provider = %set.provider,
-            credential = tracing::field::Empty,
             storage = tracing::field::Empty,
             storage.namespace = tracing::field::Empty,
             storage.reset = tracing::field::Empty,
@@ -3429,11 +3405,6 @@ where
         );
         if set.constraints.storage.is_some() {
             execute.record("storage", true);
-        }
-        if let Some(secret) = request.secret_use.as_ref() {
-            execute.record("credential", secret.secret().as_str());
-        } else if let Some(credential) = self.constraints.credential_for(&set, context.actor()) {
-            execute.record("credential", credential);
         }
         self.execute(
             context, request, set, policy_ids, slots, space, assets, outputs,
@@ -3564,7 +3535,6 @@ where
         decision_id: &str,
         decision: DecisionReference,
         set: &ConstraintSet,
-        credential: Option<&str>,
         policy_ids: &[String],
         policy_evidence: Evidence,
         reason: &'static str,
@@ -3585,7 +3555,6 @@ where
             artifact.as_deref(),
             &self.broker_principal,
             set,
-            credential,
             InvocationOutcome::Failed,
             None,
             0,
@@ -3975,14 +3944,6 @@ where
         };
 
         let proposed_secret = authorized.proposal().secret_use.clone();
-        let legacy_credential_name = self
-            .constraints
-            .credential_for(&set, context.actor())
-            .map(str::to_owned);
-        let audit_credential = proposed_secret
-            .is_none()
-            .then_some(legacy_credential_name.as_deref())
-            .flatten();
         let credential = if let Some(proposal) = proposed_secret {
             let material = match self.secrets.resolver.resolve(proposal.secret()).await {
                 Ok(material) => material,
@@ -4002,7 +3963,6 @@ where
                             &decision_id,
                             decision,
                             &set,
-                            audit_credential,
                             &policy_ids,
                             policy_evidence,
                             "secret-resolution",
@@ -4020,21 +3980,25 @@ where
                         &decision_id,
                         decision,
                         &set,
-                        audit_credential,
                         &policy_ids,
                         policy_evidence,
                         "secret-authorization",
                     )
                     .await;
             };
+            let SecretMaterial {
+                bytes,
+                chatgpt_account,
+            } = material;
             let built = match proposal.sink() {
-                SecretSinkKind::HttpBearer => {
-                    BoundCredential::secret_bearer(material.into_secret_bytes(), grant)
-                }
-                SecretSinkKind::HttpBasic => {
-                    BoundCredential::secret_basic(material.into_secret_bytes(), grant)
-                }
-            };
+                SecretSinkKind::HttpBearer => BoundCredential::secret_bearer(bytes, grant),
+                SecretSinkKind::HttpBasic => BoundCredential::secret_basic(bytes, grant),
+                SecretSinkKind::HttpBot => BoundCredential::secret_bot(bytes, grant),
+            }
+            .and_then(|credential| match &chatgpt_account {
+                Some(account) => credential.with_chatgpt_account(account.expose()),
+                None => Ok(credential),
+            });
             match built {
                 Ok(credential) => Some(credential),
                 Err(source) => {
@@ -4054,7 +4018,6 @@ where
                             &decision_id,
                             decision,
                             &set,
-                            audit_credential,
                             &policy_ids,
                             policy_evidence,
                             "secret-credential",
@@ -4063,54 +4026,7 @@ where
                 }
             }
         } else {
-            // Refreshing credentials must resolve here, never inside the execution context, or the
-            // renewal call would wrongly consume the guest's request budget and evidence.
-            match legacy_credential_name
-                .as_deref()
-                .and_then(|name| self.credentials.get(name))
-            {
-                None => None,
-                Some(StoredCredential::Fixed(credential)) => Some((**credential).clone()),
-                Some(StoredCredential::Refreshing(source)) => match source.resolve().await {
-                    Ok(credential) => Some(credential),
-                    Err(failure) => {
-                        if failure.permanent() {
-                            tracing::error!(
-                                event = "broker_credential_refresh_failed",
-                                invocation = %invocation_id,
-                                credential = legacy_credential_name.as_deref(),
-                                category = failure.category(),
-                                retryable = false,
-                                "broker.credential.refresh.failed"
-                            );
-                        } else {
-                            tracing::warn!(
-                                event = "broker_credential_refresh_failed",
-                                invocation = %invocation_id,
-                                credential = legacy_credential_name.as_deref(),
-                                category = failure.category(),
-                                retryable = true,
-                                "broker.credential.refresh.failed"
-                            );
-                        }
-                        return self
-                            .fail_authorized_before_provider(
-                                context,
-                                &invocation_id,
-                                trace,
-                                &capability,
-                                &decision_id,
-                                decision,
-                                &set,
-                                audit_credential,
-                                &policy_ids,
-                                policy_evidence,
-                                failure.reason(),
-                            )
-                            .await;
-                    }
-                },
-            }
+            None
         };
         let provider_artifact_sha256 = self
             .registry
@@ -4167,7 +4083,6 @@ where
                     provider_artifact_sha256.as_deref(),
                     &self.broker_principal,
                     &set,
-                    audit_credential,
                     InvocationOutcome::Succeeded,
                     None,
                     duration_ms,
@@ -4226,7 +4141,6 @@ where
                     provider_artifact_sha256.as_deref(),
                     &self.broker_principal,
                     &set,
-                    audit_credential,
                     InvocationOutcome::Failed,
                     Some(&failure.error),
                     duration_ms,
@@ -4372,14 +4286,18 @@ fn encode_capability_authority(
     encoded: &mut AuthorityEncoder,
     capability: &CapabilityId,
     set: &ConstraintSet,
-    credential: Option<&str>,
+    default_secret: Option<&SecretUseProposal>,
     provider_artifact_sha256: &str,
 ) {
     encoded.text("capability", capability.as_str());
     encoded.text("provider", set.provider.as_str());
     encoded.byte("effect", effect_tag(set.effect));
     encoded.byte("risk", risk_tag(set.risk));
-    encoded.optional_text("credential", credential);
+    if let Some(default) = default_secret {
+        encoded.text("defaultSecretDrn", default.secret().as_str());
+        encoded.text("defaultSecretSink", &default.sink().to_string());
+        encoded.optional_text("defaultSecretBasicUsername", default.username());
+    }
     encode_execution_constraints(encoded, &set.constraints);
     encoded.text("providerArtifactSha256", provider_artifact_sha256);
 }
@@ -5074,7 +4992,6 @@ fn emit_audit_event_record(event: &AuditEvent) {
             provider_artifact_sha256,
             effect,
             risk,
-            credential,
             outcome,
             exit_status,
             duration_ms,
@@ -5105,7 +5022,6 @@ fn emit_audit_event_record(event: &AuditEvent) {
                 secret.sink = secret_sink.as_ref().map(ToString::to_string),
                 effect = ?effect,
                 risk = ?risk,
-                credential = credential.as_deref(),
                 outcome = ?outcome,
                 process.exit.code = exit_status.map(std::num::NonZeroU8::get),
                 duration_ms = duration_ms,
@@ -5206,7 +5122,6 @@ fn execution_event(
     provider_artifact_sha256: Option<&str>,
     authorized_by: &PrincipalId,
     set: &ConstraintSet,
-    credential: Option<&str>,
     outcome: InvocationOutcome,
     provider_failure: Option<&BrokerHostError>,
     duration_ms: u64,
@@ -5242,7 +5157,6 @@ fn execution_event(
         provider_artifact_sha256: provider_artifact_sha256.map(str::to_owned),
         effect: set.effect,
         risk: set.risk,
-        credential: credential.map(str::to_owned),
         outcome,
         exit_status: provider_failure.and_then(provider_execution_exit_status),
         duration_ms,

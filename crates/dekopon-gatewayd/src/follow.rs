@@ -917,7 +917,7 @@ mod tests {
         );
         let table = Arc::new(FollowTable::load(journal).unwrap());
         let secret = dekopon_core::SecretUseProposal::HttpBasic {
-            secret: "drn:com.xrl:secret:prod:api/token".parse().unwrap(),
+            secret: "drn:secret:api/token".parse().unwrap(),
             username: "deploy".to_owned(),
         };
         for (index, (input, secret_use, result, expected)) in [

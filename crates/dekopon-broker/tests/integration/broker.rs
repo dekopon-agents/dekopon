@@ -6,11 +6,10 @@ use async_trait::async_trait;
 use dekopon_broker::{
     AssetInvocationResult, Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker,
     BrokerBuildError, BrokerError, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
-    CredentialRefreshError, CredentialStore, IdentityDirectory, InMemoryAuditLog,
-    InvocationRequest, Leniency, PolicyEngine, PolicyWorld, RefreshingCredential, SecretCatalog,
-    SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding, StartupWarning,
+    IdentityDirectory, InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld,
+    SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding,
+    StartupWarning,
 };
-use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule};
 use dekopon_core::{
@@ -157,16 +156,8 @@ fn set_with_metadata(
             .expect("valid provider fixture"),
         effect,
         risk,
-        credential: None,
         constraints,
     }
-}
-
-fn rebind_for_nestedset(name: &str, rebound: &str) -> BTreeMap<AgentId, BTreeMap<String, String>> {
-    BTreeMap::from([(
-        agent("nestedset-github"),
-        BTreeMap::from([(name.to_owned(), rebound.to_owned())]),
-    )])
 }
 
 fn catalog<'a>(entries: impl IntoIterator<Item = (&'a str, ConstraintSet)>) -> ConstraintCatalog {
@@ -220,7 +211,7 @@ fn http_probe_engine(policies: &str) -> PolicyEngine {
 }
 
 fn secret_drn() -> SecretDrn {
-    "drn:com.xrl:secret:test:http-probe/token"
+    "drn:secret:http-probe/token"
         .parse()
         .expect("canonical secret fixture")
 }
@@ -389,7 +380,6 @@ async fn attested_broker(
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         identities,
         audit,
         BrokerLimits::default(),
@@ -414,7 +404,6 @@ async fn policy_authorizes_and_audits_no_payloads() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -474,7 +463,6 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["allowed-caller", "other-caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -532,7 +520,6 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             "cli-probe.upper",
             set("different-provider", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         audit,
         BrokerLimits::default(),
@@ -562,7 +549,6 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
                 },
             ),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         audit,
         BrokerLimits::default(),
@@ -594,7 +580,6 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             "http-probe.conditional-write",
             set("http-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         audit,
         BrokerLimits::default(),
@@ -680,7 +665,6 @@ async fn broker_request_policy_narrows_untemplated_post_and_admits_json_reply() 
         principal("broker-test"),
         http_probe_engine(&policies),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(32).expect("audit")),
         BrokerLimits::default(),
@@ -993,7 +977,6 @@ async fn request_body_fences_read_decide_and_canvas_bodies_and_deny_an_opaque_on
         principal("broker-test"),
         http_probe_engine(&policies),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(64).expect("audit")),
         BrokerLimits::default(),
@@ -1178,7 +1161,6 @@ async fn request_audit_sink_failure_is_reported_and_denied_before_dns() {
             "http-probe.fetch",
             set("http-probe", loopback_constraints("no-such-egress.invalid")),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(1).expect("one invocation decision")),
         BrokerLimits::default(),
@@ -1265,7 +1247,6 @@ async fn a_response_over_max_response_bytes_tells_the_model_byte_limit() {
         principal("broker-test"),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
         BrokerLimits::default(),
@@ -1339,7 +1320,6 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
             .expect("valid broker principal"),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -1426,7 +1406,6 @@ async fn a_request_template_pins_the_attested_conversation_and_needs_a_chat_scop
         principal("broker-test"),
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([("http-probe.fetch", set("http-probe", constraints))]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -1567,7 +1546,6 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
                     ),
                 ),
             ]),
-            CredentialStore::empty(),
             callers(["caller"]),
             Arc::clone(&audit),
             BrokerLimits::default(),
@@ -1675,58 +1653,52 @@ async fn external_writes_are_authorized_and_audited_even_when_the_provider_fails
 }
 
 #[derive(Debug)]
-struct ScriptedRefreshingCredential {
-    destinations: Vec<String>,
+struct ChatgptSecretResolver {
     resolutions: Arc<std::sync::atomic::AtomicUsize>,
-    script: parking_lot::Mutex<Vec<Result<&'static str, CredentialRefreshError>>>,
-}
-
-impl ScriptedRefreshingCredential {
-    fn new(
-        destinations: Vec<String>,
-        script: Vec<Result<&'static str, CredentialRefreshError>>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            destinations,
-            resolutions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            script: parking_lot::Mutex::new(script),
-        })
-    }
 }
 
 #[async_trait]
-impl RefreshingCredential for ScriptedRefreshingCredential {
-    fn destinations(&self) -> &[String] {
-        &self.destinations
-    }
-
-    async fn resolve(&self) -> Result<BoundCredential, CredentialRefreshError> {
+impl SecretResolver for ChatgptSecretResolver {
+    async fn resolve(&self, _secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError> {
         self.resolutions
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let next = {
-            let mut script = self.script.lock();
-            assert!(
-                !script.is_empty(),
-                "the broker resolved more times than the script allows"
-            );
-            script.remove(0)
-        };
-        let access = next?;
-        BoundCredential::chatgpt_subscription(
-            Redacted::new(access.to_owned()),
-            "acct-fixture",
-            self.destinations.clone(),
-        )
-        .map_err(|source| {
-            panic!("the fixture access token must be presentable: {source}");
-        })
+        Ok(SecretMaterial::new(CHATGPT_ACCESS.as_bytes().to_vec())
+            .with_chatgpt_account(Redacted::new("acct-fixture".to_owned())))
+    }
+}
+
+const CHATGPT_ACCESS: &str = "refreshed-access-token-audit-must-never-see";
+
+fn secret_binding(id: &str, secret: &str, authority: &str, path: &str) -> SecretUseBinding {
+    SecretUseBinding {
+        binding_id: id.to_owned(),
+        secret: secret.parse().expect("secret DRN"),
+        capabilities: ["http-probe.fetch".parse().expect("capability")].into(),
+        sink: SecretSinkKind::HttpBearer,
+        basic_username: None,
+        allowed_hosts: vec![authority.to_owned()],
+        allowed_methods: vec!["GET".to_owned()],
+        allowed_paths: vec![HttpPathRule::Exact {
+            path: path.to_owned(),
+        }],
+        allow_query: false,
+        max_injections: 1,
+    }
+}
+
+fn defaulted(authority: &str, secret: &str) -> ConstraintSet {
+    ConstraintSet {
+        default_secret_use: Some(dekopon_broker::DefaultSecretUse {
+            drn: secret.parse().expect("secret DRN"),
+            sink: dekopon_broker::DefaultSecretSink::HttpBearer,
+        }),
+        ..set("http-probe", loopback_constraints(authority))
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_budget() {
+async fn a_chatgpt_default_carries_its_account_header_once_per_invocation_outside_the_audit() {
     dekopon_broker_host::enable_test_component_memoization();
-    const ACCESS: &str = "refreshed-access-token-audit-must-never-see";
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -1737,23 +1709,7 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
     let authority = server.authority().to_owned();
-    let constraints = loopback_constraints(&authority);
-    assert_eq!(
-        constraints
-            .http
-            .as_ref()
-            .expect("the fixture grants HTTP")
-            .max_requests,
-        1,
-        "the whole point is one guest call and no headroom for a renewal"
-    );
-    let source = ScriptedRefreshingCredential::new(vec![authority.clone()], vec![Ok(ACCESS)]);
-    let resolutions = Arc::clone(&source.resolutions);
-    let credentials = CredentialStore::new([(
-        "chatgpt-fixture".to_owned(),
-        source as Arc<dyn RefreshingCredential>,
-    )])
-    .expect("credential store builds");
+    let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = Broker::new(
         registry,
@@ -1761,46 +1717,50 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
         http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
         catalog([(
             "http-probe.fetch",
-            ConstraintSet {
-                default_secret_use: None,
-                route: CapabilityRoute::Generic,
-                credential: Some("chatgpt-fixture".to_owned()),
-                ..set("http-probe", constraints)
-            },
+            defaulted(&authority, "drn:secret:chatgpt/gpt-image"),
         )]),
-        credentials,
         callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
-    .expect("a refreshing credential proves its destinations at startup");
+    .expect("broker")
+    .with_secret_catalog(
+        SecretCatalog::new(
+            vec![secret_binding(
+                "chatgpt-image",
+                "drn:secret:chatgpt/gpt-image",
+                &authority,
+                "/images/generations",
+            )],
+            Arc::new(ChatgptSecretResolver {
+                resolutions: Arc::clone(&resolutions),
+            }),
+        )
+        .expect("catalog"),
+    )
+    .expect("the default has exactly one binding");
 
     let result = invoke_as(
         &broker,
         "caller",
         "provider-test",
         request(
-            "invoke-refreshing",
+            "invoke-chatgpt",
             "http-probe.fetch",
             json!({ "uri": format!("http://{authority}/images/generations"), "method": "GET" }),
         ),
     )
     .await
-    .expect("the renewed credential serves the invocation");
+    .expect("the default serves the invocation");
 
     assert_eq!(
         result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(
-        resolutions.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "one invocation must resolve the credential exactly once"
-    );
-
+    assert_eq!(resolutions.load(std::sync::atomic::Ordering::SeqCst), 1);
     let wire = server.request_text();
     assert!(
-        wire.contains(&format!("authorization: Bearer {ACCESS}")),
+        wire.contains(&format!("authorization: Bearer {CHATGPT_ACCESS}")),
         "{wire}"
     );
     assert!(wire.contains("chatgpt-account-id: acct-fixture"), "{wire}");
@@ -1808,24 +1768,21 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
 
     let records = audit.records();
     let AuditEvent::Execution {
-        credential,
-        http_calls,
-        ..
+        secret, http_calls, ..
     } = &records[2]
     else {
         panic!("the terminal record is an execution event");
     };
-    assert_eq!(credential.as_deref(), Some("chatgpt-fixture"));
     assert_eq!(
-        http_calls.len(),
-        1,
-        "the renewal must not appear as a second call"
+        secret.as_ref().map(SecretDrn::as_str),
+        Some("drn:secret:chatgpt/gpt-image")
     );
+    assert_eq!(http_calls.len(), 1);
     assert!(http_calls[0].credential_injected);
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(
-        !serialized.contains(ACCESS),
-        "audit leaked the access token"
+        !serialized.contains(CHATGPT_ACCESS),
+        "audit leaked the token"
     );
     assert!(
         !serialized.contains("acct-fixture"),
@@ -1834,111 +1791,178 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
+async fn a_drn_that_is_not_the_agents_effective_default_needs_an_owner_grant() {
     dekopon_broker_host::enable_test_component_memoization();
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("http-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("HTTP provider fixture loads");
-    let authority = "127.0.0.1:9".to_owned();
-    let source = ScriptedRefreshingCredential::new(
-        vec![authority.clone()],
-        vec![
-            Err(CredentialRefreshError::ReauthorizationRequired),
-            Err(CredentialRefreshError::Unavailable {
-                category: "transport",
-            }),
-        ],
+    const APP_VILLE: &str = "drn:secret:github/app-ville";
+    const PAT_CHAT: &str = "drn:secret:github/pat-chat-is-this-real";
+    let server = LoopbackServer::serving(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        4,
     );
-    let resolutions = Arc::clone(&source.resolutions);
-    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
+    let authority = server.authority().to_owned();
+    let drn = |value: &str| value.parse::<SecretDrn>().expect("secret DRN");
     let broker = Broker::new(
-        registry,
+        BrokerProviderRegistry::load(
+            [provider_fixture("http-probe-provider.wasm")],
+            BrokerHostLimits::default(),
+        )
+        .await
+        .expect("HTTP provider fixture loads"),
         principal("broker-test"),
-        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
-        catalog([(
-            "http-probe.fetch",
-            ConstraintSet {
-                default_secret_use: None,
-                route: CapabilityRoute::Generic,
-                credential: Some("chatgpt-fixture".to_owned()),
-                ..set("http-probe", loopback_constraints(&authority))
-            },
-        )]),
-        CredentialStore::new([(
-            "chatgpt-fixture".to_owned(),
-            source as Arc<dyn RefreshingCredential>,
-        )])
-        .expect("credential store builds"),
+        http_probe_engine(&format!(
+            "{}\n{}",
+            http_policy("caller", "ville-github", "http-probe.fetch"),
+            http_policy("caller", "lange-family", "http-probe.fetch"),
+        )),
+        catalog([("http-probe.fetch", defaulted(&authority, APP_VILLE))]).with_agent_secrets(
+            std::collections::BTreeMap::from([(
+                agent("lange-family"),
+                std::collections::BTreeMap::from([(drn(APP_VILLE), drn(PAT_CHAT))]),
+            )]),
+        ),
         callers(["caller"]),
-        Arc::clone(&audit),
+        Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         BrokerLimits::default(),
     )
-    .expect("the constraint set matches the credential's destinations");
+    .expect("broker")
+    .with_secret_catalog(
+        SecretCatalog::new(
+            vec![
+                secret_binding("app-ville", APP_VILLE, &authority, "/api/v1/thing"),
+                secret_binding("pat-chat", PAT_CHAT, &authority, "/api/v1/thing"),
+            ],
+            Arc::new(StaticSecretResolver(b"default-private-sentinel")),
+        )
+        .expect("catalog"),
+    )
+    .expect("the default and the swap target each have one binding");
+    let fetch = |id: &str, secret: Option<&str>| {
+        let mut proposal = request(
+            id,
+            "http-probe.fetch",
+            json!({ "uri": format!("http://{authority}/api/v1/thing"), "method": "GET" }),
+        );
+        proposal.secret_use = secret.map(|secret| SecretUseProposal::HttpBearer {
+            secret: drn(secret),
+        });
+        proposal
+    };
+    let outcome = |result: AssetInvocationResult| result.result.outcome;
+    use dekopon_capability::InvocationOutcome::{Denied, Succeeded};
 
-    let invoke = |id: &'static str| {
-        invoke_as(
+    for (agent_name, named) in [("ville-github", PAT_CHAT), ("lange-family", APP_VILLE)] {
+        let refused = invoke_as(
             &broker,
             "caller",
-            "provider-test",
-            request(
-                id,
-                "http-probe.fetch",
-                json!({ "uri": format!("http://{authority}/"), "method": "GET" }),
-            ),
+            agent_name,
+            fetch(&format!("invoke-{agent_name}-names"), Some(named)),
         )
-    };
-
-    let permanent = invoke("invoke-reauth")
         .await
-        .expect("an unrenewable credential is a failed invocation, not a broker error");
-    assert_eq!(
-        permanent.result.outcome,
-        dekopon_capability::InvocationOutcome::Failed
-    );
-    assert_eq!(
-        permanent.result.error.as_deref(),
-        Some("credential-unavailable")
-    );
-    assert!(
-        !permanent
-            .result
-            .evidence
-            .iter()
-            .any(|evidence| evidence.kind == "http-calls"),
-        "the component must never have run"
-    );
-
-    let transient = invoke("invoke-transient")
-        .await
-        .expect("the broker keeps serving after an unusable credential");
-    assert_eq!(
-        transient.result.outcome,
-        dekopon_capability::InvocationOutcome::Failed
-    );
-    assert_eq!(
-        transient.result.error.as_deref(),
-        Some("credential-refresh-failed"),
-        "a transient renewal failure must not read as one an operator has to fix"
-    );
-    assert_eq!(resolutions.load(std::sync::atomic::Ordering::SeqCst), 2);
-
-    let records = audit.records();
-    for record in &records {
-        if let AuditEvent::Execution { credential, .. } = record {
+        .expect("a refusal is a result");
+        assert_eq!(outcome(refused), Denied, "{agent_name} naming {named}");
+    }
+    for (agent_name, default) in [("ville-github", APP_VILLE), ("lange-family", PAT_CHAT)] {
+        for (suffix, secret) in [("omits", None), ("names", Some(default))] {
+            let served = invoke_as(
+                &broker,
+                "caller",
+                agent_name,
+                fetch(&format!("invoke-{agent_name}-{suffix}-default"), secret),
+            )
+            .await
+            .expect("the effective default needs no grant");
             assert_eq!(
-                credential.as_deref(),
-                Some("chatgpt-fixture"),
-                "a failed invocation still records which credential it would have presented"
+                outcome(served),
+                Succeeded,
+                "{agent_name} {suffix} {default}"
+            );
+            assert!(
+                server
+                    .request_text()
+                    .contains("authorization: Bearer default-private-sentinel")
             );
         }
+    }
+    server.join();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_or_swap_target_without_exactly_one_binding_refuses_the_catalog() {
+    dekopon_broker_host::enable_test_component_memoization();
+    const APP_VILLE: &str = "drn:secret:github/app-ville";
+    const PAT_CHAT: &str = "drn:secret:github/pat-chat-is-this-real";
+    let authority = "127.0.0.1:1";
+    let drn = |value: &str| value.parse::<SecretDrn>().expect("secret DRN");
+    let basic = |id: &str, username: &str| SecretUseBinding {
+        sink: SecretSinkKind::HttpBasic,
+        basic_username: Some(username.to_owned()),
+        ..secret_binding(id, APP_VILLE, authority, "/api/v1/thing")
+    };
+    for (name, sink, swap, bindings) in [
+        (
+            "a default with no binding",
+            dekopon_broker::DefaultSecretSink::HttpBearer,
+            false,
+            vec![],
+        ),
+        (
+            "a Basic default with two usernames",
+            dekopon_broker::DefaultSecretSink::HttpBasic,
+            false,
+            vec![basic("user-a", "user-a"), basic("user-b", "user-b")],
+        ),
+        (
+            "a swap target with no binding",
+            dekopon_broker::DefaultSecretSink::HttpBearer,
+            true,
+            vec![secret_binding(
+                "app-ville",
+                APP_VILLE,
+                authority,
+                "/api/v1/thing",
+            )],
+        ),
+    ] {
+        let mut set = defaulted(authority, APP_VILLE);
+        if let Some(default) = set.default_secret_use.as_mut() {
+            default.sink = sink;
+        }
+        let mut constraints = catalog([("http-probe.fetch", set)]);
+        if swap {
+            constraints = constraints.with_agent_secrets(std::collections::BTreeMap::from([(
+                agent("lange-family"),
+                std::collections::BTreeMap::from([(drn(APP_VILLE), drn(PAT_CHAT))]),
+            )]));
+        }
+        let error = Broker::new(
+            BrokerProviderRegistry::load(
+                [provider_fixture("http-probe-provider.wasm")],
+                BrokerHostLimits::default(),
+            )
+            .await
+            .expect("HTTP provider fixture loads"),
+            principal("broker-test"),
+            http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
+            constraints,
+            callers(["caller"]),
+            Arc::new(InMemoryAuditLog::new(4).expect("audit")),
+            BrokerLimits::default(),
+        )
+        .expect("broker")
+        .with_secret_catalog(
+            SecretCatalog::new(bindings, Arc::new(StaticSecretResolver(b"unused")))
+                .expect("catalog"),
+        )
+        .expect_err(name);
+        assert!(
+            matches!(error, BrokerBuildError::DefaultSecretBindings { .. }),
+            "{name}: {error}"
+        );
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_binding_and_cedar() {
+async fn a_default_or_a_proposal_equal_to_it_needs_no_grant_but_still_needs_the_capability() {
     dekopon_broker_host::enable_test_component_memoization();
     use dekopon_broker::{DefaultSecretSink, DefaultSecretUse};
     use dekopon_test_support::CaptureLayer;
@@ -1956,15 +1980,14 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
     ) in [
         (false, true, true, false, true, Succeeded),
         (true, true, true, false, true, Succeeded),
-        (true, true, false, false, true, Denied),
-        (true, false, true, false, true, Denied),
-        (true, true, true, true, true, Succeeded),
+        (true, true, false, false, true, Succeeded),
+        (true, true, false, true, true, Succeeded),
         (true, true, true, false, false, Denied),
     ] {
         let server = LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}");
         let authority = server.authority().to_owned();
         let secret_policy = if grant_present {
-            r#"@id("caller-secret-use") permit(principal == Dekopon::Principal::"caller", action == Dekopon::Action::"secret.use", resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token") when { context.capability == "http-probe.fetch" && context.provider == "http-probe" && context.sink == "httpBearer" };"#
+            r#"@id("caller-secret-use") permit(principal == Dekopon::Principal::"caller", action == Dekopon::Action::"secret.use", resource == Dekopon::Secret::"drn:secret:http-probe/token") when { context.capability == "http-probe.fetch" && context.provider == "http-probe" && context.sink == "httpBearer" };"#
         } else {
             ""
         };
@@ -1982,11 +2005,7 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
         let mut set = set("http-probe", loopback_constraints(&authority));
         if default_present {
             set.default_secret_use = Some(DefaultSecretUse {
-                drn: if explicit {
-                    "drn:com.xrl:secret:test:unbound/token".parse().unwrap()
-                } else {
-                    secret_drn()
-                },
+                drn: secret_drn(),
                 sink: DefaultSecretSink::HttpBearer,
             });
         }
@@ -1995,7 +2014,6 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
             principal("broker-test"),
             http_probe_secret_engine(&format!("{capability_policy}\n{secret_policy}")),
             catalog([("http-probe.fetch", set)]),
-            CredentialStore::empty(),
             callers(["caller"]),
             Arc::new(InMemoryAuditLog::new(4).unwrap()),
             BrokerLimits::default(),
@@ -2007,7 +2025,7 @@ async fn an_omitted_secret_proposal_uses_the_configured_default_only_with_bindin
                     vec![SecretUseBinding {
                         binding_id: "http-probe-token".to_owned(),
                         secret: secret_drn(),
-                        capability: "http-probe.fetch".parse().unwrap(),
+                        capabilities: ["http-probe.fetch".parse().expect("capability")].into(),
                         sink: SecretSinkKind::HttpBearer,
                         basic_username: None,
                         allowed_hosts: vec![authority.clone()],
@@ -2102,7 +2120,7 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
         r#"@id("caller-secret-use")
            permit(principal == Dekopon::Principal::"caller",
                   action == Dekopon::Action::"secret.use",
-                  resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token")
+                  resource == Dekopon::Secret::"drn:secret:http-probe/token")
            when { context.capability == "http-probe.fetch"
                && context.provider == "http-probe"
                && context.sink == "httpBearer" };"#,
@@ -2116,7 +2134,6 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
             "http-probe.fetch",
             set("http-probe", loopback_constraints(&authority)),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -2127,7 +2144,7 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
             vec![SecretUseBinding {
                 binding_id: "http-probe-token".to_owned(),
                 secret: secret_drn(),
-                capability: "http-probe.fetch".parse().expect("capability"),
+                capabilities: ["http-probe.fetch".parse().expect("capability")].into(),
                 sink: SecretSinkKind::HttpBearer,
                 basic_username: None,
                 allowed_hosts: vec![authority.clone()],
@@ -2196,7 +2213,7 @@ async fn secret_policy_denial_and_source_failure_have_distinct_audited_outcomes(
             r#"@id("caller-secret-use")
             permit(principal == Dekopon::Principal::"caller",
                    action == Dekopon::Action::"secret.use",
-                   resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token");"#,
+                   resource == Dekopon::Secret::"drn:secret:http-probe/token");"#,
             Arc::new(MissingSecretResolver),
             Failed,
             "secret-resolution",
@@ -2220,7 +2237,6 @@ async fn secret_policy_denial_and_source_failure_have_distinct_audited_outcomes(
                 "http-probe.fetch",
                 set("http-probe", loopback_constraints("127.0.0.1:9")),
             )]),
-            CredentialStore::empty(),
             callers(["caller"]),
             Arc::clone(&audit),
             BrokerLimits::default(),
@@ -2231,7 +2247,7 @@ async fn secret_policy_denial_and_source_failure_have_distinct_audited_outcomes(
                 vec![SecretUseBinding {
                     binding_id: "http-probe-token".to_owned(),
                     secret: secret_drn(),
-                    capability: "http-probe.fetch".parse().expect("capability"),
+                    capabilities: ["http-probe.fetch".parse().expect("capability")].into(),
                     sink: SecretSinkKind::HttpBearer,
                     basic_username: None,
                     allowed_hosts: vec!["127.0.0.1:9".to_owned()],
@@ -2303,7 +2319,7 @@ fn basic_secret_broker(
         r#"@id("caller-basic-secret-use")
            permit(principal == Dekopon::Principal::"caller",
                   action == Dekopon::Action::"secret.use",
-                  resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token")
+                  resource == Dekopon::Secret::"drn:secret:http-probe/token")
            when { context.capability == "http-probe.fetch"
                && context.provider == "http-probe"
                && context.sink == "httpBasic" };"#,
@@ -2316,7 +2332,6 @@ fn basic_secret_broker(
             "http-probe.fetch",
             set("http-probe", loopback_constraints(authority)),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::clone(audit),
         BrokerLimits::default(),
@@ -2327,7 +2342,7 @@ fn basic_secret_broker(
             vec![SecretUseBinding {
                 binding_id: "http-probe-basic".to_owned(),
                 secret: secret_drn(),
-                capability: "http-probe.fetch".parse().expect("capability"),
+                capabilities: ["http-probe.fetch".parse().expect("capability")].into(),
                 sink: SecretSinkKind::HttpBasic,
                 basic_username: Some(username.to_owned()),
                 allowed_hosts: vec![authority.to_owned()],
@@ -2466,323 +2481,6 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[expect(clippy::too_many_lines, reason = "one long test scenario")]
-async fn per_agent_credentials_select_only_a_named_credential_and_never_expose_it() {
-    dekopon_broker_host::enable_test_component_memoization();
-    const DEFAULT_SECRET: &str = "dekopon-agents-token";
-    const OVERRIDE_SECRET: &str = "scientist-hq-token";
-    for credential in [Some("github-pat"), None] {
-        let registry = BrokerProviderRegistry::load(
-            [provider_fixture("http-probe-provider.wasm")],
-            BrokerHostLimits::default(),
-        )
-        .await
-        .expect("HTTP provider fixture loads");
-        let server = LoopbackServer::serving(
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-        2,
-    );
-        let authority = server.authority().to_owned();
-        let credentials = CredentialStore::new(
-            [
-                (
-                    "github-pat".to_owned(),
-                    BoundCredential::bearer(
-                        "Bearer",
-                        Redacted::new(DEFAULT_SECRET.to_owned()),
-                        vec![authority.clone()],
-                    )
-                    .expect("valid credential fixture"),
-                ),
-                (
-                    "github-pat-scientist-hq".to_owned(),
-                    BoundCredential::bearer(
-                        "Bearer",
-                        Redacted::new(OVERRIDE_SECRET.to_owned()),
-                        vec![authority.clone()],
-                    )
-                    .expect("valid credential fixture"),
-                ),
-            ]
-            .into_iter()
-            .filter(|(name, _)| credential.is_some() || name != "github-pat"),
-        )
-        .expect("credential store builds");
-        let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
-        let broker = Broker::new(
-            registry,
-            principal("broker-test"),
-            engine(
-                &format!(
-                    "{}\n{}",
-                    http_policy("caller", "dekoponville-github", "http-probe.fetch"),
-                    http_policy("caller", "nestedset-github", "http-probe.fetch"),
-                ),
-                ["caller"],
-                [("http-probe.fetch", "http-probe")],
-            ),
-            catalog([(
-                "http-probe.fetch",
-                ConstraintSet {
-                    default_secret_use: None,
-                    route: CapabilityRoute::Generic,
-                    credential: credential.map(str::to_owned),
-                    ..set("http-probe", loopback_constraints(&authority))
-                },
-            )])
-            .with_agent_credentials(rebind_for_nestedset(
-                "github-pat",
-                "github-pat-scientist-hq",
-            )),
-            credentials,
-            callers(["caller"]),
-            Arc::clone(&audit),
-            BrokerLimits::default(),
-        )
-        .expect("both the default and the override match the store and its destinations");
-
-        for (id, agent_name) in [
-            ("invoke-nestedset", "nestedset-github"),
-            ("invoke-dekoponville", "dekoponville-github"),
-        ] {
-            let result = invoke_as(
-                &broker,
-                "caller",
-                agent_name,
-                request(
-                    id,
-                    "http-probe.fetch",
-                    json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-                ),
-            )
-            .await
-            .expect("the authorized request is accounted");
-            assert_eq!(
-                result.result.outcome,
-                dekopon_capability::InvocationOutcome::Succeeded
-            );
-            let public = serde_json::to_string(&result.result).expect("result serializes");
-            for secret in [DEFAULT_SECRET, OVERRIDE_SECRET] {
-                assert!(!public.contains(secret), "result leaked the secret");
-            }
-        }
-
-        let wire = || server.request_text();
-        for (index, (present, absent)) in [
-            (OVERRIDE_SECRET, DEFAULT_SECRET),
-            (DEFAULT_SECRET, OVERRIDE_SECRET),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let request = wire();
-            if credential.is_some() {
-                assert!(
-                    request.contains(&format!("authorization: Bearer {present}")),
-                    "request {index} presented the wrong credential: {request}"
-                );
-                assert!(
-                    !request.contains(absent),
-                    "request {index} leaked the other organization's token: {request}"
-                );
-            } else {
-                assert!(
-                    !request.to_ascii_lowercase().contains("authorization"),
-                    "request {index} carried a credential its set never named: {request}"
-                );
-            }
-        }
-        server.join();
-
-        let records = audit.records();
-        let encoded = serde_json::to_value(&records).expect("audit serializes");
-        let selected = encoded
-            .as_array()
-            .expect("records serialize as an array")
-            .iter()
-            .filter_map(|record| record["credential"].as_str())
-            .collect::<Vec<_>>();
-        let serialized = serde_json::to_string(&records).expect("audit serializes");
-        if credential.is_some() {
-            assert_eq!(
-                selected,
-                ["github-pat-scientist-hq", "github-pat"],
-                "each terminal record names the credential its own invocation selected"
-            );
-            assert!(
-                serialized.contains("\"credentialInjected\":true"),
-                "{serialized}"
-            );
-        } else {
-            assert!(
-                !serialized.contains("\"credential\""),
-                "an invocation with no credential names none: {serialized}"
-            );
-        }
-        for secret in [DEFAULT_SECRET, OVERRIDE_SECRET] {
-            assert!(!serialized.contains(secret), "audit leaked a secret");
-        }
-        assert!(!serialized.contains("Bearer"), "audit leaked the scheme");
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn credentialed_constraint_sets_fail_closed_at_construction() {
-    dekopon_broker_host::enable_test_component_memoization();
-    let http = |hosts: Vec<String>| ExecutionConstraints {
-        asset: None,
-        timeout_ms: 5_000,
-        http: Some(HttpConstraints {
-            allowed_hosts: hosts,
-            propagate_trace: false,
-            allowed_methods: vec!["GET".to_owned()],
-            max_requests: 1,
-            max_request_bytes: 64 * 1024,
-            max_response_bytes: 64 * 1024,
-            allow_plaintext_loopback: false,
-            request_templates: Vec::new(),
-            signed_download: None,
-        }),
-        storage: None,
-        secret_use: None,
-    };
-    let store = || {
-        CredentialStore::new([
-            (
-                "fetch-token".to_owned(),
-                BoundCredential::bearer(
-                    "Bearer",
-                    Redacted::new("fetch-token-secret-value".to_owned()),
-                    vec!["api.example.test".to_owned()],
-                )
-                .expect("valid credential fixture"),
-            ),
-            (
-                "other-token".to_owned(),
-                BoundCredential::bearer(
-                    "Bearer",
-                    Redacted::new("other-token-secret-value".to_owned()),
-                    vec!["other.example.test".to_owned()],
-                )
-                .expect("valid credential fixture"),
-            ),
-        ])
-        .expect("credential store builds")
-    };
-    let build_set = |set: ConstraintSet, store: CredentialStore, rebound: Option<String>| {
-        let registry_limits = BrokerHostLimits::default();
-        let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-        async move {
-            let registry = BrokerProviderRegistry::load(
-                [provider_fixture("http-probe-provider.wasm")],
-                registry_limits,
-            )
-            .await
-            .expect("HTTP provider fixture loads");
-            Broker::new(
-                registry,
-                "broker-test"
-                    .parse::<PrincipalId>()
-                    .expect("valid broker principal"),
-                http_probe_engine(""),
-                catalog([("http-probe.fetch", set)]).with_agent_credentials(
-                    rebound.map_or_else(BTreeMap::new, |credential| {
-                        rebind_for_nestedset("fetch-token", &credential)
-                    }),
-                ),
-                store,
-                IdentityDirectory::empty(),
-                audit,
-                BrokerLimits::default(),
-            )
-        }
-    };
-    let build = |credential: String, constraints: ExecutionConstraints, store: CredentialStore| {
-        build_set(
-            ConstraintSet {
-                default_secret_use: None,
-                route: CapabilityRoute::Generic,
-                credential: Some(credential),
-                ..set("http-probe", constraints)
-            },
-            store,
-            None,
-        )
-    };
-    let build_override = |credential: String, constraints: ExecutionConstraints| {
-        build_set(
-            ConstraintSet {
-                default_secret_use: None,
-                route: CapabilityRoute::Generic,
-                credential: Some("fetch-token".to_owned()),
-                ..set("http-probe", constraints)
-            },
-            store(),
-            Some(credential),
-        )
-    };
-
-    let error = build(
-        "missing-token".to_owned(),
-        http(vec!["api.example.test".to_owned()]),
-        store(),
-    )
-    .await
-    .expect_err("unknown credential names are refused");
-    assert!(matches!(error, BrokerBuildError::UnknownCredential { .. }));
-
-    let error = build_override(
-        "missing-token".to_owned(),
-        http(vec!["api.example.test".to_owned()]),
-    )
-    .await
-    .expect_err("an override naming an unknown credential is refused");
-    assert!(matches!(
-        error,
-        BrokerBuildError::UnknownCredential { name, .. } if name == "missing-token"
-    ));
-
-    let error = build(
-        "fetch-token".to_owned(),
-        ExecutionConstraints::default(),
-        store(),
-    )
-    .await
-    .expect_err("credentialed constraint sets require HTTP authority");
-    assert!(matches!(
-        error,
-        BrokerBuildError::CredentialWithoutHttp { .. }
-    ));
-
-    let error = build(
-        "fetch-token".to_owned(),
-        http(vec![
-            "api.example.test".to_owned(),
-            "other.example.test".to_owned(),
-        ]),
-        store(),
-    )
-    .await
-    .expect_err("allowed hosts outside the binding are refused");
-    assert!(matches!(
-        error,
-        BrokerBuildError::CredentialDestinationMismatch { host, .. } if host == "other.example.test"
-    ));
-
-    let error = build_override(
-        "other-token".to_owned(),
-        http(vec!["api.example.test".to_owned()]),
-    )
-    .await
-    .expect_err("an override that does not cover the set's hosts is refused");
-    assert!(matches!(
-        error,
-        BrokerBuildError::CredentialDestinationMismatch { name, host, .. }
-            if name == "other-token" && host == "api.example.test"
-    ));
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_policy() {
     use dekopon_test_support::CaptureLayer;
     use tracing::instrument::WithSubscriber as _;
@@ -2811,7 +2509,6 @@ async fn a_direct_peer_is_denied_every_capability_and_attested_sessions_follow_p
                 set("cli-probe", ExecutionConstraints::default()),
             ),
         ]),
-        CredentialStore::empty(),
         directory([(SLACK_SUBJECT, "cpetersen")]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -3612,7 +3309,6 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
         BrokerLimits::default(),
@@ -3641,7 +3337,6 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
                 "cli-probe.upper",
                 set("cli-probe", ExecutionConstraints::default()),
             )]),
-            CredentialStore::empty(),
             callers(["caller"]),
             Arc::clone(&audit),
             BrokerLimits::default(),
@@ -3709,7 +3404,6 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["caller", "other-caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -3787,7 +3481,6 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
             ["caller"],
         ),
         catalog(unrouted.clone()),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
         BrokerLimits::default(),
@@ -3807,7 +3500,6 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
             ["caller"],
         ),
         catalog(unrouted),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
         BrokerLimits::default(),
@@ -3851,7 +3543,6 @@ async fn command_words_are_filtered_by_policy_and_unknown_words_are_refused() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -3908,7 +3599,6 @@ async fn an_installed_but_ungranted_word_renders_only_its_word_at_exit_127() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -3953,7 +3643,6 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -4003,7 +3692,6 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
             "cli-probe.upper",
             set("cli-probe", ExecutionConstraints::default()),
         )]),
-        CredentialStore::empty(),
         callers(["caller"]),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -4108,7 +3796,6 @@ async fn a_spaces_request_forbid_stops_http_before_the_network() {
             "http-probe.fetch",
             set("http-probe", loopback_constraints(server.authority())),
         )]),
-        CredentialStore::empty(),
         IdentityDirectory::new(mappings).expect("directory"),
         Arc::clone(&audit),
         BrokerLimits::default(),
@@ -4199,7 +3886,6 @@ async fn a_space_only_policy_error_records_its_id() {
             "http-probe.fetch",
             set("http-probe", loopback_constraints(server.authority())),
         )]),
-        CredentialStore::empty(),
         IdentityDirectory::new(mappings).expect("directory"),
         Arc::clone(&audit),
         BrokerLimits::default(),

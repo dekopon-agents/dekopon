@@ -394,7 +394,7 @@ async fn ipc_process_boundary() {
         if role == "mapped" && std::env::var_os("DEKOPON_IPC_TEST_PRIVATE").is_some() {
             let private =
                 std::path::PathBuf::from(std::env::var("DEKOPON_IPC_TEST_PRIVATE").unwrap());
-            for name in ["credentials.json", "broker.json", "storage/sentinel"] {
+            for name in ["api-token", "broker.json", "storage/sentinel"] {
                 assert_eq!(
                     fs::read(private.join(name)).unwrap_err().kind(),
                     std::io::ErrorKind::PermissionDenied,
@@ -465,11 +465,8 @@ async fn ipc_process_boundary() {
         &provider,
     )
     .unwrap();
-    let credentials = private.join("credentials.json");
-    fs::write(&credentials, serde_json::to_vec(&json!({
-        "apiVersion": "dekopon.dev/broker-credentials/v1alpha1",
-        "credentials": [{"name": "fixture-token", "kind": "bearerToken", "scheme": "Bearer", "destinations": ["example.com"], "secret": "IPC-PRIVATE-SENTINEL"}]
-    })).unwrap()).unwrap();
+    let secret = private.join("api-token");
+    fs::write(&secret, "IPC-PRIVATE-SENTINEL").unwrap();
     let policy = private.join("policy.cedar");
     fs::write(&policy, r#"@id("cpetersen-may-prompt-chat-agent")
 permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent");
@@ -486,11 +483,11 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     fs::write(&config, serde_json::to_vec(&json!({
         "apiVersion": "dekopon.dev/brokerd/v1alpha1", "socketPath": socket,
         "policiesPath": policy,
-        "providers": [provider], "credentialsPath": credentials, "identities": identities,
+        "providers": [provider], "identities": identities,
         "principals": {"cpetersen": {"subjects": ["drn:slack:user:t0123abc:u9xyz"]}},
         "capabilities": {"cli-probe": {"constraints": {"timeoutMs": 30000}, "capabilities": {"cli-probe.upper": {}}}}
     })).unwrap()).unwrap();
-    for path in [&provider, &credentials, &policy, &config] {
+    for path in [&provider, &secret, &policy, &config] {
         owned(path, server_uid, gid, 0o600, root);
     }
     let mut command = Command::new(env!("CARGO_BIN_EXE_dekopon-brokerd"));

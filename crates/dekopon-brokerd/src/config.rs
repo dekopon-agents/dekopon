@@ -18,7 +18,7 @@ use dekopon_broker_protocol::{
 };
 use dekopon_core::{
     Actor, AgentId, FileHygieneError, FileTier, GroupId, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
-    ProviderId, Subject,
+    ProviderId, SecretDrn, Subject,
     fragments::{self, FragmentError, MergeRules},
     read_trusted_file,
 };
@@ -52,8 +52,6 @@ pub enum ConfigApiVersion {
 pub struct BrokerdConfig {
     pub api_version: ConfigApiVersion,
     pub socket_path: PathBuf,
-    #[serde(default)]
-    pub credentials_path: Option<PathBuf>,
     #[serde(default)]
     pub secret_map_path: Option<PathBuf>,
     #[serde(default)]
@@ -177,7 +175,7 @@ impl PeerIdentity {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentBindingConfig {
-    pub credentials: BTreeMap<String, String>,
+    pub secrets: BTreeMap<SecretDrn, SecretDrn>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -311,7 +309,6 @@ impl ConfigSnapshot {
 
     pub(crate) fn from_mapping(mapping: &serde_yaml::Mapping) -> Self {
         const SWAP: &[&str] = &[
-            "credentialsPath",
             "secretMapPath",
             "strict",
             "identities",
@@ -412,15 +409,8 @@ impl ConfigSnapshot {
 
     pub(crate) fn record_authority_references(
         &mut self,
-        credentials: Option<&serde_yaml::Value>,
         secret_map: Option<&[u8]>,
     ) -> Result<(), ConfigError> {
-        if let Some(value) = credentials {
-            self.0.insert(
-                "credentialReferences".to_owned(),
-                (Disposition::Swap, value.clone()),
-            );
-        }
         if let Some(bytes) = secret_map {
             let value = serde_yaml::from_slice(bytes).map_err(|source: serde_yaml::Error| {
                 ConfigError::SecretMapDecode {
@@ -572,7 +562,6 @@ pub struct ResolvedConfig {
     pub source: PathBuf,
     pub(crate) snapshot: ConfigSnapshot,
     pub socket_path: PathBuf,
-    pub credentials_path: Option<PathBuf>,
     pub secret_map_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
     pub locked_providers: Option<Vec<LockedProviderSource>>,
@@ -925,10 +914,6 @@ async fn resolve(
         })
         .transpose()
     };
-    let credentials_path = match mode {
-        LoadMode::Boot | LoadMode::Reload { .. } => canonical(config.credentials_path)?,
-        LoadMode::Check => config.credentials_path.map(resolve_path),
-    };
     // The final path component is left uncanonicalized so the secret-map loader's O_NOFOLLOW check
     // can actually reject a symlink, rather than being handed a target canonicalization already
     // resolved away.
@@ -1063,9 +1048,6 @@ async fn resolve(
         return Err(ConfigError::NoProviders);
     }
     let mut reserved = vec![source.clone(), socket_path.clone()];
-    if let Some(credentials_path) = &credentials_path {
-        reserved.push(credentials_path.clone());
-    }
     if let Some(secret_map_path) = &secret_map_path {
         reserved.push(secret_map_path.clone());
     }
@@ -1314,7 +1296,6 @@ async fn resolve(
         source,
         snapshot: ConfigSnapshot::default(),
         socket_path,
-        credentials_path,
         secret_map_path,
         providers,
         locked_providers,
@@ -1527,7 +1508,7 @@ mod secret_map_reference_tests {
         let sentinel = "sensitive-token-in-invalid-map-reference";
         let bytes = format!("source: [{{invalid: {sentinel}}}");
         let error = ConfigSnapshot::default()
-            .record_authority_references(None, Some(bytes.as_bytes()))
+            .record_authority_references(Some(bytes.as_bytes()))
             .expect_err("invalid YAML");
         assert!(matches!(error, ConfigError::SecretMapDecode { .. }));
         assert!(!dekopon_core::error_chain(&error).contains(sentinel));

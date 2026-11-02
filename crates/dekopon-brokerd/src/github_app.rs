@@ -1,12 +1,9 @@
 use std::{collections::BTreeMap, num::NonZeroU64};
 
-use async_trait::async_trait;
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
-use dekopon_broker::{CredentialRefreshError, RefreshingCredential};
-use dekopon_broker_host::BoundCredential;
 use dekopon_core::{Redacted, error_chain};
 use reqwest::{
     StatusCode,
@@ -22,7 +19,7 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::Instrument as _;
 
-use crate::credentials::REFRESH_TIMEOUT;
+use crate::secrets::{REFRESH_TIMEOUT, RefreshError};
 
 pub(crate) const HARD_MAX_GITHUB_APP_KEY_BYTES: usize = 16 * 1024;
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -114,7 +111,6 @@ pub(crate) struct GithubAppCredential {
     key: GithubAppKey,
     endpoint: String,
     body: Option<Vec<u8>>,
-    destinations: Vec<String>,
     client: reqwest::Client,
     cached: parking_lot::Mutex<Option<CachedToken>>,
 }
@@ -137,7 +133,6 @@ impl std::fmt::Debug for GithubAppCredential {
             .field("name", &self.name)
             .field("app_id", &self.app_id)
             .field("endpoint", &self.endpoint)
-            .field("destinations", &self.destinations)
             .finish_non_exhaustive()
     }
 }
@@ -147,16 +142,14 @@ impl GithubAppCredential {
         name: String,
         installation: Installation,
         key: GithubAppKey,
-        destinations: Vec<String>,
     ) -> Result<Self, GithubAppError> {
-        Self::with_api_base(name, installation, key, destinations, GITHUB_API_BASE)
+        Self::with_api_base(name, installation, key, GITHUB_API_BASE)
     }
 
     pub(crate) fn with_api_base(
         name: String,
         installation: Installation,
         key: GithubAppKey,
-        destinations: Vec<String>,
         api_base: &str,
     ) -> Result<Self, GithubAppError> {
         let body = installation
@@ -182,24 +175,12 @@ impl GithubAppCredential {
                 installation.installation_id
             ),
             body,
-            destinations,
             client,
             cached: parking_lot::Mutex::new(None),
         })
     }
 
-    fn bind(&self, token: &Redacted<String>) -> Result<BoundCredential, CredentialRefreshError> {
-        BoundCredential::bearer("Bearer", token.clone(), self.destinations.clone()).map_err(
-            |source| {
-                self.failed("invalid-material", Some(&source));
-                CredentialRefreshError::Unavailable {
-                    category: "invalid-material",
-                }
-            },
-        )
-    }
-
-    fn jwt(&self, now: OffsetDateTime) -> Result<Redacted<String>, CredentialRefreshError> {
+    fn jwt(&self, now: OffsetDateTime) -> Result<Redacted<String>, RefreshError> {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
         let claims = URL_SAFE_NO_PAD.encode(
             serde_json::json!({
@@ -221,7 +202,7 @@ impl GithubAppCredential {
             )
             .map_err(|_unspecified| {
                 self.failed("signing", None);
-                CredentialRefreshError::Unavailable {
+                RefreshError::Unavailable {
                     category: "signing",
                 }
             })?;
@@ -231,7 +212,7 @@ impl GithubAppCredential {
         )))
     }
 
-    async fn mint(&self, now: OffsetDateTime) -> Result<CachedToken, CredentialRefreshError> {
+    async fn mint(&self, now: OffsetDateTime) -> Result<CachedToken, RefreshError> {
         let jwt = self.jwt(now)?;
         let mut authorization = HeaderValue::try_from(format!("Bearer {}", jwt.expose()))
             .map_err(|_invalid| self.unavailable("signing"))?;
@@ -261,7 +242,7 @@ impl GithubAppCredential {
                 causes = "a revoked or wrong key, a deleted App, or a clock more than a minute ahead",
                 "broker.github.app.credential.reauth.required"
             );
-            return Err(CredentialRefreshError::ReauthorizationRequired);
+            return Err(RefreshError::ReauthorizationRequired);
         }
         if status.is_server_error() {
             return Err(self.unavailable("token-endpoint-unavailable"));
@@ -290,14 +271,14 @@ impl GithubAppCredential {
         })
     }
 
-    fn unavailable(&self, category: &'static str) -> CredentialRefreshError {
+    fn unavailable(&self, category: &'static str) -> RefreshError {
         self.failed(category, None);
-        CredentialRefreshError::Unavailable { category }
+        RefreshError::Unavailable { category }
     }
 
-    fn transport(&self, error: &reqwest::Error) -> CredentialRefreshError {
+    fn transport(&self, error: &reqwest::Error) -> RefreshError {
         self.failed("transport", Some(error));
-        CredentialRefreshError::Unavailable {
+        RefreshError::Unavailable {
             category: "transport",
         }
     }
@@ -313,20 +294,15 @@ impl GithubAppCredential {
     }
 }
 
-#[async_trait]
-impl RefreshingCredential for GithubAppCredential {
-    fn destinations(&self) -> &[String] {
-        &self.destinations
-    }
-
-    async fn resolve(&self) -> Result<BoundCredential, CredentialRefreshError> {
+impl GithubAppCredential {
+    pub(crate) async fn resolve(&self) -> Result<Redacted<String>, RefreshError> {
         let now = OffsetDateTime::now_utc();
         {
             let cached = self.cached.lock();
             if let Some(current) = cached.as_ref()
                 && now < current.renew_at
             {
-                return self.bind(&current.token);
+                return Ok(current.token.clone());
             }
         }
         let span = tracing::info_span!(
@@ -345,9 +321,9 @@ impl RefreshingCredential for GithubAppCredential {
             }
         };
         span.record("outcome", "renewed");
-        let bound = self.bind(&minted.token)?;
+        let token = minted.token.clone();
         *self.cached.lock() = Some(minted);
-        Ok(bound)
+        Ok(token)
     }
 }
 
@@ -355,8 +331,8 @@ impl RefreshingCredential for GithubAppCredential {
 mod tests {
     use std::{num::NonZeroU64, sync::Arc};
 
+    use crate::secrets::RefreshError;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use dekopon_broker::{CredentialRefreshError, RefreshingCredential as _};
     use dekopon_test_support::{CaptureLayer, LoopbackServer, Record};
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -408,7 +384,6 @@ mod tests {
                 downscope,
             },
             GithubAppKey::from_pem(KEY_PEM).expect("the fixture key parses"),
-            vec!["api.github.com".to_owned()],
             api_base,
         )
         .expect("the credential builds")
@@ -662,7 +637,7 @@ mod tests {
             .resolve()
             .await
             .expect_err("a refused JWT fails");
-        assert_eq!(error, CredentialRefreshError::ReauthorizationRequired);
+        assert_eq!(error, RefreshError::ReauthorizationRequired);
         server.join();
     }
 
@@ -690,7 +665,7 @@ mod tests {
                 .resolve()
                 .await
                 .expect_err("the mint fails");
-            assert_eq!(error, CredentialRefreshError::Unavailable { category });
+            assert_eq!(error, RefreshError::Unavailable { category });
             server.join();
         }
     }
@@ -712,7 +687,7 @@ mod tests {
                 .expect_err("upstream refusal must not mint");
             assert!(matches!(
                 error,
-                CredentialRefreshError::Unavailable {
+                RefreshError::Unavailable {
                     category: "token-endpoint-rejected"
                 }
             ));
@@ -739,20 +714,6 @@ mod tests {
                 && record.field("http.response.status_code") == code));
             server.join();
         }
-    }
-
-    #[tokio::test]
-    async fn github_app_binds_the_token_only_to_its_destinations() {
-        let server = LoopbackServer::once(&token_response(TOKEN, time::Duration::hours(1)));
-        let credential = credential(&server, None);
-        let bound = credential.resolve().await.expect("resolution");
-
-        assert_eq!(credential.destinations(), ["api.github.com"]);
-        assert_eq!(bound.destinations(), ["api.github.com"]);
-        assert!(bound.covers("api.github.com"));
-        assert!(!bound.covers("uploads.github.com"));
-        assert!(!bound.covers("chatgpt.com"));
-        server.join();
     }
 
     #[derive(Clone, Default)]

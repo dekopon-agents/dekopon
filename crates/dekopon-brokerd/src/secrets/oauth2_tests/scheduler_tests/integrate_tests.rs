@@ -248,8 +248,8 @@ async fn inspecting_a_loaded_map_reports_all_sealed_and_malformed_records_withou
     fs::write(&paths[2], format!("{{\"state\":{sentinel}}}")).unwrap();
     fs::set_permissions(&paths[2], fs::Permissions::from_mode(0o600)).unwrap();
     let entries: Vec<Value> = ["one", "two", "bad"].iter().enumerate().map(|(index, name)| json!({
-        "drn":drn(name), "source":source_value(&paths[index], &api.endpoint),
-        "bindings":[{"id":format!("binding-{name}"),"capability":"vm.session.create","sink":"httpBearer",
+        "drn":drn(name), "destinations":["runner.example"], "source":source_value(&paths[index], &api.endpoint),
+        "bindings":[{"id":format!("binding-{name}"),"capabilities":["vm.session.create"],"sink":"httpBearer",
             "allowedHosts":["runner.example"],"allowedMethods":["POST"],
             "allowedPaths":[{"match":"exact","path":"/v1/sessions"}]}]
     })).collect();
@@ -259,12 +259,12 @@ async fn inspecting_a_loaded_map_reports_all_sealed_and_malformed_records_withou
     let capture = CaptureLayer::new();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
     let catalog = async {
-        let (catalog, _, scheduled) =
+        let loaded =
             super::super::super::load_with_bytes(&map_path, rustix::process::geteuid().as_raw())
                 .await
                 .expect("load valid map with unavailable records");
-        scheduled.inspect_records().await;
-        catalog
+        loaded.scheduled.inspect_records().await;
+        loaded.catalog
     }
     .with_subscriber(subscriber)
     .await;

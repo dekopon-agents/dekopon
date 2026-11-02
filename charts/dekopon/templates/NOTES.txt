@@ -17,7 +17,7 @@ Image: {{ include "dekopon.image" . }}
 
 The broker refuses to start rather than serving with a path it does not trust, so read the
 prepare-files and broker logs before assuming the image or the network is at fault.
-{{- if or .Values.broker.config.existingSecret .Values.broker.policies.existingSecret .Values.broker.credentials.existingSecret }}
+{{- if or .Values.broker.config.existingSecret .Values.broker.policies.existingSecret .Values.broker.secretMap.existingSecret }}
 
 Broker configuration is copied once, by the init container, at pod start. This release reads at
 least one existing broker Secret, whose contents the chart cannot checksum, so editing it changes
@@ -61,7 +61,7 @@ says whether this start seeded anything or left the live credential alone.
 
 The BROKER's ChatGPT credential is seeded ONCE into {{ include "dekopon.brokerChatgptDir" . }}/{{ .Values.broker.chatgpt.fileName }}
 on the persistent claim, and the init container never overwrites it again. Point the
-`kind: chatgptSubscription` entry in broker-credentials.yaml at exactly that path; dekopon-brokerd
+`chatgptSubscription` secret map entry's authFile at exactly that path; dekopon-brokerd
 refuses to start if it is not an owner-only file in an owner-only writable directory.
 
 This is a SEPARATE refresh-token family from the gateway's. Never point both at one file: the

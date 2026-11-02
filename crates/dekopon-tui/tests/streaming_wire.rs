@@ -228,7 +228,7 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let secret = SecretUseProposal::HttpBearer {
-        secret: "drn:com.xrl:secret:prod:api/token".parse().unwrap(),
+        secret: "drn:secret:api/token".parse().unwrap(),
     };
     let expected_secret = secret.clone();
     let server = tokio::spawn(async move {

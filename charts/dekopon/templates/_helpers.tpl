@@ -86,10 +86,6 @@ Object names.
 {{- printf "%s-gateway-config" (include "dekopon.fullname" .) -}}
 {{- end -}}
 
-{{- define "dekopon.credentialsSecretName" -}}
-{{- printf "%s-credentials" (include "dekopon.fullname" .) -}}
-{{- end -}}
-
 {{- define "dekopon.catalogConfigMapName" -}}
 {{- printf "%s-catalog" (include "dekopon.fullname" .) -}}
 {{- end -}}
@@ -115,10 +111,6 @@ Whether each optional file has a source at all.
 */}}
 {{- define "dekopon.hasPolicies" -}}
 {{- if or .Values.broker.policies.inline .Values.broker.policies.existingSecret -}}true{{- end -}}
-{{- end -}}
-
-{{- define "dekopon.hasCredentials" -}}
-{{- if or .Values.broker.credentials.inline .Values.broker.credentials.existingSecret -}}true{{- end -}}
 {{- end -}}
 
 {{- define "dekopon.hasSecretMap" -}}
@@ -257,11 +249,6 @@ cannot drift apart.
 - file: policies.cedar
   secret: {{ default (include "dekopon.configSecretName" .) .Values.broker.policies.existingSecret }}
   key: {{ if .Values.broker.policies.existingSecret }}{{ .Values.broker.policies.existingSecretKey }}{{ else }}policies.cedar{{ end }}
-{{- end }}
-{{- if include "dekopon.hasCredentials" . }}
-- file: broker-credentials.yaml
-  secret: {{ default (include "dekopon.credentialsSecretName" .) .Values.broker.credentials.existingSecret }}
-  key: {{ if .Values.broker.credentials.existingSecret }}{{ .Values.broker.credentials.existingSecretKey }}{{ else }}broker-credentials.yaml{{ end }}
 {{- end }}
 {{- if include "dekopon.hasSecretMap" . }}
 - file: secret-map.yaml
@@ -406,9 +393,6 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- if and .Values.broker.policies.inline .Values.broker.policies.existingSecret -}}
 {{- fail "broker.policies.inline and broker.policies.existingSecret are mutually exclusive" -}}
 {{- end -}}
-{{- if and .Values.broker.credentials.inline .Values.broker.credentials.existingSecret -}}
-{{- fail "broker.credentials.inline and broker.credentials.existingSecret are mutually exclusive" -}}
-{{- end -}}
 {{- if and .Values.broker.secretMap.inline .Values.broker.secretMap.existingSecret -}}
 {{- fail "broker.secretMap.inline and broker.secretMap.existingSecret are mutually exclusive" -}}
 {{- end -}}
@@ -417,9 +401,6 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- if .Values.broker.config.inline -}}
 {{- if and (regexMatch "(?m)^[[:space:]]*policiesPath:" .Values.broker.config.inline) (not (include "dekopon.hasPolicies" .)) -}}
 {{- fail "broker.config.inline names policiesPath but no policy set was supplied; set broker.policies.inline or broker.policies.existingSecret" -}}
-{{- end -}}
-{{- if and (regexMatch "(?m)^[[:space:]]*credentialsPath:" .Values.broker.config.inline) (not (include "dekopon.hasCredentials" .)) -}}
-{{- fail "broker.config.inline names credentialsPath but no credentials were supplied; set broker.credentials.inline or broker.credentials.existingSecret" -}}
 {{- end -}}
 {{- if and (regexMatch "(?m)^[[:space:]]*secretMapPath:" .Values.broker.config.inline) (not (include "dekopon.hasSecretMap" .)) -}}
 {{- fail "broker.config.inline names secretMapPath but no secret map was supplied; set broker.secretMap.inline or broker.secretMap.existingSecret" -}}
@@ -730,7 +711,7 @@ broker that lands mid-invocation. */}}
 {{- fail (printf "broker.oauth2Records.mountPath overlaps %s" $name) -}}
 {{- end -}}
 {{- end -}}
-{{- $bootstrapNames := dict "broker.yaml" true "policies.cedar" true "broker-credentials.yaml" true "secret-map.yaml" true "gatewayd.yaml" true "broker.d" true -}}
+{{- $bootstrapNames := dict "broker.yaml" true "policies.cedar" true "secret-map.yaml" true "gatewayd.yaml" true "broker.d" true -}}
 {{- range (include "dekopon.seedFiles" . | fromYamlArray) -}}
 {{- $_ := set $bootstrapNames .source true -}}
 {{- end -}}

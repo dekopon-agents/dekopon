@@ -8,16 +8,16 @@ use dekopon_capability::{
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, MAX_FAILURE_MESSAGE_BYTES, PrincipalId,
-    ProviderFailureDetail, ProviderId, TraceId,
+    ProviderFailureDetail, ProviderId, SecretDrn, SecretSinkKind, SecretUseProposal, TraceId,
 };
 
 use super::{
     AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuthenticatedContext,
     AuthorityEncoder, Broker, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ConstraintCatalog,
-    ConstraintSet, ContextError, CredentialStore, IdentityDirectory, InMemoryAuditLog,
-    PolicyEngine, PolicyWorld, encode_capability_authority, encode_execution_constraints,
-    encode_host_limits, encode_memory_config, encode_storage_limits, provider_exit_status,
-    provider_failure_detail, public_host_error, render_chat_slots,
+    ConstraintSet, ContextError, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
+    encode_capability_authority, encode_execution_constraints, encode_host_limits,
+    encode_memory_config, encode_storage_limits, provider_exit_status, provider_failure_detail,
+    public_host_error, render_chat_slots,
 };
 
 #[tokio::test]
@@ -77,7 +77,6 @@ async fn desired_pin_without_a_loaded_artifact_is_not_an_execution_digest() {
         provider: pin.provider_id().clone(),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        credential: None,
         constraints: ExecutionConstraints::default(),
     };
     super::emit_audit_event(&super::execution_event(
@@ -91,7 +90,6 @@ async fn desired_pin_without_a_loaded_artifact_is_not_an_execution_digest() {
         artifact.as_deref(),
         &broker,
         &set,
-        None,
         InvocationOutcome::Failed,
         None,
         0,
@@ -140,7 +138,6 @@ async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
             "broker".parse().expect("principal"),
             PolicyEngine::new("", &world).expect("policy"),
             ConstraintCatalog::new([]).expect("constraints"),
-            CredentialStore::empty(),
             IdentityDirectory::empty(),
             Arc::new(InMemoryAuditLog::new(4).expect("audit")),
             BrokerLimits::default(),
@@ -589,7 +586,6 @@ fn capability_authority_commits_exactly_these_fields() {
         provider: "cli-probe".parse().expect("valid provider fixture"),
         effect: dekopon_capability::EffectKind::ReadOnly,
         risk: dekopon_core::RiskLevel::Low,
-        credential: Some("probe-token".to_owned()),
         constraints: ExecutionConstraints::default(),
     };
     let mut encoded = AuthorityEncoder::new();
@@ -599,7 +595,9 @@ fn capability_authority_commits_exactly_these_fields() {
             .parse::<CapabilityId>()
             .expect("valid fixture"),
         &set,
-        Some("probe-token"),
+        Some(&SecretUseProposal::HttpBearer {
+            secret: "drn:secret:probe/token".parse().expect("secret DRN"),
+        }),
         "sha256:artifact",
     );
 
@@ -610,8 +608,9 @@ fn capability_authority_commits_exactly_these_fields() {
             "provider",
             "effect",
             "risk",
-            "credential.present",
-            "credential",
+            "defaultSecretDrn",
+            "defaultSecretSink",
+            "defaultSecretBasicUsername.present",
             "execution.timeoutMs",
             "execution.http.present",
             "execution.storage.present",
@@ -646,7 +645,6 @@ fn capability_authority_commits_exactly_these_fields() {
             "provider",
             "effect",
             "risk",
-            "credential.present",
             "execution.timeoutMs",
             "execution.http.present",
             "execution.storage.present",
@@ -981,7 +979,6 @@ fn policy_http_scope_values_are_bounded() {
             provider: "cli-probe".parse().expect("provider"),
             effect: dekopon_capability::EffectKind::ReadOnly,
             risk: dekopon_core::RiskLevel::Low,
-            credential: None,
             constraints: ExecutionConstraints {
                 http: Some(http),
                 ..ExecutionConstraints::default()
@@ -1064,22 +1061,22 @@ fn policy_http_scope_values_are_bounded() {
 }
 
 #[test]
-fn an_agent_rebinds_only_the_credential_name_its_set_already_uses() {
+fn an_agent_swaps_only_the_default_its_set_already_names() {
     let document = r#"{
+        "defaultSecretUse": { "drn": "drn:secret:github/app-ville", "sink": "httpBearer" },
         "provider": "gh",
         "effect": "external-write",
         "risk": "Medium",
-        "credential": "github-pat",
         "constraints": { "timeoutMs": 1000 }
     }"#;
     let named =
         serde_json::from_str::<super::ConstraintSet>(document).expect("authored set decodes");
     let unnamed = super::ConstraintSet {
         default_secret_use: None,
-        credential: None,
         ..named.clone()
     };
     let agent = |name: &str| name.parse::<AgentId>().expect("valid agent");
+    let drn = |value: &str| value.parse::<SecretDrn>().expect("secret DRN");
     let catalog = super::ConstraintCatalog::new([(
         "gh.pull-request.merge"
             .parse::<CapabilityId>()
@@ -1087,25 +1084,36 @@ fn an_agent_rebinds_only_the_credential_name_its_set_already_uses() {
         named.clone(),
     )])
     .expect("one set builds a catalog")
-    .with_agent_credentials(BTreeMap::from([(
-        agent("nestedset-github"),
+    .with_agent_secrets(BTreeMap::from([(
+        agent("lange-family"),
         BTreeMap::from([(
-            "github-pat".to_owned(),
-            "github-pat-scientist-hq".to_owned(),
+            drn("drn:secret:github/app-ville"),
+            drn("drn:secret:github/pat-chat-is-this-real"),
         )]),
     )]));
     let actor = |name: &str| Actor::Agent { agent: agent(name) };
+    let effective = |set: &ConstraintSet, actor: &Actor| -> Option<(String, SecretSinkKind)> {
+        catalog
+            .effective_default(set, actor)
+            .map(|(secret, sink)| (secret.as_str().to_owned(), sink))
+    };
 
     assert_eq!(
-        catalog.credential_for(&named, &actor("nestedset-github")),
-        Some("github-pat-scientist-hq")
+        effective(&named, &actor("lange-family")),
+        Some((
+            "drn:secret:github/pat-chat-is-this-real".to_owned(),
+            SecretSinkKind::HttpBearer
+        ))
     );
     assert_eq!(
-        catalog.credential_for(&named, &actor("dekoponville-github")),
-        Some("github-pat")
+        effective(&named, &actor("ville-github")),
+        Some((
+            "drn:secret:github/app-ville".to_owned(),
+            SecretSinkKind::HttpBearer
+        ))
     );
     assert_eq!(
-        catalog.credential_for(
+        effective(
             &named,
             &Actor::Service {
                 principal: "local-user"
@@ -1113,20 +1121,20 @@ fn an_agent_rebinds_only_the_credential_name_its_set_already_uses() {
                     .expect("valid principal"),
             }
         ),
-        Some("github-pat")
+        Some((
+            "drn:secret:github/app-ville".to_owned(),
+            SecretSinkKind::HttpBearer
+        ))
     );
-    assert_eq!(
-        catalog.credential_for(&unnamed, &actor("nestedset-github")),
-        None
-    );
+    assert_eq!(effective(&unnamed, &actor("lange-family")), None);
 
     assert!(
         serde_json::from_str::<super::ConstraintSet>(&document.replace(
-            r#""credential": "github-pat","#,
-            r#""credential": "github-pat", "credentialByAgent": {},"#,
+            r#""provider": "gh","#,
+            r#""provider": "gh", "credential": "github-pat","#,
         ))
         .is_err(),
-        "the retired per-set override key must not decode"
+        "the retired credential key must not decode"
     );
 }
 
@@ -1321,12 +1329,10 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
                 provider: provider_id,
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
-                credential: None,
                 constraints: ExecutionConstraints::default(),
             },
         )])
         .unwrap(),
-        CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::new(InMemoryAuditLog::new(4).unwrap()),
         BrokerLimits::default(),
@@ -1422,7 +1428,6 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
         provider: "probe".parse().unwrap(),
         effect: EffectKind::LocalWrite,
         risk: dekopon_core::RiskLevel::Low,
-        credential: None,
         constraints: ExecutionConstraints {
             asset: Some(AssetConstraints {
                 attach: true,
@@ -1482,7 +1487,6 @@ fn storage_retention_policy_rejects_conflicts_for_one_resource_family() {
         provider: "storage-probe".parse().unwrap(),
         effect: EffectKind::ReadOnly,
         risk: dekopon_core::RiskLevel::Low,
-        credential: None,
         constraints: ExecutionConstraints {
             storage: Some(StorageConstraints {
                 interface: StorageInterface::DurableFiles,
@@ -1634,7 +1638,6 @@ fn storage_set(
             StorageAccess::ReadWrite => dekopon_capability::EffectKind::LocalWrite,
         },
         risk: dekopon_core::RiskLevel::Low,
-        credential: None,
         constraints: ExecutionConstraints {
             storage: Some(StorageConstraints {
                 interface,
@@ -1863,7 +1866,6 @@ fn a_host_redirect_refusal_records_no_provider_exit_code() {
         provider: "gh".parse().unwrap(),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        credential: None,
         constraints: ExecutionConstraints::default(),
     };
     let captured = CaptureLayer::workspace();
@@ -1881,7 +1883,6 @@ fn a_host_redirect_refusal_records_no_provider_exit_code() {
         None,
         &principal,
         &set,
-        None,
         InvocationOutcome::Failed,
         Some(&failure),
         0,
@@ -2059,23 +2060,6 @@ fn capability_routes_have_distinct_stable_names() {
 }
 
 #[test]
-fn credential_refresh_errors_have_distinct_categories() {
-    use super::CredentialRefreshError;
-
-    assert_eq!(
-        CredentialRefreshError::ReauthorizationRequired.category(),
-        "reauthorization-required"
-    );
-    assert_eq!(
-        CredentialRefreshError::Unavailable {
-            category: "timeout"
-        }
-        .category(),
-        "timeout"
-    );
-}
-
-#[test]
 fn a_default_secret_use_field_deserializes_to_some() {
     let set = |extra: serde_json::Value| {
         let mut value = serde_json::to_value(storage_set(
@@ -2095,7 +2079,7 @@ fn a_default_secret_use_field_deserializes_to_some() {
     };
     assert_eq!(set(serde_json::json!({})).default_secret_use, None);
     let secret = set(serde_json::json!({
-        "defaultSecretUse": {"drn": "drn:com.xrl:secret:prod:api/token", "sink": "httpBearer"}
+        "defaultSecretUse": {"drn": "drn:secret:api/token", "sink": "httpBearer"}
     }));
     assert_eq!(
         secret
@@ -2103,7 +2087,7 @@ fn a_default_secret_use_field_deserializes_to_some() {
             .expect("a present field decodes")
             .drn
             .as_str(),
-        "drn:com.xrl:secret:prod:api/token"
+        "drn:secret:api/token"
     );
 }
 
@@ -2138,7 +2122,7 @@ fn a_constraint_catalog_reports_its_length() {
 
 #[tokio::test]
 async fn a_catalog_over_the_constraint_set_ceiling_is_refused() {
-    use super::{BrokerBuildError, CredentialStore};
+    use super::BrokerBuildError;
 
     let registry = dekopon_broker_host::BrokerProviderRegistry::load(
         [dekopon_test_support::provider_fixture(
@@ -2149,7 +2133,7 @@ async fn a_catalog_over_the_constraint_set_ceiling_is_refused() {
     .await
     .expect("a real component loads");
     let error = two_probe_sets()
-        .validate(&registry, &CredentialStore::empty(), 1)
+        .validate(&registry, 1)
         .expect_err("two sets exceed a ceiling of one");
     assert!(matches!(
         error,
@@ -2417,7 +2401,7 @@ fn permit(principal: &str, action: &str, kind: &str, resource: &str) -> String {
     )
 }
 
-const SECRET_DRN: &str = "drn:com.xrl:secret:test:http-probe/token";
+const SECRET_DRN: &str = "drn:secret:http-probe/token";
 
 fn capability_policy(permitted: &[(&str, &str)]) -> String {
     permitted
@@ -2483,7 +2467,6 @@ fn http_probe_set() -> ConstraintSet {
         provider: "http-probe".parse().expect("provider"),
         effect: dekopon_capability::EffectKind::ReadOnly,
         risk: dekopon_core::RiskLevel::Low,
-        credential: None,
         constraints: ExecutionConstraints {
             http: Some(HttpConstraints {
                 allowed_hosts: vec!["127.0.0.1:1".to_owned()],
@@ -2511,7 +2494,6 @@ fn cli_probe_set(
         provider: "cli-probe".parse().expect("provider"),
         effect,
         risk,
-        credential: None,
         constraints: ExecutionConstraints::default(),
     }
 }
@@ -2520,7 +2502,7 @@ fn http_probe_binding() -> super::SecretUseBinding {
     super::SecretUseBinding {
         binding_id: "http-probe-token".to_owned(),
         secret: SECRET_DRN.parse().expect("secret"),
-        capability: "http-probe.fetch".parse().expect("capability"),
+        capabilities: ["http-probe.fetch".parse().expect("capability")].into(),
         sink: dekopon_core::SecretSinkKind::HttpBearer,
         basic_username: None,
         allowed_hosts: vec!["127.0.0.1:1".to_owned()],
@@ -2651,7 +2633,6 @@ impl<'a> SurfaceBroker<'a> {
             "broker".parse().expect("principal"),
             PolicyEngine::new(&self.policy, &world).expect("policy"),
             ConstraintCatalog::new(self.constraints).expect("constraints"),
-            CredentialStore::empty(),
             IdentityDirectory::new(self.identities.iter().map(|(subject, principal)| {
                 (
                     subject.parse().expect("subject"),
@@ -2877,14 +2858,14 @@ fn secret_catalog_refuses_each_binding_that_exceeds_its_capability_http_constrai
     assert!(broker_error(http_probe_binding()).is_none());
     assert!(matches!(
         broker_error(SecretUseBinding {
-            capability: "missing.capability".parse().expect("capability"),
+            capabilities: ["missing.capability".parse().expect("capability")].into(),
             ..http_probe_binding()
         }),
         Some(BrokerBuildError::SecretBindingUnknownCapability { .. })
     ));
     assert!(matches!(
         broker_error(SecretUseBinding {
-            capability: "cli-probe.upper".parse().expect("capability"),
+            capabilities: ["cli-probe.upper".parse().expect("capability")].into(),
             ..http_probe_binding()
         }),
         Some(BrokerBuildError::SecretBindingWithoutHttp { .. })
@@ -3735,7 +3716,6 @@ async fn an_authorized_failure_before_the_provider_names_the_loaded_artifact() {
             "decision-early",
             broker.decision_reference("decision-early"),
             &set,
-            None,
             &[],
             Evidence {
                 kind: "policy-decision".to_owned(),
@@ -3787,12 +3767,10 @@ async fn a_successful_provider_that_wrote_stderr_carries_it_as_detail() {
                 provider: provider_id,
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
-                credential: None,
                 constraints: ExecutionConstraints::default(),
             },
         )])
         .unwrap(),
-        CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::new(InMemoryAuditLog::new(4).unwrap()),
         BrokerLimits::default(),
@@ -4042,7 +4020,6 @@ async fn with_chat_memory_refuses_routes_whose_matching_risk_is_not_the_fixed_ri
         "broker".parse().expect("principal"),
         PolicyEngine::new("", &world).expect("policy"),
         ConstraintCatalog::new(routes).expect("constraints"),
-        CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::new(InMemoryAuditLog::new(4).expect("audit")),
         BrokerLimits::default(),

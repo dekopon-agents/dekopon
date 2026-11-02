@@ -387,7 +387,7 @@ async fn published_client_against_real_broker_allows_only_attested_agent_surface
             "ungranted fixture capability cannot run"
         );
         let drn = SecretUseProposal::HttpBearer {
-            secret: "drn:com.xrl:secret:prod:api/token"
+            secret: "drn:secret:api/token"
                 .parse::<SecretDrn>()
                 .unwrap(),
         };

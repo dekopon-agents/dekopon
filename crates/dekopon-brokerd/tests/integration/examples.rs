@@ -288,9 +288,11 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
             "{id} talks to the upstream API only"
         );
         assert_eq!(
-            set.credential.as_deref(),
-            Some("api-token"),
-            "{id} presents the broker-held credential; the upstream needs it even to read"
+            set.default_secret_use
+                .as_ref()
+                .map(|default| default.drn.as_str()),
+            Some(SECRET_DRN),
+            "{id} defaults to the broker-held token; the upstream needs it even to read"
         );
         let (methods, requests) = if capability.effect == EffectKind::ExternalWrite {
             (vec!["GET".to_owned(), "POST".to_owned()], 2)
@@ -302,51 +304,52 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
     }
 }
 
+const SECRET_DRN: &str = "drn:secret:example/api-token";
+
 #[tokio::test(flavor = "multi_thread")]
-async fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
+async fn the_secret_map_example_binds_the_default_once_per_capability_within_its_destinations() {
     #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct File {
-        api_version: String,
-        credentials: Vec<Entry>,
+        secrets: Vec<Entry>,
     }
     #[derive(Deserialize)]
     struct Entry {
-        name: String,
-        kind: String,
-        scheme: String,
+        drn: String,
         destinations: Vec<String>,
-        secret: String,
+        bindings: Vec<Binding>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Binding {
+        capabilities: Vec<String>,
+        allowed_hosts: Vec<String>,
     }
 
-    let file = serde_yaml::from_str::<File>(&read("broker-credentials.yaml.example"))
-        .expect("the credentials example decodes");
-    assert_eq!(file.api_version, dekopon_brokerd::CREDENTIALS_API_VERSION);
-    let entry = file
-        .credentials
-        .iter()
-        .find(|entry| entry.name == "api-token")
-        .expect("the example names the credential every constraint set binds");
-    assert_eq!(entry.kind, "bearerToken");
-    assert_eq!(entry.scheme, "Bearer");
+    let file = serde_yaml::from_str::<File>(&read("secret-map.yaml.example"))
+        .expect("the secret map example decodes");
+    let [entry] = file.secrets.as_slice() else {
+        panic!("the example maps one secret");
+    };
+    assert_eq!(entry.drn, SECRET_DRN);
 
     let sets = constraint_sets(&config(), &probe_registry().await);
     for (id, set) in &sets {
-        let Some(http) = &set.constraints.http else {
-            continue;
-        };
-        for host in &http.allowed_hosts {
-            assert!(
-                entry.destinations.contains(host),
-                "{id} allows {host}, which the credential is not bound to"
-            );
+        let bound = entry
+            .bindings
+            .iter()
+            .filter(|binding| binding.capabilities.iter().any(|name| name == id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bound.len(),
+            1,
+            "{id} needs exactly one binding for its default"
+        );
+        let http = set.constraints.http.as_ref().expect("HTTP authority");
+        for host in &bound[0].allowed_hosts {
+            assert!(http.allowed_hosts.contains(host), "{id} binds {host}");
+            assert!(entry.destinations.contains(host), "{host} is a destination");
         }
     }
-
-    assert!(
-        entry.secret.starts_with("replace-me_X") && entry.secret.contains("XXXXXXXX"),
-        "the checked-in secret must stay an obvious placeholder"
-    );
 }
 
 #[test]
@@ -362,8 +365,8 @@ fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
         "sibling of broker.yaml"
     );
     assert_eq!(
-        config.credentials_path,
-        Some(PathBuf::from("broker-credentials.yaml")),
+        config.secret_map_path,
+        Some(PathBuf::from("secret-map.yaml")),
         "the copied file, not the .example"
     );
     for relative in [

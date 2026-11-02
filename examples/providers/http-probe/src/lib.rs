@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn secret_flags_propose_only_secret_use_not_credentials_in_input() {
         let uri = "https://example.test/records/1";
-        let drn = "drn:com.xrl:secret:test:http-probe/token";
+        let drn = "drn:secret:http-probe/token";
         for (flags, expected) in [
             (vec!["--bearer", drn], "httpBearer"),
             (vec!["--basic", "user-a", drn], "httpBasic"),

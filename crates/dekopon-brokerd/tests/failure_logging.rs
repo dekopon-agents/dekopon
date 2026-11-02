@@ -12,8 +12,8 @@ use std::{
 
 use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog,
-    ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
-    PolicyEngine, PolicyWorld,
+    ConstraintSet, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
@@ -125,7 +125,6 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
             provider: "cli-probe".parse::<ProviderId>().expect("provider"),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            credential: None,
             constraints: ExecutionConstraints::default(),
         },
     )])
@@ -136,7 +135,6 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
             "broker-test".parse::<PrincipalId>().expect("principal"),
             PolicyEngine::new(POLICY, &world).expect("fixture policy validates"),
             catalog,
-            CredentialStore::empty(),
             IdentityDirectory::new([(
                 SUBJECT.parse::<Subject>().expect("canonical subject"),
                 "cpetersen".parse::<PrincipalId>().expect("valid principal"),

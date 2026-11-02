@@ -625,7 +625,7 @@ async fn post(
         } else if status.is_client_error() {
             let response: Option<ErrorResponse> = serde_json::from_slice(&body).ok();
             if response.as_ref().is_some_and(|value| {
-                crate::credentials::REAUTHORIZATION_CODES.contains(&value.error.as_str())
+                crate::secrets::REAUTHORIZATION_CODES.contains(&value.error.as_str())
             }) {
                 Err(SourceError::ReauthorizationRequired)
             } else {

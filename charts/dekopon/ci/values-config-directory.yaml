@@ -3,8 +3,8 @@ broker:
     inline: ""
   configDirectory:
     configMap: dekopon-broker-d
-  credentials:
-    existingSecret: dekopon-broker-credentials
+  secretMap:
+    existingSecret: dekopon-broker-secret-map
 
 gateway:
   enabled: true

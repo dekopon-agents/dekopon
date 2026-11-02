@@ -82,28 +82,30 @@ fences that capability only, not the agent's Slack replies.
 
 ## `secret.use` and public DRNs
 
-A DRN (`drn:…`) publicly names a secret; knowing one grants nothing. The model passes it on a
-provider command's argv; the command step returns it as a typed proposal beside the capability and
-input, never inside the invoke input. A constraint set may also name a default DRN for proposals
-that name none.
+A DRN (`drn:secret:<path>`) publicly names a secret; knowing one grants nothing. Cedar `secret.use`
+says who may use a secret. The owner's private secret map alone says how: each binding fixes the
+capabilities, sink, hosts, methods, path rules, query and injection count, inside the capability's
+own HTTP authority and the entry's `destinations`.
 
-Using it takes three allows:
-
-1. the ordinary capability decision;
-2. a separate `secret.use` decision on `Dekopon::Secret::"<drn>"`, whose context names the exact
-   capability, provider and sink;
-3. an owner binding in the private secret map that fixes the capability, sink, hosts, methods, path
-   rules, query and injection count, inside the capability's own HTTP authority.
+When the model names no DRN, the broker uses the capability's default, after the acting agent's
+swap. A default needs no grant: the broker's own permit, under the reserved id prefix
+`dekopon-broker-`, allows `secret.use` when `context.selection == "default"`, so a default works
+whenever its capability does. An owner `forbid` still narrows it. The model may name another DRN
+on a provider command's argv, which the command step returns as a typed proposal beside the
+capability and input. A proposal equal to the effective default on DRN, sink and username is the
+default; any other is `proposed` and needs an owner `permit`, so an agent cannot reach a secret
+swapped away from it.
 
 Every refusal looks the same, so guessing names reveals nothing about the map, though a DRN's public
 path can reveal what the secret is for.
 
 After the decision record is emitted, the broker resolves the DRN once, for this invocation, from
 the store its map entry names, such as a file, a Kubernetes projection, Vault, 1Password Connect or
-a cloud secret manager (`crates/dekopon-brokerd/src/secrets.rs`). The bytes go only into an HTTP
-`Authorization` header, Bearer or Basic, never a URL, body or environment; the invoked provider sees
-neither name nor value. The store is read per invocation: a rotated secret applies at once, a
-deleted one fails closed. You write the private map: an owner-only file the gateway can't read.
+a cloud secret manager (`crates/dekopon-brokerd/src/secrets.rs`), or mints it from a ChatGPT
+subscription or a GitHub App key. The bytes go only into an HTTP `Authorization` header, Bearer,
+Basic or Bot, never a URL, body or environment; the invoked provider sees neither name nor value. A
+store is read per invocation, so a rotated secret applies at once and a deleted one fails closed;
+the two minted sources cache their token until shortly before it expires. You write the private map: an owner-only file the gateway can't read.
 
 ## Each outbound request is checked again
 

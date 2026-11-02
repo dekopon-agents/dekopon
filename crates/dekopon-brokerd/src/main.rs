@@ -73,7 +73,7 @@ enum Command {
     /// Resolve, materialize, and verify a startup-fixed provider set.
     Provider(ProviderArgs),
     /// Run startup validation on a configuration without serving: no socket is bound and no
-    /// credentials file, secret map, asset root or storage root is read or created.
+    /// secret source, asset root or storage root is read or created.
     Check(CheckArgs),
 }
 

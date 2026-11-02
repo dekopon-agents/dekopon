@@ -3,9 +3,9 @@ use dekopon_core::{RiskLevel, SecretSinkKind};
 use serde_json::json;
 
 use super::{
-    AGENT_PROMPT_ACTION, HttpRequestFacts, MAX_POLICY_BYTES, OpaqueBody, PolicyBuildError,
-    PolicyContext, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld,
-    RequestBody, SECRET_USE_ACTION, UnresolvedKind,
+    AGENT_PROMPT_ACTION, DEFAULT_SECRET_USE_POLICY_ID, HttpRequestFacts, MAX_POLICY_BYTES,
+    OpaqueBody, PolicyBuildError, PolicyContext, PolicyDecision, PolicyEngine, PolicyRequest,
+    PolicyTarget, PolicyWorld, RequestBody, SECRET_USE_ACTION, SecretSelection, UnresolvedKind,
 };
 
 fn world() -> PolicyWorld {
@@ -22,7 +22,7 @@ fn world() -> PolicyWorld {
 }
 
 fn world_with_secret() -> PolicyWorld {
-    world().with_secrets(["drn:com.xrl:secret:prod:api/token"
+    world().with_secrets(["drn:secret:api/token"
         .parse()
         .expect("canonical secret DRN")])
 }
@@ -51,15 +51,24 @@ fn prompt_request(principal: &str, agent: &str, context: PolicyContext) -> Polic
 }
 
 fn secret_request(principal: &str, context: PolicyContext) -> PolicyRequest {
+    selected_secret_request(principal, SecretSelection::Proposed, context)
+}
+
+fn selected_secret_request(
+    principal: &str,
+    selection: SecretSelection,
+    context: PolicyContext,
+) -> PolicyRequest {
     PolicyRequest {
         principal: principal.parse().expect("valid principal fixture"),
         target: PolicyTarget::SecretUse {
-            secret: "drn:com.xrl:secret:prod:api/token"
+            secret: "drn:secret:api/token"
                 .parse()
                 .expect("canonical secret DRN"),
             capability: "cli-probe.upper".parse().expect("capability"),
             provider: "cli-probe".parse().expect("provider"),
             sink: SecretSinkKind::HttpBearer,
+            selection,
         },
         context,
     }
@@ -1102,7 +1111,7 @@ fn every_action_declares_exactly_these_context_attributes() {
         capability_context["attributes"][name] = json!({ "type": "String" });
     }
     let mut secret_context = prompt_context.clone();
-    for name in ["capability", "provider", "sink"] {
+    for name in ["capability", "provider", "sink", "selection"] {
         secret_context["attributes"][name] = json!({ "type": "String" });
     }
 
@@ -1302,7 +1311,7 @@ fn secret_use_is_a_separate_exact_resource_decision() {
             r#"@id("secret-use")
                permit(principal == Dekopon::Principal::"cpetersen",
                       action == Dekopon::Action::"{SECRET_USE_ACTION}",
-                      resource == Dekopon::Secret::"drn:com.xrl:secret:prod:api/token")
+                      resource == Dekopon::Secret::"drn:secret:api/token")
                when {{ context.capability == "cli-probe.upper"
                     && context.provider == "cli-probe"
                     && context.sink == "httpBearer" }};"#
@@ -1318,7 +1327,7 @@ fn secret_use_is_a_separate_exact_resource_decision() {
         r#"@id("names-typo-drn")
            permit(principal == Dekopon::Principal::"cpetersen",
                   action == Dekopon::Action::"secret.use",
-                  resource == Dekopon::Secret::"drn:com.xrl:secret:prod:api/typo");"#,
+                  resource == Dekopon::Secret::"drn:secret:api/typo");"#,
         &world_with_secret(),
     )
     .expect_err("unknown DRN refuses startup");
@@ -1846,7 +1855,7 @@ fn a_world_lists_what_it_registers() {
             .secrets()
             .map(|secret| secret.as_str())
             .collect::<Vec<_>>(),
-        ["drn:com.xrl:secret:prod:api/token"]
+        ["drn:secret:api/token"]
     );
 }
 
@@ -1983,7 +1992,7 @@ fn canonical_subject_literals_and_patterns_load() {
         r#"context.subject == "drn:slack:user:t045p84s5:u07a1mjhnux""#,
         r#""drn:github:repo:dekopon-agents:dekopon-agents.github.io" == context.subject"#,
         r#"context.subject like "drn:slack:*:t045p84s5:*""#,
-        r#"[context.subject].containsAny(["drn:github:repo-id::42", "drn:tel:number::16034700182"])"#,
+        r#"[context.subject].containsAny(["drn:github:repo:o:r", "drn:tel:number::16034700182"])"#,
     ] {
         PolicyEngine::new(&subject_policy(condition), &world())
             .unwrap_or_else(|error| panic!("{condition}: {error}"));
@@ -2027,4 +2036,86 @@ fn only_a_permit_naming_a_capability_or_its_group_or_any_action_reaches_it() {
         ),
         [true, true]
     );
+}
+
+#[test]
+fn an_id_form_compared_with_context_subject_is_refused_at_load() {
+    for condition in [
+        r#"context.subject == "drn:github:repo-id::42""#,
+        r#"[context.subject].containsAny(["drn:github:user-id::7"])"#,
+    ] {
+        assert!(
+            matches!(
+                PolicyEngine::new(&subject_policy(condition), &world()),
+                Err(PolicyBuildError::IdFormSubject { .. })
+            ),
+            "{condition}"
+        );
+    }
+}
+
+#[test]
+fn a_mixed_case_secret_uid_is_refused_at_load() {
+    let error = PolicyEngine::new(
+        r#"@id("mixed-case-secret")
+           forbid(principal,
+                  action == Dekopon::Action::"secret.use",
+                  resource == Dekopon::Secret::"drn:secret:API/token");"#,
+        &world_with_secret(),
+    )
+    .expect_err("a non-canonical secret uid would never match");
+    assert!(matches!(
+        error,
+        PolicyBuildError::NonCanonicalSecret { ref secret, .. } if secret == "drn:secret:API/token"
+    ));
+}
+
+#[test]
+fn an_owner_policy_id_with_the_broker_prefix_is_refused() {
+    let error = PolicyEngine::new(
+        r#"@id("dekopon-broker-default-secret-use")
+           forbid(principal, action == Dekopon::Action::"secret.use", resource);"#,
+        &world_with_secret(),
+    )
+    .expect_err("the broker prefix is reserved");
+    assert!(matches!(error, PolicyBuildError::ReservedPolicyId { .. }));
+}
+
+#[test]
+fn the_broker_permit_admits_only_a_default_selection_and_an_owner_forbid_still_refuses_it() {
+    let empty = PolicyEngine::new("", &world_with_secret()).expect("an empty set loads");
+    let default = empty.authorize(selected_secret_request(
+        "cpetersen",
+        SecretSelection::Default,
+        session(),
+    ));
+    assert!(default.allowed, "{default:?}");
+    assert_eq!(
+        default.determining_policy_ids,
+        [DEFAULT_SECRET_USE_POLICY_ID]
+    );
+    assert_eq!(empty.policy_count(), 0);
+    let proposed = empty.authorize(selected_secret_request(
+        "cpetersen",
+        SecretSelection::Proposed,
+        session(),
+    ));
+    assert!(!proposed.allowed, "{proposed:?}");
+
+    let narrowed = PolicyEngine::new(
+        r#"@id("narrow-token")
+           forbid(principal,
+                  action == Dekopon::Action::"secret.use",
+                  resource == Dekopon::Secret::"drn:secret:api/token")
+           unless { context has agent && context.agent == "lange-family" };"#,
+        &world_with_secret(),
+    )
+    .expect("a narrowing forbid loads");
+    let refused = narrowed.authorize(selected_secret_request(
+        "cpetersen",
+        SecretSelection::Default,
+        session(),
+    ));
+    assert!(!refused.allowed, "{refused:?}");
+    assert_eq!(refused.determining_policy_ids, ["narrow-token"]);
 }

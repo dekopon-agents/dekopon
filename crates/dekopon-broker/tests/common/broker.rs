@@ -1,6 +1,6 @@
 use dekopon_broker::{
-    Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore,
-    IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, IdentityDirectory,
+    InMemoryAuditLog, InvocationRequest, PolicyEngine,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints};
@@ -32,7 +32,6 @@ pub(crate) fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSe
             provider: provider(),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            credential: None,
             constraints: ExecutionConstraints::default(),
         },
     )
@@ -55,7 +54,6 @@ pub(crate) async fn configured_broker(
         policy,
         ConstraintCatalog::new([constraint_set("cli-probe.reverse")])
             .expect("one capability builds a catalog"),
-        CredentialStore::empty(),
         identities,
         audit,
         BrokerLimits::default(),

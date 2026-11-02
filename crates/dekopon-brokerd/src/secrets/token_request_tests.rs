@@ -48,16 +48,16 @@ fn source_value(root: &Path, endpoint: &str) -> Value {
 }
 
 fn drn() -> SecretDrn {
-    "drn:com.xrl:secret:test:vm/gylmar".parse().expect("DRN")
+    "drn:secret:vm/gylmar".parse().expect("DRN")
 }
 
 fn map(root: &Path, endpoint: &str) -> SecretMapFile {
     serde_json::from_value(json!({
         "apiVersion": "dekopon.dev/secret-map/v1alpha1", "mapRevision": "test",
         "secrets": [{
-            "drn": drn(), "source": source_value(root, endpoint),
+            "drn": drn(), "destinations": ["runner.example"], "source": source_value(root, endpoint),
             "bindings": [{
-                "id": "runner-token", "capability": "vm.session.create", "sink": "httpBearer",
+                "id": "runner-token", "capabilities":["vm.session.create"], "sink": "httpBearer",
                 "allowedHosts": ["runner.example"], "allowedMethods": ["POST"],
                 "allowedPaths": [{"match": "exact", "path": "/v1/sessions"}]
             }]
@@ -76,6 +76,7 @@ async fn resolver(root: &Path, endpoint: &str) -> MapResolver {
                 source,
                 projection: Projection::default(),
                 client: kubernetes_client(root, "ca.crt").await.expect("cluster CA"),
+                minted: None,
             },
         )]),
         expected_uid: rustix::process::geteuid().as_raw(),
@@ -324,7 +325,7 @@ async fn token_request_config_is_strict_and_its_bootstrap_cannot_be_application_
         "apiVersion":"dekopon.dev/secret-map/v1alpha1", "mapRevision":"test",
         "secrets":[
             {"drn":drn(), "source":source_value(root.path(), "https://kubernetes.default.svc"), "bindings":[]},
-            {"drn":"drn:com.xrl:secret:test:bootstrap", "source": {
+            {"drn":"drn:secret:bootstrap", "source": {
                 "kind":"kubernetesProjection", "root":root.path(), "key":"token", "declaredOrigin":"serviceAccountToken"
             }, "bindings":[]}
         ]
