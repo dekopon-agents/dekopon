@@ -1359,7 +1359,6 @@ dependencies = [
  "dekopon-core",
  "dekopon-http-host",
  "dekopon-provider-sdk",
- "dekopon-test-support",
  "hyper",
  "hyper-util",
  "parking_lot",
