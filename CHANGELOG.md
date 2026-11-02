@@ -7,6 +7,42 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.83.0] - 2026-11-02
+
+### Changed
+
+- Subjects, principal and route `subjects`, workflow `subject` and `console.subject` are DRNs such as `drn:slack:user:t045p84s5:u07a1mjhnux`, accepted in any case and stored lowercase; attestor `namespaces` are scopes such as `drn:slack:*:t045p84s5:*`.
+- A GitHub attestation names the repository and its numeric id (`drn:github:repo-id::<id>`); a principal may map either, and two forms mapped to different principals are refused as `split-subject`.
+- A policy whose `drn:` literal or `like` pattern is not canonical lowercase, or that compares `context.subject` with a literal that is not a canonical DRN, is refused at load.
+- Pending wakes are rewritten to DRN subjects on first start, keeping the old file as `<path>.pre-drn`; pending GitHub wakes are dropped and counted. Direct-message replay windows and authority-bound memory-chat history start empty once.
+- Secret DRNs are spelled `drn:secret:<path>`; mixed case folds to lowercase, and a policy naming a non-canonical `Dekopon::Secret` refuses to load.
+- A capability's default secret is usable whenever the capability is, through the broker's own `dekopon-broker-default-secret-use` permit on `context.selection == "default"`; a model-named secret that is not the agent's default needs an owner `secret.use` permit, and owner policy ids may not start with `dekopon-broker-`.
+- `defaultSecretUse` may be set at the provider level and takes `httpBasic` or `httpBot` sinks; `agents.<id>.secrets` swaps an agent's default; `check` and boot refuse a default or swap target without exactly one binding for its capability and sink.
+- Secret map entries require `destinations` covering every binding host, bindings name `capabilities: [...]`, and new sources `chatgptSubscription` and `githubApp` mint their own tokens.
+- A policy comparing `context.subject` with a `repo-id` or `user-id` DRN refuses to load, since `context.subject` is always the name form.
+- A provider request that sets its own `chatgpt-account-id` header is refused, as one setting `authorization` is.
+
+### Removed
+
+- `credentialsPath`, the broker credentials file, `credential:`, `agents.<id>.credentials` and the chart's `broker.credentials` are removed; move each entry into the secret map.
+
+### Fixed
+
+- Webhook deliveries and pull request links for GitHub repositories with a dot in the name, such as `dekopon-agents.github.io`, are no longer ignored.
+
+## [dekopon-chart-0.70.0] - 2026-11-02
+
+### Changed
+
+- Chart 0.70.0 targets core v0.83.0 and renders the `v0.83.0` image tag.
+- The broker ChatGPT seed note points to the `chatgptSubscription` secret-map entry's `authFile`.
+- CI values and the PR summarizer/linter example use DRN subjects and the secret map.
+
+### Removed
+
+- `broker.credentials.inline` and `broker.credentials.existingSecret` are removed; credentials use `broker.secretMap`.
+- `secret-credentials.yaml` and its deployment checksum annotation are removed.
+
 ## [0.82.0] - 2026-11-02
 
 ### Fixed
