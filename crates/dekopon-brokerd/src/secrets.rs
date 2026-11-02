@@ -1224,9 +1224,8 @@ impl SecretSource {
             } => Some(credentials_file.clone()),
             Self::OAuth2Refresh { seed_path, .. } => seed_path.clone(),
             Self::GithubApp { private_key, .. } => Some(private_key.clone()),
-            Self::SecureFile { .. }
-            | Self::KubernetesProjection { .. }
-            | Self::ChatgptSubscription { .. } => None,
+            Self::ChatgptSubscription { auth_file } => Some(auth_file.clone()),
+            Self::SecureFile { .. } | Self::KubernetesProjection { .. } => None,
         }
     }
 
@@ -1239,7 +1238,6 @@ impl SecretSource {
             Self::SecureFile { path } => Some(path.clone()),
             Self::KubernetesProjection { root, key, .. } => Some(root.join(key)),
             Self::OAuth2Refresh { record_path, .. } => Some(record_path.clone()),
-            Self::ChatgptSubscription { auth_file } => Some(auth_file.clone()),
             _ => None,
         }
     }
@@ -3277,6 +3275,68 @@ secrets:
                 "{problems:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_http_bot_binding_loads_without_a_username_and_refuses_one() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let map = directory.path().join("map.yaml");
+        let entry = |username: &str| {
+            format!(
+                "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: test\nsecrets:\n  - drn: drn:secret:discord/dekopon\n    destinations: [discord.com]\n    source: {{ kind: secureFile, path: /run/discord-token }}\n    bindings:\n      - id: discord-bot\n        capabilities: [http-probe.fetch]\n        sink: httpBot\n{username}        allowedHosts: [discord.com]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: segmentPrefix, path: /api }}]\n"
+            )
+        };
+        write(&map, entry("").as_bytes()).await;
+        load(&map, uid())
+            .await
+            .expect("a Bot binding takes no username");
+        write(&map, entry("        basicUsername: bot\n").as_bytes()).await;
+        let Err(SecretMapError::Validation { problems }) = load(&map, uid()).await else {
+            panic!("a Bot binding with a username must be refused");
+        };
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("binding #1 is invalid")),
+            "{problems:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chatgpt_auth_file_cannot_become_another_entrys_secret_material() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+        let auth = directory.path().join("auth.json");
+        write(&auth, chatgpt_auth_document().as_bytes()).await;
+        let map = directory.path().join("map.yaml");
+        let chatgpt = format!(
+            "  - drn: drn:secret:chatgpt/image\n    destinations: [chatgpt.com]\n    source: {{ kind: chatgptSubscription, authFile: {} }}\n",
+            auth.display()
+        );
+        let projected = format!(
+            "  - drn: drn:secret:chatgpt/refresh\n    destinations: [chatgpt.com]\n    source: {{ kind: secureFile, path: {} }}\n    projection: {{ format: json, pointer: /refresh }}\n",
+            auth.display()
+        );
+        let both = format!(
+            "{}{}",
+            minted_map(&chatgpt),
+            minted_map(&projected)
+                .split_once("secrets:\n")
+                .expect("one entry")
+                .1
+                .replace("id: minted", "id: projected")
+        );
+        write(&map, both.as_bytes()).await;
+        let Err(SecretMapError::Validation { problems }) = load(&map, uid()).await else {
+            panic!("the auth file must stay bootstrap, never material");
+        };
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("is also a backend bootstrap credential")),
+            "{problems:?}"
+        );
     }
 
     #[tokio::test]

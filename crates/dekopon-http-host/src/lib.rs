@@ -678,10 +678,6 @@ impl BoundCredential {
         Ok(value)
     }
 
-    fn companion_name(&self) -> Option<&HeaderName> {
-        self.companion_header.as_ref().map(|(name, _)| name)
-    }
-
     fn render_companion(&self) -> Option<Result<(HeaderName, HeaderValue), HttpError>> {
         let (name, value) = self.companion_header.as_ref()?;
         #[allow(
@@ -1318,11 +1314,6 @@ impl BufferedHttpClient {
                 "request has too many headers",
             ));
         }
-        let companion = self
-            .credential
-            .as_ref()
-            .and_then(BoundCredential::companion_name)
-            .cloned();
         let mut headers = HeaderMap::new();
         let mut guest_headers = Vec::with_capacity(request.headers.len());
         let mut header_bytes = 0_u64;
@@ -1348,7 +1339,7 @@ impl BufferedHttpClient {
             let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| {
                 http_error(ErrorCode::InvalidHeader, "request header name is invalid")
             })?;
-            if is_forbidden_request_header(&name, companion.as_ref()) {
+            if is_forbidden_request_header(&name) {
                 return Err(http_error(
                     ErrorCode::InvalidHeader,
                     "request header is broker-owned or hop-by-hop",
@@ -1876,13 +1867,11 @@ fn authority_matches(allowed: &str, host: &str, port: u16, scheme: &str) -> bool
             && port == DEFAULT_HTTPS_PORT)
 }
 
-fn is_forbidden_request_header(name: &HeaderName, companion: Option<&HeaderName>) -> bool {
-    if companion == Some(name) {
-        return true;
-    }
+fn is_forbidden_request_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
         "authorization"
+            | CHATGPT_ACCOUNT_HEADER
             | "connection"
             | "content-length"
             | "cookie"
@@ -3719,7 +3708,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_guest_set_companion_header_is_rejected_not_overwritten() {
+    async fn a_guest_chatgpt_account_header_is_refused_with_or_without_a_credential() {
         let forged = || Request {
             method: "GET".to_owned(),
             uri: "http://127.0.0.1:9/images/generations".to_owned(),
@@ -3747,8 +3736,20 @@ mod tests {
         let error = uncompanioned
             .send(forged())
             .await
-            .expect_err("nothing listens on port 9");
-        assert_ne!(error.code, ErrorCode::InvalidHeader);
+            .expect_err("a guest account header is refused beside any credential");
+        assert_eq!(error.code, ErrorCode::InvalidHeader);
+
+        let mut unauthenticated = BufferedHttpClient::authorized(
+            grant("127.0.0.1:9".to_owned(), "GET"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = unauthenticated
+            .send(forged())
+            .await
+            .expect_err("a guest account header is refused without a credential");
+        assert_eq!(error.code, ErrorCode::InvalidHeader);
     }
 
     #[tokio::test(flavor = "multi_thread")]

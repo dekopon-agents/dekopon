@@ -1791,6 +1791,70 @@ async fn a_chatgpt_default_carries_its_account_header_once_per_invocation_outsid
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_http_bot_default_injects_a_bot_authorization_header() {
+    dekopon_broker_host::enable_test_component_memoization();
+    const DISCORD: &str = "drn:secret:discord/dekopon";
+    let server = LoopbackServer::once(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+    );
+    let authority = server.authority().to_owned();
+    let mut set = defaulted(&authority, DISCORD);
+    if let Some(default) = set.default_secret_use.as_mut() {
+        default.sink = dekopon_broker::DefaultSecretSink::HttpBot;
+    }
+    let broker = Broker::new(
+        BrokerProviderRegistry::load(
+            [provider_fixture("http-probe-provider.wasm")],
+            BrokerHostLimits::default(),
+        )
+        .await
+        .expect("HTTP provider fixture loads"),
+        principal("broker-test"),
+        http_probe_engine(&http_policy("caller", "provider-test", "http-probe.fetch")),
+        catalog([("http-probe.fetch", set)]),
+        callers(["caller"]),
+        Arc::new(InMemoryAuditLog::new(4).expect("audit")),
+        BrokerLimits::default(),
+    )
+    .expect("broker")
+    .with_secret_catalog(
+        SecretCatalog::new(
+            vec![SecretUseBinding {
+                sink: SecretSinkKind::HttpBot,
+                ..secret_binding("discord-bot", DISCORD, &authority, "/api/v1/thing")
+            }],
+            Arc::new(StaticSecretResolver(b"discord-bot-token-sentinel")),
+        )
+        .expect("a Bot binding builds a catalog"),
+    )
+    .expect("the Bot default has exactly one binding");
+
+    let result = invoke_as(
+        &broker,
+        "caller",
+        "provider-test",
+        request(
+            "invoke-bot",
+            "http-probe.fetch",
+            json!({ "uri": format!("http://{authority}/api/v1/thing"), "method": "GET" }),
+        ),
+    )
+    .await
+    .expect("the Bot default serves the invocation");
+
+    assert_eq!(
+        result.result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    let wire = server.request_text();
+    assert!(
+        wire.contains("authorization: Bot discord-bot-token-sentinel"),
+        "{wire}"
+    );
+    server.join();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_drn_that_is_not_the_agents_effective_default_needs_an_owner_grant() {
     dekopon_broker_host::enable_test_component_memoization();
     const APP_VILLE: &str = "drn:secret:github/app-ville";
