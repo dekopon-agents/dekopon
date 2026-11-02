@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, io,
     net::SocketAddr,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -347,6 +348,27 @@ pub struct GatewaydConfig {
     pub metering: Option<crate::metering::MeteringConfig>,
     #[serde(default)]
     pub proxy: Option<crate::proxy::ProxyConfig>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub probe: ProbeConfig,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProbeConfig {
+    #[serde(default = "default_probe_max_output_tokens")]
+    pub max_output_tokens: NonZeroU32,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: default_probe_max_output_tokens(),
+        }
+    }
+}
+
+const fn default_probe_max_output_tokens() -> NonZeroU32 {
+    NonZeroU32::MIN.saturating_add(1023)
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1139,6 +1161,7 @@ pub struct ResolvedConfig {
     pub telemetry: Option<ResolvedTelemetry>,
     pub metering: crate::metering::ResolvedMetering,
     pub proxy: Option<crate::proxy::ResolvedProxy>,
+    pub probe: ProbeConfig,
 }
 
 impl ResolvedConfig {
@@ -1533,6 +1556,7 @@ impl GatewaySources {
             ("telemetry", "telemetry"),
             ("metering", "metering"),
             ("proxy", "proxy"),
+            ("probe", "probe"),
             ("apiVersion", "apiVersion"),
         ];
         if old.keys().chain(new.keys()).any(|key| {
@@ -1561,7 +1585,7 @@ impl GatewaySources {
                 continue;
             }
             match category {
-                "models" | "routes" | "stopWords" | "catalog" | "extraCABundles" => {
+                "models" | "routes" | "stopWords" | "catalog" | "extraCABundles" | "probe" => {
                     changes.swap.push(category)
                 }
                 "transports" | "sessions" => {
@@ -2934,6 +2958,7 @@ fn resolve_with_service(
                 telemetry,
                 metering,
                 proxy,
+                probe: config.probe,
             })
         }
         _ => Err(ConfigError::Invalid {

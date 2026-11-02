@@ -19130,7 +19130,11 @@ fn assert_canary_request(request: &Value, expected_images: usize) {
                 .starts_with("data:image/png;base64,")
         );
     }
-    assert_eq!(request["max_tokens"], 16);
+    assert!(
+        request["max_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0)
+    );
 }
 
 async fn probed(
@@ -21577,6 +21581,176 @@ async fn canary_result(model: &str, passes: bool) {
     assert_eq!(vendor.asked.lock().as_slice(), [model]);
     assert_eq!(vendor.requests.lock().len(), 1);
     assert_canary_request(&vendor.requests.lock()[0], 1);
+    assert_eq!(vendor.requests.lock()[0]["max_tokens"], 1024);
+}
+
+#[tokio::test]
+async fn probe_budget_change_reprobes_on_check_and_reload_without_changing_serving_budget() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: |variable| (variable == "PATH").then(|| PROBE_KEY.into()),
+    };
+    let root = catalog_root();
+    let mut document = document(root.path());
+    let mut model = openrouter_model("router", "vendor/accepted", 5_000);
+    model["generation"] = json!({"maxOutputTokens": 4096});
+    model["apiKeyEnv"] = json!("PATH");
+    document["models"] = json!([model]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    let baseline = root.path().join("baseline.json");
+    fs::copy(&path, &baseline).unwrap();
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let routes = active_routes(&active);
+    let sources = gateway_sources(&active).await;
+
+    document["probe"] = json!({"maxOutputTokens": 2048});
+    write_config(root.path(), &document);
+    let (_, report) = crate::load_candidate(
+        &path,
+        None,
+        config::LoadMode::Check,
+        Some((&crate::ProbeScope::ChangedFrom(baseline), &environment)),
+    )
+    .await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(vendor.requests.lock()[0]["max_tokens"], 2048);
+
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        Some((&crate::ProbeScope::Every, &environment)),
+        Some((&active, &sources, &routes)),
+    )
+    .await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    let candidate = candidate.expect("reload prepares the changed budget");
+    assert_eq!(candidate.config.probe.max_output_tokens.get(), 2048);
+    assert_eq!(active.probe.max_output_tokens.get(), 1024);
+    assert_eq!(
+        vendor.asked.lock().as_slice(),
+        ["vendor/accepted", "vendor/accepted"]
+    );
+    assert_eq!(vendor.requests.lock()[1]["max_tokens"], 2048);
+    let crate::config::ModelConfig::Openrouter { generation, .. } = &candidate.config.models[0]
+    else {
+        panic!("expected OpenRouter model")
+    };
+    assert_eq!(
+        generation
+            .as_ref()
+            .unwrap()
+            .max_output_tokens
+            .unwrap()
+            .get(),
+        4096
+    );
+}
+
+#[tokio::test]
+async fn a_failed_probe_budget_change_does_not_prepare_a_reload() {
+    let vendor = spawn_fake_vendor();
+    let environment = crate::probe::Vendor {
+        openrouter_endpoint: Some(vendor.endpoint.clone()),
+        environment: |variable| (variable == "PATH").then(|| PROBE_KEY.into()),
+    };
+    let root = catalog_root();
+    let mut document = document(root.path());
+    let mut model = openrouter_model("router", "vendor/refused", 5_000);
+    model["apiKeyEnv"] = json!("PATH");
+    document["models"] = json!([model]);
+    document["routes"][0]["model"] = json!("router");
+    let path = write_config(root.path(), &document);
+    let active = config::load(&path, crate::current_uid()).await.unwrap();
+    let routes = active_routes(&active);
+    let sources = gateway_sources(&active).await;
+    document["probe"] = json!({"maxOutputTokens": 2048});
+    write_config(root.path(), &document);
+    let (candidate, report) = crate::load_candidate_against(
+        &path,
+        None,
+        config::LoadMode::Boot,
+        Some((&crate::ProbeScope::Every, &environment)),
+        Some((&active, &sources, &routes)),
+    )
+    .await;
+    assert!(candidate.is_none());
+    assert!(report.problems.iter().any(|problem| matches!(
+        problem,
+        crate::GatewaydError::Probe(problem) if problem.model == "router"
+    )));
+    assert_eq!(active.probe.max_output_tokens.get(), 1024);
+    assert_eq!(vendor.requests.lock()[0]["max_tokens"], 2048);
+}
+
+#[tokio::test]
+async fn a_probe_fragment_supplies_the_budget_to_directory_check() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    let directory = check_fixture(
+        root.path(),
+        "reviewer",
+        &[
+            (
+                "vendor.yaml",
+                models_fragment(json!([openrouter_model(
+                    "router",
+                    "vendor/accepted",
+                    5_000
+                )])),
+            ),
+            ("probe.yaml", json!({"probe": {"maxOutputTokens": 1536}})),
+        ],
+    );
+    let report = probed(&directory, &crate::ProbeScope::Every, &vendor).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(vendor.requests.lock()[0]["max_tokens"], 1536);
+}
+
+#[tokio::test]
+async fn an_empty_probe_block_uses_the_default_budget() {
+    let vendor = spawn_fake_vendor();
+    let root = temporary();
+    let directory = check_fixture(
+        root.path(),
+        "reviewer",
+        &[
+            (
+                "vendor.yaml",
+                models_fragment(json!([openrouter_model(
+                    "router",
+                    "vendor/accepted",
+                    5_000
+                )])),
+            ),
+            ("probe.yaml", json!({"probe": {}})),
+        ],
+    );
+    let report = probed(&directory, &crate::ProbeScope::Every, &vendor).await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(vendor.requests.lock()[0]["max_tokens"], 1024);
+}
+
+#[tokio::test]
+async fn zero_and_negative_probe_budgets_refuse_directory_check() {
+    for value in [json!(0), json!(-1)] {
+        let root = temporary();
+        let directory = check_fixture(
+            root.path(),
+            "reviewer",
+            &[("probe.yaml", json!({"probe": {"maxOutputTokens": value}}))],
+        );
+        let report = crate::check(&directory, None, None).await;
+        assert!(
+            report.problems.iter().any(|problem| matches!(
+                problem,
+                crate::GatewaydError::Config(ConfigError::Decode { .. })
+            )),
+            "{report:?}"
+        );
+    }
 }
 
 #[tokio::test]
