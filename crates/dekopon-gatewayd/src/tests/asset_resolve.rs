@@ -148,6 +148,18 @@ async fn settle(store: &AssetStore) {
 
 async fn assert_idle(store: &AssetStore, bytes: usize) {
     settle(store).await;
+    // An aborted async task can leave its blocking publication holding a permit.
+    let permits = tokio::time::timeout(
+        Duration::from_secs(5),
+        store
+            .downloads
+            .permits
+            .acquire_many(MAX_CONCURRENT_DOWNLOADS as u32),
+    )
+    .await
+    .expect("blocking publications end")
+    .unwrap();
+    drop(permits);
     assert_eq!(
         store.downloads.permits.available_permits(),
         MAX_CONCURRENT_DOWNLOADS
@@ -300,22 +312,89 @@ async fn cancelling_every_waiter_lets_a_later_resolve_download_again() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_racing_a_completion_never_publishes_twice_or_strands_a_download() {
-    let store = store(1024);
-    let access = access("race");
-    let gate = Gate::open(b"race");
-    let session = session(&store, &access, &gate);
     for round in 0..32_usize {
+        // A cancelled task may still enter fetch after the next round starts.
+        let store = store(1024);
+        let access = access("race");
+        let gate = Gate::open(b"race");
+        let session = session(&store, &access, &gate);
         let id = register(&store, &access, None);
-        let before = gate.fetches();
         let mut pending = session.resolve_input(id);
-        let _raced =
+        let raced =
             tokio::time::timeout(Duration::from_micros(round as u64 * 50), &mut pending).await;
         drop(pending);
         let resolved = session.resolve_input(id).await.unwrap();
         assert_eq!(resolved.row.bytes, Some(4));
-        assert!((1..=2).contains(&(gate.fetches() - before)));
+        assert_eq!(resolved.blob.read().unwrap(), b"race");
+        drop((raced, resolved));
+        assert_idle(&store, 4).await;
+        assert!((1..=2).contains(&gate.fetches()), "round={round}");
     }
-    assert_idle(&store, 4).await;
+}
+
+#[tokio::test]
+async fn a_stale_attempt_cannot_reset_or_publish_over_its_replacement() {
+    let store = store(1024);
+    let access = access("stale-completion");
+    let gate = Gate::open(b"unused");
+    let id = register(&store, &access, None);
+    let held = store
+        .downloads
+        .permits
+        .acquire_many(MAX_CONCURRENT_DOWNLOADS as u32)
+        .await
+        .unwrap();
+    let join = || match store
+        .join(
+            &access,
+            id,
+            AssetSourceRef::Telegram {
+                file_id: "file".into(),
+            },
+            Arc::clone(&gate) as Arc<dyn AssetFetcher>,
+            &Handle::current(),
+        )
+        .unwrap()
+    {
+        Download::Pending(waiter) => waiter,
+        Download::Ready(_) => panic!("the asset has not been published"),
+    };
+    let first = join();
+    let stale = first.ticket.clone();
+    drop(first);
+    let replacement = join();
+    let current = replacement.ticket.clone();
+    assert_ne!(stale.attempt, current.attempt);
+    store.reset(&stale);
+    assert!(matches!(
+        store.complete(&stale, b"stale bytes"),
+        Err(AssetFailure::Unavailable)
+    ));
+    assert!(
+        row_mut(&mut store.entries.lock(), &access.key, id)
+            .unwrap()
+            .state
+            .is_attempt(current.attempt)
+    );
+    assert_eq!(store.retention.lock().bytes, 0);
+    store.complete(&current, b"fresh").unwrap();
+    assert!(matches!(
+        store.complete(&stale, b"stale bytes"),
+        Err(AssetFailure::Unavailable)
+    ));
+    assert!(matches!(
+        store.complete(&current, b"duplicate bytes"),
+        Err(AssetFailure::Unavailable)
+    ));
+    store.reset(&stale);
+    store.reset(&current);
+    let resident = store.pin(&access, id, Recency::Keep).unwrap().unwrap();
+    assert_eq!(resident.read().unwrap(), b"fresh");
+    assert_eq!(store.get_inventory(&access)[0].size, Some(5));
+    drop(replacement);
+    store.downloads.tasks.lock().abort_all();
+    drop(held);
+    assert_idle(&store, 5).await;
 }
 
 #[tokio::test]
