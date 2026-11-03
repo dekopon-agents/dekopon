@@ -213,8 +213,8 @@ permit(principal == Dekopon::Principal::"cpetersen",
     assert!(execution.get("policy.revision").is_none(), "{execution}");
     assert_eq!(execution["policy.digest"], decision["policy.digest"]);
 
-    assert!(decision.get("trace_id").is_none(), "{decision}");
-    assert!(decision.get("span_id").is_none(), "{decision}");
+    assert_eq!(decision["trace_id"], CLIENT_TRACE_HEX, "{decision}");
+    assert!(decision["span_id"].is_string(), "{decision}");
 
     for record in &records {
         let invocation = record["spans"]
