@@ -396,8 +396,6 @@ async fn execute(cli: Cli, log: Option<dekopon_telemetry::LogFile>) -> ExitCode 
             // service's contract, observability is not, so a telemetry failure costs a missing
             // dashboard, not a working authority boundary.
             let exporter = settings.as_ref().map(|telemetry| &telemetry.settings);
-            let tracer_provider =
-                dekopon_telemetry::optional_tracer_provider(exporter, "dekopon-brokerd");
             let logger_provider =
                 dekopon_telemetry::optional_logger_provider(exporter, "dekopon-brokerd");
             let mut install = Install::new(Console {
@@ -410,10 +408,8 @@ async fn execute(cli: Cli, log: Option<dekopon_telemetry::LogFile>) -> ExitCode 
                     None => ConsoleWriter::Stdout("bk-stdout"),
                 },
                 filter: ConsoleFilter::Environment("info".to_owned()),
-            });
-            if let Some(provider) = tracer_provider {
-                install = install.with_traces(provider, "dekopon-brokerd", OTEL_TRACE_FILTER);
-            }
+            })
+            .with_trace_settings(exporter, "dekopon-brokerd", OTEL_TRACE_FILTER);
             if let Some(provider) = logger_provider {
                 install = install.with_logs(provider, OTEL_LOG_FILTER);
             }

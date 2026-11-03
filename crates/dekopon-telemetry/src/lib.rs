@@ -25,7 +25,7 @@ pub use install::LogFileArgs;
 #[cfg(feature = "exporter")]
 pub use install::{
     Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install, InstallError, ShutdownError,
-    TelemetryGuard, optional_logger_provider, optional_tracer_provider,
+    TelemetryGuard, optional_logger_provider,
 };
 #[cfg(all(unix, feature = "exporter"))]
 pub use install::{LogFile, LogFileError, LogFileOperation};

@@ -273,11 +273,6 @@ async fn serve(
         .ok()
         .flatten();
 
-    let tracer_provider = dekopon_telemetry::optional_tracer_provider(
-        settings.as_ref().map(|telemetry| &telemetry.settings),
-        "dekopon-gatewayd",
-    );
-
     let logger_provider = dekopon_telemetry::optional_logger_provider(
         settings.as_ref().map(|telemetry| &telemetry.settings),
         "dekopon-gatewayd",
@@ -292,14 +287,12 @@ async fn serve(
             None => ConsoleWriter::Stdout("gw-stdout"),
         },
         filter: ConsoleFilter::Environment("info".to_owned()),
-    });
-    if let Some(provider) = tracer_provider {
-        install = install.with_traces(
-            provider,
-            "dekopon-gatewayd",
-            dekopon_gatewayd::OTEL_TRACE_FILTER,
-        );
-    }
+    })
+    .with_trace_settings(
+        settings.as_ref().map(|telemetry| &telemetry.settings),
+        "dekopon-gatewayd",
+        dekopon_gatewayd::OTEL_TRACE_FILTER,
+    );
     if let Some(provider) = logger_provider {
         install = install.with_logs(provider, OTEL_LOG_FILTER);
     }
