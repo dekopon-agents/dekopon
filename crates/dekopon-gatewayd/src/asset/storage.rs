@@ -146,6 +146,8 @@ pub(crate) struct Retention {
     publications: Vec<Arc<PublicationRange>>,
     #[cfg(test)]
     pub(super) after_publish_error: Option<io::ErrorKind>,
+    #[cfg(test)]
+    binding_publications: HashMap<StoredKey, usize>,
 }
 
 impl Retention {
@@ -162,6 +164,8 @@ impl Retention {
             publications: Vec::new(),
             #[cfg(test)]
             after_publish_error: None,
+            #[cfg(test)]
+            binding_publications: HashMap::new(),
             index: Index {
                 version: 2,
                 clock: 0,
@@ -522,6 +526,14 @@ impl Retention {
     }
 
     #[cfg(test)]
+    pub(super) fn publication_count(&self, key: &AssetStateKey, asset: &AssetRef) -> usize {
+        self.binding_publications
+            .get(&StoredKey::of(key, asset))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
     pub(super) fn resident_files(&self) -> usize {
         self.index
             .files
@@ -642,7 +654,12 @@ impl Retention {
                 retained: self.references.contains(&stored_key),
             });
         }
-        self.persist()
+        self.persist()?;
+        #[cfg(test)]
+        {
+            *self.binding_publications.entry(stored_key).or_default() += 1;
+        }
+        Ok(())
     }
 
     pub(super) fn tombstone(&mut self, key: RetentionKey) {

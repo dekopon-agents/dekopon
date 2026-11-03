@@ -129,15 +129,19 @@ fn downloading(store: &AssetStore) -> usize {
         .count()
 }
 
-async fn settle(store: &AssetStore) {
+async fn settle(store: &AssetStore, fixture_owned: usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            {
+            let tasks_empty = {
                 let mut tasks = store.downloads.tasks.lock();
                 while tasks.try_join_next().is_some() {}
-                if tasks.is_empty() {
-                    break;
-                }
+                tasks.is_empty()
+            };
+            if tasks_empty
+                && store.downloads.permits.available_permits()
+                    == MAX_CONCURRENT_DOWNLOADS - fixture_owned
+            {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -147,7 +151,7 @@ async fn settle(store: &AssetStore) {
 }
 
 async fn assert_idle(store: &AssetStore, bytes: usize) {
-    settle(store).await;
+    settle(store, 0).await;
     assert_eq!(
         store.downloads.permits.available_permits(),
         MAX_CONCURRENT_DOWNLOADS
@@ -230,7 +234,7 @@ async fn cancelling_the_sole_waiter_while_it_waits_for_a_permit_returns_the_entr
     stays_pending(&mut pending).await;
     assert_eq!(downloading(&store), 1);
     drop(pending);
-    settle(&store).await;
+    settle(&store, held.num_permits()).await;
     drop(held);
     assert_idle(&store, 0).await;
     assert_eq!(gate.fetches(), 0);
@@ -306,6 +310,14 @@ async fn a_cancel_racing_a_completion_never_publishes_twice_or_strands_a_downloa
     let session = session(&store, &access, &gate);
     for round in 0..32_usize {
         let id = register(&store, &access, None);
+        let asset = store.get_access(&access, id, Instant::now()).unwrap();
+        assert_eq!(
+            store
+                .retention
+                .lock()
+                .publication_count(&access.key, &asset),
+            0
+        );
         let before = gate.fetches();
         let mut pending = session.resolve_input(id);
         let _raced =
@@ -313,6 +325,16 @@ async fn a_cancel_racing_a_completion_never_publishes_twice_or_strands_a_downloa
         drop(pending);
         let resolved = session.resolve_input(id).await.unwrap();
         assert_eq!(resolved.row.bytes, Some(4));
+        assert_eq!(resolved.blob.read().unwrap(), b"race");
+        assert_idle(&store, 4).await;
+        assert_eq!(
+            store
+                .retention
+                .lock()
+                .publication_count(&access.key, &asset),
+            1,
+            "each round publishes its asset exactly once"
+        );
         assert!((1..=2).contains(&(gate.fetches() - before)));
     }
     assert_idle(&store, 4).await;
