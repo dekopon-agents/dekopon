@@ -392,7 +392,7 @@ struct TraceExport {
 #[derive(Debug, Eq, PartialEq)]
 enum Spans {
     Filtered(String),
-    Console,
+    Ids,
 }
 
 impl TraceExport {
@@ -403,7 +403,7 @@ impl TraceExport {
         let layer = trace_layer(self.provider.tracer(self.tracer_name));
         let layer = match self.spans {
             Spans::Filtered(filter) => layer.with_filter(otlp_filter(&filter)).boxed(),
-            Spans::Console => layer.with_filter(console_spans(console)).boxed(),
+            Spans::Ids => layer.with_filter(id_spans(console)).boxed(),
         };
         (layer, self.provider)
     }
@@ -460,7 +460,7 @@ impl Install {
             self.traces = Some(TraceExport {
                 provider: SdkTracerProvider::builder().build(),
                 tracer_name: program.to_owned(),
-                spans: Spans::Console,
+                spans: Spans::Ids,
             });
             return self;
         };
@@ -614,16 +614,20 @@ pub fn optional_logger_provider(
     }
 }
 
-// Without an exporter the layer only activates contexts for console-visible spans; its max-level hint becomes
-// `log`'s max level at init, so an unhinted span filter would route every Cranelift `log::trace!` through tracing.
-fn console_spans<S>(console: &ConsoleFilter) -> impl tracing_subscriber::layer::Filter<S> + use<S>
+// Without an exporter every span from INFO up activates a context, whatever the console shows; the hint stays at
+// that level because `try_init` copies it into `log`'s max level, which gates Cranelift's `log::trace!` calls.
+fn id_spans<S>(console: &ConsoleFilter) -> impl tracing_subscriber::layer::Filter<S> + use<S>
 where
-    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    S: tracing::Subscriber,
 {
-    use tracing_subscriber::filter::{FilterExt as _, LevelFilter, filter_fn};
-    console
+    use tracing_subscriber::filter::{LevelFilter, filter_fn};
+    let level = console
         .env_filter()
-        .and(filter_fn(|metadata| metadata.is_span()).with_max_level_hint(LevelFilter::TRACE))
+        .max_level_hint()
+        .unwrap_or(LevelFilter::TRACE)
+        .max(LevelFilter::INFO);
+    filter_fn(move |metadata| metadata.is_span() && *metadata.level() <= level)
+        .with_max_level_hint(level)
 }
 
 fn otlp_filter(directive: &str) -> EnvFilter {
@@ -1407,6 +1411,31 @@ mod tests {
         super::ConsoleFilter::Directive(CONSOLE_FILTER.into())
     }
 
+    fn ids_under(
+        console: &super::ConsoleFilter,
+        output: &Output,
+    ) -> (
+        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+        opentelemetry_sdk::trace::SdkTracerProvider,
+    ) {
+        let (trace, provider) = super::Install::new(super::Console {
+            format: super::ConsoleFormat::Json,
+            writer: super::ConsoleWriter::Stderr,
+            filter: console.clone(),
+        })
+        .with_trace_settings(None, "trace-test", EXPORT_FILTER)
+        .traces
+        .expect("ids without a block")
+        .into_layer(console);
+        let writer = output.clone();
+        let console = super::ConsoleFormat::Json.layer(
+            console,
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(move || writer.clone()),
+        );
+        (console, trace, provider)
+    }
+
     fn trace_layer_for(
         settings: Option<&crate::ExporterSettings>,
     ) -> Option<(
@@ -1498,6 +1527,26 @@ mod tests {
             Some(tracing_subscriber::filter::LevelFilter::DEBUG)
         );
         provider.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_warning_inside_an_info_span_carries_trace_ids_under_a_warn_console_filter() {
+        let output = Output::default();
+        let warn = super::ConsoleFilter::Directive("warn".into());
+        let (console, trace, provider) = ids_under(&warn, &output);
+        let parts =
+            tracing::subscriber::with_default(registry().with(vec![console, trace]), || {
+                let span = tracing::info_span!(target: "dekopon_gatewayd", "gateway.session");
+                let _entered = span.enter();
+                tracing::warn!(target: "dekopon_gatewayd", "gateway.session.failed");
+                crate::current_trace_context()
+            });
+        provider.shutdown().expect("shutdown");
+        let (trace_id, span_id) = hex_ids(parts.expect("the hidden info span still has ids"));
+        let lines = json_lines(&output);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["trace_id"], trace_id.as_str());
+        assert_eq!(lines[0]["span_id"], span_id.as_str());
     }
 
     #[test]
@@ -1605,7 +1654,7 @@ mod tests {
         };
 
         let ids = selected(None).expect("ids without a block");
-        assert_eq!(ids.spans, super::Spans::Console);
+        assert_eq!(ids.spans, super::Spans::Ids);
         ids.provider.shutdown().expect("shutdown");
 
         assert!(
