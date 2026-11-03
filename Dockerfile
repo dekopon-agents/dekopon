@@ -42,7 +42,7 @@
 # back from cleanly at runtime — but glibc's dynamic linker refuses to load a binary naming a
 # version node the runtime library lacks at all, weak reference or not, so the weak binding does
 # not exempt it from this floor. Debian 13 (glibc 2.41) covers it with room to spare.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:08476c244888bfb425bae1ae4dd7c17f093e972aab8426883d97f3c6f280f7c1
 
 # BuildKit sets this per requested platform. It is the only thing that differs between the two.
 ARG TARGETARCH
