@@ -54,6 +54,7 @@ skip = [
   { crate = "syn@2.0.119", reason = "Wasmtime and WIT macro dependencies have not converged on syn 3" },
   { crate = "unicode-width@0.1.14", reason = "miette's diagnostic renderer trails the pretty printer cedar-policy-formatter uses" },
   { crate = "wasm-encoder@0.258.3", reason = "Wasmtime 49 pins the 0.258 WIT toolchain while wit-bindgen 0.62 uses 0.259" },
+  { crate = "wasm-encoder@0.262.0", reason = "wat 1.262 uses encoder 0.262 for test fixtures while the pinned component toolchain retains 0.259" },
   { crate = "wasmparser@0.258.3", reason = "Wasmtime 49 pins the 0.258 WIT toolchain while wit-bindgen 0.62 uses 0.259" },
   { crate = "wasm-metadata@0.258.3", reason = "Wasmtime 49 pins the 0.258 WIT toolchain while wit-bindgen 0.62 uses 0.259" },
   { crate = "wit-component@0.258.3", reason = "Wasmtime 49 pins the 0.258 WIT toolchain while wit-bindgen 0.62 uses 0.259" },
