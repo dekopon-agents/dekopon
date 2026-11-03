@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.83.1] - 2026-11-02
+
+### Fixed
+
+- Allow configuring vendor probe output tokens with a 1024-token default.
+
+## [dekopon-chart-0.70.1] - 2026-11-02
+
+### Changed
+
+- Chart 0.70.1 targets core v0.83.1 and renders the `v0.83.1` image tag.
+
 ## [0.83.0] - 2026-11-02
 
 ### Changed
