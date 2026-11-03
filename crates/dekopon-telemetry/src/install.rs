@@ -70,18 +70,24 @@ pub struct Console {
     pub filter: ConsoleFilter,
 }
 
+impl ConsoleFilter {
+    fn env_filter(&self) -> EnvFilter {
+        match self {
+            Self::Environment(default) => {
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default))
+            }
+            Self::Directive(directive) => EnvFilter::new(directive),
+        }
+    }
+}
+
 impl ConsoleFormat {
     fn layer(
         self,
-        filter: ConsoleFilter,
+        filter: &ConsoleFilter,
         writer: BoxMakeWriter,
     ) -> Box<dyn Layer<Registry> + Send + Sync> {
-        let filter = match filter {
-            ConsoleFilter::Environment(default) => {
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default))
-            }
-            ConsoleFilter::Directive(directive) => EnvFilter::new(directive),
-        };
+        let filter = filter.env_filter();
         match self {
             Self::Json => fmt::layer()
                 .json()
@@ -386,15 +392,18 @@ struct TraceExport {
 #[derive(Debug, Eq, PartialEq)]
 enum Spans {
     Filtered(String),
-    All,
+    Console,
 }
 
 impl TraceExport {
-    fn into_layer(self) -> (Box<dyn Layer<Registry> + Send + Sync>, SdkTracerProvider) {
+    fn into_layer(
+        self,
+        console: &ConsoleFilter,
+    ) -> (Box<dyn Layer<Registry> + Send + Sync>, SdkTracerProvider) {
         let layer = trace_layer(self.provider.tracer(self.tracer_name));
         let layer = match self.spans {
             Spans::Filtered(filter) => layer.with_filter(otlp_filter(&filter)).boxed(),
-            Spans::All => layer.with_filter(every_span()).boxed(),
+            Spans::Console => layer.with_filter(console_spans(console)).boxed(),
         };
         (layer, self.provider)
     }
@@ -451,7 +460,7 @@ impl Install {
             self.traces = Some(TraceExport {
                 provider: SdkTracerProvider::builder().build(),
                 tracer_name: program.to_owned(),
-                spans: Spans::All,
+                spans: Spans::Console,
             });
             return self;
         };
@@ -516,10 +525,10 @@ impl Install {
             }
         };
         let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> =
-            vec![format.layer(filter, writer)];
+            vec![format.layer(&filter, writer)];
         layers.extend(extra);
         let tracer_provider = traces.map(|traces| {
-            let (layer, provider) = traces.into_layer();
+            let (layer, provider) = traces.into_layer(&filter);
             layers.push(layer);
             provider
         });
@@ -605,9 +614,16 @@ pub fn optional_logger_provider(
     }
 }
 
-// Without an exporter the layer only activates span contexts, so the export filter's skipped spans still need ids.
-fn every_span() -> tracing_subscriber::filter::FilterFn<fn(&tracing::Metadata<'_>) -> bool> {
-    tracing_subscriber::filter::filter_fn(|metadata| metadata.is_span())
+// Without an exporter the layer only activates contexts for console-visible spans; its max-level hint becomes
+// `log`'s max level at init, so an unhinted span filter would route every Cranelift `log::trace!` through tracing.
+fn console_spans<S>(console: &ConsoleFilter) -> impl tracing_subscriber::layer::Filter<S> + use<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    use tracing_subscriber::filter::{FilterExt as _, LevelFilter, filter_fn};
+    console
+        .env_filter()
+        .and(filter_fn(|metadata| metadata.is_span()).with_max_level_hint(LevelFilter::TRACE))
 }
 
 fn otlp_filter(directive: &str) -> EnvFilter {
@@ -1385,6 +1401,11 @@ mod tests {
     }
 
     const EXPORT_FILTER: &str = "dekopon_gatewayd=trace,h2=off";
+    const CONSOLE_FILTER: &str = "info,h2=debug";
+
+    fn console_filter() -> super::ConsoleFilter {
+        super::ConsoleFilter::Directive(CONSOLE_FILTER.into())
+    }
 
     fn trace_layer_for(
         settings: Option<&crate::ExporterSettings>,
@@ -1395,17 +1416,17 @@ mod tests {
         super::Install::new(super::Console {
             format: super::ConsoleFormat::Json,
             writer: super::ConsoleWriter::Stderr,
-            filter: super::ConsoleFilter::Directive("info".into()),
+            filter: console_filter(),
         })
         .with_trace_settings(settings, "trace-test", EXPORT_FILTER)
         .traces
-        .map(super::TraceExport::into_layer)
+        .map(|traces| traces.into_layer(&console_filter()))
     }
 
     fn json_console(
         writer: tracing_subscriber::fmt::writer::BoxMakeWriter,
     ) -> Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync> {
-        super::ConsoleFormat::Json.layer(super::ConsoleFilter::Directive("trace".into()), writer)
+        super::ConsoleFormat::Json.layer(&console_filter(), writer)
     }
 
     fn output_console(
@@ -1468,6 +1489,18 @@ mod tests {
     }
 
     #[test]
+    fn ids_without_an_exporter_keep_the_subscriber_at_the_console_level() {
+        use tracing::Subscriber as _;
+        let (trace, provider) = trace_layer_for(None).expect("ids without a block");
+        let subscriber = registry().with(vec![output_console(&Output::default()), trace]);
+        assert_eq!(
+            subscriber.max_level_hint(),
+            Some(tracing_subscriber::filter::LevelFilter::DEBUG)
+        );
+        provider.shutdown().expect("shutdown");
+    }
+
+    #[test]
     fn a_record_outside_any_span_carries_no_trace_ids() {
         let output = Output::default();
         let (trace, provider) = trace_layer_for(None).expect("ids without a block");
@@ -1521,11 +1554,11 @@ mod tests {
         let (trace, provider) = super::Install::new(super::Console {
             format: super::ConsoleFormat::Json,
             writer: super::ConsoleWriter::Stderr,
-            filter: super::ConsoleFilter::Directive("info".into()),
+            filter: console_filter(),
         })
         .with_traces(provider, "trace-test", EXPORT_FILTER)
         .traces
-        .map(super::TraceExport::into_layer)
+        .map(|traces| traces.into_layer(&console_filter()))
         .expect("trace layer");
         tracing::subscriber::with_default(
             registry().with(vec![output_console(&output), trace]),
@@ -1572,7 +1605,7 @@ mod tests {
         };
 
         let ids = selected(None).expect("ids without a block");
-        assert_eq!(ids.spans, super::Spans::All);
+        assert_eq!(ids.spans, super::Spans::Console);
         ids.provider.shutdown().expect("shutdown");
 
         assert!(
