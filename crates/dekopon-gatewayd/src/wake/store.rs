@@ -10,7 +10,7 @@ use std::{
 use dekopon_agent::wake::{WakeId, WakeRefusal, WakeSummary, WatchSummary};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, TraceParent};
 use dekopon_core::github::{GithubEvent, GithubEventName, GithubThread};
-use dekopon_core::{AgentId, AttestedSubject, Subject, SubjectKind};
+use dekopon_core::{AgentId, AttestedSubject, Subject};
 use dekopon_shell::{CapabilityInvoker, Interpreter};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -514,13 +514,7 @@ impl WakeStore {
                 .create(parent)?;
         }
         let wakes = match File::open(&config.path) {
-            Ok(file) => {
-                let (wakes, rewrite) = read(file)?;
-                if rewrite.happened() {
-                    rewrite_legacy(&config.path, &wakes, rewrite)?;
-                }
-                wakes
-            }
+            Ok(file) => read(file)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error.into()),
         };
@@ -996,93 +990,16 @@ fn subscription_matches(wake: &Wake, agent: &AgentId, event: &GithubEvent) -> bo
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Rewrite {
-    rewritten: usize,
-    dropped_github: usize,
-}
-
-impl Rewrite {
-    const fn happened(self) -> bool {
-        self.rewritten > 0 || self.dropped_github > 0
-    }
-}
-
-fn read(file: File) -> Result<(Vec<Wake>, Rewrite), WakeStoreError> {
+fn read(file: File) -> Result<Vec<Wake>, WakeStoreError> {
     let mut wakes = Vec::new();
-    let mut rewrite = Rewrite::default();
     for (index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
-        let corrupt = WakeStoreError::Corrupt { line: index + 1 };
-        if let Some(wake) = serde_json::from_str::<Line>(&line)
+        let wake = serde_json::from_str::<Line>(&line?)
             .ok()
             .and_then(Line::wake)
-        {
-            wakes.push(wake);
-            continue;
-        }
-        match legacy_line(&line).ok_or(corrupt)? {
-            Legacy::Wake(wake) => {
-                rewrite.rewritten += 1;
-                wakes.push(*wake);
-            }
-            Legacy::Github => rewrite.dropped_github += 1,
-        }
+            .ok_or(WakeStoreError::Corrupt { line: index + 1 })?;
+        wakes.push(wake);
     }
-    Ok((wakes, rewrite))
-}
-
-enum Legacy {
-    Wake(Box<Wake>),
-    Github,
-}
-
-fn legacy_line(line: &str) -> Option<Legacy> {
-    let mut value = serde_json::from_str::<serde_json::Value>(line).ok()?;
-    let fields = value.as_object_mut()?;
-    let legacy = fields.get("subject")?.as_str()?;
-    let mut segments = legacy.split('.');
-    let (service, first, second) = (segments.next()?, segments.next()?, segments.next());
-    if segments.next().is_some() {
-        return None;
-    }
-    let subject = match (service, second) {
-        ("github", _) => return Some(Legacy::Github),
-        ("slack", Some(id)) if id.starts_with(['c', 'g']) => {
-            Subject::new(SubjectKind::SlackChannel, first, id)
-        }
-        ("slack", Some(id)) => Subject::new(SubjectKind::SlackUser, first, id),
-        ("fauxlack", Some(id)) if id.starts_with('c') => {
-            Subject::new(SubjectKind::FauxlackChannel, first, id)
-        }
-        ("fauxlack", Some(id)) => Subject::new(SubjectKind::FauxlackUser, first, id),
-        ("discord", None) => Subject::new(SubjectKind::DiscordUser, "", first),
-        ("discord", Some(channel)) => Subject::new(SubjectKind::DiscordChannel, first, channel),
-        ("telegram", None) => Subject::new(SubjectKind::TelegramUser, "", first),
-        ("whatsapp", None) => Subject::new(SubjectKind::WhatsappNumber, "", first),
-        ("tel", None) => Subject::new(SubjectKind::TelNumber, "", first),
-        _ => return None,
-    }
-    .ok()?;
-    fields.insert("subject".to_owned(), subject.canonical().into());
-    serde_json::from_value::<Line>(value)
-        .ok()
-        .and_then(Line::wake)
-        .map(|wake| Legacy::Wake(Box::new(wake)))
-}
-
-fn rewrite_legacy(path: &Path, wakes: &[Wake], rewrite: Rewrite) -> Result<(), WakeStoreError> {
-    let mut kept = path.as_os_str().to_owned();
-    kept.push(".pre-drn");
-    fs::copy(path, PathBuf::from(kept))?;
-    write(path, wakes)?;
-    tracing::info!(
-        event = "wake.store.rewritten",
-        rewritten = rewrite.rewritten,
-        dropped_github = rewrite.dropped_github,
-        "wake.store.rewritten"
-    );
-    Ok(())
+    Ok(wakes)
 }
 
 fn write(path: &Path, wakes: &[Wake]) -> Result<(), WakeStoreError> {

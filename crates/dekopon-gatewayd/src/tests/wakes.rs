@@ -833,8 +833,7 @@ fn a_wake_or_job_from_a_github_turn_re_attests_the_stored_twin() {
 }
 
 #[test]
-fn a_legacy_store_is_rewritten_once_keeping_a_pre_drn_copy() {
-    use tracing_subscriber::prelude::*;
+fn a_drn_store_loads_unchanged_and_is_not_rewritten() {
     let directory = temporary();
     let now = SystemTime::now();
     let path = directory.path().join("wakes").join("wakes.jsonl");
@@ -842,39 +841,39 @@ fn a_legacy_store_is_rewritten_once_keeping_a_pre_drn_copy() {
         let store = wake_store(directory.path());
         once(&store, "kept", now);
     }
+    let stored = fs::read(&path).expect("store bytes");
+
+    let store = wake_store(directory.path());
+
+    assert_eq!(store.list(anchor().subject(), now).len(), 1);
+    assert_eq!(fs::read(&path).expect("store bytes"), stored);
+}
+
+#[test]
+fn a_pre_drn_wake_line_refuses_to_open_as_corrupt() {
+    let directory = temporary();
+    let now = SystemTime::now();
+    let path = directory.path().join("wakes").join("wakes.jsonl");
+    let bounds = {
+        let store = wake_store(directory.path());
+        once(&store, "kept", now);
+        store.bounds()
+    };
     let mut line: serde_json::Value =
         serde_json::from_str(fs::read_to_string(&path).expect("store text").trim())
             .expect("one line");
-    line["subject"] = "slack.t0123abc.w9xyz".into();
-    let mut github = line.clone();
-    github["id"] = 2.into();
-    github["subject"] = "github.owner.repo".into();
-    let legacy = format!("{line}\n{github}\n");
-    fs::write(&path, &legacy).expect("legacy store");
+    for legacy in ["slack.t0123abc.w9xyz", "github.owner.repo"] {
+        line["subject"] = legacy.into();
+        let text = format!("{line}\n");
+        fs::write(&path, &text).expect("pre-DRN store");
 
-    let capture = dekopon_test_support::CaptureLayer::workspace();
-    let store = {
-        let _guard = tracing_subscriber::registry()
-            .with(capture.clone())
-            .set_default();
-        wake_store(directory.path())
-    };
-    let user: dekopon_core::Subject = "drn:slack:user:t0123abc:w9xyz".parse().expect("subject");
-    assert_eq!(store.list(&user, now).len(), 1);
-    assert_eq!(
-        fs::read_to_string(directory.path().join("wakes").join("wakes.jsonl.pre-drn"))
-            .expect("rollback copy"),
-        legacy
-    );
-    assert_eq!(
-        fs::read_to_string(&path)
-            .expect("rewritten")
-            .lines()
-            .count(),
-        1
-    );
-    let rewritten = capture.events_where("dekopon_gatewayd", &[("event", "wake.store.rewritten")]);
-    assert_eq!(rewritten.len(), 1);
-    assert_eq!(rewritten[0].field("rewritten"), Some("1"));
-    assert_eq!(rewritten[0].field("dropped_github"), Some("1"));
+        assert!(matches!(
+            WakeStore::open(&ResolvedWakes {
+                path: path.clone(),
+                bounds,
+            }),
+            Err(crate::wake::WakeStoreError::Corrupt { line: 1 })
+        ));
+        assert_eq!(fs::read_to_string(&path).expect("store text"), text);
+    }
 }
