@@ -380,7 +380,24 @@ where
 struct TraceExport {
     provider: SdkTracerProvider,
     tracer_name: String,
-    filter: String,
+    spans: Spans,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Spans {
+    Filtered(String),
+    All,
+}
+
+impl TraceExport {
+    fn into_layer(self) -> (Box<dyn Layer<Registry> + Send + Sync>, SdkTracerProvider) {
+        let layer = trace_layer(self.provider.tracer(self.tracer_name));
+        let layer = match self.spans {
+            Spans::Filtered(filter) => layer.with_filter(otlp_filter(&filter)).boxed(),
+            Spans::All => layer.with_filter(every_span()).boxed(),
+        };
+        (layer, self.provider)
+    }
 }
 
 struct LogExport {
@@ -418,9 +435,33 @@ impl Install {
         self.traces = Some(TraceExport {
             provider,
             tracer_name: tracer_name.into(),
-            filter: filter.into(),
+            spans: Spans::Filtered(filter.into()),
         });
         self
+    }
+
+    #[must_use]
+    pub fn with_trace_settings(
+        mut self,
+        settings: Option<&ExporterSettings>,
+        program: &str,
+        filter: impl Into<String>,
+    ) -> Self {
+        let Some(settings) = settings else {
+            self.traces = Some(TraceExport {
+                provider: SdkTracerProvider::builder().build(),
+                tracer_name: program.to_owned(),
+                spans: Spans::All,
+            });
+            return self;
+        };
+        match settings.tracer_provider() {
+            Ok(provider) => self.with_traces(provider, program, filter),
+            Err(error) => {
+                eprintln!("{program}: telemetry disabled: {error}");
+                self
+            }
+        }
     }
 
     #[must_use]
@@ -478,13 +519,9 @@ impl Install {
             vec![format.layer(filter, writer)];
         layers.extend(extra);
         let tracer_provider = traces.map(|traces| {
-            let tracer = traces.provider.tracer(traces.tracer_name);
-            layers.push(
-                trace_layer(tracer)
-                    .with_filter(otlp_filter(&traces.filter))
-                    .boxed(),
-            );
-            traces.provider
+            let (layer, provider) = traces.into_layer();
+            layers.push(layer);
+            provider
         });
         let logger_provider = logs.map(|logs| {
             layers.push(
@@ -555,20 +592,6 @@ impl TelemetryGuard {
 }
 
 #[must_use]
-pub fn optional_tracer_provider(
-    settings: Option<&ExporterSettings>,
-    program: &str,
-) -> Option<SdkTracerProvider> {
-    match settings?.tracer_provider() {
-        Ok(provider) => Some(provider),
-        Err(error) => {
-            eprintln!("{program}: telemetry disabled: {error}");
-            None
-        }
-    }
-}
-
-#[must_use]
 pub fn optional_logger_provider(
     settings: Option<&ExporterSettings>,
     program: &str,
@@ -580,6 +603,11 @@ pub fn optional_logger_provider(
             None
         }
     }
+}
+
+// Without an exporter the layer only activates span contexts, so the export filter's skipped spans still need ids.
+fn every_span() -> tracing_subscriber::filter::FilterFn<fn(&tracing::Metadata<'_>) -> bool> {
+    tracing_subscriber::filter::filter_fn(|metadata| metadata.is_span())
 }
 
 fn otlp_filter(directive: &str) -> EnvFilter {
@@ -1354,5 +1382,211 @@ mod tests {
         assert!(stopped.is_err());
         assert_eq!(*timed_out.lock(), Some(timeout));
         release.send(()).ok();
+    }
+
+    const EXPORT_FILTER: &str = "dekopon_gatewayd=trace,h2=off";
+
+    fn trace_layer_for(
+        settings: Option<&crate::ExporterSettings>,
+    ) -> Option<(
+        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+        opentelemetry_sdk::trace::SdkTracerProvider,
+    )> {
+        super::Install::new(super::Console {
+            format: super::ConsoleFormat::Json,
+            writer: super::ConsoleWriter::Stderr,
+            filter: super::ConsoleFilter::Directive("info".into()),
+        })
+        .with_trace_settings(settings, "trace-test", EXPORT_FILTER)
+        .traces
+        .map(super::TraceExport::into_layer)
+    }
+
+    fn json_console(
+        writer: tracing_subscriber::fmt::writer::BoxMakeWriter,
+    ) -> Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync> {
+        super::ConsoleFormat::Json.layer(super::ConsoleFilter::Directive("trace".into()), writer)
+    }
+
+    fn output_console(
+        output: &Output,
+    ) -> Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync> {
+        let writer = output.clone();
+        json_console(tracing_subscriber::fmt::writer::BoxMakeWriter::new(
+            move || writer.clone(),
+        ))
+    }
+
+    fn hex_ids(parts: crate::TraceContextParts) -> (String, String) {
+        (
+            opentelemetry::trace::TraceId::from_bytes(parts.trace_id).to_string(),
+            opentelemetry::trace::SpanId::from_bytes(parts.span_id).to_string(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn console_records_inside_a_span_carry_trace_ids_without_an_exporter() {
+        use crate::install::log_file::tests::{directory, open};
+        let directory = directory();
+        let path = directory.root.join("gateway.log");
+        let (sink, guard) = file_sink(open(&path, 1 << 20, 1));
+        let (trace, provider) = trace_layer_for(None).expect("ids without a block");
+        let console = json_console(tracing_subscriber::fmt::writer::BoxMakeWriter::new(sink));
+        let parts =
+            tracing::subscriber::with_default(registry().with(vec![console, trace]), || {
+                let span = tracing::info_span!(target: "dekopon_gatewayd", "gateway.message");
+                let _entered = span.enter();
+                tracing::info!(target: "dekopon_gatewayd", "turn");
+                crate::current_trace_context()
+            });
+        guard.shutdown().expect("file drained");
+        provider.shutdown().expect("shutdown");
+        let (trace_id, span_id) = hex_ids(parts.expect("the layer minted ids"));
+        let lines = file_lines(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["trace_id"], trace_id.as_str());
+        assert_eq!(lines[0]["span_id"], span_id.as_str());
+    }
+
+    #[test]
+    fn a_span_the_trace_filter_excludes_still_gives_its_records_trace_ids_without_an_exporter() {
+        let output = Output::default();
+        let (trace, provider) = trace_layer_for(None).expect("ids without a block");
+        let subscriber = registry().with(vec![output_console(&output), trace]);
+        let parts = tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!(target: "h2", "Connection");
+            let _entered = span.enter();
+            tracing::debug!(target: "h2", "connection.state");
+            crate::current_trace_context()
+        });
+        provider.shutdown().expect("shutdown");
+        let (trace_id, span_id) = hex_ids(parts.expect("the excluded span still has ids"));
+        let lines = json_lines(&output);
+        assert_eq!(lines[0]["trace_id"], trace_id.as_str());
+        assert_eq!(lines[0]["span_id"], span_id.as_str());
+    }
+
+    #[test]
+    fn a_record_outside_any_span_carries_no_trace_ids() {
+        let output = Output::default();
+        let (trace, provider) = trace_layer_for(None).expect("ids without a block");
+        tracing::subscriber::with_default(
+            registry().with(vec![output_console(&output), trace]),
+            || tracing::info!(target: "dekopon_gatewayd", "startup"),
+        );
+        provider.shutdown().expect("shutdown");
+        let lines = json_lines(&output);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].get("trace_id").is_none());
+        assert!(lines[0].get("span_id").is_none());
+    }
+
+    #[test]
+    fn a_remote_parent_joins_console_records_to_its_trace_without_an_exporter() {
+        let sender = Output::default();
+        let receiver = Output::default();
+        let (trace, sender_provider) = trace_layer_for(None).expect("ids without a block");
+        let parts = tracing::subscriber::with_default(
+            registry().with(vec![output_console(&sender), trace]),
+            || {
+                let span = tracing::info_span!(target: "dekopon_gatewayd", "gateway.message");
+                let _entered = span.enter();
+                tracing::info!(target: "dekopon_gatewayd", "turn");
+                crate::current_trace_context().expect("the sender minted ids")
+            },
+        );
+        let (trace, receiver_provider) = trace_layer_for(None).expect("ids without a block");
+        tracing::subscriber::with_default(
+            registry().with(vec![output_console(&receiver), trace]),
+            || {
+                let span = tracing::info_span!(target: "dekopon_brokerd", "broker.invocation");
+                crate::parent_remote(&span, parts).expect("the parent context is well formed");
+                let _entered = span.enter();
+                tracing::info!(target: "dekopon_brokerd", "broker.decision");
+            },
+        );
+        sender_provider.shutdown().expect("shutdown");
+        receiver_provider.shutdown().expect("shutdown");
+        let sent = json_lines(&sender);
+        let received = json_lines(&receiver);
+        assert_eq!(received[0]["trace_id"], sent[0]["trace_id"]);
+        assert_ne!(received[0]["span_id"], sent[0]["span_id"]);
+    }
+
+    #[test]
+    fn console_ids_equal_exported_span_ids_with_an_exporter() {
+        let (provider, exported) = crate::span_sink::exporting_provider();
+        let output = Output::default();
+        let (trace, provider) = super::Install::new(super::Console {
+            format: super::ConsoleFormat::Json,
+            writer: super::ConsoleWriter::Stderr,
+            filter: super::ConsoleFilter::Directive("info".into()),
+        })
+        .with_traces(provider, "trace-test", EXPORT_FILTER)
+        .traces
+        .map(super::TraceExport::into_layer)
+        .expect("trace layer");
+        tracing::subscriber::with_default(
+            registry().with(vec![output_console(&output), trace]),
+            || {
+                let span = tracing::info_span!(target: "dekopon_gatewayd", "gateway.message");
+                let _entered = span.enter();
+                tracing::info!(target: "dekopon_gatewayd", "turn");
+            },
+        );
+        provider.shutdown().expect("shutdown");
+        let spans = exported.0.lock().clone();
+        assert_eq!(spans.len(), 1);
+        let lines = json_lines(&output);
+        assert_eq!(
+            lines[0]["trace_id"],
+            spans[0].span_context.trace_id().to_string().as_str()
+        );
+        assert_eq!(
+            lines[0]["span_id"],
+            spans[0].span_context.span_id().to_string().as_str()
+        );
+    }
+
+    #[test]
+    fn trace_settings_select_ids_without_a_block_export_with_one_and_nothing_when_it_fails_to_build()
+     {
+        let settings = crate::ExporterSettings::new(
+            "http://127.0.0.1:4318",
+            crate::Transport::Http,
+            "trace-test",
+            "trace-test",
+            "",
+            std::time::Duration::from_secs(1),
+        )
+        .expect("valid settings");
+        let selected = |settings| {
+            super::Install::new(super::Console {
+                format: super::ConsoleFormat::Json,
+                writer: super::ConsoleWriter::Stderr,
+                filter: super::ConsoleFilter::Directive("info".into()),
+            })
+            .with_trace_settings(settings, "trace-test", EXPORT_FILTER)
+            .traces
+        };
+
+        let ids = selected(None).expect("ids without a block");
+        assert_eq!(ids.spans, super::Spans::All);
+        ids.provider.shutdown().expect("shutdown");
+
+        assert!(
+            selected(Some(&settings)).is_none(),
+            "outside a runtime the exporter fails to build"
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _runtime = runtime.enter();
+        let exported = selected(Some(&settings)).expect("an exporter with a block");
+        assert_eq!(exported.spans, super::Spans::Filtered(EXPORT_FILTER.into()));
+        exported.provider.shutdown().expect("shutdown");
     }
 }
