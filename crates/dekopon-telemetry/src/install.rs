@@ -396,14 +396,18 @@ enum Spans {
 }
 
 impl TraceExport {
-    fn into_layer(
-        self,
-        console: &ConsoleFilter,
-    ) -> (Box<dyn Layer<Registry> + Send + Sync>, SdkTracerProvider) {
+    fn log_level(&self, console: &ConsoleFilter) -> Option<log::LevelFilter> {
+        match self.spans {
+            Spans::Filtered(_) => None,
+            Spans::Ids => Some(console_log_level(console)),
+        }
+    }
+
+    fn into_layer(self) -> (Box<dyn Layer<Registry> + Send + Sync>, SdkTracerProvider) {
         let layer = trace_layer(self.provider.tracer(self.tracer_name));
         let layer = match self.spans {
             Spans::Filtered(filter) => layer.with_filter(otlp_filter(&filter)).boxed(),
-            Spans::Ids => layer.with_filter(id_spans(console)).boxed(),
+            Spans::Ids => layer.with_filter(id_spans()).boxed(),
         };
         (layer, self.provider)
     }
@@ -527,8 +531,9 @@ impl Install {
         let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> =
             vec![format.layer(&filter, writer)];
         layers.extend(extra);
+        let log_level = traces.as_ref().and_then(|traces| traces.log_level(&filter));
         let tracer_provider = traces.map(|traces| {
-            let (layer, provider) = traces.into_layer(&filter);
+            let (layer, provider) = traces.into_layer();
             layers.push(layer);
             provider
         });
@@ -550,6 +555,11 @@ impl Install {
         if let Err(error) = tracing_subscriber::registry().with(layers).try_init() {
             drop(guard.shutdown());
             return Err(InstallError::from(error));
+        }
+        // `try_init` copied the id layer's TRACE hint into `log`, which would route every Cranelift `log::trace!`
+        // through tracing at provider compile.
+        if let Some(level) = log_level {
+            log::set_max_level(level);
         }
         Ok(guard)
     }
@@ -614,20 +624,21 @@ pub fn optional_logger_provider(
     }
 }
 
-// Without an exporter every span from INFO up activates a context, whatever the console shows; the hint stays at
-// that level because `try_init` copies it into `log`'s max level, which gates Cranelift's `log::trace!` calls.
-fn id_spans<S>(console: &ConsoleFilter) -> impl tracing_subscriber::layer::Filter<S> + use<S>
-where
-    S: tracing::Subscriber,
-{
-    use tracing_subscriber::filter::{LevelFilter, filter_fn};
-    let level = console
-        .env_filter()
-        .max_level_hint()
-        .unwrap_or(LevelFilter::TRACE)
-        .max(LevelFilter::INFO);
-    filter_fn(move |metadata| metadata.is_span() && *metadata.level() <= level)
-        .with_max_level_hint(level)
+// Without an exporter the layer only activates span contexts, so every span gets ids whatever the console shows.
+fn id_spans() -> tracing_subscriber::filter::FilterFn<fn(&tracing::Metadata<'_>) -> bool> {
+    tracing_subscriber::filter::filter_fn(|metadata| metadata.is_span())
+}
+
+fn console_log_level(console: &ConsoleFilter) -> log::LevelFilter {
+    use tracing_subscriber::filter::LevelFilter;
+    match console.env_filter().max_level_hint() {
+        Some(level) if level == LevelFilter::OFF => log::LevelFilter::Off,
+        Some(level) if level == LevelFilter::ERROR => log::LevelFilter::Error,
+        Some(level) if level == LevelFilter::WARN => log::LevelFilter::Warn,
+        Some(level) if level == LevelFilter::INFO => log::LevelFilter::Info,
+        Some(level) if level == LevelFilter::DEBUG => log::LevelFilter::Debug,
+        Some(_) | None => log::LevelFilter::Trace,
+    }
 }
 
 fn otlp_filter(directive: &str) -> EnvFilter {
@@ -1411,14 +1422,13 @@ mod tests {
         super::ConsoleFilter::Directive(CONSOLE_FILTER.into())
     }
 
-    fn ids_under(
-        console: &super::ConsoleFilter,
-        output: &Output,
-    ) -> (
-        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
-        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
-        opentelemetry_sdk::trace::SdkTracerProvider,
-    ) {
+    struct IdHarness {
+        console: Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+        trace: Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+        provider: opentelemetry_sdk::trace::SdkTracerProvider,
+    }
+
+    fn ids_under(console: &super::ConsoleFilter, output: &Output) -> IdHarness {
         let (trace, provider) = super::Install::new(super::Console {
             format: super::ConsoleFormat::Json,
             writer: super::ConsoleWriter::Stderr,
@@ -1427,13 +1437,38 @@ mod tests {
         .with_trace_settings(None, "trace-test", EXPORT_FILTER)
         .traces
         .expect("ids without a block")
-        .into_layer(console);
+        .into_layer();
         let writer = output.clone();
-        let console = super::ConsoleFormat::Json.layer(
+        IdHarness {
+            console: super::ConsoleFormat::Json.layer(
+                console,
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(move || writer.clone()),
+            ),
+            trace,
+            provider,
+        }
+    }
+
+    fn assert_warning_has_ids(console: &str, hidden: impl FnOnce() -> tracing::Span) {
+        let output = Output::default();
+        let IdHarness {
             console,
-            tracing_subscriber::fmt::writer::BoxMakeWriter::new(move || writer.clone()),
-        );
-        (console, trace, provider)
+            trace,
+            provider,
+        } = ids_under(&super::ConsoleFilter::Directive(console.into()), &output);
+        let parts =
+            tracing::subscriber::with_default(registry().with(vec![console, trace]), || {
+                let span = hidden();
+                let _entered = span.enter();
+                tracing::warn!(target: "dekopon_gatewayd", "gateway.session.failed");
+                crate::current_trace_context()
+            });
+        provider.shutdown().expect("shutdown");
+        let (trace_id, span_id) = hex_ids(parts.expect("the hidden span still has ids"));
+        let lines = json_lines(&output);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["trace_id"], trace_id.as_str());
+        assert_eq!(lines[0]["span_id"], span_id.as_str());
     }
 
     fn trace_layer_for(
@@ -1449,7 +1484,7 @@ mod tests {
         })
         .with_trace_settings(settings, "trace-test", EXPORT_FILTER)
         .traces
-        .map(|traces| traces.into_layer(&console_filter()))
+        .map(super::TraceExport::into_layer)
     }
 
     fn json_console(
@@ -1518,35 +1553,13 @@ mod tests {
     }
 
     #[test]
-    fn ids_without_an_exporter_keep_the_subscriber_at_the_console_level() {
-        use tracing::Subscriber as _;
-        let (trace, provider) = trace_layer_for(None).expect("ids without a block");
-        let subscriber = registry().with(vec![output_console(&Output::default()), trace]);
-        assert_eq!(
-            subscriber.max_level_hint(),
-            Some(tracing_subscriber::filter::LevelFilter::DEBUG)
+    fn a_warning_inside_a_span_the_console_hides_carries_trace_ids() {
+        assert_warning_has_ids(
+            "warn",
+            || tracing::info_span!(target: "dekopon_gatewayd", "gateway.session"),
         );
-        provider.shutdown().expect("shutdown");
-    }
-
-    #[test]
-    fn a_warning_inside_an_info_span_carries_trace_ids_under_a_warn_console_filter() {
-        let output = Output::default();
-        let warn = super::ConsoleFilter::Directive("warn".into());
-        let (console, trace, provider) = ids_under(&warn, &output);
-        let parts =
-            tracing::subscriber::with_default(registry().with(vec![console, trace]), || {
-                let span = tracing::info_span!(target: "dekopon_gatewayd", "gateway.session");
-                let _entered = span.enter();
-                tracing::warn!(target: "dekopon_gatewayd", "gateway.session.failed");
-                crate::current_trace_context()
-            });
-        provider.shutdown().expect("shutdown");
-        let (trace_id, span_id) = hex_ids(parts.expect("the hidden info span still has ids"));
-        let lines = json_lines(&output);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0]["trace_id"], trace_id.as_str());
-        assert_eq!(lines[0]["span_id"], span_id.as_str());
+        assert_warning_has_ids("info", || tracing::debug_span!(target: "h2", "Connection"));
+        assert_warning_has_ids("info", || tracing::trace_span!(target: "h2", "poll"));
     }
 
     #[test]
@@ -1607,7 +1620,7 @@ mod tests {
         })
         .with_traces(provider, "trace-test", EXPORT_FILTER)
         .traces
-        .map(|traces| traces.into_layer(&console_filter()))
+        .map(super::TraceExport::into_layer)
         .expect("trace layer");
         tracing::subscriber::with_default(
             registry().with(vec![output_console(&output), trace]),

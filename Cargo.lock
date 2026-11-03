@@ -1424,6 +1424,7 @@ dependencies = [
  "clap",
  "dekopon-core",
  "libc",
+ "log",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-http",
