@@ -7,11 +7,29 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.84.0] - 2026-11-03
+
+### Changed
+
+- Update the test fixture WAT parser to 1.262.0 while retaining the pinned component toolchain.
+- Gateway and broker console records carry trace_id and span_id without a telemetry block, so one message can be followed across both log files.
+
+### Removed
+
+- The gateway no longer rewrites pre-DRN wake store lines; a pre-DRN line now stops the gateway at start with its line number.
+
+## [dekopon-chart-0.71.0] - 2026-11-03
+
+### Changed
+
+- Chart 0.71.0 targets core v0.84.0 and renders the `v0.84.0` image tag.
+
 ## [0.83.1] - 2026-11-02
 
 ### Fixed
 
 - Allow configuring vendor probe output tokens with a 1024-token default.
+- Keep group-DM events and interactive controls enabled in the Slack Agent app manifest.
 
 ## [dekopon-chart-0.70.1] - 2026-11-02
 
