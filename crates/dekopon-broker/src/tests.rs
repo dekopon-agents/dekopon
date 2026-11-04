@@ -4643,3 +4643,51 @@ async fn the_legacy_surface_reproduces_the_released_bytes() {
         assert_eq!(digest, released, "memory route {memory_route}");
     }
 }
+
+#[test]
+fn continuity_configuration_refuses_old_spellings_and_malformed_migrations() {
+    let parse = |extra: serde_json::Value| {
+        let mut config = serde_json::to_value(valid_memory_config()).expect("config");
+        config
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        serde_json::from_value::<ChatMemoryConfig>(config)
+    };
+    let digest = format!("sha256:{}", "0".repeat(64));
+    for spelling in ["relaxed", "paranoid"] {
+        parse(serde_json::json!({ "continuityPolicy": spelling })).expect(spelling);
+    }
+    for refused in [
+        serde_json::json!({ "continuityPolicy": "stable" }),
+        serde_json::json!({ "continuityPolicy": "authority-bound" }),
+        serde_json::json!({ "continuityMigration": { "authorityDigest": "sha256:ABC" } }),
+        serde_json::json!({ "continuityMigration": { "onUnproven": "reset" } }),
+        serde_json::json!({ "continuityMigration": { "candidates": [{
+            "resolvedDigest": digest, "overrides": { "storage": { "allowedHosts": ["x"] } }
+        }] } }),
+        serde_json::json!({ "continuityMigration": { "candidates": [{
+            "resolvedDigest": digest, "overrides": { "memory": { "enabledAgents": ["x"] } }
+        }] } }),
+        serde_json::json!({ "continuityMigration": { "candidates": [{
+            "resolvedDigest": digest, "overrides": { "hostLimits": { "allowedHosts": ["x"] } }
+        }] } }),
+    ] {
+        assert!(parse(refused.clone()).is_err(), "{refused}");
+    }
+    let unpaired = parse(serde_json::json!({
+        "continuityMigration": { "authorityDigest": digest }
+    }))
+    .expect("parses");
+    assert!(matches!(
+        unpaired.validate(&dekopon_storage_host::StorageLimits::default()),
+        Err(super::BrokerBuildError::InvalidChatMemory)
+    ));
+    let disposition = parse(serde_json::json!({
+        "continuityMigration": { "onUnproven": "fresh-epoch" }
+    }))
+    .expect("a disposition alone is valid");
+    disposition
+        .validate(&dekopon_storage_host::StorageLimits::default())
+        .expect("valid");
+}
