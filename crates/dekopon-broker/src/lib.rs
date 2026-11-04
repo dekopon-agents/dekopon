@@ -3188,13 +3188,13 @@ where
             if memory_route {
                 self.chat_memory
                     .as_ref()
-                    .map_or(ContinuityPolicy::AuthorityBound, |config| {
+                    .map_or(ContinuityPolicy::Paranoid, |config| {
                         config.continuity_policy
                     })
             } else if storage.scope == StorageScope::PrivateConversation {
-                ContinuityPolicy::AuthorityBound
+                ContinuityPolicy::Paranoid
             } else {
-                ContinuityPolicy::Stable
+                ContinuityPolicy::Relaxed
             },
             authority,
         )
@@ -4444,8 +4444,8 @@ fn encode_memory_config(encoded: &mut AuthorityEncoder, memory: &ChatMemoryConfi
     encoded.byte(
         "memory.continuityPolicy",
         match memory.continuity_policy {
-            ContinuityPolicy::Stable => 0,
-            ContinuityPolicy::AuthorityBound => 1,
+            ContinuityPolicy::Relaxed => 0,
+            ContinuityPolicy::Paranoid => 1,
         },
     );
     encoded.number(

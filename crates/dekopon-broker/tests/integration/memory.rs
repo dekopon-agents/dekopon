@@ -49,7 +49,7 @@ fn stdout_assets() -> (
 
 fn memory_config() -> ChatMemoryConfig {
     ChatMemoryConfig {
-        continuity_policy: ContinuityPolicy::AuthorityBound,
+        continuity_policy: ContinuityPolicy::Paranoid,
         enabled_agents: vec!["reviewer".parse().expect("agent")],
         max_lookback_turns: 200,
         max_recent_turns: 20,

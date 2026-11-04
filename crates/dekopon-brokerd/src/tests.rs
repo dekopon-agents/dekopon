@@ -1236,7 +1236,7 @@ async fn chat_memory_rejects_a_host_fuel_ceiling_that_cannot_reach_compaction() 
         .extend([("rootPath".to_owned(), json!("provider-storage"))]);
     document["storage"] = storage;
     document["chatMemory"] = serde_json::to_value(dekopon_broker::ChatMemoryConfig {
-        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::Paranoid,
         enabled_agents: vec!["reviewer".parse().expect("agent")],
         max_lookback_turns: 200,
         max_recent_turns: 20,
@@ -2651,7 +2651,7 @@ async fn reaper_sweeps_with_the_committed_generation_retention() {
         "work",
         "c123",
         "c123:123.456",
-        ContinuityPolicy::Stable,
+        ContinuityPolicy::Relaxed,
         vec![],
     );
     drop(host.grant(request).unwrap());

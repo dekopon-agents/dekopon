@@ -17,8 +17,8 @@ use std::{
 use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
 use dekopon_core::error_chain;
 use dekopon_storage_host::{
-    ContinuityPolicy, Durability, OpenOptions, StorageGrantRequest, StorageHost, StorageHostError,
-    StorageLimits,
+    ContinuityCheck, ContinuityPolicy, Durability, LegacyContinuity, MemoryContinuity, OpenOptions,
+    StorageGrantRequest, StorageHost, StorageHostError, StorageLimits, UnprovenDisposition,
 };
 use dekopon_test_support::{CaptureLayer, snapshot_tree};
 use tempfile::TempDir;
@@ -77,7 +77,7 @@ fn vfs_request(invocation: &str, access: StorageAccess) -> StorageGrantRequest {
         "scientist-slack",
         "c0123abc",
         "c0123abc:1712345678.000100",
-        ContinuityPolicy::Stable,
+        ContinuityPolicy::Relaxed,
         b"authority".to_vec(),
     )
 }
@@ -142,7 +142,7 @@ fn agent_request(
         "scientist-slack",
         "c0123abc",
         "c0123abc:1712345678.000100",
-        ContinuityPolicy::Stable,
+        ContinuityPolicy::Relaxed,
         format!("{provider}-authority").into_bytes(),
     )
     .with_shared_namespace(namespace.map(|name| name.parse().expect("namespace")))
@@ -301,11 +301,11 @@ fn two_providers_share_one_named_agent_namespace_and_no_other_agent_reaches_it()
 #[test]
 fn authority_bound_never_reopens_an_epoch_after_continuity_changes() {
     for (surface, continuity, limits) in [
-        (b"a".as_slice(), ContinuityPolicy::Stable, None),
-        (b"b".as_slice(), ContinuityPolicy::AuthorityBound, None),
+        (b"a".as_slice(), ContinuityPolicy::Relaxed, None),
+        (b"b".as_slice(), ContinuityPolicy::Paranoid, None),
         (
             b"b".as_slice(),
-            ContinuityPolicy::AuthorityBound,
+            ContinuityPolicy::Paranoid,
             Some(StorageLimits {
                 max_namespace_bytes: 20 * 1024,
                 max_file_bytes: 1,
@@ -320,7 +320,7 @@ fn authority_bound_never_reopens_an_epoch_after_continuity_changes() {
             .begin(
                 host.grant(request(
                     b"a",
-                    ContinuityPolicy::AuthorityBound,
+                    ContinuityPolicy::Paranoid,
                     "authority-before-change",
                     StorageAccess::ReadWrite,
                 ))
@@ -359,7 +359,7 @@ fn authority_bound_never_reopens_an_epoch_after_continuity_changes() {
             .begin(
                 host.grant(request(
                     b"a",
-                    ContinuityPolicy::AuthorityBound,
+                    ContinuityPolicy::Paranoid,
                     "authority-after-change",
                     StorageAccess::ReadOnly,
                 ))
@@ -397,12 +397,7 @@ fn namespace_tokens_are_stable_across_processes() {
     let (_temporary, root) = fixture();
     let (_elsewhere, other_root) = fixture();
     let scope = |invocation: &str, access| {
-        request(
-            b"authority",
-            ContinuityPolicy::AuthorityBound,
-            invocation,
-            access,
-        )
+        request(b"authority", ContinuityPolicy::Paranoid, invocation, access)
     };
 
     let first = StorageHost::open(&root, StorageLimits::default()).expect("first host");
@@ -513,7 +508,7 @@ fn every_trusted_scope_dimension_isolated_from_the_others() {
     let grant = host
         .grant(request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "writer",
             StorageAccess::ReadWrite,
         ))
@@ -569,7 +564,7 @@ fn every_trusted_scope_dimension_isolated_from_the_others() {
                 transport,
                 channel,
                 conversation,
-                ContinuityPolicy::Stable,
+                ContinuityPolicy::Relaxed,
                 b"authority".to_vec(),
             ))
             .expect("reader grant");
@@ -593,7 +588,7 @@ fn exact_file_quota_succeeds_and_one_byte_overflow_mutates_nothing() {
     let grant = host
         .grant(request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "quota-write",
             StorageAccess::ReadWrite,
         ))
@@ -610,7 +605,7 @@ fn exact_file_quota_succeeds_and_one_byte_overflow_mutates_nothing() {
     let grant = host
         .grant(request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "quota-deny",
             StorageAccess::ReadWrite,
         ))
@@ -625,7 +620,7 @@ fn exact_file_quota_succeeds_and_one_byte_overflow_mutates_nothing() {
     let grant = host
         .grant(request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "quota-read",
             StorageAccess::ReadOnly,
         ))
@@ -674,7 +669,7 @@ fn namespace_housekeeping_quota_denial_precedes_every_mutation() {
     let (result, events) = captured(|| {
         host.grant(request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "namespace-housekeeping-denied",
             StorageAccess::ReadOnly,
         ))
@@ -761,7 +756,7 @@ fn logical_names_reject_traversal_and_separators_without_creating_data_entries()
         .begin(
             host.grant(request(
                 b"authority",
-                ContinuityPolicy::Stable,
+                ContinuityPolicy::Relaxed,
                 "invalid-logical-names",
                 StorageAccess::ReadWrite,
             ))
@@ -810,7 +805,7 @@ fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
         .begin(
             host.grant(request(
                 b"authority",
-                ContinuityPolicy::Stable,
+                ContinuityPolicy::Relaxed,
                 "hard-link-seed",
                 StorageAccess::ReadWrite,
             ))
@@ -844,7 +839,7 @@ fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
     let before = tree_snapshot(&root);
     let refused = host.grant(request(
         b"authority",
-        ContinuityPolicy::Stable,
+        ContinuityPolicy::Relaxed,
         "hard-link-read",
         StorageAccess::ReadOnly,
     ));
@@ -1144,7 +1139,7 @@ fn barrier_concurrent_first_grants_publish_one_epoch_and_authority_changes_publi
                     barrier.wait();
                     let grant = host.grant(request(
                         &surface,
-                        ContinuityPolicy::AuthorityBound,
+                        ContinuityPolicy::Paranoid,
                         &format!("first-grant-{index}"),
                         StorageAccess::ReadOnly,
                     ))?;
@@ -1180,7 +1175,7 @@ fn same_namespace_serializes_while_a_distinct_namespace_can_overlap() {
     let held = host
         .grant(scoped_request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "lease-held",
             StorageAccess::ReadOnly,
             "drn:slack:user:t0123abc:uone",
@@ -1194,7 +1189,7 @@ fn same_namespace_serializes_while_a_distinct_namespace_can_overlap() {
         let result = same_host
             .grant(scoped_request(
                 b"authority",
-                ContinuityPolicy::Stable,
+                ContinuityPolicy::Relaxed,
                 "lease-same",
                 StorageAccess::ReadOnly,
                 "drn:slack:user:t0123abc:uone",
@@ -1216,7 +1211,7 @@ fn same_namespace_serializes_while_a_distinct_namespace_can_overlap() {
         let result = other_host
             .grant(scoped_request(
                 b"authority",
-                ContinuityPolicy::Stable,
+                ContinuityPolicy::Relaxed,
                 "lease-distinct",
                 StorageAccess::ReadOnly,
                 "drn:slack:user:t0123abc:utwo",
@@ -1249,7 +1244,7 @@ fn slot_refusal_reports_present_plus_pending_and_byte_refusals_do_not() {
     let seed = StorageHost::open(&root, limits.clone()).expect("seed host");
     seed.grant(scoped_request(
         b"authority",
-        ContinuityPolicy::Stable,
+        ContinuityPolicy::Relaxed,
         "seed",
         StorageAccess::ReadOnly,
         "drn:slack:user:t0123abc:uone",
@@ -1264,7 +1259,7 @@ fn slot_refusal_reports_present_plus_pending_and_byte_refusals_do_not() {
     let (result, refusal) = captured(|| {
         host.grant(scoped_request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "second",
             StorageAccess::ReadOnly,
             "drn:slack:user:t0123abc:utwo",
@@ -1293,7 +1288,7 @@ fn concurrent_namespace_and_root_caps_are_atomic_and_denials_are_byte_identical(
     let seed_grant = seed
         .grant(scoped_request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "root-cap-seed",
             StorageAccess::ReadOnly,
             "drn:slack:user:t0123abc:uone",
@@ -1331,7 +1326,7 @@ fn concurrent_namespace_and_root_caps_are_atomic_and_denials_are_byte_identical(
                 barrier.wait();
                 host.grant(scoped_request(
                     b"authority",
-                    ContinuityPolicy::Stable,
+                    ContinuityPolicy::Relaxed,
                     &format!("root-cap-race-{index}"),
                     StorageAccess::ReadOnly,
                     subject,
@@ -1366,7 +1361,7 @@ fn concurrent_namespace_and_root_caps_are_atomic_and_denials_are_byte_identical(
         assert!(matches!(
             host.grant(scoped_request(
                 b"authority",
-                ContinuityPolicy::Stable,
+                ContinuityPolicy::Relaxed,
                 "root-cap-plus-one",
                 StorageAccess::ReadOnly,
                 "drn:slack:user:t0123abc:uthree",
@@ -1379,7 +1374,7 @@ fn concurrent_namespace_and_root_caps_are_atomic_and_denials_are_byte_identical(
 }
 
 #[test]
-fn stable_reactivation_survives_restart() {
+fn relaxed_provider_reactivation_survives_restart() {
     let (_temporary, root) = fixture();
     let limits = StorageLimits {
         ..StorageLimits::default()
@@ -1388,7 +1383,7 @@ fn stable_reactivation_survives_restart() {
     let stable = host
         .grant(request(
             b"authority-a",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "stable-reactivation-write",
             StorageAccess::ReadWrite,
         ))
@@ -1402,16 +1397,16 @@ fn stable_reactivation_survives_restart() {
     drop(
         host.grant(request(
             b"authority-b",
-            ContinuityPolicy::AuthorityBound,
+            ContinuityPolicy::Paranoid,
             "stable-reactivation-bound",
             StorageAccess::ReadOnly,
         ))
-        .expect("authority-bound generation"),
+        .expect("paranoid generation"),
     );
     let reactivated = host
         .grant(request(
             b"authority-c",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "stable-reactivation-return",
             StorageAccess::ReadOnly,
         ))
@@ -1425,7 +1420,7 @@ fn stable_reactivation_survives_restart() {
     let reader = host
         .grant(request(
             b"authority-d",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "stable-reactivation-read",
             StorageAccess::ReadOnly,
         ))
@@ -1439,7 +1434,7 @@ fn stable_reactivation_survives_restart() {
     let reader = host
         .grant(request(
             b"authority-e",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "stable-reactivation-restart",
             StorageAccess::ReadOnly,
         ))
@@ -1452,7 +1447,7 @@ fn stable_reactivation_survives_restart() {
 #[test]
 #[expect(clippy::too_many_lines, reason = "one long test scenario")]
 fn corrupt_namespaces_reset_once_without_losing_the_previous_generation_or_neighbour() {
-    for continuity in [ContinuityPolicy::AuthorityBound, ContinuityPolicy::Stable] {
+    for continuity in [ContinuityPolicy::Paranoid, ContinuityPolicy::Relaxed] {
         let (_temporary, root) = fixture();
         let first_scope = |invocation: &str, access| {
             scoped_request(
@@ -1501,7 +1496,7 @@ fn corrupt_namespaces_reset_once_without_losing_the_previous_generation_or_neigh
             .into_owned();
         let [previous] = <[String; 1]>::try_from(generations(&first_base)).expect("one generation");
         let (host, damaged, expected_scope) = match continuity {
-            ContinuityPolicy::AuthorityBound => {
+            ContinuityPolicy::Paranoid => {
                 drop(host);
                 let pointer = first_base.join("current");
                 let mut document: serde_json::Value =
@@ -1517,7 +1512,7 @@ fn corrupt_namespaces_reset_once_without_losing_the_previous_generation_or_neigh
                     "authority-pointer",
                 )
             }
-            ContinuityPolicy::Stable => {
+            ContinuityPolicy::Relaxed => {
                 let stray = first_base.join(&previous).join("data").join("not-a-token");
                 fs::write(&stray, b"stray").expect("stray logical entry");
                 fs::set_permissions(&stray, fs::Permissions::from_mode(0o600)).expect("stray mode");
@@ -1542,8 +1537,8 @@ fn corrupt_namespaces_reset_once_without_losing_the_previous_generation_or_neigh
         assert_eq!(site.path.as_deref(), Some(damaged.as_path()));
         let fresh = site.reset.as_ref().expect("the fresh generation is named");
         match continuity {
-            ContinuityPolicy::AuthorityBound => assert_ne!(*fresh, previous),
-            ContinuityPolicy::Stable => {
+            ContinuityPolicy::Paranoid => assert_ne!(*fresh, previous),
+            ContinuityPolicy::Relaxed => {
                 assert_eq!(*fresh, previous);
                 let kept = generations(&first_base);
                 assert_eq!(kept.len(), 2, "{kept:?}");
@@ -1621,7 +1616,7 @@ fn symlink_substitution_is_never_followed_at_any_namespace_tree_level() {
             .begin(
                 host.grant(request(
                     b"authority",
-                    ContinuityPolicy::Stable,
+                    ContinuityPolicy::Relaxed,
                     &format!("substitution-{level}"),
                     StorageAccess::ReadWrite,
                 ))
@@ -1673,7 +1668,7 @@ fn symlink_substitution_is_never_followed_at_any_namespace_tree_level() {
             .unwrap_or_else(|error| panic!("level {level} stopped the broker: {error}"));
         let refused = host.grant(request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             &format!("substitution-{level}-read"),
             StorageAccess::ReadOnly,
         ));
@@ -1867,7 +1862,7 @@ fn b1_original_load_budget_and_write_growth_are_independent() {
     let grant = storage
         .grant(request(
             b"b1",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "b1-seed",
             StorageAccess::ReadWrite,
         ))
@@ -1889,7 +1884,7 @@ fn b1_original_load_budget_and_write_growth_are_independent() {
     let grant = storage
         .grant(request(
             b"b1",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "b1-write",
             StorageAccess::ReadWrite,
         ))
@@ -1987,7 +1982,7 @@ fn every_contender_for_a_held_namespace_times_out_within_one_lock_timeout() {
     let held = host
         .grant(scoped_request(
             b"authority",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             "lease-held",
             StorageAccess::ReadOnly,
             "drn:slack:user:t0123abc:uone",
@@ -2006,7 +2001,7 @@ fn every_contender_for_a_held_namespace_times_out_within_one_lock_timeout() {
                 let started = std::time::Instant::now();
                 let result = host.grant(scoped_request(
                     b"authority",
-                    ContinuityPolicy::Stable,
+                    ContinuityPolicy::Relaxed,
                     &format!("lease-contender-{index}"),
                     StorageAccess::ReadOnly,
                     "drn:slack:user:t0123abc:uone",
@@ -2050,7 +2045,7 @@ fn space_storage_separates_channels_and_shares_threads_across_speakers() {
                     transport,
                     channel,
                     thread,
-                    ContinuityPolicy::Stable,
+                    ContinuityPolicy::Relaxed,
                     subject.as_bytes().to_vec(),
                 )
                 .with_space_key(Some(dekopon_core::SpaceKey {
@@ -2130,5 +2125,345 @@ fn space_storage_separates_channels_and_shares_threads_across_speakers() {
                 1
             );
         }
+    }
+}
+
+fn continuity_events(capture: &CaptureLayer, event: &str) -> Vec<dekopon_test_support::Record> {
+    capture.events_where("dekopon_storage_host", &[("event", event)])
+}
+
+fn memory_request(
+    invocation: &str,
+    access: StorageAccess,
+    continuity: MemoryContinuity,
+) -> StorageGrantRequest {
+    request(b"unused", ContinuityPolicy::Paranoid, invocation, access)
+        .with_memory_continuity(continuity)
+}
+
+fn paranoid(
+    surface: &[u8],
+    legacy: LegacyContinuity,
+    on_unproven: UnprovenDisposition,
+) -> MemoryContinuity {
+    MemoryContinuity::Paranoid {
+        surface: surface.to_vec(),
+        legacy,
+        on_unproven,
+    }
+}
+
+fn append_turn(host: &StorageHost, request: StorageGrantRequest, line: &[u8]) {
+    let mut handle = host
+        .begin(host.grant(request).expect("write grant"))
+        .expect("writer");
+    let offset = handle.jsonl_size("turns.jsonl").unwrap_or(0);
+    handle
+        .jsonl_append("turns.jsonl", offset, line)
+        .expect("append turn");
+    handle.commit().expect("commit turn");
+}
+
+fn turn_bytes(host: &StorageHost, request: StorageGrantRequest) -> Result<u64, StorageHostError> {
+    let mut handle = host.begin(host.grant(request)?).expect("reader");
+    let size = handle.jsonl_size("turns.jsonl").unwrap_or(0);
+    handle.finish_read().expect("finish read");
+    Ok(size)
+}
+
+fn pointer_version(base: &Path) -> String {
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&fs::read(base.join("current")).expect("pointer")).expect("json");
+    pointer["apiVersion"].as_str().expect("version").to_owned()
+}
+
+#[test]
+fn a_legacy_pointer_migrates_in_place_when_a_candidate_reproduces_it() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    append_turn(
+        &host,
+        request(
+            b"v1-surface",
+            ContinuityPolicy::Paranoid,
+            "legacy-write",
+            StorageAccess::ReadWrite,
+        ),
+        br#"{"turn":1}"#,
+    );
+    let base = only_base(&root);
+    let legacy_generations = generations(&base);
+    assert!(pointer_version(&base).ends_with("/v1alpha1"));
+
+    let migrate = |invocation: &str| {
+        memory_request(
+            invocation,
+            StorageAccess::ReadOnly,
+            paranoid(
+                b"v2-surface",
+                LegacyContinuity::Candidates(vec![b"other".to_vec(), b"v1-surface".to_vec()]),
+                UnprovenDisposition::Refuse,
+            ),
+        )
+    };
+    let (migrated, capture) = captured(|| turn_bytes(&host, migrate("migrate")));
+    assert_eq!(migrated.expect("migrated read"), 11);
+    assert_eq!(
+        continuity_events(&capture, "storage_continuity_migrated").len(),
+        1
+    );
+    assert!(pointer_version(&base).ends_with("/v1alpha2"));
+    assert_eq!(generations(&base), legacy_generations);
+    drop(host);
+
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("restart");
+    let (again, capture) = captured(|| turn_bytes(&host, migrate("after-restart")));
+    assert_eq!(again.expect("idempotent read"), 11);
+    assert!(continuity_events(&capture, "storage_continuity_migrated").is_empty());
+}
+
+#[test]
+fn an_interrupted_migration_is_retried_from_the_legacy_pointer() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    append_turn(
+        &host,
+        request(
+            b"v1-surface",
+            ContinuityPolicy::Paranoid,
+            "legacy-write",
+            StorageAccess::ReadWrite,
+        ),
+        br#"{"turn":1}"#,
+    );
+    let base = only_base(&root);
+    let legacy_pointer = fs::read(base.join("current")).expect("legacy pointer");
+    let migrate = |invocation: &str| {
+        memory_request(
+            invocation,
+            StorageAccess::ReadOnly,
+            paranoid(
+                b"v2-surface",
+                LegacyContinuity::Candidates(vec![b"v1-surface".to_vec()]),
+                UnprovenDisposition::Refuse,
+            ),
+        )
+    };
+    assert_eq!(turn_bytes(&host, migrate("first")).expect("first"), 11);
+    drop(host);
+    // A crash before the atomic rename leaves the legacy pointer in place.
+    fs::write(base.join("current"), &legacy_pointer).expect("restore legacy pointer");
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("restart");
+    assert_eq!(turn_bytes(&host, migrate("retry")).expect("retry"), 11);
+    assert!(pointer_version(&base).ends_with("/v1alpha2"));
+}
+
+#[test]
+fn an_unproven_legacy_pointer_is_refused_and_left_byte_identical() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    append_turn(
+        &host,
+        request(
+            b"v1-surface",
+            ContinuityPolicy::Paranoid,
+            "legacy-write",
+            StorageAccess::ReadWrite,
+        ),
+        br#"{"turn":1}"#,
+    );
+    let base = only_base(&root);
+    let before = snapshot_tree(&root);
+    for (legacy, expected) in [
+        (
+            LegacyContinuity::Candidates(vec![b"changed-authority".to_vec()]),
+            ContinuityCheck::NoCandidate,
+        ),
+        (
+            LegacyContinuity::Unproven(ContinuityCheck::DigestMismatch),
+            ContinuityCheck::DigestMismatch,
+        ),
+    ] {
+        let (refused, capture) = captured(|| {
+            host.grant(memory_request(
+                "unproven",
+                StorageAccess::ReadOnly,
+                paranoid(b"v2-surface", legacy, UnprovenDisposition::Refuse),
+            ))
+        });
+        assert!(
+            matches!(refused, Err(StorageHostError::ContinuityUnproven { check }) if check == expected)
+        );
+        assert_eq!(
+            continuity_events(&capture, "storage_continuity_unproven").len(),
+            1
+        );
+        assert!(continuity_events(&capture, "storage_namespace_reset").is_empty());
+    }
+    assert_eq!(snapshot_tree(&root), before);
+    assert!(pointer_version(&base).ends_with("/v1alpha1"));
+}
+
+#[test]
+fn a_fresh_epoch_disposition_starts_empty_and_keeps_the_old_generation() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    append_turn(
+        &host,
+        request(
+            b"v1-surface",
+            ContinuityPolicy::Paranoid,
+            "legacy-write",
+            StorageAccess::ReadWrite,
+        ),
+        br#"{"turn":1}"#,
+    );
+    let base = only_base(&root);
+    let legacy_generations = generations(&base);
+    let (fresh, capture) = captured(|| {
+        turn_bytes(
+            &host,
+            memory_request(
+                "fresh",
+                StorageAccess::ReadOnly,
+                paranoid(
+                    b"v2-surface",
+                    LegacyContinuity::Unproven(ContinuityCheck::Absent),
+                    UnprovenDisposition::FreshEpoch,
+                ),
+            ),
+        )
+    });
+    assert_eq!(fresh.expect("fresh read"), 0);
+    assert_eq!(
+        continuity_events(&capture, "storage_continuity_fresh_epoch").len(),
+        1
+    );
+    let after = generations(&base);
+    assert_eq!(after.len(), legacy_generations.len() + 1);
+    assert!(legacy_generations.iter().all(|old| after.contains(old)));
+    assert!(pointer_version(&base).ends_with("/v1alpha2"));
+}
+
+#[test]
+fn paranoid_memory_never_reuses_an_epoch_across_an_authority_round_trip() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    let grant = |surface: &[u8], invocation: &str, access| {
+        memory_request(
+            invocation,
+            access,
+            paranoid(
+                surface,
+                LegacyContinuity::Unproven(ContinuityCheck::Absent),
+                UnprovenDisposition::Refuse,
+            ),
+        )
+    };
+    append_turn(
+        &host,
+        grant(b"a", "a-write", StorageAccess::ReadWrite),
+        br#"{"turn":1}"#,
+    );
+    assert_eq!(
+        turn_bytes(&host, grant(b"a", "a-read", StorageAccess::ReadOnly)).unwrap(),
+        11
+    );
+    assert_eq!(
+        turn_bytes(&host, grant(b"b", "b-read", StorageAccess::ReadOnly)).unwrap(),
+        0
+    );
+    assert_eq!(
+        turn_bytes(&host, grant(b"a", "a-again", StorageAccess::ReadOnly)).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn entering_relaxed_memory_after_paranoid_never_reopens_an_earlier_relaxed_generation() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    let relaxed =
+        |invocation: &str, access| memory_request(invocation, access, MemoryContinuity::Relaxed);
+    append_turn(
+        &host,
+        relaxed("relaxed-write", StorageAccess::ReadWrite),
+        br#"{"turn":1}"#,
+    );
+    drop(host);
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("restart");
+    assert_eq!(
+        turn_bytes(&host, relaxed("relaxed-restart", StorageAccess::ReadOnly)).unwrap(),
+        11,
+        "a relaxed deployment keeps its generation"
+    );
+    drop(
+        host.grant(memory_request(
+            "paranoid",
+            StorageAccess::ReadOnly,
+            paranoid(
+                b"a",
+                LegacyContinuity::Unproven(ContinuityCheck::Absent),
+                UnprovenDisposition::Refuse,
+            ),
+        ))
+        .expect("paranoid generation"),
+    );
+    assert_eq!(
+        turn_bytes(&host, relaxed("relaxed-return", StorageAccess::ReadOnly)).unwrap(),
+        0
+    );
+    assert!(!only_base(&root).join("current").exists());
+}
+
+fn layout_version(root: &Path) -> String {
+    let layout: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("layout")).expect("layout")).expect("json");
+    layout["apiVersion"].as_str().expect("version").to_owned()
+}
+
+#[test]
+fn opening_a_legacy_layout_upgrades_it_so_the_previous_release_refuses_the_root() {
+    let (_temporary, root) = fixture();
+    drop(StorageHost::open(&root, StorageLimits::default()).expect("create"));
+    fs::write(
+        root.join("layout"),
+        b"{\"apiVersion\":\"dekopon.dev/provider-storage-layout/v1alpha1\"}\n",
+    )
+    .expect("legacy layout");
+    drop(StorageHost::open(&root, StorageLimits::default()).expect("upgrade"));
+    assert_eq!(
+        layout_version(&root),
+        "dekopon.dev/provider-storage-layout/v1alpha2"
+    );
+}
+
+#[test]
+fn an_interrupted_layout_upgrade_temporary_is_removed_by_the_writer_only() {
+    let (_temporary, root) = fixture();
+    drop(StorageHost::open(&root, StorageLimits::default()).expect("create"));
+    let temporary = root.join(format!("tmp-{}", "0a".repeat(16)));
+    fs::write(&temporary, b"partial").expect("temporary");
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).expect("private");
+
+    let writer = StorageHost::open(&root, StorageLimits::default()).expect("writer recovers");
+    assert!(!temporary.exists());
+    fs::write(&temporary, b"partial").expect("second temporary");
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).expect("private");
+    assert!(matches!(
+        StorageHost::open(&root, StorageLimits::default()),
+        Err(StorageHostError::SecondWriter)
+    ));
+    assert!(temporary.exists());
+    drop(writer);
+    fs::remove_file(&temporary).expect("cleanup");
+
+    for name in ["tmp-short".to_owned(), "unrelated".to_owned()] {
+        fs::write(root.join(&name), b"x").expect("stray entry");
+        assert!(matches!(
+            StorageHost::open(&root, StorageLimits::default()),
+            Err(StorageHostError::CorruptLayout { .. })
+        ));
+        fs::remove_file(root.join(&name)).expect("cleanup");
     }
 }

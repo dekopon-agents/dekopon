@@ -8,7 +8,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ContinuityPolicy, StorageGrantRequest, StorageHostError,
+    Comparison, ContinuityCheck, ContinuityPolicy, LegacyContinuity, MemoryContinuity,
+    StorageGrantRequest, StorageHostError, UnprovenDisposition,
     key::{
         DOMAIN_AUDIT_SCOPE, DOMAIN_AUTHORITY, DOMAIN_GENERATION, DOMAIN_NAMESPACE_PATH, commitment,
         random_bytes, token,
@@ -19,7 +20,8 @@ use crate::{
     },
 };
 
-const POINTER_VERSION: &str = "dekopon.dev/storage-authority-pointer/v1alpha1";
+const POINTER_V1: &str = "dekopon.dev/storage-authority-pointer/v1alpha1";
+const POINTER_V2: &str = "dekopon.dev/storage-authority-pointer/v1alpha2";
 const IDENTITY_VERSION: &str = "dekopon.dev/storage-resource/v1alpha1";
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -127,7 +129,14 @@ pub(crate) struct Reset {
     pub(crate) path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ContinuityOutcome {
+    Migrated,
+    FreshEpoch { check: ContinuityCheck },
+}
+
 pub(crate) struct NamespacePlan {
+    continuity: Option<ContinuityOutcome>,
     base_token: String,
     scope_commitment: String,
     generation_token: String,
@@ -146,6 +155,7 @@ pub(crate) struct NamespacePlan {
 }
 
 struct Selection {
+    continuity: Option<ContinuityOutcome>,
     generation_token: String,
     authority_pointer: Option<Vec<u8>>,
     removed_pointer_length: Option<u64>,
@@ -173,7 +183,6 @@ impl NamespacePlan {
         let base_token = token(DOMAIN_NAMESPACE_PATH, &fields);
         let scope_commitment = commitment(DOMAIN_AUDIT_SCOPE, &fields);
         debug_assert_ne!(base_token, scope_commitment);
-        let authority = token(DOMAIN_AUTHORITY, &[request.authority_surface()]);
 
         let (existing_base, existing_base_lease, before_usage, pointer_length) = (|| {
             if !namespaces_root.exists(&base_token)? {
@@ -229,8 +238,7 @@ impl NamespacePlan {
             select_generation(
                 base,
                 &base_token,
-                &authority,
-                request.continuity_policy(),
+                request.comparison(),
                 pointer_length,
                 maximum_entries,
                 reset,
@@ -278,6 +286,7 @@ impl NamespacePlan {
             simulation.remove(length)?;
         }
         Ok(Self {
+            continuity: selection.continuity,
             base_token,
             scope_commitment,
             generation_token: selection.generation_token,
@@ -314,6 +323,10 @@ impl NamespacePlan {
 
     pub(crate) const fn take_reset(&mut self) -> Option<Reset> {
         self.reset.take()
+    }
+
+    pub(crate) const fn take_continuity(&mut self) -> Option<ContinuityOutcome> {
+        self.continuity.take()
     }
 
     pub(crate) fn apply(
@@ -363,92 +376,243 @@ impl NamespacePlan {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "every argument is one already-derived input of the single selection both passes share"
-)]
 fn select_generation(
     base: Option<&Directory>,
     base_token: &str,
-    authority: &str,
-    policy: ContinuityPolicy,
+    comparison: &Comparison,
     pointer_length: Option<u64>,
     maximum_entries: u64,
     reset: bool,
 ) -> Result<Selection, StorageHostError> {
-    match policy {
-        ContinuityPolicy::Stable => {
-            let generation_token = token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]);
-            let set_aside = match base {
-                Some(base) if reset && base.exists(&generation_token)? => {
-                    Some(crate::key::hex(&random_bytes(32)?))
-                }
-                _ => None,
-            };
-            let retained_peak_bytes = match base {
-                Some(base) if set_aside.is_none() => {
-                    retained_generation(base, base_token, &generation_token, maximum_entries)?
-                }
-                _ => None,
-            };
-            // A stale authority pointer must not survive stable continuity, or authority-bound A to
-            // stable to A would reopen A's old epoch instead of minting a new non-reusing
-            // generation.
-            Ok(Selection {
-                generation_token,
-                authority_pointer: None,
-                removed_pointer_length: pointer_length,
-                retained_peak_bytes,
-                set_aside,
-            })
-        }
-        ContinuityPolicy::AuthorityBound => {
+    match comparison {
+        Comparison::Provider {
+            policy: ContinuityPolicy::Relaxed,
+            ..
+        } => select_relaxed(base, base_token, pointer_length, maximum_entries, reset),
+        Comparison::Provider {
+            policy: ContinuityPolicy::Paranoid,
+            surface,
+        } => {
+            let authority = token(DOMAIN_AUTHORITY, &[surface]);
             let previous = match base {
                 Some(base) if !reset => read_pointer(base, base_token)?,
                 _ => None,
             };
-            if let Some(base) = base
-                && let Some(pointer) = previous.filter(|pointer| pointer.authority == authority)
-            {
-                let generation_token = token(
-                    DOMAIN_GENERATION,
-                    &[base_token.as_bytes(), pointer.epoch.as_bytes()],
+            let (Some(base), Some((scheme, pointer))) = (base, previous) else {
+                return mint_epoch(
+                    base,
+                    base_token,
+                    PointerScheme::V1,
+                    authority,
+                    maximum_entries,
+                    None,
                 );
-                let retained =
-                    retained_generation(base, base_token, &generation_token, maximum_entries)?
-                        .ok_or_else(|| {
-                            base.corrupt(&generation_token, "missing-current-generation")
-                                .in_namespace(base_token, Some(&generation_token))
-                        })?;
-                return Ok(Selection {
-                    generation_token,
-                    authority_pointer: None,
-                    removed_pointer_length: None,
-                    retained_peak_bytes: Some(retained),
-                    set_aside: None,
-                });
-            }
-            let epoch = crate::key::hex(&random_bytes(32)?);
-            let generation_token = token(
-                DOMAIN_GENERATION,
-                &[base_token.as_bytes(), epoch.as_bytes()],
-            );
-            let authority_pointer = encode_pointer(authority.to_owned(), epoch)?;
-            let retained_peak_bytes = match base {
-                Some(base) => {
-                    retained_generation(base, base_token, &generation_token, maximum_entries)?
-                }
-                None => None,
             };
-            Ok(Selection {
-                generation_token,
-                authority_pointer: Some(authority_pointer),
-                removed_pointer_length: None,
-                retained_peak_bytes,
-                set_aside: None,
-            })
+            match scheme {
+                PointerScheme::V1 if pointer.authority == authority => reuse_epoch(
+                    base,
+                    base_token,
+                    &pointer.epoch,
+                    maximum_entries,
+                    None,
+                    None,
+                ),
+                PointerScheme::V1 => mint_epoch(
+                    Some(base),
+                    base_token,
+                    PointerScheme::V1,
+                    authority,
+                    maximum_entries,
+                    None,
+                ),
+                PointerScheme::V2 => Err(base
+                    .corrupt("current", "authority-pointer")
+                    .in_namespace(base_token, None)),
+            }
+        }
+        Comparison::Memory(MemoryContinuity::Relaxed) => select_relaxed(
+            base,
+            base_token,
+            pointer_length,
+            maximum_entries,
+            // Entering relaxed from paranoid must not reopen a stable generation an earlier
+            // relaxed period left behind.
+            reset || pointer_length.is_some(),
+        ),
+        Comparison::Memory(MemoryContinuity::Paranoid {
+            surface,
+            legacy,
+            on_unproven,
+        }) => {
+            let authority = token(DOMAIN_AUTHORITY, &[surface]);
+            let previous = match base {
+                Some(base) if !reset => read_pointer(base, base_token)?,
+                _ => None,
+            };
+            let (Some(base), Some((scheme, pointer))) = (base, previous) else {
+                return mint_epoch(
+                    base,
+                    base_token,
+                    PointerScheme::V2,
+                    authority,
+                    maximum_entries,
+                    None,
+                );
+            };
+            match scheme {
+                PointerScheme::V2 if pointer.authority == authority => reuse_epoch(
+                    base,
+                    base_token,
+                    &pointer.epoch,
+                    maximum_entries,
+                    None,
+                    None,
+                ),
+                PointerScheme::V2 => mint_epoch(
+                    Some(base),
+                    base_token,
+                    PointerScheme::V2,
+                    authority,
+                    maximum_entries,
+                    None,
+                ),
+                PointerScheme::V1 => {
+                    let proved = match legacy {
+                        LegacyContinuity::Unproven(check) => Err(*check),
+                        LegacyContinuity::Candidates(candidates) => candidates
+                            .iter()
+                            .any(|candidate| {
+                                token(DOMAIN_AUTHORITY, &[candidate]) == pointer.authority
+                            })
+                            .then_some(())
+                            .ok_or(ContinuityCheck::NoCandidate),
+                    };
+                    match (proved, on_unproven) {
+                        (Ok(()), UnprovenDisposition::Refuse | UnprovenDisposition::FreshEpoch) => {
+                            let migrated = encode_pointer(
+                                PointerScheme::V2,
+                                authority,
+                                pointer.epoch.clone(),
+                            )?;
+                            reuse_epoch(
+                                base,
+                                base_token,
+                                &pointer.epoch,
+                                maximum_entries,
+                                Some(migrated),
+                                Some(ContinuityOutcome::Migrated),
+                            )
+                        }
+                        (Err(check), UnprovenDisposition::Refuse) => {
+                            tracing::warn!(
+                                event = "storage_continuity_unproven",
+                                category = "storage",
+                                storage.namespace = %base_token,
+                                storage.continuity.check = check.label(),
+                                "storage.continuity.unproven"
+                            );
+                            Err(StorageHostError::ContinuityUnproven { check })
+                        }
+                        (Err(check), UnprovenDisposition::FreshEpoch) => mint_epoch(
+                            Some(base),
+                            base_token,
+                            PointerScheme::V2,
+                            authority,
+                            maximum_entries,
+                            Some(ContinuityOutcome::FreshEpoch { check }),
+                        ),
+                    }
+                }
+            }
         }
     }
+}
+
+fn select_relaxed(
+    base: Option<&Directory>,
+    base_token: &str,
+    pointer_length: Option<u64>,
+    maximum_entries: u64,
+    set_aside_existing: bool,
+) -> Result<Selection, StorageHostError> {
+    let generation_token = token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]);
+    let set_aside = match base {
+        Some(base) if set_aside_existing && base.exists(&generation_token)? => {
+            Some(crate::key::hex(&random_bytes(32)?))
+        }
+        _ => None,
+    };
+    let retained_peak_bytes = match base {
+        Some(base) if set_aside.is_none() => {
+            retained_generation(base, base_token, &generation_token, maximum_entries)?
+        }
+        _ => None,
+    };
+    // A stale authority pointer must not survive relaxed continuity, or paranoid A to relaxed to A
+    // would reopen A's old epoch instead of minting a new non-reusing generation.
+    Ok(Selection {
+        continuity: None,
+        generation_token,
+        authority_pointer: None,
+        removed_pointer_length: pointer_length,
+        retained_peak_bytes,
+        set_aside,
+    })
+}
+
+fn reuse_epoch(
+    base: &Directory,
+    base_token: &str,
+    epoch: &str,
+    maximum_entries: u64,
+    authority_pointer: Option<Vec<u8>>,
+    continuity: Option<ContinuityOutcome>,
+) -> Result<Selection, StorageHostError> {
+    let generation_token = token(
+        DOMAIN_GENERATION,
+        &[base_token.as_bytes(), epoch.as_bytes()],
+    );
+    let retained = retained_generation(base, base_token, &generation_token, maximum_entries)?
+        .ok_or_else(|| {
+            base.corrupt(&generation_token, "missing-current-generation")
+                .in_namespace(base_token, Some(&generation_token))
+        })?;
+    Ok(Selection {
+        continuity,
+        generation_token,
+        authority_pointer,
+        removed_pointer_length: None,
+        retained_peak_bytes: Some(retained),
+        set_aside: None,
+    })
+}
+
+fn mint_epoch(
+    base: Option<&Directory>,
+    base_token: &str,
+    scheme: PointerScheme,
+    authority: String,
+    maximum_entries: u64,
+    continuity: Option<ContinuityOutcome>,
+) -> Result<Selection, StorageHostError> {
+    let epoch = crate::key::hex(&random_bytes(32)?);
+    let generation_token = token(
+        DOMAIN_GENERATION,
+        &[base_token.as_bytes(), epoch.as_bytes()],
+    );
+    let authority_pointer = encode_pointer(scheme, authority, epoch)?;
+    let retained_peak_bytes = match base {
+        Some(base) => retained_generation(base, base_token, &generation_token, maximum_entries)?,
+        None => None,
+    };
+    Ok(Selection {
+        continuity,
+        generation_token,
+        authority_pointer: Some(authority_pointer),
+        removed_pointer_length: None,
+        retained_peak_bytes,
+        set_aside: None,
+    })
 }
 
 fn retained_generation(
@@ -593,9 +757,17 @@ fn file_length(parent: &Directory, name: &str) -> Result<Option<u64>, StorageHos
               fails only on a non-string map key or a Serialize implementation error, and neither \
               exists here"
 )]
-fn encode_pointer(authority: String, epoch: String) -> Result<Vec<u8>, StorageHostError> {
+fn encode_pointer(
+    scheme: PointerScheme,
+    authority: String,
+    epoch: String,
+) -> Result<Vec<u8>, StorageHostError> {
     serde_json::to_vec(&PointerDocument {
-        api_version: POINTER_VERSION.to_owned(),
+        api_version: match scheme {
+            PointerScheme::V1 => POINTER_V1,
+            PointerScheme::V2 => POINTER_V2,
+        }
+        .to_owned(),
         authority,
         epoch,
     })
@@ -616,10 +788,16 @@ fn ensure_generation(
     Ok((directory, data))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerScheme {
+    V1,
+    V2,
+}
+
 fn read_pointer(
     base_directory: &Directory,
     base_token: &str,
-) -> Result<Option<PointerDocument>, StorageHostError> {
+) -> Result<Option<(PointerScheme, PointerDocument)>, StorageHostError> {
     if !base_directory.exists("current")? {
         return Ok(None);
     }
@@ -630,10 +808,12 @@ fn read_pointer(
         crate::report_decode_failure("authority-pointer", &error);
         base_directory.corrupt("current", "authority-pointer")
     })?;
-    if document.api_version != POINTER_VERSION
-        || !is_token(&document.epoch)
-        || !is_token(&document.authority)
-    {
+    let scheme = match document.api_version.as_str() {
+        POINTER_V1 => Some(PointerScheme::V1),
+        POINTER_V2 => Some(PointerScheme::V2),
+        _ => None,
+    };
+    if scheme.is_none() || !is_token(&document.epoch) || !is_token(&document.authority) {
         let previous = is_token(&document.epoch).then(|| {
             token(
                 DOMAIN_GENERATION,
@@ -644,7 +824,7 @@ fn read_pointer(
             .corrupt("current", "authority-pointer")
             .in_namespace(base_token, previous.as_deref()));
     }
-    Ok(Some(document))
+    Ok(scheme.map(|scheme| (scheme, document)))
 }
 
 pub(crate) fn deadline_after(timeout_ms: u64) -> Result<Instant, StorageHostError> {

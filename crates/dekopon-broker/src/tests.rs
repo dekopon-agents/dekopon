@@ -280,7 +280,7 @@ fn the_declared_route_is_what_reserves_a_capability_not_its_spelling() {
 #[test]
 fn memory_composition_reserves_host_calls_and_pre_compaction_peak() {
     let memory = ChatMemoryConfig {
-        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::Paranoid,
         enabled_agents: vec!["reviewer".parse().expect("agent")],
         max_lookback_turns: 200,
         max_recent_turns: 20,
@@ -520,7 +520,7 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
     assert_rotations(&storage, storage_mutations, encoded_storage);
 
     let memory = ChatMemoryConfig {
-        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::Paranoid,
         enabled_agents: vec![
             "reviewer".parse().expect("agent"),
             "other".parse().expect("agent"),
@@ -536,7 +536,7 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
     };
     let memory_mutations: &[Mutation<ChatMemoryConfig>] = &[
         ("continuityPolicy", |v| {
-            v.continuity_policy = dekopon_storage_host::ContinuityPolicy::Stable;
+            v.continuity_policy = dekopon_storage_host::ContinuityPolicy::Relaxed;
         }),
         ("maxLookbackTurns", |v| v.max_lookback_turns += 1),
         ("maxRecentTurns", |v| v.max_recent_turns += 1),
@@ -1928,7 +1928,7 @@ fn terminal_redirect_refusal_keeps_its_safe_label_detail_and_exit_three() {
 
 fn valid_memory_config() -> ChatMemoryConfig {
     ChatMemoryConfig {
-        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::Paranoid,
         enabled_agents: vec!["reviewer".parse().expect("agent")],
         max_lookback_turns: 200,
         max_recent_turns: 20,
