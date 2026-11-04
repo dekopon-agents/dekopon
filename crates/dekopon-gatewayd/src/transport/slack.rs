@@ -1928,7 +1928,9 @@ fn project_message(message: &Value) -> SlackProjection {
 
     if let Some(forward) = message["attachments"].as_array().and_then(|attachments| {
         attachments.iter().find(|attachment| {
-            attachment["is_share"] == true && attachment["is_msg_unfurl"] == true
+            attachment["is_msg_unfurl"] == true
+                && (attachment["is_share"] == true
+                    || attachment["is_share"].is_null() && quotes_a_message(attachment))
         })
     }) {
         let label = |value: Option<&str>| {
@@ -1979,6 +1981,29 @@ fn project_message(message: &Value) -> SlackProjection {
         assets,
         asset_overflow: file_count > MAX_ATTACHMENTS,
     }
+}
+
+fn quotes_a_message(attachment: &Value) -> bool {
+    let (Some(url), Some(channel), Some(ts)) = (
+        attachment["from_url"].as_str(),
+        attachment["channel_id"].as_str(),
+        attachment["ts"]
+            .as_str()
+            .filter(|ts| canonical_timestamp(ts)),
+    ) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let permalink = format!("p{}", ts.replace('.', ""));
+    url.scheme() == "https"
+        && attachment["author_id"]
+            .as_str()
+            .is_some_and(|author| !author.is_empty())
+        && url
+            .path_segments()
+            .is_some_and(|segments| segments.eq(["archives", channel, permalink.as_str()]))
 }
 
 fn forward_blocks(blocks: &Value) -> String {
@@ -3509,6 +3534,70 @@ mod driver_tests {
             "author_id": "UORIGINAL", "channel_id": "CORIGINAL",
             "ts": "1700000000.000100", "text": text, "files": files,
         })
+    }
+
+    fn message_unfurl(text: Value, files: Value) -> Value {
+        json!({
+            "id": 1, "fallback": "[forwarded]", "is_msg_unfurl": true, "is_reply_unfurl": false,
+            "from_url": "https://example.slack.com/archives/CORIGINAL/p1700000000000100",
+            "original_url": "https://example.slack.com/archives/CORIGINAL/p1700000000000100",
+            "author_id": "UORIGINAL", "author_subname": "Original Author",
+            "author_name": "Original Author", "author_link": "https://example.slack.com/team/UORIGINAL",
+            "author_icon": "https://example.invalid/avatar.png",
+            "channel_id": "CORIGINAL", "channel_team": "T0123ABC",
+            "ts": "1700000000.000100", "footer": "Posted in #original",
+            "mrkdwn_in": ["text"], "text": text, "files": files,
+            "blocks": [{"type":"rich_text", "elements":[{
+                "type":"rich_text_section", "elements":[{"type":"text", "text":"from blocks"}]
+            }]}],
+        })
+    }
+
+    async fn delivered(attachment: Value) -> (String, Vec<crate::transport::PendingAsset>) {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        let mut event = forwarded_event("<@B0123ABC> look at this", attachment);
+        event["type"] = json!("app_mention");
+        let ingress = transport
+            .routable(TEAM, &event, &Span::none())
+            .await
+            .expect("readable")
+            .expect("addressed");
+        let history = past_message(&event, TEAM, BOT_USER).expect("history");
+        assert_eq!(ingress.text, history.text);
+        assert_eq!(ingress.assets, history.assets);
+        (ingress.text, ingress.assets)
+    }
+
+    #[tokio::test]
+    async fn a_message_unfurl_without_is_share_is_read_as_a_forward() {
+        let (text, assets) = delivered(message_unfurl(json!("a quoted answer"), photo())).await;
+        assert!(text.contains(
+            "[quoted Slack forward — author: \"UORIGINAL\"; channel: \"CORIGINAL\"; time: \"1700000000.000100\"]\na quoted answer"
+        ));
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].name, "cat.png");
+
+        let (text, assets) = delivered(message_unfurl(json!(""), json!([]))).await;
+        assert!(text.contains("from blocks"), "{text}");
+        assert!(assets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_link_unfurl_or_an_unprovenanced_quote_is_not_a_forward() {
+        let link = json!({
+            "id": 1, "from_url": "https://example.com/post", "original_url": "https://example.com/post",
+            "title": "A post", "text": "a page summary", "service_name": "example.com",
+        });
+        let mut elsewhere = message_unfurl(json!("a quoted answer"), photo());
+        elsewhere["from_url"] =
+            json!("https://example.slack.com/archives/COTHER/p1700000000000100");
+        let mut unshared = message_unfurl(json!("a quoted answer"), photo());
+        unshared["is_share"] = json!(false);
+        for attachment in [link, elsewhere, unshared] {
+            let (text, assets) = delivered(attachment).await;
+            assert!(!text.contains("[quoted Slack forward"), "{text}");
+            assert!(assets.is_empty());
+        }
     }
 
     fn forwarded_event(top_text: &str, attachment: Value) -> Value {

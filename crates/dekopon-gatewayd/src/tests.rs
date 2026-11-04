@@ -10649,11 +10649,37 @@ async fn slack_uploads_are_routed_and_described_for_numbering() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
+    live_forward_keeps_its_image_for_an_authorized_follow_up(json!({
+        "is_share": true, "is_msg_unfurl": true,
+        "author_id": "UORIGINAL", "channel_id": "CORIGINAL",
+        "ts": "1700000000.000100", "text": "the original question",
+        "files": [{"id": "F-FORWARD", "name": "scene.png", "mimetype": "image/png",
+            "size": 24, "url_private_download": "https://files.slack.com/f/F-FORWARD/scene.png"}]
+    }))
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_slack_message_unfurl_forward_without_is_share_keeps_its_image_for_an_authorized_follow_up()
+ {
+    live_forward_keeps_its_image_for_an_authorized_follow_up(json!({
+        "is_msg_unfurl": true, "is_reply_unfurl": false,
+        "from_url": "https://example.slack.com/archives/CORIGINAL/p1700000000000100",
+        "original_url": "https://example.slack.com/archives/CORIGINAL/p1700000000000100",
+        "author_id": "UORIGINAL", "author_subname": "Original Author", "channel_id": "CORIGINAL",
+        "channel_team": "T0123ABC", "ts": "1700000000.000100", "text": "the original question",
+        "files": [{"id": "F-FORWARD", "name": "scene.png", "mimetype": "image/png",
+            "size": 24, "url_private_download": "https://files.slack.com/f/F-FORWARD/scene.png"}]
+    }))
+    .await;
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one live forward scenario across private, shared and inaccessible fetches"
 )]
-async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
+async fn live_forward_keeps_its_image_for_an_authorized_follow_up(forward: Value) {
     struct ForwardImage(Arc<AtomicUsize>, bool);
     impl AssetFetcher for ForwardImage {
         fn fetch(
@@ -10678,13 +10704,7 @@ async fn a_live_slack_forward_keeps_its_image_for_an_authorized_follow_up() {
         json!({
             "type": "message", "channel": "d0123abc", "channel_type": "im",
             "user": "u9xyz", "ts": "1700000000.000001", "text": "What is in this image?",
-            "attachments": [{
-                "is_share": true, "is_msg_unfurl": true,
-                "author_id": "UORIGINAL", "channel_id": "CORIGINAL",
-                "ts": "1700000000.000100", "text": "the original question",
-                "files": [{"id": "F-FORWARD", "name": "scene.png", "mimetype": "image/png",
-                    "size": 24, "url_private_download": "https://files.slack.com/f/F-FORWARD/scene.png"}]
-            }]
+            "attachments": [forward]
         }),
     )]);
     let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
