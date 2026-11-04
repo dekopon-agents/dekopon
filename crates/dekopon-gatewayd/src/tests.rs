@@ -22325,6 +22325,208 @@ async fn a_slack_follow_batch_keeps_both_speakers_and_authorizes_only_the_newest
     }
 }
 
+const FOLLOW_ROOT: &str = "1700000000.000001";
+
+fn owned_follow_claim() -> ThreadClaim {
+    ThreadClaim::Slack {
+        team_id: TEAM.to_owned(),
+        channel_id: "c0123abc".to_owned(),
+        thread_ts: FOLLOW_ROOT.to_owned(),
+        user_id: "u9xyz".to_owned(),
+    }
+}
+
+fn follow_gateway(
+    fixture: &SlackFollowFixture,
+    broker: ResolvedBroker,
+    models: &Arc<ModelScript>,
+    driver: &Arc<RecordingDriver>,
+) -> crate::gateway::Gateway {
+    let mut running = Arc::into_inner(runner(broker, Arc::clone(models), 4)).unwrap();
+    running.follow = Some(Arc::clone(&fixture.table));
+    crate::gateway::Gateway::new(
+        Arc::new(running),
+        Arc::clone(&fixture.routes),
+        Arc::default(),
+        Arc::new(BTreeMap::from([(
+            "scientist-slack".to_owned(),
+            Arc::clone(driver) as Arc<dyn ChatDriver>,
+        )])),
+        Arc::default(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_follow_route_admits_an_owned_unmentioned_continuation_without_a_ticket() {
+    for (experience, ticket, admitted) in [
+        (
+            SlackExperience::Agent,
+            false,
+            &["1700000000.000004", "1700000000.000005"][..],
+        ),
+        (
+            SlackExperience::Agent,
+            true,
+            &[
+                "1700000000.000002",
+                "1700000000.000004",
+                "1700000000.000005",
+            ][..],
+        ),
+        (SlackExperience::Classic, false, &["1700000000.000005"][..]),
+    ] {
+        let fixture = SlackFollowFixture::new().await;
+        if ticket {
+            fixture
+                .table
+                .stay_and_write(&fixture.key, SystemTime::now())
+                .unwrap();
+        }
+        let socket = spawn_socket_mock(vec![
+            events_envelope(
+                "ambient",
+                channel_message("u9xyz", "1700000000.000010", None, "top-level chatter"),
+            ),
+            events_envelope(
+                "unowned",
+                channel_message("u8other", "1700000000.000002", Some(FOLLOW_ROOT), "me too"),
+            ),
+            events_envelope(
+                "unclaimed",
+                channel_message(
+                    "u9xyz",
+                    "1700000000.000003",
+                    Some("1700000000.000006"),
+                    "another thread",
+                ),
+            ),
+            events_envelope(
+                "owned",
+                channel_message(
+                    "u9xyz",
+                    "1700000000.000004",
+                    Some(FOLLOW_ROOT),
+                    "now edit it",
+                ),
+            ),
+            events_envelope(
+                "sentinel",
+                channel_message(
+                    "u7third",
+                    "1700000000.000005",
+                    Some("1700000000.000007"),
+                    "<@u0botbot> done",
+                ),
+            ),
+        ]);
+        let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+        let mut transport = slack_with(&http.base, experience, LivenessConfig::default())
+            .with_generation(fixture.generation.clone());
+        transport.connect().await.unwrap();
+        if let Some(ownership) = transport.thread_ownership() {
+            ownership.claim(owned_follow_claim());
+        }
+        let mut received = Vec::new();
+        for _ in admitted {
+            received.push(next_message(&mut transport).await);
+        }
+        assert_eq!(
+            received
+                .iter()
+                .map(|message| message.message_id.clone())
+                .collect::<Vec<_>>(),
+            admitted
+                .iter()
+                .map(|ts| MessageId::Native((*ts).to_owned()))
+                .collect::<Vec<_>>(),
+            "{experience:?}, ticket {ticket}"
+        );
+        if experience == SlackExperience::Classic {
+            continue;
+        }
+        let owned = received
+            .into_iter()
+            .find(|message| message.message_id == MessageId::Native("1700000000.000004".into()))
+            .expect("owned continuation admitted");
+        assert!(
+            owned
+                .thread_continuation
+                .as_ref()
+                .is_some_and(|continuation| continuation.inherited)
+        );
+        let (broker, _observed) =
+            stub_broker(fixture.directory.path(), listings(1, &["cli-probe.upper"])).await;
+        let models = ModelScript::new([answer("Edited.")]);
+        let driver = Arc::new(RecordingDriver::default());
+        let gateway = follow_gateway(&fixture, broker, &models, &driver);
+        let mut pending = crate::follow::Debounce::default();
+        let mut sessions = tokio::task::JoinSet::new();
+        let mut collector = crate::collection::Collector::new(&[], 4);
+        gateway.dispatch(&mut sessions, &mut collector, &mut pending, owned);
+        if ticket {
+            assert!(sessions.is_empty(), "an Active ticket still debounces");
+            assert!(pending.deadline().is_some());
+            continue;
+        }
+        assert_eq!(sessions.len(), 1);
+        assert!(pending.deadline().is_none());
+        while let Some(result) = sessions.join_next().await {
+            result.expect("owned continuation session completes");
+        }
+        assert_eq!(models.requests(), 1);
+        assert_eq!(driver.replies(), ["Edited."]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_follow_dispatch_without_a_ticket_starts_only_an_inherited_continuation() {
+    for inherited in [true, false] {
+        let fixture = SlackFollowFixture::new().await;
+        let socket = spawn_socket_mock(vec![events_envelope(
+            "mentioned",
+            channel_message(
+                "u9xyz",
+                "1700000000.000004",
+                Some(FOLLOW_ROOT),
+                "<@u0botbot> now edit it",
+            ),
+        )]);
+        let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+        let mut transport = slack_with(
+            &http.base,
+            SlackExperience::Agent,
+            LivenessConfig::default(),
+        )
+        .with_generation(fixture.generation.clone());
+        transport.connect().await.unwrap();
+        let mut message = next_message(&mut transport).await;
+        message.addressed = Some(false);
+        message.thread_continuation = Some(ThreadContinuation {
+            claim: owned_follow_claim(),
+            inherited,
+        });
+        let (broker, _observed) =
+            stub_broker(fixture.directory.path(), listings(1, &["cli-probe.upper"])).await;
+        let models = if inherited {
+            ModelScript::new([answer("Edited.")])
+        } else {
+            ModelScript::forbidden()
+        };
+        let driver = Arc::new(RecordingDriver::default());
+        let gateway = follow_gateway(&fixture, broker, &models, &driver);
+        let mut pending = crate::follow::Debounce::default();
+        let mut sessions = tokio::task::JoinSet::new();
+        let mut collector = crate::collection::Collector::new(&[], 4);
+        gateway.dispatch(&mut sessions, &mut collector, &mut pending, message);
+        assert_eq!(sessions.len(), usize::from(inherited));
+        assert!(pending.deadline().is_none());
+        while let Some(result) = sessions.join_next().await {
+            result.expect("inherited continuation session completes");
+        }
+        assert_eq!(models.requests(), usize::from(inherited));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn slack_follow_mute_and_lapse_close_the_ticket_without_a_model_call() {
     let mentioned = format!("<@{BOT_USER}> mute");

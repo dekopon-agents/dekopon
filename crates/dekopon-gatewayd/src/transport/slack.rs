@@ -532,9 +532,6 @@ impl SlackTransport {
                     table.ticket(&key, SystemTime::now()) != crate::follow::FollowTicket::Absent
                 })
         });
-        if follow_route.is_some() && !explicitly_addressed && !followed && !ambient {
-            return Ok(None);
-        }
         let thread_continuation = match (kind != ConversationKind::DirectMessage, self.experience) {
             (true, SlackExperience::Agent) => {
                 let claim = ThreadClaim::Slack {
@@ -551,6 +548,9 @@ impl SlackTransport {
                 Some(ThreadContinuation { claim, inherited })
             }
             (true, SlackExperience::Classic) if !explicitly_addressed && !followed && !ambient => {
+                return Ok(None);
+            }
+            _ if follow_route.is_some() && !explicitly_addressed && !followed && !ambient => {
                 return Ok(None);
             }
             _ => None,
