@@ -154,6 +154,11 @@ pub(crate) fn receive_span(kind: ChatTransportKind) -> tracing::Span {
         conversation.container = tracing::field::Empty,
         conversation.id = tracing::field::Empty,
         conversation.thread = tracing::field::Empty,
+        slack.event.subtype = tracing::field::Empty,
+        slack.attachments.count = tracing::field::Empty,
+        slack.attachments.msg_unfurl = tracing::field::Empty,
+        slack.attachments.is_share_present = tracing::field::Empty,
+        slack.attachments.quotes_message = tracing::field::Empty,
     )
 }
 
