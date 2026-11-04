@@ -66,8 +66,10 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+mod continuity;
 mod github;
 mod request;
+pub use continuity::RequestOutcome;
 pub use request::{HttpRequestFacts, OpaqueBody, RequestBody};
 
 pub const NAMESPACE: &str = "Dekopon";
@@ -692,6 +694,7 @@ impl PolicyEngine {
         request: PolicyRequest,
         facts: Option<HttpRequestFacts>,
     ) -> PolicyDecision {
+        let facts = facts.map_or(RequestFacts::Absent, RequestFacts::Known);
         let (cedar_request, opaque_body) = match self.build_request(request, facts) {
             Ok(built) => built,
             Err(error) => return PolicyDecision::refused(&error),
@@ -728,6 +731,23 @@ impl PolicyEngine {
         }
     }
 
+    #[must_use]
+    pub fn request_outcome(&self, request: PolicyRequest) -> RequestOutcome {
+        match self.build_request(request, RequestFacts::Unknown) {
+            Ok((request, _)) => RequestOutcome::from_partial(
+                &self
+                    .authorizer
+                    .is_authorized_partial(&request, &self.policies, &self.entities),
+            ),
+            Err(_) => RequestOutcome::Denied,
+        }
+    }
+
+    #[must_use]
+    pub fn routing_dependent_policies(&self) -> Vec<String> {
+        continuity::routing_dependent_policies(&self.policies)
+    }
+
     pub fn referenced_capabilities(&self) -> impl Iterator<Item = &CapabilityId> {
         self.referenced_capabilities.iter()
     }
@@ -753,14 +773,17 @@ impl PolicyEngine {
     fn build_request(
         &self,
         request: PolicyRequest,
-        request_facts: Option<HttpRequestFacts>,
+        request_facts: RequestFacts,
     ) -> Result<(cedar_policy::Request, Option<OpaqueBody>), RequestError> {
         let PolicyRequest {
             principal,
             target,
             context,
         } = request;
-        let has_request = request_facts.is_some();
+        let has_request = match request_facts {
+            RequestFacts::Absent => false,
+            RequestFacts::Known(_) | RequestFacts::Unknown => true,
+        };
         let action = entity_uid(&self.entity_types.action, target.action());
         let principal = entity_uid(&self.entity_types.principal, principal.as_str());
         let (resource, mut attributes) = match target {
@@ -834,16 +857,24 @@ impl PolicyEngine {
                     message: source.to_string(),
                 }
             })?;
-        let (context, opaque_body) = if let Some(facts) = request_facts {
-            let (request, opaque_body) = facts.context()?;
-            let context = context
-                .merge(request)
-                .map_err(|source| RequestError::Context {
-                    message: source.to_string(),
-                })?;
-            (context, opaque_body)
-        } else {
-            (context, None)
+        let merge_error = |source: cedar_policy::ContextCreationError| RequestError::Context {
+            message: source.to_string(),
+        };
+        let (context, opaque_body) = match request_facts {
+            RequestFacts::Known(facts) => {
+                let (request, opaque_body) = facts.context()?;
+                (context.merge(request).map_err(merge_error)?, opaque_body)
+            }
+            RequestFacts::Unknown => (
+                context
+                    .merge([(
+                        "request".to_owned(),
+                        RestrictedExpression::new_unknown("request"),
+                    )])
+                    .map_err(merge_error)?,
+                None,
+            ),
+            RequestFacts::Absent => (context, None),
         };
         let schema = if has_request {
             None
@@ -856,6 +887,12 @@ impl PolicyEngine {
                 message: source.to_string(),
             })
     }
+}
+
+enum RequestFacts {
+    Absent,
+    Known(HttpRequestFacts),
+    Unknown,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
