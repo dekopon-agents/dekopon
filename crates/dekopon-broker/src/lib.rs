@@ -28,6 +28,15 @@ use std::{
     time::Instant,
 };
 
+mod continuity;
+
+pub use continuity::{
+    CandidateReport, ContinuityCandidate, ContinuityDigest, ContinuityDigestError,
+    ContinuityMigration, ContinuityReport, HostLimitFields, HostLimitOverrides, MemoryOverrides,
+    OperationalOverrides, StorageOverrides,
+};
+use continuity::{ContinuityState, OperationalSnapshot};
+
 use async_trait::async_trait;
 use dekopon_broker_host::{
     BoundCredential, BrokerHostError, BrokerProviderRegistry, CommandRunOutcome, HttpCallEvidence,
@@ -55,8 +64,8 @@ use dekopon_policy::{
     PolicyContext, PolicyConversation, PolicyDecision, PolicyRequest, PolicyTarget, SecretSelection,
 };
 use dekopon_storage_host::{
-    ContinuityPolicy, RetentionPolicies, StorageEvidence, StorageGrantPreparation,
-    StorageGrantRequest, StorageScopeCommitment,
+    ContinuityPolicy, MemoryContinuity, RetentionPolicies, StorageEvidence,
+    StorageGrantPreparation, StorageGrantRequest, StorageScopeCommitment,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -97,6 +106,8 @@ pub struct ChatMemoryConfig {
     pub max_turn_bytes: u64,
     pub compaction_target_bytes: u64,
     pub compaction_threshold_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_migration: Option<ContinuityMigration>,
 }
 
 impl ChatMemoryConfig {
@@ -124,6 +135,10 @@ impl ChatMemoryConfig {
             || self.compaction_threshold_bytes > storage.max_file_bytes
             || self.max_turn_bytes < MEMORY_MIN_TURN_LINE_BYTES
             || self.max_result_bytes < MEMORY_MIN_RESULT_BYTES
+            || self
+                .continuity_migration
+                .as_ref()
+                .is_some_and(|migration| !migration.valid())
         {
             return Err(BrokerBuildError::InvalidChatMemory);
         }
@@ -1174,6 +1189,10 @@ impl IdentityDirectory {
         self.mappings.get(subject)
     }
 
+    fn mappings(&self) -> impl ExactSizeIterator<Item = (&Subject, &PrincipalId)> {
+        self.mappings.iter()
+    }
+
     pub fn resolve_attested(
         &self,
         subjects: &AttestedSubject,
@@ -1241,6 +1260,44 @@ fn space_subject(scope: &ChatScopeClaim) -> Option<Subject> {
     };
     let container = scope.conversation.container.as_deref()?;
     Subject::new(kind, container, &scope.conversation.id).ok()
+}
+
+fn policy_contexts(
+    context: &PolicyContext,
+    github: Option<&dekopon_core::github::GithubBatch>,
+) -> Result<Vec<(PolicyContext, Option<GithubDenial>)>, GithubDenial> {
+    let Some(batch) = github else {
+        return Ok(vec![(context.clone(), None)]);
+    };
+    let mut contexts = Vec::new();
+    for event in batch.events() {
+        let full = serde_json::to_value(event).map_err(|source| {
+            tracing::warn!(event="broker_policy_context_failed",error=%source,"broker.policy.context.failed");
+            GithubDenial {
+                phase: GithubDenier::Facts,
+                delivery: event.delivery.clone(),
+            }
+        })?;
+        let mut stripped = full.clone();
+        if let Some(record) = stripped.as_object_mut() {
+            record.remove("authorSet");
+        }
+        for (value, phase) in [
+            (stripped, GithubDenier::Facts),
+            (full, GithubDenier::AuthorSet),
+        ] {
+            let mut pass = context.clone();
+            pass.github = Some(value);
+            contexts.push((
+                pass,
+                Some(GithubDenial {
+                    phase,
+                    delivery: event.delivery.clone(),
+                }),
+            ));
+        }
+    }
+    Ok(contexts)
 }
 
 fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
@@ -1749,6 +1806,7 @@ pub struct Broker<A> {
     gate: AuthorizationGate,
     audit: Arc<A>,
     chat_memory: Option<ChatMemoryConfig>,
+    continuity: Option<ContinuityState>,
     console_smoke_nonce: [u8; 16],
 }
 
@@ -1856,6 +1914,7 @@ where
                 gate: AuthorizationGate::new(),
                 audit,
                 chat_memory: None,
+                continuity: None,
                 console_smoke_nonce,
             },
             warnings,
@@ -1950,6 +2009,18 @@ where
             return Err(BrokerBuildError::InvalidChatMemory);
         }
         self.chat_memory = Some(config);
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "the only failure is a missing storage host, which this method refused above"
+        )]
+        let current = self
+            .current_operational()
+            .map_err(|_| BrokerBuildError::InvalidChatMemory)?;
+        let migration = self
+            .chat_memory
+            .as_ref()
+            .and_then(|memory| memory.continuity_migration.clone());
+        self.continuity = Some(self.continuity_state(&current, migration.as_ref()));
         Ok(self)
     }
 
@@ -2133,49 +2204,20 @@ where
             Some(facts) => policy.authorize_http(request, facts),
             None => policy.authorize(request),
         };
-        let mut contexts = Vec::new();
-        if let Some(batch) = github {
-            for event in batch.events() {
-                let full = match serde_json::to_value(event) {
-                    Ok(value) => value,
-                    Err(source) => {
-                        tracing::warn!(event="broker_policy_context_failed",error=%source,"broker.policy.context.failed");
-                        return EvaluatedDecision {
-                            policy: PolicyDecision {
-                                errors_present: true,
-                                refusal: Some("github-context".to_owned()),
-                                ..PolicyDecision::default()
-                            },
-                            space: None,
-                            github_denial: Some(GithubDenial {
-                                phase: GithubDenier::Facts,
-                                delivery: event.delivery.clone(),
-                            }),
-                        };
-                    }
+        let contexts = match policy_contexts(&request.context, github) {
+            Ok(contexts) => contexts,
+            Err(denial) => {
+                return EvaluatedDecision {
+                    policy: PolicyDecision {
+                        errors_present: true,
+                        refusal: Some("github-context".to_owned()),
+                        ..PolicyDecision::default()
+                    },
+                    space: None,
+                    github_denial: Some(denial),
                 };
-                let mut stripped = full.clone();
-                if let Some(record) = stripped.as_object_mut() {
-                    record.remove("authorSet");
-                }
-                for (value, phase) in [
-                    (stripped, GithubDenier::Facts),
-                    (full, GithubDenier::AuthorSet),
-                ] {
-                    let mut context = request.context.clone();
-                    context.github = Some(value);
-                    contexts.push((
-                        context,
-                        Some(GithubDenial {
-                            phase,
-                            delivery: event.delivery.clone(),
-                        }),
-                    ));
-                }
             }
-        } else {
-            contexts.push((request.context.clone(), None));
-        }
+        };
         let mut result = EvaluatedDecision {
             policy: PolicyDecision {
                 allowed: true,
@@ -2995,11 +3037,78 @@ where
         })
     }
 
-    fn canonical_authority_surface(
+    fn effective_authority(
+        &self,
+        context: &AuthenticatedContext,
+        memory_route: bool,
+    ) -> Vec<(&CapabilityId, &ConstraintSet)> {
+        let effective_memory_surface = memory_route
+            && match context.actor() {
+                Actor::Agent { agent } => self.memory_surface(context, agent).is_some(),
+                Actor::Human { .. } | Actor::Service { .. } => false,
+            };
+        self.constraints
+            .iter()
+            .filter(|(capability, set)| {
+                (set.route.is_generic() || effective_memory_surface)
+                    && storage_scope_permits(context, set)
+                    && self
+                        .authorize_capability(context, capability, set, None)
+                        .allowed
+            })
+            .collect()
+    }
+
+    fn authorized_bindings<'a>(
+        &'a self,
+        context: &AuthenticatedContext,
+        effective_capabilities: &BTreeSet<CapabilityId>,
+    ) -> Vec<(&'a SecretUseBinding, &'a CapabilityId)> {
+        self.secrets
+            .authority_bindings()
+            .into_iter()
+            .flat_map(|binding| {
+                binding
+                    .capabilities
+                    .iter()
+                    .map(move |capability| (binding, capability))
+            })
+            .filter(|(binding, capability)| {
+                let proposal = binding.proposal();
+                effective_capabilities.contains(*capability)
+                    && self.constraints.get(capability).is_some_and(|set| {
+                        self.authorize_secret_use(
+                            context,
+                            capability,
+                            set,
+                            &proposal,
+                            self.selection(context.actor(), capability, &proposal),
+                        )
+                        .allowed
+                    })
+            })
+            .collect()
+    }
+
+    fn current_operational(&self) -> Result<OperationalSnapshot, BrokerError> {
+        Ok(OperationalSnapshot {
+            host: self.registry.host_limits().clone(),
+            storage: self
+                .registry
+                .storage_host()
+                .ok_or(BrokerError::MemoryUnavailable)?
+                .limits()
+                .clone(),
+            memory: self.chat_memory.clone(),
+        })
+    }
+
+    fn authority_surface_v1(
         &self,
         context: &AuthenticatedContext,
         interface: StorageInterface,
         memory_route: bool,
+        operational: &OperationalSnapshot,
     ) -> Result<Vec<u8>, BrokerError> {
         let mut encoded = AuthorityEncoder::new();
         encoded.text("format", "dekopon-authority-surface-v1");
@@ -3027,22 +3136,7 @@ where
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let effective_memory_surface = memory_route
-            && match context.actor() {
-                Actor::Agent { agent } => self.memory_surface(context, agent).is_some(),
-                Actor::Human { .. } | Actor::Service { .. } => false,
-            };
-        let effective = self
-            .constraints
-            .iter()
-            .filter(|(capability, set)| {
-                (set.route.is_generic() || effective_memory_surface)
-                    && storage_scope_permits(context, set)
-                    && self
-                        .authorize_capability(context, capability, set, None)
-                        .allowed
-            })
-            .collect::<Vec<_>>();
+        let effective = self.effective_authority(context, memory_route);
         let effective_capabilities = effective
             .iter()
             .map(|(capability, _)| (*capability).clone())
@@ -3062,31 +3156,7 @@ where
             );
         }
 
-        let secret_bindings = self
-            .secrets
-            .authority_bindings()
-            .into_iter()
-            .flat_map(|binding| {
-                binding
-                    .capabilities
-                    .iter()
-                    .map(move |capability| (binding, capability))
-            })
-            .filter(|(binding, capability)| {
-                let proposal = binding.proposal();
-                effective_capabilities.contains(*capability)
-                    && self.constraints.get(capability).is_some_and(|set| {
-                        self.authorize_secret_use(
-                            context,
-                            capability,
-                            set,
-                            &proposal,
-                            self.selection(context.actor(), capability, &proposal),
-                        )
-                        .allowed
-                    })
-            })
-            .collect::<Vec<_>>();
+        let secret_bindings = self.authorized_bindings(context, &effective_capabilities);
         if !secret_bindings.is_empty() {
             encoded.number("secretBindingCount", secret_bindings.len() as u128);
             encoded.optional_text("secretMapRevision", self.secrets.authority_revision());
@@ -3133,14 +3203,12 @@ where
             encoded.number("secretMaxInjections", u128::from(binding.max_injections));
         }
 
-        encode_host_limits(&mut encoded, self.registry.host_limits());
-
-        let storage = self
-            .registry
+        encode_host_limits(&mut encoded, &operational.host);
+        self.registry
             .storage_host()
             .ok_or(BrokerError::MemoryUnavailable)?;
-        encode_storage_limits(&mut encoded, storage.limits());
-        if let Some(memory) = self.chat_memory.as_ref().filter(|_| memory_route) {
+        encode_storage_limits(&mut encoded, &operational.storage);
+        if let Some(memory) = operational.memory.as_ref().filter(|_| memory_route) {
             encode_memory_config(&mut encoded, memory);
         }
         Ok(encoded.finish())
@@ -3166,8 +3234,40 @@ where
             }
         };
         let memory_route = set.route.is_chat_memory();
-        let authority =
-            self.canonical_authority_surface(context, storage.interface, memory_route)?;
+        let (policy, authority, memory) = if memory_route {
+            let memory = match self
+                .chat_memory
+                .as_ref()
+                .map_or(ContinuityPolicy::Paranoid, |config| {
+                    config.continuity_policy
+                }) {
+                ContinuityPolicy::Relaxed => MemoryContinuity::Relaxed,
+                ContinuityPolicy::Paranoid => MemoryContinuity::Paranoid {
+                    surface: self.memory_surface_v2(context)?,
+                    legacy: self.legacy_continuity(context)?,
+                    on_unproven: self
+                        .chat_memory
+                        .as_ref()
+                        .and_then(|config| config.continuity_migration.as_ref())
+                        .map(|migration| migration.on_unproven)
+                        .unwrap_or_default(),
+                },
+            };
+            (ContinuityPolicy::Paranoid, Vec::new(), Some(memory))
+        } else {
+            let policy = if storage.scope == StorageScope::PrivateConversation {
+                ContinuityPolicy::Paranoid
+            } else {
+                ContinuityPolicy::Relaxed
+            };
+            let authority = self.authority_surface_v1(
+                context,
+                storage.interface,
+                false,
+                &self.current_operational()?,
+            )?;
+            (policy, authority, None)
+        };
         let host = self
             .registry
             .storage_host()
@@ -3185,21 +3285,15 @@ where
             scope.transport.to_string(),
             scope.conversation.id.clone(),
             scope.conversation.key(),
-            if memory_route {
-                self.chat_memory
-                    .as_ref()
-                    .map_or(ContinuityPolicy::Paranoid, |config| {
-                        config.continuity_policy
-                    })
-            } else if storage.scope == StorageScope::PrivateConversation {
-                ContinuityPolicy::Paranoid
-            } else {
-                ContinuityPolicy::Relaxed
-            },
+            policy,
             authority,
         )
         .with_shared_namespace(storage.namespace.clone())
         .with_space_key(context.space_binding().map(|binding| binding.key));
+        let grant_request = match memory {
+            Some(memory) => grant_request.with_memory_continuity(memory),
+            None => grant_request,
+        };
         host.prepare_grant(grant_request)
             .map(Some)
             .map_err(|source| BrokerError::Storage { source })
@@ -4338,39 +4432,54 @@ fn encode_execution_constraints(
         if http.signed_download == Some(dekopon_capability::SignedDownload::GithubActionsLogsV1) {
             encoded.text("execution.http.signedDownload", "github-actions-logs-v1");
         }
-        if !http.request_templates.is_empty() {
-            let templates = http.request_templates.iter().collect::<BTreeSet<_>>();
-            encoded.number(
-                "execution.http.requestTemplateCount",
-                templates.len() as u128,
-            );
-            for template in templates {
-                encoded.text("execution.http.requestTemplate.method", &template.method);
-                encoded.text(
-                    "execution.http.requestTemplate.path",
-                    &template.path.to_string(),
-                );
-                encoded.number(
-                    "execution.http.requestTemplate.pinnedCount",
-                    template.query.pinned.len() as u128,
-                );
-                for (key, slot) in &template.query.pinned {
-                    encoded.text("execution.http.requestTemplate.pinnedKey", key);
-                    encoded.text("execution.http.requestTemplate.pinnedSlot", slot.as_str());
-                }
-                encoded.number(
-                    "execution.http.requestTemplate.allowedCount",
-                    template.query.allowed.len() as u128,
-                );
-                for key in &template.query.allowed {
-                    encoded.text("execution.http.requestTemplate.allowedKey", key);
-                }
-            }
-        }
+        encode_request_templates(encoded, &http.request_templates);
     } else {
         encoded.byte("execution.http.present", 0);
     }
-    if let Some(storage) = &constraints.storage {
+    encode_storage_constraints(encoded, constraints.storage.as_ref());
+    encode_asset_constraints(encoded, constraints.asset.as_ref());
+}
+
+fn encode_request_templates(
+    encoded: &mut AuthorityEncoder,
+    templates: &[dekopon_capability::RequestTemplate],
+) {
+    if !templates.is_empty() {
+        let templates = templates.iter().collect::<BTreeSet<_>>();
+        encoded.number(
+            "execution.http.requestTemplateCount",
+            templates.len() as u128,
+        );
+        for template in templates {
+            encoded.text("execution.http.requestTemplate.method", &template.method);
+            encoded.text(
+                "execution.http.requestTemplate.path",
+                &template.path.to_string(),
+            );
+            encoded.number(
+                "execution.http.requestTemplate.pinnedCount",
+                template.query.pinned.len() as u128,
+            );
+            for (key, slot) in &template.query.pinned {
+                encoded.text("execution.http.requestTemplate.pinnedKey", key);
+                encoded.text("execution.http.requestTemplate.pinnedSlot", slot.as_str());
+            }
+            encoded.number(
+                "execution.http.requestTemplate.allowedCount",
+                template.query.allowed.len() as u128,
+            );
+            for key in &template.query.allowed {
+                encoded.text("execution.http.requestTemplate.allowedKey", key);
+            }
+        }
+    }
+}
+
+fn encode_storage_constraints(
+    encoded: &mut AuthorityEncoder,
+    storage: Option<&StorageConstraints>,
+) {
+    if let Some(storage) = storage {
         encoded.byte("execution.storage.present", 1);
         encoded.byte(
             "execution.storage.interface",
@@ -4401,7 +4510,13 @@ fn encode_execution_constraints(
     } else {
         encoded.byte("execution.storage.present", 0);
     }
-    if let Some(asset) = &constraints.asset {
+}
+
+fn encode_asset_constraints(
+    encoded: &mut AuthorityEncoder,
+    asset: Option<&dekopon_capability::AssetConstraints>,
+) {
+    if let Some(asset) = asset {
         encoded.byte("execution.asset.present", 1);
         encoded.boolean("execution.asset.attach", asset.attach);
         encoded.boolean("execution.asset.remove", asset.remove);
