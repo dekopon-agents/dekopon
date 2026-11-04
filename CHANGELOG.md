@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.84.1] - 2026-11-04
+
+### Changed
+
+- Update the WebAssembly component toolchain dependencies.
+
+## [dekopon-chart-0.71.1] - 2026-11-04
+
+### Changed
+
+- Chart 0.71.1 targets core v0.84.1 and renders the `v0.84.1` image tag.
+
 ## [0.84.0] - 2026-11-03
 
 ### Changed
