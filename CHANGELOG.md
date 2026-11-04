@@ -7,6 +7,20 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.84.2] - 2026-11-04
+
+### Fixed
+
+- A message forwarded in Slack reaches the agent with its text and files when Slack sends it as a message unfurl without is_share.
+- On a Slack route with follow enabled, an unmentioned reply from the person who started a thread with the agent continues that thread again, as it does on other routes.
+- The model no longer reads the agent's own model/steps/time footer back from earlier Slack image answers; the footer stays visible in Slack.
+
+## [dekopon-chart-0.71.2] - 2026-11-04
+
+### Changed
+
+- Chart 0.71.2 targets core v0.84.2 and renders the `v0.84.2` image tag.
+
 ## [0.84.1] - 2026-11-04
 
 ### Changed
