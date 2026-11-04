@@ -1743,18 +1743,26 @@ fn is_uuid_v4(id: &str) -> bool {
 }
 
 fn is_footer_line(line: &str) -> bool {
-    let digits = |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    fn canonical<N: std::str::FromStr + ToString>(value: &str) -> Option<N> {
+        let number = value.parse::<N>().ok()?;
+        (number.to_string() == value).then_some(number)
+    }
     let mut fields = line.rsplitn(3, " \u{b7} ");
     let (Some(elapsed), Some(steps), Some(models)) = (fields.next(), fields.next(), fields.next())
     else {
         return false;
     };
+    let steps = match (steps.strip_suffix(" steps"), steps.strip_suffix(" step")) {
+        (Some(count), _) => canonical::<u32>(count).is_some_and(|count| count != 1),
+        (None, Some(count)) => canonical::<u32>(count) == Some(1),
+        (None, None) => false,
+    };
     !models.is_empty()
-        && elapsed.strip_suffix(" s").is_some_and(digits)
         && steps
-            .strip_suffix(" steps")
-            .or_else(|| steps.strip_suffix(" step"))
-            .is_some_and(digits)
+        && elapsed
+            .strip_suffix(" s")
+            .and_then(canonical::<u64>)
+            .is_some()
 }
 
 fn markdown_block(text: &str) -> Value {
@@ -3836,6 +3844,26 @@ mod driver_tests {
                 "Synthetic answer. Posted by the release bot",
             ),
         ];
+        let malformed = [
+            "\u{203a} gpt-6-luna \u{b7} 1 steps \u{b7} 3 s",
+            "\u{203a} gpt-6-luna \u{b7} 2 step \u{b7} 3 s",
+            "\u{203a} gpt-6-luna \u{b7} 02 steps \u{b7} 3 s",
+            "\u{203a} gpt-6-luna \u{b7} 4294967296 steps \u{b7} 3 s",
+            "\u{203a} gpt-6-luna \u{b7} 2 steps \u{b7} 18446744073709551616 s",
+        ]
+        .map(|line| {
+            let text = format!("Synthetic answer. {line}");
+            let block = footer_block(
+                "dekopon-footer:00000000-0000-4000-8000-000000000001",
+                json!([{"type": "plain_text", "text": line}]),
+            );
+            (reply(BOT_USER, true, &text, block), text)
+        });
+        let cases = cases
+            .iter()
+            .map(|(message, expected)| (message.clone(), (*expected).to_owned()))
+            .chain(malformed)
+            .collect::<Vec<_>>();
         let count = cases.len();
         let mut messages = cases
             .iter()
