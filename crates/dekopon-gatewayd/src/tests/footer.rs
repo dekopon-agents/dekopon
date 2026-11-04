@@ -46,6 +46,24 @@ fn assert_footer(line: &str) {
     assert_eq!(line, format!("portable · 1 step · {seconds} s"));
 }
 
+fn assert_slack_footer_block(block: &Value, line: &str) {
+    let id = block["block_id"]
+        .as_str()
+        .and_then(|id| id.strip_prefix("dekopon-footer:"))
+        .expect("marked footer block");
+    let groups = id.split('-').map(str::len).collect::<Vec<_>>();
+    assert_eq!(groups, [8, 4, 4, 4, 12], "{id}");
+    assert!(id.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+    assert_eq!(&id[14..15], "4", "version 4: {id}");
+    assert!("89ab".contains(&id[19..20]), "RFC 4122 variant: {id}");
+    let mut unmarked = block.clone();
+    unmarked.as_object_mut().unwrap().remove("block_id");
+    assert_eq!(
+        unmarked,
+        json!({"type":"context","elements":[{"type":"plain_text","text":format!("\u{203a} {line}")}]})
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn slack_posts_the_exact_footer_and_the_next_prompt_has_none() {
     let http = spawn_http_mock(slack_handler(Vec::new()));
@@ -68,12 +86,13 @@ async fn slack_posts_the_exact_footer_and_the_next_prompt_has_none() {
         assert_eq!(post["text"], answer);
         assert_eq!(post["blocks"][0]["text"], answer);
         assert_eq!(post["blocks"].as_array().unwrap().len(), 2);
-        let line = post["blocks"][1]["elements"][0]["text"].as_str().unwrap();
+        let line = post["blocks"][1]["elements"][0]["text"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("\u{203a} ")
+            .unwrap();
         assert_footer(line);
-        assert_eq!(
-            post["blocks"][1],
-            json!({"type":"context","elements":[{"type":"plain_text","text":line}]})
-        );
+        assert_slack_footer_block(&post["blocks"][1], line);
     }
 }
 
@@ -400,18 +419,32 @@ async fn a_short_slack_image_answer_is_one_file_share_ending_with_its_footer() {
         3,
         "one upload and file share, with no separate answer post"
     );
-    assert_eq!(calls[2].0, "/api/files.completeUploadExternal");
-    let posted: Value = serde_json::from_str(&calls[2].1).unwrap();
-    assert_eq!(posted["channel_id"], "d0123abc");
-    assert_eq!(posted["thread_ts"], "1712345678.000100");
-    assert!(posted.get("initial_comment").is_none());
-    let blocks: Value = serde_json::from_str(posted["blocks"].as_str().unwrap()).unwrap();
     assert_eq!(
-        blocks,
-        json!([
-            {"type":"markdown","text":"Here is your kitty."},
-            {"type":"context","elements":[{"type":"plain_text","text":"model-a · 1 step · 7 s"}]}
-        ])
+        calls
+            .iter()
+            .filter(|(path, _)| path == "/api/files.completeUploadExternal")
+            .count(),
+        1
+    );
+    assert_eq!(calls[2].0, "/api/files.completeUploadExternal");
+    let mut posted: Value = serde_json::from_str(&calls[2].1).unwrap();
+    let blocks: Value =
+        serde_json::from_str(posted["blocks"].as_str().expect("blocks string")).unwrap();
+    assert_eq!(blocks.as_array().unwrap().len(), 2);
+    assert_eq!(
+        blocks[0],
+        json!({"type":"markdown","text":"Here is your kitty."})
+    );
+    assert_slack_footer_block(&blocks[1], "model-a · 1 step · 7 s");
+    posted.as_object_mut().unwrap().remove("blocks");
+    assert_eq!(
+        posted,
+        json!({
+            "files": [{"id": "f-generated", "title": "asset-1.png"}],
+            "channel_id": "d0123abc",
+            "thread_ts": "1712345678.000100",
+        }),
+        "the documented upload fields only: no text and no initial_comment"
     );
 }
 

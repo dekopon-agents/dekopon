@@ -797,13 +797,15 @@ impl Gateway {
                     follow::FollowTicket::Absent => {}
                 }
             }
-            tracing::debug!(
-                event = "gateway_message_ignored",
-                transport = %message.transport,
-                reason = "not-addressed",
-                "gateway.message.ignored"
-            );
-            return;
+            if !inherited_thread {
+                tracing::debug!(
+                    event = "gateway_message_ignored",
+                    transport = %message.transport,
+                    reason = "not-addressed",
+                    "gateway.message.ignored"
+                );
+                return;
+            }
         }
         match collector.offer(RouteIdentity::of(route, &message), message) {
             collection::Offered::Pending => {}

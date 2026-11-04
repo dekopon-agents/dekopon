@@ -532,9 +532,6 @@ impl SlackTransport {
                     table.ticket(&key, SystemTime::now()) != crate::follow::FollowTicket::Absent
                 })
         });
-        if follow_route.is_some() && !explicitly_addressed && !followed && !ambient {
-            return Ok(None);
-        }
         let thread_continuation = match (kind != ConversationKind::DirectMessage, self.experience) {
             (true, SlackExperience::Agent) => {
                 let claim = ThreadClaim::Slack {
@@ -551,6 +548,9 @@ impl SlackTransport {
                 Some(ThreadContinuation { claim, inherited })
             }
             (true, SlackExperience::Classic) if !explicitly_addressed && !followed && !ambient => {
+                return Ok(None);
+            }
+            _ if follow_route.is_some() && !explicitly_addressed && !followed && !ambient => {
                 return Ok(None);
             }
             _ => None,
@@ -571,7 +571,7 @@ impl SlackTransport {
         // The conversation key is minted once and carried rather than re-derived, since a Stop
         // button spelling it a second way would name no session at all.
         let conversation_id = conversation.key();
-        let projection = project_message(event);
+        let projection = project_message(event, event["text"].as_str().unwrap_or_default());
 
         Ok(Some(InboundMessage {
             pull_request_links,
@@ -1250,7 +1250,7 @@ impl ProgressMessage for SlackReplier {
             "channel": channel_id,
             "ts": message.id,
             "text": reply.text,
-            "blocks": answer_blocks(&reply.text, reply.footer.as_ref()),
+            "blocks": answer_blocks(&reply.text, reply.footer.as_ref(), footer_block_id)?,
         });
         self.liveness_call("chat.update", &body).await.map(|_| ())
     }
@@ -1280,7 +1280,7 @@ impl SlackReplier {
         let mut body = json!({
             "channel": channel,
             "text": text,
-            "blocks": answer_blocks(text, footer),
+            "blocks": answer_blocks(text, footer, footer_block_id)?,
         });
         if let Some(thread_ts) = thread_ts {
             body["thread_ts"] = Value::String(thread_ts.to_owned());
@@ -1372,6 +1372,9 @@ impl SlackReplier {
         image: super::hydration::HydratedImage,
         footer: Option<&crate::progress::Footer>,
     ) -> Result<(), TransportError> {
+        let blocks = footer
+            .map(|_| answer_blocks(initial_comment.unwrap_or_default(), footer, footer_block_id))
+            .transpose()?;
         let filename = image.filename;
         let length = image.bytes.len().to_string();
         let described = check_ok(
@@ -1416,10 +1419,8 @@ impl SlackReplier {
             "files": [{"id": file_id, "title": filename}],
             "channel_id": channel,
         });
-        if footer.is_some() {
-            body["blocks"] = Value::String(
-                answer_blocks(initial_comment.unwrap_or_default(), footer).to_string(),
-            );
+        if let Some(blocks) = blocks {
+            body["blocks"] = Value::String(blocks.to_string());
         } else if let Some(initial_comment) = initial_comment {
             body["initial_comment"] = Value::String(initial_comment.to_owned());
         }
@@ -1657,7 +1658,11 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
     seconds.min(MAX_PROGRESS_COOLDOWN)
 }
 
-fn answer_blocks(text: &str, footer: Option<&crate::progress::Footer>) -> Value {
+fn answer_blocks(
+    text: &str,
+    footer: Option<&crate::progress::Footer>,
+    marker: impl FnOnce() -> Result<String, TransportError>,
+) -> Result<Value, TransportError> {
     let mut blocks = if text.is_empty() && footer.is_some() {
         Vec::new()
     } else {
@@ -1665,10 +1670,99 @@ fn answer_blocks(text: &str, footer: Option<&crate::progress::Footer>) -> Value 
     };
     if let Some(footer) = footer {
         blocks.push(
-            json!({"type": "context", "elements": [{"type": "plain_text", "text": footer.line()}]}),
+            json!({"type": "context", "block_id": marker()?, "elements": [
+                {"type": "plain_text", "text": format!("{FOOTER_CHEVRON}{}", footer.line())}
+            ]}),
         );
     }
-    Value::Array(blocks)
+    Ok(Value::Array(blocks))
+}
+
+const FOOTER_CHEVRON: &str = "\u{203a} ";
+const FOOTER_MARKER: &str = "dekopon-footer:";
+
+fn footer_block_id() -> Result<String, TransportError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(TransportError::Entropy)?;
+    bytes[6] = bytes[6] & 0x0f | 0x40;
+    bytes[8] = bytes[8] & 0x3f | 0x80;
+    let mut id = String::with_capacity(FOOTER_MARKER.len() + 36);
+    id.push_str(FOOTER_MARKER);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            id.push('-');
+        }
+        id.push_str(&format!("{byte:02x}"));
+    }
+    Ok(id)
+}
+
+fn recalled_text<'a>(message: &'a Value, bot: &str) -> &'a str {
+    let text = message["text"].as_str().unwrap_or_default();
+    if message["user"].as_str() != Some(bot)
+        || message["upload"] != true
+        || message["files"].as_array().is_none_or(Vec::is_empty)
+    {
+        return text;
+    }
+    let Some(footer) = marked_footer(&message["blocks"]) else {
+        return text;
+    };
+    if text == footer {
+        return "";
+    }
+    text.strip_suffix(footer)
+        .and_then(|answer| answer.strip_suffix(' '))
+        .unwrap_or(text)
+}
+
+fn marked_footer(blocks: &Value) -> Option<&str> {
+    let block = blocks.as_array()?.last()?;
+    let id = block["block_id"].as_str()?.strip_prefix(FOOTER_MARKER)?;
+    let [element] = block["elements"].as_array()?.as_slice() else {
+        return None;
+    };
+    let text = element["text"].as_str()?;
+    (block["type"] == "context"
+        && element["type"] == "plain_text"
+        && is_uuid_v4(id)
+        && text
+            .strip_prefix(FOOTER_CHEVRON)
+            .is_some_and(is_footer_line))
+    .then_some(text)
+}
+
+fn is_uuid_v4(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            14 => byte == b'4',
+            19 => matches!(byte.to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+fn is_footer_line(line: &str) -> bool {
+    fn canonical<N: std::str::FromStr + ToString>(value: &str) -> Option<N> {
+        let number = value.parse::<N>().ok()?;
+        (number.to_string() == value).then_some(number)
+    }
+    let mut fields = line.rsplitn(3, " \u{b7} ");
+    let (Some(elapsed), Some(steps), Some(models)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    let steps = match (steps.strip_suffix(" steps"), steps.strip_suffix(" step")) {
+        (Some(count), _) => canonical::<u32>(count).is_some_and(|count| count != 1),
+        (None, Some(count)) => canonical::<u32>(count) == Some(1),
+        (None, None) => false,
+    };
+    !models.is_empty()
+        && steps
+        && elapsed
+            .strip_suffix(" s")
+            .and_then(canonical::<u64>)
+            .is_some()
 }
 
 fn markdown_block(text: &str) -> Value {
@@ -1805,7 +1899,8 @@ impl PermanentReactionError {
             | TransportError::Closed
             | TransportError::Io(_)
             | TransportError::InsecureSocket { .. }
-            | TransportError::Subject(_) => None,
+            | TransportError::Subject(_)
+            | TransportError::Entropy(_) => None,
         }
     }
 
@@ -1918,8 +2013,7 @@ struct SlackProjection {
     asset_overflow: bool,
 }
 
-fn project_message(message: &Value) -> SlackProjection {
-    let raw = message["text"].as_str().unwrap_or_default();
+fn project_message(message: &Value, raw: &str) -> SlackProjection {
     let mut text = decode_slack_text(raw);
     let mut control = raw.to_owned();
     let top_files = message["files"].as_array();
@@ -1928,7 +2022,9 @@ fn project_message(message: &Value) -> SlackProjection {
 
     if let Some(forward) = message["attachments"].as_array().and_then(|attachments| {
         attachments.iter().find(|attachment| {
-            attachment["is_share"] == true && attachment["is_msg_unfurl"] == true
+            attachment["is_msg_unfurl"] == true
+                && (attachment["is_share"] == true
+                    || attachment["is_share"].is_null() && quotes_a_message(attachment))
         })
     }) {
         let label = |value: Option<&str>| {
@@ -1979,6 +2075,29 @@ fn project_message(message: &Value) -> SlackProjection {
         assets,
         asset_overflow: file_count > MAX_ATTACHMENTS,
     }
+}
+
+fn quotes_a_message(attachment: &Value) -> bool {
+    let (Some(url), Some(channel), Some(ts)) = (
+        attachment["from_url"].as_str(),
+        attachment["channel_id"].as_str(),
+        attachment["ts"]
+            .as_str()
+            .filter(|ts| canonical_timestamp(ts)),
+    ) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let permalink = format!("p{}", ts.replace('.', ""));
+    url.scheme() == "https"
+        && attachment["author_id"]
+            .as_str()
+            .is_some_and(|author| !author.is_empty())
+        && url
+            .path_segments()
+            .is_some_and(|segments| segments.eq(["archives", channel, permalink.as_str()]))
 }
 
 fn forward_blocks(blocks: &Value) -> String {
@@ -2263,7 +2382,7 @@ fn past_message(message: &Value, team: &str, bot: &str) -> Option<PastMessage> {
     if !has_request_content(message) {
         return None;
     }
-    let projection = project_message(message);
+    let projection = project_message(message, recalled_text(message, bot));
     Some(PastMessage {
         id: ts.to_owned(),
         from_bot: user == bot,
@@ -3047,9 +3166,66 @@ mod driver_tests {
     fn an_attachment_only_answer_has_a_footer_without_an_empty_markdown_block() {
         let footer =
             crate::progress::Footer::new(&["model-a".into()], 1, std::time::Duration::from_secs(7));
+        let blocks = super::answer_blocks("", Some(&footer), super::footer_block_id).unwrap();
+        let [block] = blocks.as_array().unwrap().as_slice() else {
+            panic!("one footer block: {blocks}");
+        };
         assert_eq!(
-            super::answer_blocks("", Some(&footer)),
-            json!([{"type":"context", "elements":[{"type":"plain_text", "text":"model-a · 1 step · 7 s"}]}])
+            block["elements"],
+            json!([{"type":"plain_text", "text":"\u{203a} model-a · 1 step · 7 s"}])
+        );
+        assert_eq!(
+            super::marked_footer(&blocks),
+            Some("\u{203a} model-a · 1 step · 7 s")
+        );
+    }
+
+    #[tokio::test]
+    async fn every_footer_finalization_carries_a_fresh_v4_marker() {
+        let mock = spawn_slack_mock(accepting);
+        let replier = replier(&mock.base, SlackExperience::Classic);
+        let reply = OutboundReply::text("All good.").with_footer(Some(
+            crate::progress::Footer::new(&["model-a".into()], 2, std::time::Duration::from_secs(3)),
+        ));
+        for _ in 0..2 {
+            ProgressMessage::finalize(&replier, &progress_message(), &reply)
+                .await
+                .unwrap();
+        }
+        let ids = mock
+            .calls()
+            .into_iter()
+            .filter(|(path, _)| path == "/api/chat.update")
+            .map(|(_, body)| {
+                let id = body["blocks"][1]["block_id"]
+                    .as_str()
+                    .expect("marked")
+                    .to_owned();
+                assert!(
+                    super::is_uuid_v4(id.strip_prefix("dekopon-footer:").expect("prefix")),
+                    "{id}"
+                );
+                id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn a_footer_without_entropy_is_refused_rather_than_sent_unmarked() {
+        let footer =
+            crate::progress::Footer::new(&["model-a".into()], 1, std::time::Duration::from_secs(7));
+        let failed = super::answer_blocks("Answer.", Some(&footer), || {
+            Err(TransportError::Entropy(getrandom::Error::UNSUPPORTED))
+        });
+        assert!(matches!(failed, Err(TransportError::Entropy(_))));
+        let unfooted = super::answer_blocks("Answer.", None, || {
+            Err(TransportError::Entropy(getrandom::Error::UNSUPPORTED))
+        });
+        assert_eq!(
+            unfooted.expect("a text-only answer draws no marker"),
+            json!([{"type":"markdown", "text":"Answer."}])
         );
     }
 
@@ -3069,8 +3245,13 @@ mod driver_tests {
         let body = mock.body("/api/chat.update");
         assert_eq!(body["text"], "All good.");
         assert_eq!(
-            body["blocks"],
-            json!([{"type":"markdown", "text":"All good."}, {"type":"context", "elements":[{"type":"plain_text", "text":"model-a · 1 step · 8 s"}]}])
+            body["blocks"][0],
+            json!({"type":"markdown", "text":"All good."})
+        );
+        assert_eq!(body["blocks"][1]["type"], "context");
+        assert_eq!(
+            super::marked_footer(&body["blocks"]),
+            Some("\u{203a} model-a · 1 step · 8 s")
         );
     }
 
@@ -3509,6 +3690,246 @@ mod driver_tests {
             "author_id": "UORIGINAL", "channel_id": "CORIGINAL",
             "ts": "1700000000.000100", "text": text, "files": files,
         })
+    }
+
+    fn message_unfurl(text: Value, files: Value) -> Value {
+        json!({
+            "id": 1, "fallback": "[forwarded]", "is_msg_unfurl": true, "is_reply_unfurl": false,
+            "from_url": "https://example.slack.com/archives/CORIGINAL/p1700000000000100",
+            "original_url": "https://example.slack.com/archives/CORIGINAL/p1700000000000100",
+            "author_id": "UORIGINAL", "author_subname": "Original Author",
+            "author_name": "Original Author", "author_link": "https://example.slack.com/team/UORIGINAL",
+            "author_icon": "https://example.invalid/avatar.png",
+            "channel_id": "CORIGINAL", "channel_team": "T0123ABC",
+            "ts": "1700000000.000100", "footer": "Posted in #original",
+            "mrkdwn_in": ["text"], "text": text, "files": files,
+            "blocks": [{"type":"rich_text", "elements":[{
+                "type":"rich_text_section", "elements":[{"type":"text", "text":"from blocks"}]
+            }]}],
+        })
+    }
+
+    async fn delivered(attachment: Value) -> (String, Vec<crate::transport::PendingAsset>) {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        let mut event = forwarded_event("<@B0123ABC> look at this", attachment);
+        event["type"] = json!("app_mention");
+        let ingress = transport
+            .routable(TEAM, &event, &Span::none())
+            .await
+            .expect("readable")
+            .expect("addressed");
+        let history = past_message(&event, TEAM, BOT_USER).expect("history");
+        assert_eq!(ingress.text, history.text);
+        assert_eq!(ingress.assets, history.assets);
+        (ingress.text, ingress.assets)
+    }
+
+    const FOOTER: &str = "\u{203a} gpt-6-luna \u{b7} 2 steps \u{b7} 3 s";
+
+    fn footer_block(id: &str, elements: Value) -> Value {
+        json!({"type": "context", "block_id": id, "elements": elements})
+    }
+
+    fn marked() -> Value {
+        footer_block(
+            "dekopon-footer:00000000-0000-4000-8000-000000000001",
+            json!([{"type": "plain_text", "text": FOOTER}]),
+        )
+    }
+
+    fn reply(user: &str, upload: bool, text: &str, last: Value) -> Value {
+        let mut message = json!({
+            "type": "message", "user": user, "bot_id": "B_SYNTHETIC_BOT", "text": text,
+            "blocks": [{"type": "rich_text", "elements": [{"type": "rich_text_section",
+                "elements": [{"type": "text", "text": "Synthetic answer."}]}]}, last],
+        });
+        if upload {
+            message["upload"] = json!(true);
+            message["files"] = photo();
+        }
+        message
+    }
+
+    #[test]
+    fn cold_recall_drops_only_the_marked_footer_of_the_bots_own_image_reply() {
+        let answered = format!("Synthetic answer. {FOOTER}");
+        let twice = format!("Synthetic answer. {FOOTER} {FOOTER}");
+        let once = format!("Synthetic answer. {FOOTER}");
+        let unspaced = format!("Synthetic answer.{FOOTER}");
+        let mut not_final = reply(BOT_USER, true, &answered, marked());
+        not_final["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "divider"}));
+        let mut quoted = forwarded_event("look", {
+            let mut attachment = forward(json!(answered), json!([]));
+            attachment["blocks"] = json!([marked()]);
+            attachment
+        });
+        quoted.as_object_mut().unwrap().remove("channel");
+        let cases = [
+            (
+                reply(BOT_USER, true, &answered, marked()),
+                "Synthetic answer.",
+            ),
+            (reply(BOT_USER, true, FOOTER, marked()), ""),
+            (reply(BOT_USER, true, &twice, marked()), once.as_str()),
+            (
+                reply(BOT_USER, false, &answered, marked()),
+                answered.as_str(),
+            ),
+            (
+                reply("UHUMAN", true, &answered, marked()),
+                answered.as_str(),
+            ),
+            (
+                reply(BOT_USER, true, &answered, {
+                    let mut block = marked();
+                    block.as_object_mut().unwrap().remove("block_id");
+                    block
+                }),
+                answered.as_str(),
+            ),
+            (
+                reply(
+                    BOT_USER,
+                    true,
+                    &answered,
+                    footer_block(
+                        "dekopon-footer:00000000-0000-1000-8000-000000000001",
+                        json!([{"type": "plain_text", "text": FOOTER}]),
+                    ),
+                ),
+                answered.as_str(),
+            ),
+            (
+                reply(
+                    BOT_USER,
+                    true,
+                    &answered,
+                    footer_block(
+                        "dekopon-footer:00000000-0000-4000-8000-000000000001",
+                        json!([{"type": "plain_text", "text": FOOTER}, {"type": "plain_text", "text": "x"}]),
+                    ),
+                ),
+                answered.as_str(),
+            ),
+            (
+                reply(
+                    BOT_USER,
+                    true,
+                    &answered,
+                    footer_block(
+                        "dekopon-footer:00000000-0000-4000-8000-000000000001",
+                        json!([{"type": "mrkdwn", "text": FOOTER}]),
+                    ),
+                ),
+                answered.as_str(),
+            ),
+            (
+                reply(BOT_USER, true, &unspaced, marked()),
+                unspaced.as_str(),
+            ),
+            (not_final, answered.as_str()),
+            (
+                reply(
+                    BOT_USER,
+                    true,
+                    "Synthetic answer. Posted by the release bot",
+                    footer_block(
+                        "release-note",
+                        json!([{"type": "plain_text", "text": "Posted by the release bot"}]),
+                    ),
+                ),
+                "Synthetic answer. Posted by the release bot",
+            ),
+        ];
+        let malformed = [
+            "\u{203a} gpt-6-luna \u{b7} 1 steps \u{b7} 3 s",
+            "\u{203a} gpt-6-luna \u{b7} 2 step \u{b7} 3 s",
+            "\u{203a} gpt-6-luna \u{b7} 02 steps \u{b7} 3 s",
+            "\u{203a} gpt-6-luna \u{b7} 4294967296 steps \u{b7} 3 s",
+            "\u{203a} gpt-6-luna \u{b7} 2 steps \u{b7} 18446744073709551616 s",
+        ]
+        .map(|line| {
+            let text = format!("Synthetic answer. {line}");
+            let block = footer_block(
+                "dekopon-footer:00000000-0000-4000-8000-000000000001",
+                json!([{"type": "plain_text", "text": line}]),
+            );
+            (reply(BOT_USER, true, &text, block), text)
+        });
+        let cases = cases
+            .iter()
+            .map(|(message, expected)| (message.clone(), (*expected).to_owned()))
+            .chain(malformed)
+            .collect::<Vec<_>>();
+        let count = cases.len();
+        let mut messages = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (message, _))| {
+                let mut message = message.clone();
+                message["ts"] = json!(format!("17000000{:02}.000100", index));
+                message
+            })
+            .collect::<Vec<_>>();
+        quoted["ts"] = json!(format!("17000000{count:02}.000100"));
+        messages.push(quoted);
+        let page = json!({"ok": true, "messages": messages});
+        let range = super::PastRange {
+            after: None,
+            before: std::time::SystemTime::now(),
+        };
+        let recalled = super::past_messages(&page, TEAM, BOT_USER, range).expect("decoded page");
+        assert_eq!(recalled.len(), count + 1);
+        for (index, ((message, expected), past)) in cases.iter().zip(&recalled).enumerate() {
+            assert_eq!(past.text, *expected, "case {index}");
+            assert_eq!(
+                past.assets.len(),
+                message["files"].as_array().map_or(0, Vec::len)
+            );
+        }
+        let forwarded = &recalled[count].text;
+        assert!(
+            forwarded.contains("look\n[quoted Slack forward"),
+            "{forwarded}"
+        );
+        assert!(forwarded.contains(&answered), "{forwarded}");
+        assert_eq!(recalled[0].assets[0].name, "cat.png");
+        assert!(recalled[0].from_bot);
+    }
+
+    #[tokio::test]
+    async fn a_message_unfurl_without_is_share_is_read_as_a_forward() {
+        let (text, assets) = delivered(message_unfurl(json!("a quoted answer"), photo())).await;
+        assert!(text.contains(
+            "[quoted Slack forward — author: \"UORIGINAL\"; channel: \"CORIGINAL\"; time: \"1700000000.000100\"]\na quoted answer"
+        ));
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].name, "cat.png");
+
+        let (text, assets) = delivered(message_unfurl(json!(""), json!([]))).await;
+        assert!(text.contains("from blocks"), "{text}");
+        assert!(assets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_link_unfurl_or_an_unprovenanced_quote_is_not_a_forward() {
+        let link = json!({
+            "id": 1, "from_url": "https://example.com/post", "original_url": "https://example.com/post",
+            "title": "A post", "text": "a page summary", "service_name": "example.com",
+        });
+        let mut elsewhere = message_unfurl(json!("a quoted answer"), photo());
+        elsewhere["from_url"] =
+            json!("https://example.slack.com/archives/COTHER/p1700000000000100");
+        let mut unshared = message_unfurl(json!("a quoted answer"), photo());
+        unshared["is_share"] = json!(false);
+        for attachment in [link, elsewhere, unshared] {
+            let (text, assets) = delivered(attachment).await;
+            assert!(!text.contains("[quoted Slack forward"), "{text}");
+            assert!(assets.is_empty());
+        }
     }
 
     fn forwarded_event(top_text: &str, attachment: Value) -> Value {
