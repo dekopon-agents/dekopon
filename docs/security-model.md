@@ -124,8 +124,10 @@ API offers on a granted model. The budget bounds the spend.
 - Whoever reads the telemetry store reads every conversation.
 - If something hostile already runs as root or as the broker's user, you've lost.
 - Gateway history in memory can reach swap and core dumps; the daemon controls neither.
-- Chat memory with `continuityPolicy: stable`, and shared, agent and space storage always, stay
-  readable after the capability, constraints or credential that wrote them change.
+- Chat memory with `continuityPolicy: relaxed`, and shared, agent and space storage always, stay
+  readable after the authority that wrote them changes. Under `paranoid`, a secret reference cannot
+  prove its upstream account unchanged, and the journal, summaries and model context keep earlier
+  turns.
 - A GitHub issue template can apply labels for an outsider, so never permit on a label. Logins are
   chosen by their owners; trust the numeric actor ID.
 - A GitHub webhook delivery carries no signed timestamp, so a captured delivery can be replayed.

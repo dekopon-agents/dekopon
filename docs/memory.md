@@ -78,8 +78,7 @@ locator, and is evicted with its record.
 `scope: privateConversation` gives each authenticated sender their own history in a
 conversation. `sharedConversation` drops the sender: everyone in that one group DM, channel or
 thread shares it, and one participant's earlier prompt and answer replay to all of them. It is never
-cross-agent or cross-conversation memory. A record replays only under the capability set it was
-written with, so a changed grant starts afresh.
+cross-agent or cross-conversation memory.
 
 ## Durable memory
 
@@ -90,9 +89,16 @@ and the model may retrieve turns with `memory recent` and `memory search`; it ca
 record route. Stored turns never enter a prompt on their own. Recording does not deduplicate, and
 there is no deletion, export or encryption at rest.
 
+`continuityPolicy: paranoid` gives a sender's durable memory a new generation when their effective
+authority changes; `relaxed` never does.
+
+| `paranoid` [rotates](../crates/dekopon-broker/src/continuity.rs) on | Neither rotates on |
+|---|---|
+| capabilities, providers, storage access | limits, timeouts, artifact digests |
+| HTTP authority, CA bytes | binding names, map revision |
+| applicable request policy, secret references and sinks | inapplicable policy and labels |
+
 ## Memory never grants authority
 
 History, summaries, descriptions and pins never reach the broker as policy input; each later
-capability call is a fresh proposal authorized for the person asking now. The grant check compares
-capability identifiers only: tightening a capability's constraints or credential under the same
-identifier keeps the history, including what the agent read under the looser grant.
+capability call is a fresh proposal authorized for the person asking now.

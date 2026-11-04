@@ -4624,7 +4624,7 @@ async fn the_legacy_surface_reproduces_the_released_bytes() {
         .with_secret(true, Some("revision-a"))
         .build()
         .await;
-    // Recorded from v0.84.2; a legacy pointer can only be proved while these stay equal.
+    // Recorded from the released broker; a legacy pointer can only be proved while these match.
     for (memory_route, released) in [
         (
             false,
