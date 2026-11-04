@@ -720,6 +720,8 @@ pub enum TransportError {
     InsecureSocket { path: String },
     #[error("subject could not be represented canonically")]
     Subject(#[source] dekopon_core::SubjectError),
+    #[error("could not draw entropy for a message marker")]
+    Entropy(#[source] getrandom::Error),
 }
 
 impl TransportError {
@@ -746,6 +748,7 @@ impl TransportError {
             Self::Io(_) => "io",
             Self::InsecureSocket { .. } => "insecure-socket",
             Self::Subject(_) => "subject",
+            Self::Entropy(_) => "entropy",
         }
     }
 }
