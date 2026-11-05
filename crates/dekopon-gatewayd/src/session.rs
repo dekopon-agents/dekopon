@@ -445,11 +445,71 @@ struct Running {
     received_at: tokio::time::Instant,
     mapping: participants::Mapping,
     authorizing: usize,
-    steers: VecDeque<InboundMessage>,
+    steers: VecDeque<Queued>,
     follow_ups: VecDeque<FollowUp>,
+    turn: VecDeque<TurnId>,
+}
+
+struct TurnId {
+    id: String,
+    subject: dekopon_core::Subject,
+}
+
+pub(crate) enum Queued {
+    Request(InboundMessage),
+    Enrichment(InboundMessage),
+}
+
+impl Queued {
+    pub(crate) fn message(&self) -> &InboundMessage {
+        match self {
+            Self::Request(message) | Self::Enrichment(message) => message,
+        }
+    }
+
+    pub(crate) fn into_message(self) -> InboundMessage {
+        match self {
+            Self::Request(message) | Self::Enrichment(message) => message,
+        }
+    }
+}
+
+fn turn_ids(message: &InboundMessage) -> VecDeque<TurnId> {
+    let lead = match &message.message_id {
+        MessageId::Native(id) => Some(id.clone()),
+        MessageId::Github(_)
+        | MessageId::Wake { .. }
+        | MessageId::Job { .. }
+        | MessageId::Follow(_) => None,
+    };
+    let mut ids: VecDeque<TurnId> = lead
+        .into_iter()
+        .chain(message.folded.iter().cloned())
+        .map(|id| TurnId {
+            id,
+            subject: message.subject.name().clone(),
+        })
+        .collect();
+    while ids.len() > MAILBOX_CAPACITY {
+        ids.pop_front();
+    }
+    ids
 }
 
 impl Running {
+    pub(crate) fn queue_request(&mut self, message: InboundMessage) {
+        if let MessageId::Native(id) = &message.message_id {
+            self.turn.push_back(TurnId {
+                id: id.clone(),
+                subject: message.subject.name().clone(),
+            });
+            if self.turn.len() > MAILBOX_CAPACITY {
+                self.turn.pop_front();
+            }
+        }
+        self.steers.push_back(Queued::Request(message));
+    }
+
     fn new(route: &BoundRoute, message: &InboundMessage) -> Self {
         Self {
             subject: message.subject.name().clone(),
@@ -462,6 +522,7 @@ impl Running {
             authorizing: 0,
             steers: VecDeque::new(),
             follow_ups: VecDeque::new(),
+            turn: turn_ids(message),
         }
     }
 }
@@ -654,7 +715,7 @@ impl SessionGate {
                 };
             if participant && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
             {
-                running.steers.push_back(message);
+                running.queue_request(message);
                 return Admit::Steered(receipts);
             }
             if message.subject.name() == &running.subject
@@ -670,7 +731,7 @@ impl SessionGate {
                     MessageId::Github(_) | MessageId::Job { .. } | MessageId::Follow(_) => false,
                 };
                 record_admission(&message, MessageOutcome::Steered.label(), depth + 1, None);
-                running.steers.push_back(message);
+                running.queue_request(message);
                 if running.steering == Steering::Abort
                     && interrupts
                     && running.aborts < MAX_INTERRUPTS
@@ -734,13 +795,67 @@ impl SessionGate {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn turn_ids_for_test(&self, key: &AdmissionKey) -> Vec<String> {
+        match self.in_flight.lock().get(key) {
+            Some(Holder::Session(running)) => {
+                running.turn.iter().map(|turn| turn.id.clone()).collect()
+            }
+            Some(Holder::Probe) | None => Vec::new(),
+        }
+    }
+
+    pub(crate) fn enrich(&self, late: Box<InboundMessage>) -> Result<(), Box<InboundMessage>> {
+        let id = match &late.message_id {
+            MessageId::Native(id) => id.clone(),
+            MessageId::Github(_)
+            | MessageId::Wake { .. }
+            | MessageId::Job { .. }
+            | MessageId::Follow(_) => return Err(late),
+        };
+        let key = (late.transport.clone(), late.conversation.key());
+        let mut entries = self.in_flight.lock();
+        let running = match entries.get_mut(&key) {
+            Some(Holder::Session(running)) => running,
+            Some(Holder::Probe) | None => return Err(late),
+        };
+        if let Some(followup) = running
+            .follow_ups
+            .iter_mut()
+            .find(|followup| followup.message.message_id == late.message_id)
+        {
+            followup.message.absorb(*late);
+            return Ok(());
+        }
+        if let Some(steer) = running.steers.iter_mut().find_map(|queued| match queued {
+            Queued::Request(message) if message.message_id == late.message_id => Some(message),
+            Queued::Request(_) | Queued::Enrichment(_) => None,
+        }) {
+            steer.absorb(*late);
+            return Ok(());
+        }
+        let depth = running.steers.len() + running.follow_ups.len() + running.authorizing;
+        if running.cancellation.state.load(Ordering::Acquire) != SESSION_RUNNING
+            || depth >= MAILBOX_CAPACITY
+            || !running.turn.iter().any(|turn| turn.id == id)
+        {
+            return Err(late);
+        }
+        running.steers.push_back(Queued::Enrichment(*late));
+        if running.steering == Steering::Abort && running.aborts < MAX_INTERRUPTS {
+            running.aborts += 1;
+            running.cancellation.interrupt_model();
+        }
+        Ok(())
+    }
+
     pub(crate) fn take_steers(&self, key: &AdmissionKey) -> Vec<InboundMessage> {
         let mut entries = self.in_flight.lock();
         let Some(Holder::Session(running)) = entries.get_mut(key) else {
             return Vec::new();
         };
         running.cancellation.rearm_model();
-        running.steers.drain(..).collect()
+        running.steers.drain(..).map(Queued::into_message).collect()
     }
 
     pub(crate) fn seal_or_take(
@@ -755,7 +870,7 @@ impl SessionGate {
             && !running.steers.is_empty()
         {
             running.cancellation.rearm_model();
-            return Taken::Steers(running.steers.drain(..).collect());
+            return Taken::Steers(running.steers.drain(..).map(Queued::into_message).collect());
         }
         Taken::Sealed(seal_locked(&entries, key, cancellation))
     }
@@ -774,11 +889,18 @@ impl SessionGate {
             };
         };
         let before = running.steers.len() + running.follow_ups.len();
-        running.steers.retain(|message| {
-            let keep = message.subject.name().canonical() != request.subject;
+        running.steers.retain(|queued| {
+            let keep = queued.message().subject.name().canonical() != request.subject;
             if !keep {
-                for receipt in &message.constituents {
-                    crate::collection::disposition(receipt, "stopped");
+                match queued {
+                    Queued::Request(message) => {
+                        for receipt in &message.constituents {
+                            crate::collection::disposition(receipt, "stopped");
+                        }
+                    }
+                    Queued::Enrichment(late) => {
+                        crate::collection::disposition(&late.receive_span, "stopped");
+                    }
                 }
             }
             keep
@@ -792,6 +914,9 @@ impl SessionGate {
             }
             keep
         });
+        running
+            .turn
+            .retain(|turn| turn.subject.canonical() != request.subject);
         let dropped = before != running.steers.len() + running.follow_ups.len();
         let outcome = if running.subject.canonical() != request.subject {
             CancelOutcome::OtherSubject
@@ -893,16 +1018,22 @@ impl SessionAdmission {
                 return None;
             };
             // Fold before changing subject: leftover steers must never drain into another sender's run.
+            let mut requests = VecDeque::with_capacity(running.steers.len());
+            for queued in running.steers.drain(..) {
+                match queued {
+                    Queued::Request(message) => requests.push_back(message),
+                    Queued::Enrichment(late) => late.unheld(),
+                }
+            }
             let mut leftovers = Vec::new();
-            while let Some(mut message) = running.steers.pop_front() {
+            while let Some(mut message) = requests.pop_front() {
                 let folds = match message.message_id {
                     MessageId::Native(_) | MessageId::Wake { .. } => true,
                     MessageId::Github(_) | MessageId::Job { .. } | MessageId::Follow(_) => false,
                 };
                 if folds {
                     let mut grouped = Vec::new();
-                    while let Some(next) = running
-                        .steers
+                    while let Some(next) = requests
                         .pop_front_if(|steer| folds_in(steer) && steer.subject == message.subject)
                     {
                         grouped.push(next);
@@ -952,6 +1083,7 @@ impl SessionAdmission {
                 running.participation = TurnParticipation::of(&next.message);
                 running.authorizing = 0;
                 running.received_at = next.message.received_at;
+                running.turn = turn_ids(&next.message);
                 self.kind = TurnAdmission::FollowUp;
                 self.cancellation = running.cancellation.clone();
                 *self.route = next.route.clone();
@@ -1725,19 +1857,15 @@ pub(crate) fn run_session_resolving(
         | MessageId::Wake { .. }
         | MessageId::Job { .. } => Dispositions(message.constituents.clone()),
     };
+    // Admission runs before the task is spawned, so a later event for this message finds it in
+    // the gate instead of racing the task's first poll.
+    let span = message_span(&route, &message, &receipts);
+    let admitting = span.in_scope(|| admit(&runner, &route, message, receipts, ticket));
     async move {
-        let span = message_span(&route, &message, &receipts);
         let mut held_by = dekopon_telemetry::span_trace_context(&span);
-        let mut admission = execute(
-            &runner,
-            &route,
-            message,
-            &driver,
-            receipts,
-            (&digest, ticket),
-        )
-        .instrument(span)
-        .await;
+        let mut admission = execute(&runner, &route, admitting, &driver, &digest)
+            .instrument(span)
+            .await;
         while let Some(resolved) =
             admission.and_then(|admission| admission.next_or_release_with(&resolve))
         {
@@ -1769,14 +1897,21 @@ pub(crate) fn run_session_resolving(
     }
 }
 
-async fn execute(
+struct Admitting {
+    admitted: Admit,
+    liveness: Option<crate::transport::LivenessTarget>,
+    message_kind: dekopon_broker_protocol::ConversationKind,
+    is_unattended: bool,
+    notice: Option<crate::jobs::Notice>,
+}
+
+fn admit(
     runner: &SessionRunner,
     route: &BoundRoute,
     message: InboundMessage,
-    driver: &Arc<dyn ChatDriver>,
     receipts: Dispositions,
-    (digest, ticket): (&str, Option<crate::transport::github::AdmissionTicket>),
-) -> Option<SessionAdmission> {
+    ticket: Option<crate::transport::github::AdmissionTicket>,
+) -> Admitting {
     if message.constituents.is_empty() {
         crate::collection::record_received(&message);
     }
@@ -1800,6 +1935,28 @@ async fn execute(
         };
         ticket.answer(answer);
     }
+    Admitting {
+        admitted,
+        liveness,
+        message_kind,
+        is_unattended,
+        notice,
+    }
+}
+
+async fn execute(
+    runner: &SessionRunner,
+    route: &BoundRoute,
+    Admitting {
+        admitted,
+        liveness,
+        message_kind,
+        is_unattended,
+        notice,
+    }: Admitting,
+    driver: &Arc<dyn ChatDriver>,
+    digest: &str,
+) -> Option<SessionAdmission> {
     match admitted {
         Admit::Admitted(admission, message, receipts) => {
             if let Some(notice) = &notice {

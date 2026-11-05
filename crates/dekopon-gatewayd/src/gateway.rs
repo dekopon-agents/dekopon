@@ -512,6 +512,11 @@ impl Gateway {
                                 );
                             });
                         }
+                        TransportEvent::LateForward(late) => {
+                            if let Err(late) = self.runner.gate.enrich(late) {
+                                late.unheld();
+                            }
+                        }
                         TransportEvent::Delivery(message, ticket) => {
                             let received = message.receive_span.clone();
                             received.in_scope(|| {

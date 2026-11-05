@@ -192,7 +192,7 @@ impl SessionGate {
                         && running.participation == TurnParticipation::Ordinary
                         && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
                     {
-                        running.steers.push_back(queued.message);
+                        running.queue_request(queued.message);
                         queued.receipts.finish(MessageOutcome::Steered);
                         continue;
                     }
@@ -206,7 +206,7 @@ impl SessionGate {
             running
                 .steers
                 .make_contiguous()
-                .sort_by_key(|message| message.received_at);
+                .sort_by_key(|queued| queued.message().received_at);
         }
     }
 }
@@ -417,7 +417,11 @@ async fn authorize(
                     return Batch::Sealed(seal_locked(&entries, &inputs.key, &inputs.cancellation));
                 }
                 running.cancellation.rearm_model();
-                let messages = running.steers.drain(..).collect::<Vec<_>>();
+                let messages = running
+                    .steers
+                    .drain(..)
+                    .map(Queued::into_message)
+                    .collect::<Vec<_>>();
                 running.authorizing += messages.len();
                 messages
             }

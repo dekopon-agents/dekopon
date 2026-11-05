@@ -1036,3 +1036,124 @@ async fn another_speakers_grant_cannot_authorize_a_pr_link_turn() {
         matches!(&requests[2].request,BrokerRequest::Run { attestation: Some(claim), .. } if claim.subjects == other.subject)
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_forward_reaches_a_mapped_thread_turn_through_the_participant_drain() {
+    for flavor in [
+        crate::config::Steering::Abort,
+        crate::config::Steering::Boundary,
+    ] {
+        let (capture, _guard) = capture_spans();
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            vec![listing("asker", true), listing("asker", true)],
+        )
+        .await;
+        let turns = match flavor {
+            crate::config::Steering::Abort => vec![answer("seen")],
+            crate::config::Steering::Boundary => vec![answer("draft"), answer("seen")],
+        };
+        let models = InterruptibleModel::new(turns);
+        let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+        let driver = Arc::new(RecordingDriver::default());
+        let mut route = shared_route();
+        route.steering = flavor;
+        route.limits.max_steps = 2;
+        let first = speaker(9, "what is this?");
+        let mut late = first.clone();
+        late.text = "[quoted Slack forward — author: \"UORIGINAL\"; channel: \"CORIGINAL\"; time: \"1700000000.000100\"]\na quoted answer\n[/quoted Slack forward]".to_owned();
+        late.control_text = Some(late.text.clone());
+        late.assets = vec![pending("scene.png", "image/png", 24)];
+        let task = tokio::spawn(
+            run_session(
+                Arc::clone(&runner),
+                route,
+                first,
+                Arc::clone(&driver) as Arc<dyn ChatDriver>,
+            )
+            .with_current_subscriber(),
+        );
+        models.wait_until_entered().await;
+
+        runner
+            .gate
+            .enrich(Box::new(late))
+            .expect("the mapped turn holds the message");
+        if flavor == crate::config::Steering::Boundary {
+            models.release();
+        }
+        finish(task).await;
+
+        assert_eq!(driver.replies(), ["seen"], "{flavor:?}");
+        assert_eq!(models.requests(), 2, "{flavor:?}");
+        let prompt = models.prompt(1);
+        let forwarded = prompt
+            .iter()
+            .filter(|(role, text)| role == "user" && text.contains("[quoted Slack forward"))
+            .collect::<Vec<_>>();
+        assert_eq!(forwarded.len(), 1, "{flavor:?}: {prompt:?}");
+        assert!(
+            prompt.iter().any(|(_, text)| text.contains("chat-asset:1")),
+            "{flavor:?}: {prompt:?}"
+        );
+        assert!(
+            capture
+                .records()
+                .iter()
+                .all(|record| record.field("drop.reason") != Some("late-forward-unheld")),
+            "{flavor:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_participants_late_forward_never_enters_another_senders_turn() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![listing("asker", true), listing("ana", true)],
+    )
+    .await;
+    let models = InterruptibleModel::new([answer("final")]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let route = shared_route();
+    let first = speaker(9, "asker request");
+    let task = tokio::spawn(
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            first.clone(),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .with_current_subscriber(),
+    );
+    models.wait_until_entered().await;
+    let ana = speaker(8, "Ana's request");
+    let mut late = ana.clone();
+    late.text = "[quoted Slack forward — author: \"UORIGINAL\"; channel: \"CORIGINAL\"; time: \"1700000000.000100\"]\na quoted answer\n[/quoted Slack forward]".to_owned();
+    run_session(
+        Arc::clone(&runner),
+        route,
+        ana.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    runner.gate.cancel(&CancelRequest {
+        transport: first.transport.clone(),
+        conversation_id: first.conversation.key(),
+        subject: ana.subject.name().canonical().to_owned(),
+        via: CancelVia::StopReply,
+    });
+
+    assert!(runner.gate.enrich(Box::new(late)).is_err());
+    models.release();
+    finish(task).await;
+    assert_eq!(driver.replies(), ["final"]);
+    assert!(
+        (0..models.requests())
+            .flat_map(|index| models.prompt(index))
+            .all(|(_, text)| !text.contains("[quoted Slack forward"))
+    );
+}
