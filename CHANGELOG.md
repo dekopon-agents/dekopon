@@ -7,6 +7,22 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.86.0] - 2026-11-05
+
+### Added
+
+- Slack receive spans record the event subtype and the attachments' shape (count, message-unfurl, is_share presence, whether one quotes a Slack message) as counts and booleans, so a forward whose preview is missing can be told apart from one whose preview was refused.
+
+### Fixed
+
+- a Slack forward whose preview arrives after the message now reaches the agent with its quoted text, attribution and image in the same answer, instead of a bare permalink.
+
+## [dekopon-chart-0.73.0] - 2026-11-05
+
+### Changed
+
+- Chart 0.73.0 targets core v0.86.0 and renders the `v0.86.0` image tag.
+
 ## [0.85.0] - 2026-11-05
 
 ### Added
