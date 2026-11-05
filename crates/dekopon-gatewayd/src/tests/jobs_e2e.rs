@@ -435,12 +435,14 @@ async fn a_detached_job_records_its_start_root_finish_and_notice() {
     ]);
     let runner = runner_with_jobs(broker, Arc::clone(&models), 1, 2);
     let driver = Arc::new(RecordingDriver::default());
-    run_session(
-        Arc::clone(&runner),
-        job_route(Duration::from_secs(5), Duration::from_secs(10)),
-        message("start"),
-        Arc::clone(&driver) as Arc<dyn ChatDriver>,
-    )
+    tracing::dispatcher::with_default(&subscriber, || {
+        run_session(
+            Arc::clone(&runner),
+            job_route(Duration::from_secs(5), Duration::from_secs(10)),
+            message("start"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+    })
     .with_subscriber(subscriber.clone())
     .await;
     let mut notices = runner.jobs.take_notices();
@@ -448,12 +450,14 @@ async fn a_detached_job_records_its_start_root_finish_and_notice() {
         .await
         .expect("job finishes")
         .expect("notice arrives");
-    run_session(
-        Arc::clone(&runner),
-        job_route(Duration::from_secs(5), Duration::from_secs(10)),
-        notice,
-        driver as Arc<dyn ChatDriver>,
-    )
+    tracing::dispatcher::with_default(&subscriber, || {
+        run_session(
+            Arc::clone(&runner),
+            job_route(Duration::from_secs(5), Duration::from_secs(10)),
+            notice,
+            driver as Arc<dyn ChatDriver>,
+        )
+    })
     .with_subscriber(subscriber)
     .await;
     let records = capture.records();
