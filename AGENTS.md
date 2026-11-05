@@ -77,7 +77,8 @@ Audits and plans default to over-building, and the owner reels them back. Before
   which no compiler can enforce.
 - **Fail fast, one rich trace record, a reset path.** No quarantine, integrity MACs or detection
   that cannot fix anything ([non-goals](docs/design.md#non-goals)).
-- **Calibrate severity to the one deployment,** a Raspberry Pi serving family chats. Owner-only
+- **Calibrate severity to the reference deployment:** the maintainer's Raspberry Pi, a small ARM64
+  box for integration, development and everyday utility, used by a few trusted people. Owner-only
   and dev-only paths are P3; a process-killing input is P1 whatever the path.
 - **Compatibility is a constraint only when the owner set it.** Everything is pre-1.0; breakage in
   core and providers is expected. Before designing around a break, ask what breaking it would delete.
@@ -109,7 +110,11 @@ How the owner shapes names, config keys, grammars and policy. Bring a design alr
 
 ## Change and verify
 
-- The RPi deploys the [memory-optimized Wasmtime build](docs/development.md#memory-optimized-wasmtime) on ARM64, and CI tests it on ARM64 and x86-64; stock Wasmtime remains the default everywhere else.
+- The reference deployment runs the [memory-optimized Wasmtime build](docs/development.md#memory-optimized-wasmtime) on ARM64, and CI tests it on ARM64 and x86-64; stock Wasmtime remains the default everywhere else.
+- **Nothing personal ships.** Code, examples, docs, prompts and chat text name no real person,
+  workspace, org, host, path or ID from the reference deployment. Use placeholders (`alice`,
+  `t0123abc`, `/home/you`, `example.internal`) and write chat text for any operator. Its details
+  live in the private homelab repository.
 - Confirm repository root, branch and status; preserve unrelated work and artifacts.
   Start follow-ups from current main, not an already-merged feature branch.
 - Update the companion tests and examples. Never edit `CHANGELOG.md` in a PR; write `Changelog: <Category>: <text>` lines in commit messages instead (`docs/development.md`).

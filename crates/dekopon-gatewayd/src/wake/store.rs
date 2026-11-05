@@ -189,11 +189,11 @@ impl Fired {
     pub(crate) fn into_inbound(self) -> InboundMessage {
         let text = match &self.origin {
             WakeOrigin::Subscription(target) => format!(
-                "[gateway: PR subscription wake] Re-review https://github.com/{}/pull/{} at its current head using granted tools. Read the prior review and current diff; submit a fresh head-pinned COMMENT review. Decide whether the blocking findings changed. If every capability invocation in this turn successfully refreshed this PR's review, reply in this Slack thread only if they changed; otherwise call decline_chat_reply. Any other invocation requires a Slack report even after a successful refresh. This turn runs as the space alone; no person's grants are available.",
+                "[gateway: PR subscription wake] Re-review https://github.com/{}/pull/{} at its current head using granted tools. Read the prior review and current diff; submit a fresh head-pinned COMMENT review. Decide whether the blocking findings changed. If every capability invocation in this turn successfully refreshed this PR's review, reply in this chat thread only if they changed; otherwise call decline_chat_reply. Any other invocation requires a chat report even after a successful refresh. This turn runs as the space alone; no person's grants are available.",
                 target.repository, target.number
             ),
             WakeOrigin::Digest => format!(
-                "[gateway: daily space digest] Verify the waiting items through granted reads. Post one concise threaded digest of stale PRs, unanswered review requests and unassigned issues only if nonempty and changed. Name GitHub logins as plain text, without Slack pings. Otherwise call decline_chat_reply, including after read work. This turn runs as the space alone.\n{}",
+                "[gateway: daily space digest] Verify the waiting items through granted reads. Post one concise threaded digest of stale PRs, unanswered review requests and unassigned issues only if nonempty and changed. Write GitHub logins as plain text so nobody gets pinged. Otherwise call decline_chat_reply, including after read work. This turn runs as the space alone.\n{}",
                 self.text
             ),
             WakeOrigin::Scheduled => self.text,

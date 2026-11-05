@@ -202,7 +202,7 @@ fn every_flag_together_passes_parsing_and_stops_at_the_tty_gate() {
             "--subject",
             "drn:slack:user:t0123abc:u9xyz",
             "--model",
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             "--endpoint",
             "http://127.0.0.1:8081/v1",
             "--api-key-env",

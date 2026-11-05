@@ -671,7 +671,7 @@ where
         ReplyMode::Required => {}
         ReplyMode::Optional => messages.push(ModelMessage::system(OPTIONAL_REPLY_INSTRUCTION)),
         ReplyMode::QuietDigest => messages.push(ModelMessage::system(
-            "This is a daily space digest. Verify the waiting items through granted reads. Post one concise threaded summary only for changed, nonempty items; otherwise call decline_chat_reply, including after read work. Name GitHub logins as plain text, never Slack mentions."
+            "This is a daily space digest. Verify the waiting items through granted reads. Post one concise threaded summary only for changed, nonempty items; otherwise call decline_chat_reply, including after read work. Name GitHub logins as plain text, never as chat mentions."
         )),
         ReplyMode::QuietReview(_) => messages.push(ModelMessage::system(
             "This is a PR subscription re-review. Refresh the subscribed PR's head-pinned GitHub review using your granted tools. You may call decline_chat_reply when blocking findings are unchanged only if every capability invocation in the turn successfully refreshed the subscribed PR's review. Any other invocation, including a failed review or a review of another PR, requires a chat report even if the subscribed review was refreshed."

@@ -349,7 +349,7 @@ fn the_refusal_reads_as_one_of_three_sentences() {
             Retry::After(Duration::from_secs(14 * 60 + 20))
         )
         .to_string(),
-        "I'm at 99% of my token budget (5-hour rolling window): 10 tokens left, this message needs about 100. Try again in 15 minutes."
+        "I'm at 99% of my token budget (5-hour rolling window): 10 tokens left and this message needs about 100. Try again in 15 minutes."
     );
     assert_eq!(
         refusal(
@@ -360,11 +360,11 @@ fn the_refusal_reads_as_one_of_three_sentences() {
             Retry::After(Duration::from_secs(2 * 3_600 + 60))
         )
         .to_string(),
-        "I'm over my token budget (daily window) by 1,200 tokens. It resets in 3 hours."
+        "I've used up my token budget (daily window), and then some: 1,200 tokens over. It resets in 3 hours."
     );
     assert_eq!(
         refusal(MeterKind::Credit, 100_000, 100_000, 180_000, Retry::Never).to_string(),
-        "This message needs about 180,000 tokens, more than my whole 100,000-token budget (credit bucket). It can't run as is."
+        "This message needs about 180,000 tokens, more than my whole 100,000-token budget (credit bucket). Too big to run; try a smaller ask."
     );
 }
 
@@ -379,12 +379,23 @@ fn a_guest_refusal_speaks_of_the_agent() {
     );
     assert_eq!(
         near.for_guest().to_string(),
-        "The agent gylmar is at 99% of its token budget (5-hour session window): 10 tokens left, this request needs about 100. Try again in 2 minutes."
+        "The agent gylmar is at 99% of its token budget (5-hour session window): 10 tokens left and this request needs about 100. Try again in 2 minutes."
     );
     let never = refusal(MeterKind::Credit, 100, 100, 180, Retry::Never);
     assert_eq!(
         never.for_guest().to_string(),
-        "This request needs about 180 tokens, more than the agent gylmar's whole 100-token budget (credit bucket). It can't run as is."
+        "This request needs about 180 tokens, more than the agent gylmar's whole 100-token budget (credit bucket). Too big to run; try a smaller ask."
+    );
+    let over = refusal(
+        MeterKind::Fixed { period: hours(24) },
+        100_000,
+        -1_200,
+        100,
+        Retry::After(Duration::from_secs(2 * 3_600 + 60)),
+    );
+    assert_eq!(
+        over.for_guest().to_string(),
+        "The agent gylmar has used up its token budget (daily window), and then some: 1,200 tokens over. It resets in 3 hours."
     );
 }
 

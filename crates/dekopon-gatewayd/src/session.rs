@@ -51,7 +51,7 @@ use crate::{
     collection::Dispositions,
     config::{
         MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig, RecallSource, ResolvedBroker,
-        SeenReaction, Steering,
+        SeenReaction, Steering, StrangerReply,
     },
     conversation::{
         Commit, ConversationKey, ConversationSeed, ConversationStore, EvictionReason, Residency,
@@ -77,26 +77,26 @@ use crate::{
 
 mod participants;
 
-pub(crate) const UNMAPPED_REPLY: &str =
-    "I only talk to the Lange family. I've let my owner know you stopped by.";
+pub(crate) const DEFAULT_STRANGER_REPLY: &str =
+    "I only answer people my operator has let in. You're not on the list, so I'll pass.";
 
-pub(crate) const UNAUTHORIZED_REPLY: &str = "You're not authorized to use this agent.";
-pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
-pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
-pub(crate) const UNREPORTED_WORK_REPLY: &str = "The agent attempted capability work but could not report the result. Check the audit before retrying.";
-pub(crate) const STOPPED_REPLY: &str = "Stopped.";
+pub(crate) const UNAUTHORIZED_REPLY: &str =
+    "You don't have access to this agent. Rules are rules, and I don't write them.";
+pub(crate) const BUSY_REPLY: &str = "Hands full with another request. Try me again in a moment.";
+pub(crate) const FAILURE_REPLY: &str = "Something went wrong on my end and I couldn't finish this one. Anything I already did was not undone.";
+pub(crate) const UNREPORTED_WORK_REPLY: &str = "I did some real work but lost track of how it ended. Check what changed before you ask again, so nothing happens twice.";
+pub(crate) const STOPPED_REPLY: &str = "Stopped. Anything I already did was not undone.";
 pub(crate) const WALL_CLOCK_REPLY: &str =
-    "Stopped: this session reached its time limit. Capability calls already made were not undone.";
+    "Time's up: this session hit its time limit. Anything I already did was not undone.";
 pub(crate) const MODEL_DEADLINE_REPLY: &str =
-    "Stopped: the model did not answer in time. Capability calls already made were not undone.";
+    "Stopped: the model took too long to answer. Anything I already did was not undone.";
 pub(crate) const EMPTY_ANSWER_REPLY: &str =
-    "Stopped: the model returned an empty answer. Capability calls already made were not undone.";
-pub(crate) const MAX_STEPS_REPLY: &str =
-    "Stopped: this session reached its step limit. Capability calls already made were not undone.";
+    "Stopped: the model came back with nothing. Anything I already did was not undone.";
+pub(crate) const MAX_STEPS_REPLY: &str = "Stopped: this needed more steps than I get per message. Anything I already did was not undone.";
 pub(crate) const SESSION_TASK_REPLY: &str =
-    "Stopped: the gateway lost this session's task. Capability calls already made were not undone.";
-pub(crate) const SEALED_THREAD_REPLY: &str = "Sorry, this agent took too long and we've canceled the chat. Please feel free to start a new one with a smaller scope.";
-pub(crate) const EMPTY_REPLY: &str = "[empty response]";
+    "Stopped: I lost track of this session on my side. Anything I already did was not undone.";
+pub(crate) const SEALED_THREAD_REPLY: &str = "This thread ran out of time earlier and is closed now. Start a new one, and keep the ask smaller.";
+pub(crate) const EMPTY_REPLY: &str = "(Nothing to add in words.)";
 
 const PLATFORM_RECALL_MAX_MESSAGES: usize = 100;
 const PRINCIPAL_LOOKUPS_IN_FLIGHT: usize = 4;
@@ -2021,10 +2021,6 @@ async fn execute(
     }
 }
 
-fn permission_reply(principal: &PrincipalId) -> String {
-    format!("Sorry {principal}, you don't have permission for this agent.")
-}
-
 async fn acknowledge_steer(
     driver: &dyn ChatDriver,
     target: Option<&crate::transport::LivenessTarget>,
@@ -2413,9 +2409,15 @@ async fn session_turn(
                     if !quiet && !runner.gate.stranger_reply() {
                         return MessageOutcome::Unauthorized.into();
                     }
-                    UNMAPPED_REPLY.to_owned()
+                    match route.indicators.get(&message.conversation.kind) {
+                        Some(resolved) => match &resolved.strangers {
+                            StrangerReply::Silent => return MessageOutcome::Unauthorized.into(),
+                            StrangerReply::Reply(text) => text.clone(),
+                        },
+                        None => DEFAULT_STRANGER_REPLY.to_owned(),
+                    }
                 }
-                SessionRefusal::AgentDenied { principal } => {
+                SessionRefusal::AgentDenied { .. } => {
                     tracing::info!(
                         event = "gateway_session_rejected",
                         transport = message.transport.as_str(),
@@ -2434,7 +2436,7 @@ async fn session_turn(
                         admission.trigger = quiet.then_some("pull-request-link"),
                         "gateway.session.rejected"
                     );
-                    permission_reply(&principal)
+                    UNAUTHORIZED_REPLY.to_owned()
                 }
                 SessionRefusal::Other => {
                     tracing::info!(
@@ -2543,10 +2545,7 @@ async fn session_turn(
             reason = "unauthorized",
             "gateway.session.rejected"
         );
-        let reply = leg
-            .principal()
-            .map_or_else(|| UNAUTHORIZED_REPLY.to_owned(), permission_reply);
-        if !is_follow && !is_space_wake && answer(driver, message, &reply).await {
+        if !is_follow && !is_space_wake && answer(driver, message, UNAUTHORIZED_REPLY).await {
             reply_delivered(MessageOutcome::Unauthorized);
         }
         return MessageOutcome::Unauthorized.into();

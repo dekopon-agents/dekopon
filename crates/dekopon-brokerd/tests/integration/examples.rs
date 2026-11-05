@@ -13,9 +13,9 @@ use serde::Deserialize;
 
 const GRANTED: [&str; 2] = ["http-probe.conditional-write", "http-probe.fetch"];
 const UNGRANTED: [&str; 1] = ["http-probe.purge"];
-const PRINCIPAL: &str = "cpetersen";
+const PRINCIPAL: &str = "alice";
 const GATEWAY: &str = "dekopon-gatewayd";
-const AGENT: &str = "xaviers-conditional-writer";
+const AGENT: &str = "conditional-writer";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -169,7 +169,7 @@ async fn the_sender_may_write_through_the_gateway_and_nothing_else_may() {
     assert!(session.allowed, "the mapped sender may drive the agent");
     assert_eq!(
         session.determining_policy_ids,
-        vec!["boss-may-prompt-conditional-writer".to_owned()],
+        vec!["alice-may-prompt-conditional-writer".to_owned()],
         "the audit record names the rule a reader can find in policies.cedar"
     );
 

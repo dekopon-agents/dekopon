@@ -1,7 +1,7 @@
 # The conditional writer
 
 A Slack DM asks an agent to update a shared record. [Cedar](policies.cedar) lets the mapped sender,
-`cpetersen`, reach two `http-probe` capabilities, only via the gateway, only for this agent. The
+`alice`, reach two `http-probe` capabilities, only via the gateway, only for this agent. The
 write refuses if the record moved. The broker adds the API token; the model, shell and component
 never see it.
 

@@ -9,7 +9,7 @@ async fn an_unmapped_posters_ambient_pr_link_is_traced_silently_and_leaves_the_m
     refused_ambient_link_then_mention(
         dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
         "unmapped-subject",
-        crate::session::UNMAPPED_REPLY,
+        crate::session::DEFAULT_STRANGER_REPLY,
     )
     .await;
 }
@@ -21,7 +21,7 @@ async fn an_agent_denied_posters_ambient_pr_link_is_traced_silently_but_its_ment
             principal: "simon".parse().unwrap(),
         },
         "agent-denied",
-        "Sorry simon, you don't have permission for this agent.",
+        "You don't have access to this agent. Rules are rules, and I don't write them.",
     )
     .await;
 }

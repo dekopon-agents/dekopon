@@ -115,7 +115,7 @@ impl ModelSource {
     }
 }
 
-pub const DEFAULT_MODEL: &str = "gpt-5.6-luna";
+pub const DEFAULT_MODEL: &str = "gpt-6-luna";
 
 #[must_use]
 pub fn selected_model(cli: Option<&str>, profile: Option<&str>) -> (String, ModelSource) {

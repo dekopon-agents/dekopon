@@ -195,10 +195,17 @@ impl Refusal {
 
     fn render(&self, formatter: &mut fmt::Formatter<'_>, voice: Voice<'_>) -> fmt::Result {
         let window = WindowName(self.meter);
-        let (subject, its, whole, item) = match voice {
-            Voice::First => ("I'm".to_owned(), "my", "my".to_owned(), "message"),
+        let (subject, has, its, whole, item) = match voice {
+            Voice::First => (
+                "I'm".to_owned(),
+                "I've".to_owned(),
+                "my",
+                "my".to_owned(),
+                "message",
+            ),
             Voice::Third(agent) => (
                 format!("The agent {agent} is"),
+                format!("The agent {agent} has"),
                 "its",
                 format!("the agent {agent}'s"),
                 "request",
@@ -207,18 +214,18 @@ impl Refusal {
         match self.retry {
             Retry::Never => write!(
                 formatter,
-                "This {item} needs about {} tokens, more than {whole} whole {}-token budget ({window}). It can't run as is.",
+                "This {item} needs about {} tokens, more than {whole} whole {}-token budget ({window}). Too big to run; try a smaller ask.",
                 self.requested, self.limit
             ),
             Retry::After(wait) if self.remaining < 0 => write!(
                 formatter,
-                "{subject} over {its} token budget ({window}) by {} tokens. It resets in {}.",
+                "{has} used up {its} token budget ({window}), and then some: {} tokens over. It resets in {}.",
                 grouped(-i128::from(self.remaining)),
                 Rounded(wait)
             ),
             Retry::After(wait) => write!(
                 formatter,
-                "{subject} at {}% of {its} token budget ({window}): {} tokens left, this {item} needs about {}. Try again in {}.",
+                "{subject} at {}% of {its} token budget ({window}): {} tokens left and this {item} needs about {}. Try again in {}.",
                 self.percent(),
                 grouped(i128::from(self.remaining)),
                 self.requested,

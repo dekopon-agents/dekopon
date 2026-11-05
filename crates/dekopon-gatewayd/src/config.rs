@@ -35,7 +35,7 @@ pub use memory::{MemoryKnobs, MemorySettings, ResolvedSettings};
 
 use crate::{
     progress::{KeepAlive, ProgressDetail, Templates},
-    session::{FAILURE_REPLY, STOPPED_REPLY},
+    session::{DEFAULT_STRANGER_REPLY, FAILURE_REPLY, STOPPED_REPLY},
 };
 
 pub const CONFIG_API_VERSION: &str = "dekopon.dev/gatewayd/v1alpha1";
@@ -175,6 +175,11 @@ pub struct LivenessConfig {
     pub cancel_button: Option<bool>,
     pub keep_alive: Option<KeepAliveConfig>,
     pub templates: Option<TemplateOverrides>,
+    #[serde(
+        default,
+        deserialize_with = "serde_yaml::with::singleton_map::deserialize"
+    )]
+    pub strangers: Option<StrangerReply>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub conversations: BTreeMap<ConversationKind, LivenessOverride>,
 }
@@ -192,6 +197,24 @@ pub struct LivenessOverride {
     pub cancel_button: Option<bool>,
     pub keep_alive: Option<KeepAliveConfig>,
     pub templates: Option<TemplateOverrides>,
+    #[serde(
+        default,
+        deserialize_with = "serde_yaml::with::singleton_map::deserialize"
+    )]
+    pub strangers: Option<StrangerReply>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub enum StrangerReply {
+    Silent,
+    Reply(String),
+}
+
+impl Default for StrangerReply {
+    fn default() -> Self {
+        Self::Reply(DEFAULT_STRANGER_REPLY.to_owned())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -281,6 +304,7 @@ impl LivenessConfig {
             cancel_button: self.cancel_button,
             keep_alive: self.keep_alive.clone(),
             templates: self.templates.clone(),
+            strangers: self.strangers.clone(),
         }
     }
 }
@@ -290,6 +314,7 @@ pub(crate) struct ResolvedLiveness {
     pub settings: LivenessSettings,
     pub keep_alive: KeepAlive,
     pub templates: Templates,
+    pub strangers: StrangerReply,
 }
 
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -320,6 +345,7 @@ impl Default for ResolvedLiveness {
             settings: LivenessSettings::default(),
             keep_alive: KeepAlive::default(),
             templates,
+            strangers: StrangerReply::default(),
         }
     }
 }
@@ -2988,6 +3014,7 @@ fn resolve_liveness(
     let mut settings = LivenessSettings::default();
     let mut keep_alive = KeepAliveConfig::default();
     let mut templates = TemplateOverrides::default();
+    let mut strangers = StrangerReply::default();
     let transport_fields = config.override_fields();
     let layers = [
         Some(sessions),
@@ -3003,6 +3030,20 @@ fn resolve_liveness(
         if let Some(value) = &layer.templates {
             templates.overlay(value);
         }
+        if let Some(value) = &layer.strangers {
+            strangers.clone_from(value);
+        }
+    }
+    let blank = match &strangers {
+        StrangerReply::Silent => false,
+        StrangerReply::Reply(text) => text.trim().is_empty(),
+    };
+    if blank
+        && !problems.iter().any(|problem| matches!(problem, ConfigProblem::BlankStrangerReply { route, .. } if *route == index))
+    {
+        problems.push(ConfigProblem::BlankStrangerReply {
+            transport: transport.name().to_owned(), route: index,
+        });
     }
     if (keep_alive.every_seconds == 0 || keep_alive.at_seconds.contains(&0))
         && !problems.iter().any(|problem| matches!(problem, ConfigProblem::InvalidKeepAlive { route, .. } if *route == index))
@@ -3087,6 +3128,7 @@ fn resolve_liveness(
         settings,
         keep_alive: keep_alive_from(&keep_alive),
         templates,
+        strangers,
     }
 }
 
@@ -3410,6 +3452,10 @@ pub enum ConfigProblem {
         "routes[{route}] transport {transport:?} has an indicators.keepAlive bound of zero; everySeconds must be greater than zero and no offset may be zero"
     )]
     InvalidKeepAlive { transport: String, route: usize },
+    #[error(
+        "routes[{route}] transport {transport:?} has a blank indicators.strangers.reply; use strangers: silent to send nothing"
+    )]
+    BlankStrangerReply { transport: String, route: usize },
     #[error(
         "routes[{route}] transport {transport:?} indicators template {field} uses {{{placeholder}}}, which it cannot render"
     )]
@@ -3801,6 +3847,122 @@ mod tests {
                         )
                     )));
                 }
+            }
+        }
+    }
+
+    fn stranger_document(sessions: &str, route: &str) -> String {
+        format!(
+            "{PREAMBLE}sessions:\n  indicators: {{ {sessions} }}\ntransports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\nroutes:\n  - transport: dev\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n    indicators: {{ {route} }}\n"
+        )
+    }
+
+    async fn load_stranger_document(
+        document: &str,
+    ) -> [(Option<super::ResolvedConfig>, Vec<ConfigError>); 2] {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("gateway.yaml");
+        let directory = root.path().join("fragments");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, document).unwrap();
+        std::fs::write(directory.join("gateway.yaml"), document).unwrap();
+        [
+            super::load_reporting(&file, crate::current_uid(), LoadMode::Check).await,
+            super::load_reporting(&directory, crate::current_uid(), LoadMode::Check).await,
+        ]
+    }
+
+    #[tokio::test]
+    async fn stranger_settings_decode_at_sessions_and_routes_from_a_file_and_a_directory() {
+        use super::StrangerReply;
+        use dekopon_broker_protocol::ConversationKind;
+        let members = || StrangerReply::Reply("Members only.".to_owned());
+        for (sessions, route, expected) in [
+            ("", "", StrangerReply::default()),
+            ("strangers: silent", "", StrangerReply::Silent),
+            ("strangers: {reply: Members only.}", "", members()),
+            ("", "strangers: silent", StrangerReply::Silent),
+            (
+                "strangers: silent",
+                "strangers: {reply: Members only.}",
+                members(),
+            ),
+        ] {
+            for (resolved, errors) in
+                load_stranger_document(&stranger_document(sessions, route)).await
+            {
+                assert!(errors.is_empty(), "{sessions} / {route}: {errors:?}");
+                assert_eq!(
+                    resolved.unwrap().routes[0].indicators[&ConversationKind::DirectMessage]
+                        .strangers,
+                    expected,
+                    "{sessions} / {route}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stranger_settings_decode_at_the_transport_and_its_conversation_kinds() {
+        use super::StrangerReply;
+        use dekopon_broker_protocol::ConversationKind;
+        let config = resolved(
+            "transports:
+  - name: slack
+    kind: slackSocketMode
+    appTokenEnv: A
+    botTokenEnv: B
+    experience: agent
+    indicators:
+      strangers: {reply: Members only.}
+      conversations: { directMessage: { strangers: silent } }
+routes:
+  - transport: slack
+    conversation: { kind: [directMessage, channel] }
+    agent: reviewer
+",
+        )
+        .unwrap();
+        let indicators = &config.routes[0].indicators;
+        assert_eq!(
+            indicators[&ConversationKind::Channel].strangers,
+            StrangerReply::Reply("Members only.".to_owned())
+        );
+        assert_eq!(
+            indicators[&ConversationKind::DirectMessage].strangers,
+            StrangerReply::Silent
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_blank_stranger_setting_is_refused() {
+        for layer in [(true, false), (false, true)] {
+            let pick = |text: &'static str, on: bool| if on { text } else { "" };
+            let unknown = stranger_document(
+                pick("strangers: mute", layer.0),
+                pick("strangers: mute", layer.1),
+            );
+            for (resolved, errors) in load_stranger_document(&unknown).await {
+                assert!(resolved.is_none());
+                assert!(
+                    errors.iter().any(|error| matches!(
+                        error,
+                        ConfigError::Decode { .. } | ConfigError::DecodeFragment { .. }
+                    )),
+                    "{errors:?}"
+                );
+            }
+            let blank = stranger_document(
+                pick("strangers: {reply: ' '}", layer.0),
+                pick("strangers: {reply: ' '}", layer.1),
+            );
+            for (resolved, errors) in load_stranger_document(&blank).await {
+                assert!(resolved.is_none());
+                assert!(errors.iter().any(|error| matches!(error,
+                    ConfigError::Invalid { problems, .. } if problems.iter().any(
+                        |problem| matches!(problem, super::ConfigProblem::BlankStrangerReply { route: 0, .. })
+                    )
+                )), "{errors:?}");
             }
         }
     }

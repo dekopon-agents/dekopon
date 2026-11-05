@@ -10,10 +10,10 @@
 #   chmod 0700 ~/.local/run/dekopon
 # Every path below that is relative is resolved against this file's own directory, so the example
 # runs from a checkout without editing paths that point inside the repository. The absolute
-# `/home/xavier/...` paths are the ones to change: they are runtime state, not repository content.
+# `/home/you/...` paths are the ones to change: they are runtime state, not repository content.
 apiVersion: dekopon.dev/brokerd/v1alpha1
 
-socketPath: /home/xavier/.local/run/dekopon/broker.sock
+socketPath: /home/you/.local/run/dekopon/broker.sock
 
 
 # Relative to this file's directory. Copy secret-map.yaml.example and `chmod 600` it. Startup fails
@@ -57,7 +57,7 @@ identities:
 principals:
   # The only place a Slack user becomes a principal. An unmapped sender reaches nothing, which is
   # why the Slack app can be installed workspace-wide without widening anything.
-  cpetersen:
+  alice:
     subjects: [drn:slack:user:t0123abcd:u0123abcd]
 
 capabilities:
