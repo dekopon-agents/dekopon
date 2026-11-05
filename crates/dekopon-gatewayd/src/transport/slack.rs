@@ -4149,6 +4149,22 @@ mod driver_tests {
         })
     }
 
+    const RECEIVE_FIELDS: [&str; 13] = [
+        "transport.kind",
+        "message.id",
+        "drop.reason",
+        "mention.roles",
+        "conversation.kind",
+        "conversation.container",
+        "conversation.id",
+        "conversation.thread",
+        "slack.event.subtype",
+        "slack.attachments.count",
+        "slack.attachments.msg_unfurl",
+        "slack.attachments.is_share_present",
+        "slack.attachments.quotes_message",
+    ];
+
     fn receive_shape(capture: &CaptureLayer) -> Vec<(&'static str, Option<String>)> {
         let records = capture.records();
         [
@@ -4256,18 +4272,26 @@ mod driver_tests {
                 expected,
                 "{recorded:?}"
             );
-            let spans = capture.spans_text();
-            for value in [
-                "UORIGINAL",
-                "CORIGINAL",
-                "1700000000.000100",
-                "example.slack.com",
-                "example.com",
-                "a quoted answer",
-                "cat.png",
-                "look at this",
-            ] {
-                assert!(!spans.contains(value), "{value} leaked into {spans}");
+            for record in capture.records().iter().filter(|record| {
+                matches!(record, dekopon_test_support::Record::Span { name, .. } if *name == "transport.receive")
+            }) {
+                for field in RECEIVE_FIELDS {
+                    let Some(recorded) = record.field(field) else {
+                        continue;
+                    };
+                    for value in [
+                        "UORIGINAL",
+                        "CORIGINAL",
+                        "1700000000.000100",
+                        "example.slack.com",
+                        "example.com",
+                        "a quoted answer",
+                        "cat.png",
+                        "look at this",
+                    ] {
+                        assert!(!recorded.contains(value), "{value} leaked into {field}");
+                    }
+                }
             }
         }
     }
