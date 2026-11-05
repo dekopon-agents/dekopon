@@ -7206,7 +7206,8 @@ async fn a_stranger_notice_never_caches_the_subjects_mapping() {
 }
 
 #[tokio::test]
-async fn a_mapped_agent_denial_names_the_principal_without_an_owner_notice() {
+async fn a_mapped_agent_denial_gets_the_anonymous_refusal_and_names_the_principal_only_in_the_log()
+{
     let (capture, _guard) = capture_spans();
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
@@ -7266,7 +7267,7 @@ async fn a_mapped_agent_denial_names_the_principal_without_an_owner_notice() {
 }
 
 #[tokio::test]
-async fn a_mapped_empty_grant_gets_a_named_reply_without_an_owner_notice() {
+async fn a_mapped_empty_grant_gets_the_anonymous_refusal() {
     let (capture, _guard) = capture_spans();
     let directory = temporary();
     let (broker, mut observed) = stub_broker(

@@ -386,6 +386,17 @@ fn a_guest_refusal_speaks_of_the_agent() {
         never.for_guest().to_string(),
         "This request needs about 180 tokens, more than the agent gylmar's whole 100-token budget (credit bucket). Too big to run; try a smaller ask."
     );
+    let over = refusal(
+        MeterKind::Fixed { period: hours(24) },
+        100_000,
+        -1_200,
+        100,
+        Retry::After(Duration::from_secs(2 * 3_600 + 60)),
+    );
+    assert_eq!(
+        over.for_guest().to_string(),
+        "The agent gylmar has used up its token budget (daily window), and then some: 1,200 tokens over. It resets in 3 hours."
+    );
 }
 
 type RecordFields = Vec<(String, String)>;

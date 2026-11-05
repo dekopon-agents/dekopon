@@ -1977,7 +1977,7 @@ async fn a_job_started_after_shutdown_began_is_refused_from_a_turn_and_a_probe()
 #[tokio::test(flavor = "multi_thread")]
 async fn a_jobs_only_stop_reply_takes_a_refusal_permit_or_sends_nothing() {
     let directory = temporary();
-    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let (runner, routes) = halting_routing_loop(directory.path()).await;
     let inbound = message("stop");
     let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
     let (run, signal) = runner
@@ -2004,7 +2004,7 @@ async fn a_jobs_only_stop_reply_takes_a_refusal_permit_or_sends_nothing() {
     drop(held);
     dispatcher.dispatch(&["stop".to_owned()], inbound);
     while dispatcher.sessions.join_next().await.is_some() {}
-    assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
+    assert_eq!(driver.replies(), [HALTED]);
     drop(run);
 }
 

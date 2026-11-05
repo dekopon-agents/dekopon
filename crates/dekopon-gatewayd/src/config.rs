@@ -3902,6 +3902,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stranger_settings_decode_at_the_transport_and_its_conversation_kinds() {
+        use super::StrangerReply;
+        use dekopon_broker_protocol::ConversationKind;
+        let config = resolved(
+            "transports:
+  - name: slack
+    kind: slackSocketMode
+    appTokenEnv: A
+    botTokenEnv: B
+    experience: agent
+    indicators:
+      strangers: {reply: Members only.}
+      conversations: { directMessage: { strangers: silent } }
+routes:
+  - transport: slack
+    conversation: { kind: [directMessage, channel] }
+    agent: reviewer
+",
+        )
+        .unwrap();
+        let indicators = &config.routes[0].indicators;
+        assert_eq!(
+            indicators[&ConversationKind::Channel].strangers,
+            StrangerReply::Reply("Members only.".to_owned())
+        );
+        assert_eq!(
+            indicators[&ConversationKind::DirectMessage].strangers,
+            StrangerReply::Silent
+        );
+    }
+
     #[tokio::test]
     async fn an_unknown_or_blank_stranger_setting_is_refused() {
         for layer in [(true, false), (false, true)] {
