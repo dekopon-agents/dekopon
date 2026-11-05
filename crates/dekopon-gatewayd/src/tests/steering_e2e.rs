@@ -222,10 +222,10 @@ async fn a_photo_steer_is_acknowledged_and_offers_fetch_in_the_retried_turn() {
     assert_eq!(capability_listings(&mut observed), 1);
 }
 
-struct HeldReplyDriver {
-    recording: RecordingDriver,
-    entered: tokio::sync::Notify,
-    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+pub(super) struct HeldReplyDriver {
+    pub(super) recording: RecordingDriver,
+    pub(super) entered: tokio::sync::Notify,
+    pub(super) release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 #[async_trait]

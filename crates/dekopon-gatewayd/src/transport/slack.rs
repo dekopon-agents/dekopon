@@ -649,7 +649,14 @@ impl SlackTransport {
         };
         let forward = forward_attachment(message)?;
         let key = format!("{channel}:{ts}");
-        if !message["bot_id"].is_null() || self.late_forwards.get(&key)?.user != user {
+        let record = self.late_forwards.get(&key)?;
+        if !message["bot_id"].is_null() || record.user != user {
+            return None;
+        }
+        // A late forward skips the collector, so the message's combined files are bounded here as
+        // an on-time forward's would be.
+        if record.files + forward["files"].as_array().map_or(0, Vec::len) > MAX_ATTACHMENTS {
+            crate::collection::disposition(received, "input-limit");
             return None;
         }
         let late = self.late_forwards.take(&key)?;
@@ -2111,6 +2118,7 @@ struct SlackProjection {
 
 struct LateForward {
     user: String,
+    files: usize,
     subject: AttestedSubject,
     conversation: Conversation,
     reply: ReplyTarget,
@@ -2123,6 +2131,7 @@ impl LateForward {
     fn of(user: &str, message: &InboundMessage) -> Self {
         Self {
             user: user.to_owned(),
+            files: message.assets.len(),
             subject: message.subject.clone(),
             conversation: message.conversation.clone(),
             reply: message.reply.clone(),
@@ -2627,7 +2636,7 @@ mod driver_tests {
     use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::{
-        CANCEL_ACTION_ID, Conversation, ConversationKind, HISTORY_PAGE_LIMIT,
+        CANCEL_ACTION_ID, Conversation, ConversationKind, HISTORY_PAGE_LIMIT, MAX_ATTACHMENTS,
         MAX_INBOUND_TEXT_BYTES, MAX_TRACKED_REACTIONS, OnceLock, PROGRESS_MAX_CHARS,
         SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked, decode_slack_text,
         past_message,
@@ -4333,6 +4342,98 @@ mod driver_tests {
         assert_eq!(merged.text.matches("[quoted Slack forward").count(), 1);
         assert!(merged.text.contains("a quoted answer"));
         assert_eq!(merged.assets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_late_forward_with_more_files_than_a_message_may_carry_is_refused_as_input_limit() {
+        let capture = CaptureLayer::workspace();
+        let _subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        request(accepted(&mut transport, &bare_forward()).await);
+        let files = Value::Array(
+            (0..=MAX_ATTACHMENTS)
+                .map(|index| {
+                    let mut file = photo()[0].clone();
+                    file["id"] = json!(format!("F{index}"));
+                    file
+                })
+                .collect(),
+        );
+
+        assert!(
+            accepted(
+                &mut transport,
+                &unfurled_later(message_unfurl(json!("a quoted answer"), files))
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            capture
+                .records()
+                .iter()
+                .any(|record| record.field("outcome") == Some("input-limit"))
+        );
+        late_forward(
+            accepted(
+                &mut transport,
+                &unfurled_later(message_unfurl(json!("a quoted answer"), photo())),
+            )
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_forward_whose_files_with_the_messages_exceed_the_limit_is_refused() {
+        let capture = CaptureLayer::workspace();
+        let _subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let files = |count: usize, prefix: &str| {
+            Value::Array(
+                (0..count)
+                    .map(|index| {
+                        let mut file = photo()[0].clone();
+                        file["id"] = json!(format!("{prefix}{index}"));
+                        file
+                    })
+                    .collect(),
+            )
+        };
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        let mut original = bare_forward();
+        original["files"] = files(3, "FTOP");
+        assert_eq!(
+            request(accepted(&mut transport, &original).await)
+                .assets
+                .len(),
+            3
+        );
+
+        assert!(
+            accepted(
+                &mut transport,
+                &unfurled_later(message_unfurl(json!("a quoted answer"), files(8, "FFWD")))
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            capture
+                .records()
+                .iter()
+                .any(|record| record.field("outcome") == Some("input-limit"))
+        );
+        let within = late_forward(
+            accepted(
+                &mut transport,
+                &unfurled_later(message_unfurl(json!("a quoted answer"), files(7, "FFWD"))),
+            )
+            .await,
+        );
+        assert_eq!(within.assets.len(), 7);
     }
 
     #[tokio::test]

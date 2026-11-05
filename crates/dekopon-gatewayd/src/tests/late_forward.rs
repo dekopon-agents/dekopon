@@ -243,7 +243,7 @@ async fn a_late_forward_arriving_during_the_final_call_is_dropped_without_anothe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_late_forward_after_its_turn_sealed_or_completed_is_refused() {
+async fn a_late_forward_after_its_turn_completed_is_refused() {
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
@@ -285,39 +285,51 @@ async fn a_late_forward_after_its_turn_sealed_or_completed_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_late_forward_for_a_sealed_turn_is_refused_while_the_next_turn_runs() {
+async fn a_late_forward_is_refused_once_its_turn_has_sealed_with_the_next_turn_queued() {
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
-    let models = InterruptibleModel::new([answer("answered"), answer("next done")]);
-    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
-    let driver = Arc::new(RecordingDriver::default());
+    let models = ModelScript::new([answer("answered"), answer("next done")]);
+    let runner = runner(broker, Arc::clone(&models), 1);
+    let (release, released) = tokio::sync::oneshot::channel();
+    let driver = Arc::new(steering_e2e::HeldReplyDriver {
+        recording: RecordingDriver::default(),
+        entered: tokio::sync::Notify::new(),
+        release: Mutex::new(Some(released)),
+    });
     let route = route(model_config());
+    let first = original("what is this?");
+    let late = late_for(&first);
     let held = tokio::spawn(
         run_session(
             Arc::clone(&runner),
             route.clone(),
-            other_sender("first request", "1700000000.000000"),
+            first,
             Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .with_current_subscriber(),
     );
-    models.wait_until_entered().await;
-    let first = original("what is this?");
-    let late = late_for(&first);
+    tokio::time::timeout(Duration::from_secs(10), driver.entered.notified())
+        .await
+        .expect("the sealed turn is delivering its answer");
     run_session(
         Arc::clone(&runner),
         route,
-        first,
+        other_sender("next request", "1700000000.000005"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
-    models.release();
-    finish(held).await;
 
     assert!(runner.gate.enrich(late).is_err());
-    assert_eq!(driver.replies(), ["answered", "next done"]);
-    assert_eq!(blocks(&models), 0);
+    release.send(()).expect("reply waiting");
+    finish(held).await;
+
+    assert_eq!(driver.recording.replies(), ["answered", "next done"]);
+    assert!(
+        (0..2)
+            .flat_map(|index| models.prompt(index))
+            .all(|(_, text)| !text.contains("[quoted Slack forward"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -435,40 +447,41 @@ async fn a_late_forward_is_refused_by_a_full_mailbox_which_keeps_its_requests() 
         run_session(
             Arc::clone(&runner),
             route.clone(),
-            first,
+            first.clone(),
             Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .with_current_subscriber(),
     );
     models.wait_until_entered().await;
     for index in 0..MAILBOX_CAPACITY {
-        let mut queued = other_sender("queued", &format!("1700000001.{index:06}"));
-        queued.subject = message("").subject;
-        let admitted =
+        let queued = other_sender("queued", &format!("1700000001.{index:06}"));
+        assert!(matches!(
             runner
                 .gate
-                .admit(&route, queued, crate::collection::Dispositions(Vec::new()));
-        assert!(matches!(admitted, crate::session::Admit::Steered(_)));
+                .admit(&route, queued, crate::collection::Dispositions(Vec::new())),
+            crate::session::Admit::Queued
+        ));
     }
 
     assert!(runner.gate.enrich(late).is_err());
-    let mut overflow = other_sender("one more", "1700000002.000000");
-    overflow.subject = message("").subject;
     assert!(matches!(
         runner.gate.admit(
             &route,
-            overflow,
+            other_sender("one more", "1700000002.000000"),
             crate::collection::Dispositions(Vec::new())
         ),
         crate::session::Admit::Full(..)
     ));
     runner.gate.cancel(&CancelRequest {
-        transport: "dev".to_owned(),
-        conversation_id: message("").conversation.key(),
-        subject: message("").subject.name().canonical().to_owned(),
+        transport: first.transport.clone(),
+        conversation_id: first.conversation.key(),
+        subject: other_sender("", "").subject.name().canonical().to_owned(),
         via: CancelVia::StopReply,
     });
+    models.release();
     finish(held).await;
+    assert_eq!(driver.replies(), ["answered"]);
+    assert_eq!(blocks(&models), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

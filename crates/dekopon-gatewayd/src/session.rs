@@ -447,7 +447,12 @@ struct Running {
     authorizing: usize,
     steers: VecDeque<Queued>,
     follow_ups: VecDeque<FollowUp>,
-    turn: VecDeque<String>,
+    turn: VecDeque<TurnId>,
+}
+
+struct TurnId {
+    id: String,
+    subject: dekopon_core::Subject,
 }
 
 pub(crate) enum Queued {
@@ -469,7 +474,7 @@ impl Queued {
     }
 }
 
-fn turn_ids(message: &InboundMessage) -> VecDeque<String> {
+fn turn_ids(message: &InboundMessage) -> VecDeque<TurnId> {
     let lead = match &message.message_id {
         MessageId::Native(id) => Some(id.clone()),
         MessageId::Github(_)
@@ -477,9 +482,13 @@ fn turn_ids(message: &InboundMessage) -> VecDeque<String> {
         | MessageId::Job { .. }
         | MessageId::Follow(_) => None,
     };
-    let mut ids: VecDeque<String> = lead
+    let mut ids: VecDeque<TurnId> = lead
         .into_iter()
         .chain(message.folded.iter().cloned())
+        .map(|id| TurnId {
+            id,
+            subject: message.subject.name().clone(),
+        })
         .collect();
     while ids.len() > MAILBOX_CAPACITY {
         ids.pop_front();
@@ -490,7 +499,10 @@ fn turn_ids(message: &InboundMessage) -> VecDeque<String> {
 impl Running {
     pub(crate) fn queue_request(&mut self, message: InboundMessage) {
         if let MessageId::Native(id) = &message.message_id {
-            self.turn.push_back(id.clone());
+            self.turn.push_back(TurnId {
+                id: id.clone(),
+                subject: message.subject.name().clone(),
+            });
             if self.turn.len() > MAILBOX_CAPACITY {
                 self.turn.pop_front();
             }
@@ -786,7 +798,9 @@ impl SessionGate {
     #[cfg(test)]
     pub(crate) fn turn_ids_for_test(&self, key: &AdmissionKey) -> Vec<String> {
         match self.in_flight.lock().get(key) {
-            Some(Holder::Session(running)) => running.turn.iter().cloned().collect(),
+            Some(Holder::Session(running)) => {
+                running.turn.iter().map(|turn| turn.id.clone()).collect()
+            }
             Some(Holder::Probe) | None => Vec::new(),
         }
     }
@@ -823,7 +837,7 @@ impl SessionGate {
         let depth = running.steers.len() + running.follow_ups.len() + running.authorizing;
         if running.cancellation.state.load(Ordering::Acquire) != SESSION_RUNNING
             || depth >= MAILBOX_CAPACITY
-            || !running.turn.contains(&id)
+            || !running.turn.iter().any(|turn| turn.id == id)
         {
             return Err(late);
         }
@@ -900,6 +914,9 @@ impl SessionGate {
             }
             keep
         });
+        running
+            .turn
+            .retain(|turn| turn.subject.canonical() != request.subject);
         let dropped = before != running.steers.len() + running.follow_ups.len();
         let outcome = if running.subject.canonical() != request.subject {
             CancelOutcome::OtherSubject

@@ -75,7 +75,6 @@ impl InboundMessage {
         let control = bound_inbound(&format!("{}\n{}", self.control_text(), late.control_text()));
         self.text = bound_inbound(&format!("{}\n{}", self.text, late.text));
         self.control_text = Some(control);
-        self.asset_overflow |= late.asset_overflow;
         self.assets.extend(late.assets);
     }
 
