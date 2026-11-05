@@ -440,6 +440,7 @@ fn liveness_with(stream: bool, keep_alive: KeepAlive) -> Arc<ResolvedLiveness> {
         },
         keep_alive,
         templates: templates(),
+        strangers: crate::config::StrangerReply::default(),
     })
 }
 

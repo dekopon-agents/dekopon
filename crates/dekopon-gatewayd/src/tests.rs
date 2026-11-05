@@ -6959,7 +6959,7 @@ async fn a_session_delivers_the_model_answer() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn every_unmapped_refusal_notifies_the_owner_even_when_replies_are_limited() {
+async fn every_unmapped_refusal_is_logged_even_when_replies_are_limited() {
     let (capture, _guard) = capture_spans();
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
@@ -7008,7 +7008,7 @@ async fn every_unmapped_refusal_notifies_the_owner_even_when_replies_are_limited
     assert!(observed.try_recv().is_err());
     assert_eq!(
         driver.replies(),
-        ["I only talk to the Lange family. I've let my owner know you stopped by."]
+        ["I only answer people my operator has let in. You're not on the list, so I'll pass."]
     );
     assert_eq!(models.requests(), 0);
     let notices = capture.events_where(
@@ -7036,6 +7036,132 @@ async fn every_unmapped_refusal_notifies_the_owner_even_when_replies_are_limited
         assert_eq!(notice.field("subject"), Some(expected.as_str()));
         assert!(!format!("{notice:?}").contains("private stranger message"));
     }
+}
+
+fn stranger_route(
+    transport: serde_json::Value,
+    conversation: serde_json::Value,
+) -> crate::routes::BoundRoute {
+    let mut document = document(Path::new("/tmp"));
+    document["transports"][0]["indicators"] = serde_json::json!({
+        "strangers": transport,
+        "conversations": { "directMessage": { "strangers": conversation } },
+    });
+    let config =
+        serde_json::from_value::<crate::GatewaydConfig>(document).expect("fixture decodes");
+    let resolved = config::resolve(
+        config,
+        PathBuf::from("/tmp/dekopon-gatewayd.json"),
+        &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/1000")), None),
+        501,
+        crate::config::LoadMode::Boot,
+    )
+    .expect("stranger settings resolve");
+    let mut bound = route(model_config());
+    bound.indicators.clone_from(&resolved.routes[0].indicators);
+    bound
+}
+
+async fn stranger_replies(routes: Vec<crate::routes::BoundRoute>) -> (Vec<String>, usize) {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let refusals = routes
+        .iter()
+        .map(|_| {
+            ResponseEnvelope::session_refused(
+                &dekopon_broker_protocol::SessionRefusal::UnmappedSubject,
+            )
+        })
+        .collect();
+    let (broker, _observed) = stub_broker(directory.path(), refusals).await;
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, ModelScript::forbidden(), 4);
+    for route in routes {
+        run_session(
+            Arc::clone(&runner),
+            route,
+            message("hello"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+        tokio::time::advance(Duration::from_millis(600)).await;
+    }
+    let rejections = capture
+        .events_where(
+            "dekopon_gatewayd",
+            &[("audit.event", "gateway.session.rejected")],
+        )
+        .len();
+    (driver.replies(), rejections)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_stranger_setting_sends_nothing_but_still_logs_the_rejection() {
+    let silent = stranger_route(serde_json::json!("silent"), serde_json::Value::Null);
+
+    let (replies, rejections) = stranger_replies(vec![silent]).await;
+
+    assert!(replies.is_empty(), "{replies:?}");
+    assert_eq!(rejections, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stranger_reply_override_is_sent_instead_of_the_default() {
+    let members = stranger_route(
+        serde_json::json!({ "reply": "Members only." }),
+        serde_json::Value::Null,
+    );
+
+    let (replies, _) = stranger_replies(vec![members]).await;
+
+    assert_eq!(replies, ["Members only."]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_omitted_stranger_setting_sends_the_default_refusal() {
+    let omitted = stranger_route(serde_json::Value::Null, serde_json::Value::Null);
+
+    let (replies, _) = stranger_replies(vec![omitted]).await;
+
+    assert_eq!(replies, [crate::session::DEFAULT_STRANGER_REPLY]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_per_conversation_stranger_setting_wins_over_the_transport_setting() {
+    let silenced = stranger_route(
+        serde_json::json!({ "reply": "Members only." }),
+        serde_json::json!("silent"),
+    );
+    let answered = stranger_route(
+        serde_json::json!("silent"),
+        serde_json::json!({ "reply": "Direct messages get this." }),
+    );
+
+    let (replies, _) = stranger_replies(vec![silenced]).await;
+    assert!(replies.is_empty(), "{replies:?}");
+    let (replies, _) = stranger_replies(vec![answered]).await;
+    assert_eq!(replies, ["Direct messages get this."]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_rejection_spends_the_stranger_reply_slot_like_a_replying_one() {
+    let silent = stranger_route(serde_json::json!("silent"), serde_json::Value::Null);
+    let replying = |text: &str| {
+        stranger_route(
+            serde_json::json!({ "reply": text }),
+            serde_json::Value::Null,
+        )
+    };
+
+    let (replies, rejections) =
+        stranger_replies(vec![silent, replying("Held."), replying("Sent.")]).await;
+
+    assert_eq!(rejections, 3);
+    assert_eq!(
+        replies,
+        ["Sent."],
+        "the reply 0.6 s after the silent rejection is held; the one 1.2 s after it is sent"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -7073,7 +7199,7 @@ async fn a_stranger_notice_never_caches_the_subjects_mapping() {
     }
     assert_eq!(
         driver.replies(),
-        [crate::session::UNMAPPED_REPLY, "Welcome."]
+        [crate::session::DEFAULT_STRANGER_REPLY, "Welcome."]
     );
     assert_eq!(models.requests(), 1);
     assert!(observed.try_recv().is_err());
@@ -7103,7 +7229,7 @@ async fn a_mapped_agent_denial_names_the_principal_without_an_owner_notice() {
     .await;
     assert_eq!(
         driver.replies(),
-        ["Sorry simon, you don't have permission for this agent."]
+        ["You don't have access to this agent. Rules are rules, and I don't write them."]
     );
     assert_eq!(models.requests(), 0);
     assert!(matches!(
@@ -7165,7 +7291,7 @@ async fn a_mapped_empty_grant_gets_a_named_reply_without_an_owner_notice() {
     .await;
     assert_eq!(
         driver.replies(),
-        ["Sorry simon, you don't have permission for this agent."]
+        ["You don't have access to this agent. Rules are rules, and I don't write them."]
     );
     assert_eq!(models.requests(), 0);
     assert!(matches!(
@@ -9316,7 +9442,21 @@ async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport(
 const NO_STOP_WORDS: &[String] = &[];
 
 async fn idle_routing_loop(directory: &Path) -> (Arc<SessionRunner>, Arc<RoutingTable>) {
-    let document = document(directory);
+    idle_routing_loop_from(directory, document(directory)).await
+}
+
+const HALTED: &str = "Halted. Anything I already did was not undone.";
+
+async fn halting_routing_loop(directory: &Path) -> (Arc<SessionRunner>, Arc<RoutingTable>) {
+    let mut document = document(directory);
+    document["transports"][0]["indicators"] = json!({ "templates": { "stopped": HALTED } });
+    idle_routing_loop_from(directory, document).await
+}
+
+async fn idle_routing_loop_from(
+    directory: &Path,
+    document: serde_json::Value,
+) -> (Arc<SessionRunner>, Arc<RoutingTable>) {
     let config = resolved(directory, &document).await;
     let routes = Arc::new(
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
@@ -16435,7 +16575,7 @@ async fn an_unsupported_whatsapp_message_gets_one_refusal_only_when_routed() {
                 driver.replies(),
                 if routed {
                     vec![
-                        "I can only read text, PDF documents, and PNG or JPEG images. Please send your message in one of those forms."
+                        "I read text, PDFs, and PNG or JPEG images. That wasn't one of them, so please resend it in one of those."
                             .to_owned(),
                     ]
                 } else {
@@ -16726,7 +16866,7 @@ async fn photo_burst_serve_flushes_after_quiet_interval_with_one_lead_reply() {
 #[tokio::test(flavor = "multi_thread")]
 async fn photo_burst_dispatch_stop_disposes_owned_pending_input_without_starting_a_session() {
     let directory = temporary();
-    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let (runner, routes) = halting_routing_loop(directory.path()).await;
     let driver = Arc::new(RecordingDriver::default());
     let drivers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
     let mut dispatcher = Dispatcher::new(&runner, &routes)
@@ -16743,7 +16883,7 @@ async fn photo_burst_dispatch_stop_disposes_owned_pending_input_without_starting
     while let Some(result) = dispatcher.sessions.join_next().await {
         result.unwrap();
     }
-    assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
+    assert_eq!(driver.replies(), [HALTED]);
     assert!(
         dispatcher
             .collector
@@ -20833,7 +20973,7 @@ async fn an_agent_over_its_budget_replies_with_the_refusal_sentence() {
     assert!(
         replies[0].starts_with("This message needs about")
             && replies[0].ends_with(
-                "more than my whole 10-token budget (5-hour rolling window). It can't run as is."
+                "more than my whole 10-token budget (5-hour rolling window). Too big to run; try a smaller ask."
             ),
         "{replies:?}"
     );

@@ -3185,6 +3185,7 @@ mod driver_tests {
             },
             keep_alive: KeepAlive::default(),
             templates,
+            strangers: crate::config::StrangerReply::default(),
         });
         let target = LivenessTarget::Slack {
             channel_id: CHANNEL.to_owned(),

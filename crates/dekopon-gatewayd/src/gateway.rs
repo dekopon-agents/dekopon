@@ -618,6 +618,14 @@ impl Gateway {
                 &generation.stop_words,
             )
         {
+            let stop_reply = generation
+                .routes
+                .route(&message)
+                .and_then(|route| route.indicators.get(&message.conversation.kind))
+                .map_or(session::STOPPED_REPLY, |resolved| {
+                    resolved.templates.stopped()
+                })
+                .to_owned();
             let mut banished = false;
             if let Some(route) = generation.routes.route(&message)
                 && route.follow
@@ -665,7 +673,7 @@ impl Gateway {
                     sessions.spawn(
                         async move {
                             let _reply = reply;
-                            session::answer(&driver, &message, session::STOPPED_REPLY).await;
+                            session::answer(&driver, &message, &stop_reply).await;
                         }
                         .instrument(receipt),
                     );
@@ -701,7 +709,7 @@ impl Gateway {
                     sessions.spawn(
                         async move {
                             let _reply = reply;
-                            session::answer(&driver, &message, session::STOPPED_REPLY).await;
+                            session::answer(&driver, &message, &stop_reply).await;
                         }
                         .instrument(receipt),
                     );
@@ -826,11 +834,11 @@ impl Gateway {
                     sessions.spawn(async move {
                     let _permit = permit;
                     let reply = match reason {
-                        "collection-full" => "Busy collecting other requests. Please try again shortly.",
-                        "incompatible-group" => "Another media group is still being collected. Please retry this group separately.",
-                        "deadline-overflow" => "Input refused: the configured media collection deadline cannot be represented.",
-                        "unsupported-message" => "I can only read text, PDF documents, and PNG or JPEG images. Please send your message in one of those forms.",
-                        _ => "Input refused: too many attachments or messages, or too much text. Please send a smaller request.",
+                        "collection-full" => "Still sorting through other messages. Try again in a moment.",
+                        "incompatible-group" => "I'm still collecting another batch of files. Send this batch again on its own.",
+                        "deadline-overflow" => "I can't take that right now: a setting on my side is broken. Not your fault.",
+                        "unsupported-message" => "I read text, PDFs, and PNG or JPEG images. That wasn't one of them, so please resend it in one of those.",
+                        _ => "That's more than I can take in one go: too many files or messages, or too much text. Send a smaller piece.",
                     };
                     session::answer(&driver, &message, reply).await;
                 }.instrument(receipt));

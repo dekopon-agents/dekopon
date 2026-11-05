@@ -471,7 +471,7 @@ fn ask(socket: &Path, subject: &str, text: &str) -> String {
 fn ask_when_idle(socket: &Path, subject: &str, text: &str) -> String {
     for _ in 0..3_000 {
         let reply = ask(socket, subject, text);
-        if reply != "I'm busy — try again shortly." {
+        if reply != "Hands full with another request. Try me again in a moment." {
             return reply;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -1338,7 +1338,7 @@ async fn an_unmapped_subject_is_refused_before_a_model_is_ever_asked() {
         .expect("the request completes");
     assert_eq!(
         reply,
-        "I only talk to the Lange family. I've let my owner know you stopped by."
+        "I only answer people my operator has let in. You're not on the list, so I'll pass."
     );
     assert_eq!(
         fixture.model_requests.load(Ordering::SeqCst),
@@ -1860,7 +1860,7 @@ async fn a_stop_word_cancels_the_session_running_in_that_conversation() {
             .last()
             .and_then(|line| line["reply"].as_str())
             .expect("the answer carries text"),
-        "Stopped.",
+        "Stopped. Anything I already did was not undone.",
         "the policy is the only terminal writer on a cancel: {lines:?}"
     );
     assert_eq!(

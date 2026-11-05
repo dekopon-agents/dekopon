@@ -1264,7 +1264,7 @@ pub(super) fn owned_by(subject_text: &str) -> JobOwner {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_word_with_only_jobs_replies_stopped_and_cancels_only_its_owner() {
     let directory = temporary();
-    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let (runner, routes) = halting_routing_loop(directory.path()).await;
     let inbound = message("stop");
     let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
     let (run, signal) = runner
@@ -1285,7 +1285,7 @@ async fn a_stop_word_with_only_jobs_replies_stopped_and_cancels_only_its_owner()
     dispatcher.dispatch(&["stop".to_owned()], inbound);
     assert!(signal.is_cancelled());
     while dispatcher.sessions.join_next().await.is_some() {}
-    assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
+    assert_eq!(driver.replies(), [HALTED]);
     assert!(matches!(
         runner.jobs.list(&owned_by("b"))[0].state,
         JobState::Running { .. }
