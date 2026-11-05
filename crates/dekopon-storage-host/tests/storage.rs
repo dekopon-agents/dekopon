@@ -2467,3 +2467,38 @@ fn an_interrupted_layout_upgrade_temporary_is_removed_by_the_writer_only() {
         fs::remove_file(root.join(&name)).expect("cleanup");
     }
 }
+
+#[test]
+fn moving_the_current_pointer_out_while_stopped_resets_one_paranoid_conversation() {
+    let (temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    let grant = |invocation: &str, access| {
+        memory_request(
+            invocation,
+            access,
+            paranoid(
+                b"surface",
+                LegacyContinuity::Unproven(ContinuityCheck::Absent),
+                UnprovenDisposition::Refuse,
+            ),
+        )
+    };
+    append_turn(
+        &host,
+        grant("write", StorageAccess::ReadWrite),
+        br#"{"turn":1}"#,
+    );
+    drop(host);
+    let base = only_base(&root);
+    let retained = generations(&base);
+    fs::rename(base.join("current"), temporary.path().join("current.moved")).expect("move");
+
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("restart");
+    assert_eq!(
+        turn_bytes(&host, grant("read", StorageAccess::ReadOnly)).unwrap(),
+        0
+    );
+    let after = generations(&base);
+    assert!(retained.iter().all(|generation| after.contains(generation)));
+    assert_eq!(after.len(), retained.len() + 1);
+}

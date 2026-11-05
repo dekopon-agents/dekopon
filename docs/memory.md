@@ -2,7 +2,7 @@
 
 An agent remembers a conversation by replaying its transcript into the next prompt. Summaries are
 written before they are needed, and the replayed history changes as rarely as possible, so the
-provider's prompt cache keeps matching. None of it is authority. The keys are in
+provider's prompt cache keeps matching. The keys are in
 [`config/memory.rs`](../crates/dekopon-gatewayd/src/config/memory.rs) and the route's `memory:`
 block in [`config.rs`](../crates/dekopon-gatewayd/src/config.rs).
 
@@ -82,20 +82,19 @@ cross-agent or cross-conversation memory.
 
 ## Durable memory
 
-For memory that outlives retention, the broker can host a storage provider whose constraint sets
-carry the `chatMemoryRecord`, `chatMemoryRecent` and `chatMemorySearch` routes. When Cedar grants
-all three to the sender, the gateway records each turn after the chat service accepted the answer,
+For memory that outlives retention, the broker can host a storage provider on the three chat-memory
+routes. When Cedar grants all three to the sender, the gateway records each turn after the chat service accepted the answer,
 and the model may retrieve turns with `memory recent` and `memory search`; it can never reach the
 record route. Stored turns never enter a prompt on their own. Recording does not deduplicate, and
 there is no deletion, export or encryption at rest.
 
 `continuityPolicy: paranoid` gives a sender's durable memory a new generation when their effective
-authority changes; `relaxed` never does.
+authority changes, even between turns whose GitHub facts or trigger a request policy reads;
+`relaxed` never does.
 
 | `paranoid` [rotates](../crates/dekopon-broker/src/continuity.rs) on | Neither rotates on |
 |---|---|
-| capabilities, providers, storage access | limits, timeouts, artifact digests |
-| HTTP authority, CA bytes | binding names, map revision |
+| capabilities, providers, storage access, HTTP authority, CA bytes | limits, timeouts, artifact digests, binding names, map revision |
 | applicable request policy, secret references and sinks | inapplicable policy and labels |
 
 ## Memory never grants authority

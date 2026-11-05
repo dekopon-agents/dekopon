@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fmt, time::Duration};
 
 use dekopon_broker_host::BrokerHostLimits;
-use dekopon_capability::{ExecutionConstraints, SignedDownload};
+use dekopon_capability::{EffectKind, ExecutionConstraints, SignedDownload};
 use dekopon_core::SubjectKind;
 use dekopon_policy::{PolicyRequest, PolicyTarget, RequestOutcome};
 use dekopon_storage_host::{ContinuityCheck, LegacyContinuity, StorageLimits, UnprovenDisposition};
@@ -403,8 +403,7 @@ where
         let mut reaches_http = false;
         encoded.number("capabilityCount", effective.len() as u128);
         for (capability, set) in &effective {
-            encoded.text("capability", capability.as_str());
-            encoded.text("provider", set.provider.as_str());
+            encode_capability_identity(&mut encoded, capability, set);
             match self.effective_default_proposal(context.actor(), capability) {
                 Some(default) => {
                     encoded.byte("defaultSecret.present", 1);
@@ -568,6 +567,7 @@ where
                 RequestOutcome::Open {
                     permit_satisfied,
                     residuals,
+                    entities,
                 } => {
                     encoded.byte("requestOutcome", 1);
                     encoded.boolean("requestPermitSatisfied", permit_satisfied);
@@ -575,10 +575,32 @@ where
                     for residual in residuals {
                         encoded.text("requestResidual", &residual);
                     }
+                    encoded.number("requestEntityCount", entities.len() as u128);
+                    for entity in entities {
+                        encoded.text("requestEntity", &entity);
+                    }
                 }
             }
         }
     }
+}
+
+// Effect labels stay out of the fingerprint except where they grant authority: a probe turn admits
+// only read-only capabilities, whatever the current turn's trigger.
+pub(super) fn encode_capability_identity(
+    encoded: &mut AuthorityEncoder,
+    capability: &dekopon_core::CapabilityId,
+    set: &super::ConstraintSet,
+) {
+    encoded.text("capability", capability.as_str());
+    encoded.text("provider", set.provider.as_str());
+    encoded.boolean(
+        "probeAdmitted",
+        match set.effect {
+            EffectKind::ReadOnly => true,
+            EffectKind::LocalWrite | EffectKind::ExternalWrite => false,
+        },
+    );
 }
 
 fn encode_trust_anchors(encoded: &mut AuthorityEncoder, bundles: &[Vec<u8>]) {

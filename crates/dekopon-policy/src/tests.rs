@@ -2153,6 +2153,7 @@ fn a_request_outcome_keeps_request_predicates_and_drops_policies_that_cannot_app
     let RequestOutcome::Open {
         permit_satisfied,
         residuals,
+        ..
     } = outcome(&policies, RiskLevel::Low, session())
     else {
         panic!("an unsatisfied request fence leaves the outcome open");
@@ -2256,4 +2257,37 @@ fn routing_reads_are_found_however_the_context_is_reached() {
     ] {
         assert!(routing_dependent(fence).is_empty(), "{fence}");
     }
+}
+
+#[test]
+fn a_membership_a_residual_still_tests_changes_the_request_outcome() {
+    let policies = format!(
+        r#"{ALLOW}
+        @id("selected-fence") forbid(principal, action, resource)
+        when {{ context has request }}
+        when {{
+            (if context.request.method == "POST" then principal
+             else Dekopon::Principal::"direct-caller") in Dekopon::Group::"restricted"
+        }};
+    "#
+    );
+    let outcome_in = |world: PolicyWorld| {
+        PolicyEngine::new(&policies, &world)
+            .expect("valid selector fence")
+            .request_outcome(capability_request(
+                "cpetersen",
+                "cli-probe.upper",
+                session(),
+            ))
+    };
+    let outside = outcome_in(world().with_group_members([(
+        "someone".parse().expect("principal"),
+        "restricted".parse().expect("group"),
+    )]));
+    let inside = outcome_in(world().with_group_members([(
+        "cpetersen".parse().expect("principal"),
+        "restricted".parse().expect("group"),
+    )]));
+    assert!(matches!(outside, RequestOutcome::Open { .. }));
+    assert_ne!(outside, inside);
 }

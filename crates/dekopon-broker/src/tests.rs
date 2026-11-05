@@ -2529,6 +2529,7 @@ struct SurfaceBroker<'a> {
     storage_limits: dekopon_storage_host::StorageLimits,
     memory_config: ChatMemoryConfig,
     binding: super::SecretUseBinding,
+    groups: Vec<(&'a str, &'a str)>,
 }
 
 impl<'a> SurfaceBroker<'a> {
@@ -2577,7 +2578,13 @@ impl<'a> SurfaceBroker<'a> {
             storage_limits: dekopon_storage_host::StorageLimits::default(),
             memory_config: valid_memory_config(),
             binding: http_probe_binding(),
+            groups: Vec::new(),
         }
+    }
+
+    fn with_group_members(mut self, members: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        self.groups = members.into_iter().collect();
+        self
     }
 
     fn with_policy(mut self, policy: &str) -> Self {
@@ -2656,7 +2663,13 @@ impl<'a> SurfaceBroker<'a> {
                 .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
         )
         .expect("world")
-        .with_secrets([SECRET_DRN.parse().expect("secret")]);
+        .with_secrets([SECRET_DRN.parse().expect("secret")])
+        .with_group_members(self.groups.iter().map(|(principal, group)| {
+            (
+                principal.parse().expect("principal"),
+                group.parse().expect("group"),
+            )
+        }));
         let mut broker = Broker::new(
             registry,
             "broker".parse().expect("principal"),
@@ -4095,6 +4108,14 @@ fn memory_handle(
     broker: &Broker<InMemoryAuditLog>,
     capability: &str,
 ) -> Result<dekopon_storage_host::StorageHandle, super::BrokerError> {
+    memory_handle_in(broker, &member_context(), capability)
+}
+
+fn memory_handle_in(
+    broker: &Broker<InMemoryAuditLog>,
+    context: &AuthenticatedContext,
+    capability: &str,
+) -> Result<dekopon_storage_host::StorageHandle, super::BrokerError> {
     let request = dekopon_broker_protocol::InvocationRequest {
         capability: capability.parse().expect("capability"),
         ..invocation_with_input(serde_json::json!({}))
@@ -4105,7 +4126,7 @@ fn memory_handle(
         .expect("constrained")
         .clone();
     let grant = broker
-        .prepare_storage_grant(&member_context(), &request, &set)?
+        .prepare_storage_grant(context, &request, &set)?
         .expect("a memory route prepares a grant")
         .materialize()
         .map_err(|source| super::BrokerError::Storage { source })?;
@@ -4133,7 +4154,6 @@ fn remember(broker: &Broker<InMemoryAuditLog>, line: &[u8]) {
     handle.commit().expect("commit");
 }
 
-// The request the released broker built for a memory grant: v1 surface, authority-bound pointer.
 fn remember_as_released_broker(broker: &Broker<InMemoryAuditLog>, line: &[u8]) {
     let context = member_context();
     let capability: CapabilityId = "memory.chat.record".parse().expect("capability");
@@ -4690,4 +4710,103 @@ fn continuity_configuration_refuses_old_spellings_and_malformed_migrations() {
     disposition
         .validate(&dekopon_storage_host::StorageLimits::default())
         .expect("valid");
+}
+
+#[test]
+fn probe_admission_is_the_only_effect_authority_in_the_paranoid_fingerprint() {
+    let encode = |effect| {
+        let mut encoded = AuthorityEncoder::new();
+        super::continuity::encode_capability_identity(
+            &mut encoded,
+            &"cli-probe.upper".parse().expect("capability"),
+            &ConstraintSet {
+                effect,
+                ..cli_probe_set(
+                    dekopon_capability::EffectKind::ReadOnly,
+                    dekopon_core::RiskLevel::Low,
+                )
+            },
+        );
+        encoded.finish()
+    };
+    use dekopon_capability::EffectKind;
+    assert_ne!(
+        encode(EffectKind::ReadOnly),
+        encode(EffectKind::ExternalWrite)
+    );
+    assert_eq!(
+        encode(EffectKind::LocalWrite),
+        encode(EffectKind::ExternalWrite)
+    );
+}
+
+#[tokio::test]
+async fn a_membership_a_request_selector_tests_rotates_paranoid_memory() {
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let permitted = [memory_policy().as_slice(), &fetch].concat();
+    let fenced = |index: usize, member: &'static str, other: &'static str| {
+        SurfaceBroker::new(dirs[index].path(), &permitted)
+            .with_memory()
+            .with_identities([(MEMBER, "maintainer")])
+            .with_group_members([(member, "restricted"), (other, "elsewhere")])
+            .with_policy(
+                r#"@id("selected-fence") forbid(principal, action, resource)
+                when { context has request }
+                when {
+                    (if context.request.method == "POST" then principal
+                     else Dekopon::Principal::"someone") in Dekopon::Group::"restricted"
+                };"#,
+            )
+    };
+    let outside = paranoid_surface(&fenced(0, "someone", "maintainer").build().await);
+    let inside = paranoid_surface(&fenced(1, "maintainer", "someone").build().await);
+    assert_ne!(outside, inside);
+}
+
+#[tokio::test]
+async fn turns_that_alternate_a_fact_a_request_policy_reads_never_reuse_a_generation() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let permitted = [memory_policy().as_slice(), &fetch].concat();
+    let broker = SurfaceBroker::new(root.path(), &permitted)
+        .with_memory()
+        .with_identities([(MEMBER, "maintainer")])
+        .with_policy(
+            r#"@id("wake-fence") forbid(principal, action, resource)
+            when { context has request }
+            when { context.trigger == "wake" && context.request.method == "POST" };"#,
+        )
+        .build()
+        .await;
+    let message = member_context();
+    let wake = attested_agent_context(
+        MEMBER,
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Wake,
+        ),
+    );
+    let bytes = |context: &AuthenticatedContext| {
+        let mut handle =
+            memory_handle_in(&broker, context, "memory.chat.recent").expect("read grant");
+        let size = handle.jsonl_size("turns.jsonl").unwrap_or(0);
+        handle.finish_read().expect("finish read");
+        size
+    };
+    let mut writer = memory_handle_in(&broker, &message, "memory.chat.record").expect("record");
+    writer
+        .jsonl_append("turns.jsonl", 0, br#"{"turn":"message"}"#)
+        .expect("append");
+    writer.commit().expect("commit");
+    assert_eq!(bytes(&message), 19);
+    assert_eq!(bytes(&wake), 0, "the wake turn's request authority differs");
+    assert_eq!(
+        bytes(&message),
+        0,
+        "returning never reopens the earlier generation"
+    );
 }

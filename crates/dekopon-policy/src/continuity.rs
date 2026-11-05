@@ -1,6 +1,8 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, str::FromStr as _};
 
-use cedar_policy::{Effect, PartialResponse, Policy, PolicySet};
+use cedar_policy::{
+    Effect, Entities, EntityId, EntityTypeName, EntityUid, PartialResponse, PolicySet,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequestOutcome {
@@ -8,11 +10,12 @@ pub enum RequestOutcome {
     Open {
         permit_satisfied: bool,
         residuals: BTreeSet<String>,
+        entities: BTreeSet<String>,
     },
 }
 
 impl RequestOutcome {
-    pub(crate) fn from_partial(response: &PartialResponse) -> Self {
+    pub(crate) fn from_partial(response: &PartialResponse, store: &Entities) -> Self {
         // Dekopon denies on any evaluation error, so an errored policy must never read as false.
         if response.definitely_errored().next().is_some() {
             return Self::Denied;
@@ -24,25 +27,103 @@ impl RequestOutcome {
                 Effect::Permit => permit_satisfied = true,
             }
         }
+        let mut residuals = BTreeSet::new();
+        let mut referenced = Some(BTreeSet::new());
+        for residual in response.nontrivial_residuals() {
+            match residual.to_json() {
+                Ok(mut json) => {
+                    if let (Some(found), Some(fields)) = (referenced.as_mut(), json.as_object_mut())
+                    {
+                        fields.remove("annotations");
+                        entity_literals(&serde_json::Value::Object(fields.clone()), found);
+                    }
+                    residuals.insert(json.to_string());
+                }
+                Err(_) => {
+                    referenced = None;
+                    residuals.insert(residual.to_string());
+                }
+            }
+        }
+        // A residual still tests entity facts the request decides between (both branches of a
+        // request-dependent selector), so their attributes and ancestry are part of its meaning.
+        let entities = match referenced {
+            Some(uids) => uids.iter().map(|uid| entity_facts(store, uid)).collect(),
+            None => store
+                .iter()
+                .map(|entity| entity_facts(store, &entity.uid()))
+                .collect(),
+        };
         Self::Open {
             permit_satisfied,
-            residuals: response
-                .nontrivial_residuals()
-                .map(|residual| canonical_residual(&residual))
-                .collect(),
+            residuals,
+            entities,
         }
     }
 }
 
-fn canonical_residual(residual: &Policy) -> String {
-    match residual.to_json() {
-        Ok(mut json) => {
-            if let Some(fields) = json.as_object_mut() {
-                fields.remove("annotations");
+fn entity_literals(value: &serde_json::Value, found: &mut BTreeSet<EntityUid>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if let Some(entity) = fields.get("__entity")
+                && let (Some(kind), Some(id)) = (
+                    entity.get("type").and_then(serde_json::Value::as_str),
+                    entity.get("id").and_then(serde_json::Value::as_str),
+                )
+                && let Ok(kind) = EntityTypeName::from_str(kind)
+            {
+                found.insert(EntityUid::from_type_name_and_id(kind, EntityId::new(id)));
             }
-            json.to_string()
+            for nested in fields.values() {
+                entity_literals(nested, found);
+            }
         }
-        Err(_) => residual.to_string(),
+        serde_json::Value::Array(values) => {
+            for nested in values {
+                entity_literals(nested, found);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn entity_facts(store: &Entities, uid: &EntityUid) -> String {
+    let attributes = store
+        .get(uid)
+        .and_then(|entity| entity.to_json_value().ok())
+        .map(|json| sorted_json(&json["attrs"]).to_string())
+        .unwrap_or_default();
+    let mut ancestors = store
+        .ancestors(uid)
+        .into_iter()
+        .flatten()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    ancestors.sort();
+    format!("{uid}\0{attributes}\0{}", ancestors.join("\0"))
+}
+
+fn sorted_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut keys = fields.keys().collect::<Vec<_>>();
+            keys.sort();
+            serde_json::Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), sorted_json(&fields[key])))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(sorted_json).collect())
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => value.clone(),
     }
 }
 

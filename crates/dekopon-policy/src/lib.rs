@@ -738,6 +738,7 @@ impl PolicyEngine {
                 &self
                     .authorizer
                     .is_authorized_partial(&request, &self.policies, &self.entities),
+                &self.entities,
             ),
             Err(_) => RequestOutcome::Denied,
         }
