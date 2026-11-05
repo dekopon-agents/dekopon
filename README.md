@@ -4,7 +4,7 @@ Dekopon runs AI agents on hardware you own and lets them act on real systems wit
 keys. An agent answers in Slack, Discord, Telegram or WhatsApp, writes short bash-like scripts, and
 reaches GitHub or any HTTP API through WebAssembly providers. A separate broker decides, for the
 person asking, what each command may do, and only the broker holds credentials. A prompt injection
-can still steer the model, but it reaches only what the broker allows the person who asked.
+can still steer the model, but reaches only what the broker allows the person who asked.
 
 Install on [Kubernetes](docs/deploy.md#kubernetes), the preferred deployment, or [on a
 Mac](docs/deploy.md#mac) if you are moving from OpenClaw or Hermes.
