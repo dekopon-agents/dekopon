@@ -295,54 +295,6 @@ async fn only_a_keyed_unaddressed_human_channel_pr_link_is_admitted() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_ambient_pr_link_gains_no_forward_from_a_late_unfurl() {
-    let fixture = SlackFollowFixture::with_pull_request_links(true).await;
-    let mut unfurled = channel_message("u9xyz", "1700000000.000001", None, PR);
-    unfurled["attachments"] = json!([{
-        "is_msg_unfurl": true,
-        "from_url": "https://example.slack.com/archives/CORIGINAL/p1700000000000100",
-        "author_id": "UORIGINAL", "channel_id": "CORIGINAL", "ts": "1700000000.000100",
-        "text": "a quoted answer",
-    }]);
-    let late = json!({
-        "type": "message", "subtype": "message_changed",
-        "channel": unfurled["channel"].clone(), "channel_type": "channel",
-        "ts": "1700000000.000009", "message": unfurled,
-    });
-    let socket = spawn_socket_mock(vec![
-        events_envelope(
-            "ambient",
-            channel_message("u9xyz", "1700000000.000001", None, PR),
-        ),
-        events_envelope("unfurl", late),
-        events_envelope(
-            "mention",
-            channel_message(
-                "u9xyz",
-                "1700000000.000002",
-                None,
-                &format!("<@{BOT_USER}> {PR}"),
-            ),
-        ),
-    ]);
-    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
-    let mut transport = slack_with(
-        &http.base,
-        SlackExperience::Agent,
-        LivenessConfig::default(),
-    )
-    .with_generation(fixture.generation.clone());
-    transport.connect().await.unwrap();
-    let ambient = next_message(&mut transport).await;
-    assert!(ambient.pull_request_links.is_some());
-    let next = next_message(&mut transport).await;
-    assert_eq!(
-        next.message_id,
-        MessageId::Native("1700000000.000002".into())
-    );
-}
-
 #[tokio::test]
 async fn a_pr_link_starts_one_poster_authorized_threaded_turn_and_opens_the_follow_ticket() {
     for mapped in [false, true] {

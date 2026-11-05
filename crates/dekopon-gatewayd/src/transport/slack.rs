@@ -53,7 +53,6 @@ const CANCEL_ACTION_ID: &str = "dekopon-cancel";
 const MAX_TRACKED_REACTIONS: usize = 256;
 const MAX_TRACKED_CHANNEL_KINDS: usize = 512;
 const HISTORY_PAGE_LIMIT: usize = 200;
-const LATE_FORWARD_CAPACITY: usize = 256;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -69,7 +68,6 @@ pub(crate) struct SlackTransport {
     seen: SeenIds,
     channel_kinds: Tracked<SlackChannelKind>,
     pending: VecDeque<TransportEvent>,
-    late_forwards: Tracked<LateForward>,
     experience: SlackExperience,
     deadline: Duration,
     thread_ownership: Arc<SlackThreadOwnership>,
@@ -112,7 +110,6 @@ impl SlackTransport {
             seen: SeenIds::new(DEDUP_CAPACITY),
             channel_kinds: Tracked::new(MAX_TRACKED_CHANNEL_KINDS),
             pending: VecDeque::new(),
-            late_forwards: Tracked::new(LATE_FORWARD_CAPACITY),
             experience,
             deadline: LIVENESS_DEADLINE,
             thread_ownership,
@@ -460,9 +457,6 @@ impl SlackTransport {
         if !event["bot_id"].is_null() {
             return Ok(None);
         }
-        if event["subtype"].as_str() == Some("message_changed") {
-            return Ok(self.late_forward(event["channel"].as_str(), &event["message"], received));
-        }
         let Some(user) = event["user"].as_str() else {
             return Ok(None);
         };
@@ -493,7 +487,7 @@ impl SlackTransport {
         let explicitly_addressed = event["type"].as_str() == Some("app_mention")
             || self.identity.is_addressed(&bound_inbound(top_text));
         if !self.seen.insert(format!("{channel}:{ts}")) {
-            return Ok(self.late_forward(Some(channel), event, received));
+            return Ok(None);
         }
         let Some(posted_in) = self.channel_kind(channel, event, received).await else {
             return Ok(None);
@@ -581,38 +575,12 @@ impl SlackTransport {
         // button spelling it a second way would name no session at all.
         let conversation_id = conversation.key();
         let projection = project_message(event, event["text"].as_str().unwrap_or_default());
-        let liveness = LivenessTarget::Slack {
-            channel_id: channel.to_owned(),
-            thread_ts: root_ts,
-            message_ts: ts.to_owned(),
-            initiator_user_id: user.to_owned(),
-            conversation_id,
-        };
-        let subject = AttestedSubject::one(subject).map_err(TransportError::Subject)?;
-        let reply = ReplyTarget::Slack {
-            channel: channel.to_owned(),
-            thread_ts: reply_thread,
-        };
-        if !ambient && forward_attachment(event).is_none() {
-            self.late_forwards.insert(
-                format!("{channel}:{ts}"),
-                LateForward {
-                    user: user.to_owned(),
-                    subject: subject.clone(),
-                    conversation: conversation.clone(),
-                    reply: reply.clone(),
-                    liveness: liveness.clone(),
-                    addressed: explicitly_addressed,
-                    thread_continuation: thread_continuation.clone(),
-                },
-            );
-        }
 
         Ok(Some(InboundMessage {
             pull_request_links,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Slack,
-            subject,
+            subject: AttestedSubject::one(subject).map_err(TransportError::Subject)?,
             conversation,
             message_id: MessageId::Native(ts.to_owned()),
             text: projection.text,
@@ -620,8 +588,17 @@ impl SlackTransport {
             assets: projection.assets,
             addressed: Some(explicitly_addressed),
             thread_continuation,
-            reply,
-            liveness: Some(liveness),
+            reply: ReplyTarget::Slack {
+                channel: channel.to_owned(),
+                thread_ts: reply_thread,
+            },
+            liveness: Some(LivenessTarget::Slack {
+                channel_id: channel.to_owned(),
+                thread_ts: root_ts,
+                message_ts: ts.to_owned(),
+                initiator_user_id: user.to_owned(),
+                conversation_id,
+            }),
             receive_span: received.clone(),
             received_at: tokio::time::Instant::now(),
             native_group: None,
@@ -630,52 +607,6 @@ impl SlackTransport {
             asset_overflow: projection.asset_overflow,
             input_refusal: None,
         }))
-    }
-
-    fn late_forward(
-        &mut self,
-        channel: Option<&str>,
-        message: &Value,
-        received: &Span,
-    ) -> Option<InboundMessage> {
-        let (Some(channel), Some(ts), Some(user)) =
-            (channel, message["ts"].as_str(), message["user"].as_str())
-        else {
-            return None;
-        };
-        let forward = forward_attachment(message)?;
-        let key = format!("{channel}:{ts}");
-        if !message["bot_id"].is_null() || self.late_forwards.get(&key)?.user != user {
-            return None;
-        }
-        let late = self.late_forwards.take(&key)?;
-        let mut text = String::new();
-        let mut control = String::new();
-        let mut assets = Vec::new();
-        let file_count = quote_forward(forward, &mut text, &mut control, &mut assets);
-        record_conversation(received, &late.conversation);
-        Some(InboundMessage {
-            pull_request_links: None,
-            transport: self.name.clone(),
-            transport_kind: ChatTransportKind::Slack,
-            subject: late.subject,
-            conversation: late.conversation,
-            message_id: MessageId::Native(ts.to_owned()),
-            text: bound_inbound(text.trim_start_matches('\n')),
-            control_text: Some(bound_inbound(control.trim_start_matches('\n'))),
-            assets,
-            addressed: Some(late.addressed),
-            thread_continuation: late.thread_continuation,
-            reply: late.reply,
-            liveness: Some(late.liveness),
-            receive_span: received.clone(),
-            received_at: tokio::time::Instant::now(),
-            native_group: None,
-            constituents: Vec::new(),
-            folded: Vec::new(),
-            asset_overflow: file_count > MAX_ATTACHMENTS,
-            input_refusal: None,
-        })
     }
 
     async fn channel_kind(
@@ -2085,87 +2016,68 @@ struct SlackProjection {
     asset_overflow: bool,
 }
 
-struct LateForward {
-    user: String,
-    subject: AttestedSubject,
-    conversation: Conversation,
-    reply: ReplyTarget,
-    liveness: LivenessTarget,
-    addressed: bool,
-    thread_continuation: Option<ThreadContinuation>,
-}
-
 fn project_message(message: &Value, raw: &str) -> SlackProjection {
     let mut text = decode_slack_text(raw);
     let mut control = raw.to_owned();
+    let top_files = message["files"].as_array();
     let mut assets = pending_assets(&message["files"]);
-    let mut file_count = message["files"].as_array().map_or(0, Vec::len);
-    if let Some(forward) = forward_attachment(message) {
-        file_count += quote_forward(forward, &mut text, &mut control, &mut assets);
+    let mut file_count = top_files.map_or(0, Vec::len);
+
+    if let Some(forward) = message["attachments"].as_array().and_then(|attachments| {
+        attachments.iter().find(|attachment| {
+            attachment["is_msg_unfurl"] == true
+                && (attachment["is_share"] == true
+                    || attachment["is_share"].is_null() && quotes_a_message(attachment))
+        })
+    }) {
+        let label = |value: Option<&str>| {
+            value.filter(|value| !value.is_empty()).map_or_else(
+                || "unavailable".to_owned(),
+                |value| json!(value).to_string(),
+            )
+        };
+        let author = label(forward["author_id"].as_str());
+        let channel = label(forward["channel_id"].as_str());
+        let time = label(forward["ts"].as_str().filter(|ts| canonical_timestamp(ts)));
+        let raw_quoted = forward["text"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty());
+        let quoted = raw_quoted.map(decode_slack_text).or_else(|| {
+            Some(forward_blocks(&forward["blocks"])).filter(|text| !text.trim().is_empty())
+        });
+        let nested_files = forward["files"].as_array();
+        file_count += nested_files.map_or(0, Vec::len);
+        let remaining = MAX_ATTACHMENTS.saturating_sub(assets.len());
+        let forwarded = pending_assets(&forward["files"]);
+        assets.extend(forwarded.into_iter().take(remaining));
+        let opening = format!(
+            "\n[quoted Slack forward — author: {author}; channel: {channel}; time: {time}]"
+        );
+        text.push_str(&opening);
+        control.push_str(&opening);
+        match quoted {
+            Some(quoted) => {
+                text.push('\n');
+                text.push_str(&quoted);
+                control.push('\n');
+                control.push_str(raw_quoted.unwrap_or(&quoted));
+            }
+            None if nested_files.is_none_or(Vec::is_empty) => {
+                text.push_str("\n[forwarded content unavailable]");
+                control.push_str("\n[forwarded content unavailable]");
+            }
+            None => {}
+        }
+        text.push_str("\n[/quoted Slack forward]");
+        control.push_str("\n[/quoted Slack forward]");
     }
+
     SlackProjection {
         text: bound_inbound(&text),
         control: bound_inbound(&control),
         assets,
         asset_overflow: file_count > MAX_ATTACHMENTS,
     }
-}
-
-fn forward_attachment(message: &Value) -> Option<&Value> {
-    message["attachments"].as_array().and_then(|attachments| {
-        attachments.iter().find(|attachment| {
-            attachment["is_msg_unfurl"] == true
-                && (attachment["is_share"] == true
-                    || attachment["is_share"].is_null() && quotes_a_message(attachment))
-        })
-    })
-}
-
-fn quote_forward(
-    forward: &Value,
-    text: &mut String,
-    control: &mut String,
-    assets: &mut Vec<PendingAsset>,
-) -> usize {
-    let label = |value: Option<&str>| {
-        value.filter(|value| !value.is_empty()).map_or_else(
-            || "unavailable".to_owned(),
-            |value| json!(value).to_string(),
-        )
-    };
-    let author = label(forward["author_id"].as_str());
-    let channel = label(forward["channel_id"].as_str());
-    let time = label(forward["ts"].as_str().filter(|ts| canonical_timestamp(ts)));
-    let raw_quoted = forward["text"]
-        .as_str()
-        .filter(|text| !text.trim().is_empty());
-    let quoted = raw_quoted.map(decode_slack_text).or_else(|| {
-        Some(forward_blocks(&forward["blocks"])).filter(|text| !text.trim().is_empty())
-    });
-    let nested_files = forward["files"].as_array();
-    let remaining = MAX_ATTACHMENTS.saturating_sub(assets.len());
-    let forwarded = pending_assets(&forward["files"]);
-    assets.extend(forwarded.into_iter().take(remaining));
-    let opening =
-        format!("\n[quoted Slack forward — author: {author}; channel: {channel}; time: {time}]");
-    text.push_str(&opening);
-    control.push_str(&opening);
-    match quoted {
-        Some(quoted) => {
-            text.push('\n');
-            text.push_str(&quoted);
-            control.push('\n');
-            control.push_str(raw_quoted.unwrap_or(&quoted));
-        }
-        None if nested_files.is_none_or(Vec::is_empty) => {
-            text.push_str("\n[forwarded content unavailable]");
-            control.push_str("\n[forwarded content unavailable]");
-        }
-        None => {}
-    }
-    text.push_str("\n[/quoted Slack forward]");
-    control.push_str("\n[/quoted Slack forward]");
-    nested_files.map_or(0, Vec::len)
 }
 
 fn record_attachment_shape(event: &Value, received: &Span) {
@@ -4205,109 +4117,6 @@ mod driver_tests {
                 assert!(!spans.contains(value), "{value} leaked into {spans}");
             }
         }
-    }
-
-    const PERMALINK: &str =
-        "<https://example.slack.com/archives/CORIGINAL/p1700000000000100> what is this?";
-
-    fn bare_forward() -> Value {
-        json!({
-            "type": "message", "channel": DIRECT_CHANNEL, "channel_type": "im",
-            "user": USER, "ts": INBOUND_TS, "text": PERMALINK,
-        })
-    }
-
-    async fn routed(
-        transport: &mut SlackTransport,
-        event: &Value,
-    ) -> Option<super::InboundMessage> {
-        transport
-            .routable(TEAM, event, &Span::none())
-            .await
-            .expect("readable")
-    }
-
-    #[tokio::test]
-    async fn a_forward_unfurl_that_arrives_after_its_message_is_routed_once_for_that_message() {
-        let mut redelivered = bare_forward();
-        redelivered["attachments"] = json!([message_unfurl(json!("a quoted answer"), photo())]);
-        for late in [
-            unfurled_later(message_unfurl(json!("a quoted answer"), photo())),
-            redelivered,
-        ] {
-            let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
-            let original = routed(&mut transport, &bare_forward())
-                .await
-                .expect("the permalink message is a request");
-            assert!(!original.text.contains("[quoted Slack forward"));
-            assert!(original.assets.is_empty());
-
-            let forward = routed(&mut transport, &late)
-                .await
-                .expect("the late unfurl reaches the model");
-
-            assert_eq!(forward.message_id, original.message_id);
-            assert_eq!(forward.subject, original.subject);
-            assert_eq!(forward.conversation, original.conversation);
-            assert_eq!(forward.reply, original.reply);
-            assert_eq!(forward.liveness, original.liveness);
-            assert_eq!(
-                forward.text,
-                "[quoted Slack forward — author: \"UORIGINAL\"; channel: \"CORIGINAL\"; time: \"1700000000.000100\"]\na quoted answer\n[/quoted Slack forward]"
-            );
-            assert_eq!(forward.assets.len(), 1);
-            assert_eq!(forward.assets[0].name, "cat.png");
-            assert!(
-                routed(&mut transport, &late).await.is_none(),
-                "a repeated late event adds nothing"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_late_event_without_a_new_forward_from_its_sender_is_never_routed() {
-        let unfurl = || message_unfurl(json!("a quoted answer"), photo());
-        let mut edited = unfurled_later(unfurl());
-        edited["message"]["attachments"] = json!([]);
-        edited["message"]["text"] = json!("what is this, really?");
-        let mut other_user = unfurled_later(unfurl());
-        other_user["message"]["user"] = json!("U8OTHER");
-        let mut bot = unfurled_later(unfurl());
-        bot["message"]["bot_id"] = json!("B0OTHER");
-        let mut unknown = unfurled_later(unfurl());
-        unknown["message"]["ts"] = json!(POSTED_TS);
-        for late in [
-            unfurled_later(link_unfurl()),
-            edited,
-            other_user,
-            bot,
-            unknown,
-        ] {
-            let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
-            routed(&mut transport, &bare_forward())
-                .await
-                .expect("the permalink message is a request");
-            assert!(routed(&mut transport, &late).await.is_none(), "{late}");
-            assert!(
-                routed(&mut transport, &unfurled_later(unfurl()))
-                    .await
-                    .is_some(),
-                "a refused late event leaves the message's forward admissible"
-            );
-        }
-
-        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
-        let mut unowned = bare_forward();
-        unowned["channel"] = json!(CHANNEL);
-        unowned["channel_type"] = json!("channel");
-        unowned["thread_ts"] = json!(POSTED_TS);
-        assert!(routed(&mut transport, &unowned).await.is_none());
-        let mut late = unfurled_later(unfurl());
-        late["channel"] = json!(CHANNEL);
-        assert!(
-            routed(&mut transport, &late).await.is_none(),
-            "an unowned-thread message gains no forward later"
-        );
     }
 
     fn forwarded_event(top_text: &str, attachment: Value) -> Value {
