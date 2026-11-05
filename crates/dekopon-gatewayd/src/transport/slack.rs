@@ -314,6 +314,9 @@ impl SlackTransport {
             .ok_or(TransportError::Response)?
             .to_owned();
         let event = &payload["event"];
+        if matches!(event["type"].as_str(), Some("message" | "app_mention")) {
+            record_attachment_shape(event, received);
+        }
         if event["type"].as_str() == Some("reaction_added") {
             self.reaction_added(&team, event, received).await?;
         } else if self.experience == SlackExperience::Agent
@@ -2075,6 +2078,49 @@ fn project_message(message: &Value, raw: &str) -> SlackProjection {
         assets,
         asset_overflow: file_count > MAX_ATTACHMENTS,
     }
+}
+
+fn record_attachment_shape(event: &Value, received: &Span) {
+    let subtype = event["subtype"].as_str();
+    let message = match subtype {
+        Some("message_changed") => &event["message"],
+        _ => event,
+    };
+    let attachments = message["attachments"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    if let Some(subtype) = subtype {
+        // Slack's subtypes are short snake_case names; anything else is recorded as a category so
+        // the span never carries peer text.
+        let named = subtype.len() <= 32
+            && subtype
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
+        received.record(
+            "slack.event.subtype",
+            if named { subtype } else { "unrecognized" },
+        );
+    }
+    received.record(
+        "slack.attachments.count",
+        u64::try_from(attachments.len()).unwrap_or(u64::MAX),
+    );
+    received.record(
+        "slack.attachments.msg_unfurl",
+        attachments
+            .iter()
+            .any(|attachment| attachment["is_msg_unfurl"] == true),
+    );
+    received.record(
+        "slack.attachments.is_share_present",
+        attachments
+            .iter()
+            .any(|attachment| attachment.get("is_share").is_some()),
+    );
+    received.record(
+        "slack.attachments.quotes_message",
+        attachments.iter().any(quotes_a_message),
+    );
 }
 
 fn quotes_a_message(attachment: &Value) -> bool {
@@ -3929,6 +3975,171 @@ mod driver_tests {
             let (text, assets) = delivered(attachment).await;
             assert!(!text.contains("[quoted Slack forward"), "{text}");
             assert!(assets.is_empty());
+        }
+    }
+
+    fn link_unfurl() -> Value {
+        json!({
+            "id": 1, "from_url": "https://example.com/post", "original_url": "https://example.com/post",
+            "title": "A post", "text": "a page summary", "service_name": "example.com",
+        })
+    }
+
+    fn unfurled_later(attachment: Value) -> Value {
+        json!({
+            "type": "message", "subtype": "message_changed", "hidden": true,
+            "channel": DIRECT_CHANNEL, "channel_type": "im", "ts": "1700000000.000900",
+            "message": {
+                "type": "message", "user": USER, "ts": INBOUND_TS,
+                "text": "what is this?", "attachments": [attachment],
+            },
+        })
+    }
+
+    const RECEIVE_FIELDS: [&str; 13] = [
+        "transport.kind",
+        "message.id",
+        "drop.reason",
+        "mention.roles",
+        "conversation.kind",
+        "conversation.container",
+        "conversation.id",
+        "conversation.thread",
+        "slack.event.subtype",
+        "slack.attachments.count",
+        "slack.attachments.msg_unfurl",
+        "slack.attachments.is_share_present",
+        "slack.attachments.quotes_message",
+    ];
+
+    fn receive_shape(capture: &CaptureLayer) -> Vec<(&'static str, Option<String>)> {
+        let records = capture.records();
+        [
+            "message.id",
+            "slack.event.subtype",
+            "slack.attachments.count",
+            "slack.attachments.msg_unfurl",
+            "slack.attachments.is_share_present",
+            "slack.attachments.quotes_message",
+        ]
+        .into_iter()
+        .map(|field| {
+            let value = records
+                .iter()
+                .filter(|record| {
+                    matches!(record, dekopon_test_support::Record::Span { name, .. } if *name == "transport.receive")
+                })
+                .find_map(|record| record.field(field).map(str::to_owned));
+            (field, value)
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn the_receive_span_records_attachment_shape_without_attachment_values() {
+        let mut addressed = forwarded_event(
+            "<@B0123ABC> look at this",
+            message_unfurl(json!("a quoted answer"), photo()),
+        );
+        addressed["type"] = json!("app_mention");
+        let mut bare = said(USER, INBOUND_TS, "<@B0123ABC> hello");
+        bare["type"] = json!("app_mention");
+        bare["channel"] = json!(CHANNEL);
+        bare["channel_type"] = json!("channel");
+        let mut linked = forwarded_event("<@B0123ABC> see https://example.com/post", link_unfurl());
+        linked["type"] = json!("app_mention");
+        let some = |value: &str| Some(value.to_owned());
+        let cases = [
+            (
+                addressed,
+                [
+                    some(INBOUND_TS),
+                    None,
+                    some("1"),
+                    some("true"),
+                    some("false"),
+                    some("true"),
+                ],
+            ),
+            (
+                bare,
+                [
+                    some(INBOUND_TS),
+                    None,
+                    some("0"),
+                    some("false"),
+                    some("false"),
+                    some("false"),
+                ],
+            ),
+            (
+                linked,
+                [
+                    some(INBOUND_TS),
+                    None,
+                    some("1"),
+                    some("false"),
+                    some("false"),
+                    some("false"),
+                ],
+            ),
+            (
+                unfurled_later(message_unfurl(json!("a quoted answer"), photo())),
+                [
+                    None,
+                    some("message_changed"),
+                    some("1"),
+                    some("true"),
+                    some("false"),
+                    some("true"),
+                ],
+            ),
+        ];
+        for (event, expected) in cases {
+            let capture = CaptureLayer::workspace();
+            let _subscriber = tracing_subscriber::registry()
+                .with(capture.clone())
+                .set_default();
+            let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+            let span = receive_span(ChatTransportKind::Slack);
+            let frame = json!({"type": "events_api", "payload": {"team_id": TEAM, "event": event}});
+
+            transport
+                .accept(&frame, &span)
+                .instrument(span.clone())
+                .await
+                .expect("readable");
+
+            let recorded = receive_shape(&capture);
+            assert_eq!(
+                recorded
+                    .iter()
+                    .map(|(_, value)| value.clone())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{recorded:?}"
+            );
+            for record in capture.records().iter().filter(|record| {
+                matches!(record, dekopon_test_support::Record::Span { name, .. } if *name == "transport.receive")
+            }) {
+                for field in RECEIVE_FIELDS {
+                    let Some(recorded) = record.field(field) else {
+                        continue;
+                    };
+                    for value in [
+                        "UORIGINAL",
+                        "CORIGINAL",
+                        "1700000000.000100",
+                        "example.slack.com",
+                        "example.com",
+                        "a quoted answer",
+                        "cat.png",
+                        "look at this",
+                    ] {
+                        assert!(!recorded.contains(value), "{value} leaked into {field}");
+                    }
+                }
+            }
         }
     }
 
