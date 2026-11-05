@@ -48,11 +48,7 @@ fn the_conditional_write_example_gives_the_model_explicit_standing_orders() {
     let catalog = load(&example("conditional-write/dekopon.yaml"));
 
     let agent = catalog
-        .agent(
-            &"conditional-writer"
-                .parse()
-                .expect("valid agent id"),
-        )
+        .agent(&"conditional-writer".parse().expect("valid agent id"))
         .expect("the conditional writer agent exists");
     assert!(agent.spec.enabled, "a disabled agent routes to nothing");
     assert_eq!(agent.spec.model_class.as_deref(), Some("reasoning"));
