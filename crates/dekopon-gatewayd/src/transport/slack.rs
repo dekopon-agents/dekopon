@@ -329,13 +329,19 @@ impl SlackTransport {
                 self.pending
                     .push_back(TransportEvent::CancelRequested(stopped));
             }
-        } else if let Some(late) = self.late_forward(event, received) {
-            self.deliver_late_forward(late);
-        } else if let Some(message) = self.routable(&team, event, received).await? {
-            received.record("message.id", message.message_id.to_string().as_str());
-            self.remember_for_late_forward(event, &message);
-            self.pending
-                .push_back(TransportEvent::Message(Box::new(message)));
+        } else {
+            match self.late_forward(event, received) {
+                LateEvent::Forward(late) => self.deliver_late_forward(*late),
+                LateEvent::Held => {}
+                LateEvent::Unrelated => {
+                    if let Some(message) = self.routable(&team, event, received).await? {
+                        received.record("message.id", message.message_id.to_string().as_str());
+                        self.remember_for_late_forward(event, &message);
+                        self.pending
+                            .push_back(TransportEvent::Message(Box::new(message)));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -635,7 +641,7 @@ impl SlackTransport {
         }
     }
 
-    fn late_forward(&mut self, event: &Value, received: &Span) -> Option<InboundMessage> {
+    fn late_forward(&mut self, event: &Value, received: &Span) -> LateEvent {
         let message = match event["subtype"].as_str() {
             Some("message_changed") => &event["message"],
             _ => event,
@@ -645,28 +651,34 @@ impl SlackTransport {
             message["ts"].as_str(),
             message["user"].as_str(),
         ) else {
-            return None;
+            return LateEvent::Unrelated;
         };
-        let forward = forward_attachment(message)?;
         let key = format!("{channel}:{ts}");
-        let record = self.late_forwards.get(&key)?;
+        let Some(record) = self.late_forwards.get(&key) else {
+            return LateEvent::Unrelated;
+        };
         if !message["bot_id"].is_null() || record.user != user {
-            return None;
+            return LateEvent::Unrelated;
         }
+        let Some(forward) = forward_attachment(message) else {
+            return LateEvent::Held;
+        };
         // A late forward skips the collector, so the message's combined files are bounded here as
         // an on-time forward's would be.
         if record.files + forward["files"].as_array().map_or(0, Vec::len) > MAX_ATTACHMENTS {
             crate::collection::disposition(received, "input-limit");
-            return None;
+            return LateEvent::Held;
         }
-        let late = self.late_forwards.take(&key)?;
+        let Some(late) = self.late_forwards.take(&key) else {
+            return LateEvent::Unrelated;
+        };
         let mut text = String::new();
         let mut control = String::new();
         let mut assets = Vec::new();
         let file_count = quote_forward(forward, &mut text, &mut control, &mut assets);
         record_conversation(received, &late.conversation);
         received.record("message.id", ts);
-        Some(InboundMessage {
+        LateEvent::Forward(Box::new(InboundMessage {
             pull_request_links: None,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Slack,
@@ -687,7 +699,7 @@ impl SlackTransport {
             folded: Vec::new(),
             asset_overflow: file_count > MAX_ATTACHMENTS,
             input_refusal: None,
-        })
+        }))
     }
 
     fn deliver_late_forward(&mut self, late: InboundMessage) {
@@ -2116,6 +2128,12 @@ struct SlackProjection {
     asset_overflow: bool,
 }
 
+enum LateEvent {
+    Unrelated,
+    Held,
+    Forward(Box<InboundMessage>),
+}
+
 struct LateForward {
     user: String,
     files: usize,
@@ -2636,10 +2654,10 @@ mod driver_tests {
     use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::{
-        CANCEL_ACTION_ID, Conversation, ConversationKind, HISTORY_PAGE_LIMIT, MAX_ATTACHMENTS,
-        MAX_INBOUND_TEXT_BYTES, MAX_TRACKED_REACTIONS, OnceLock, PROGRESS_MAX_CHARS,
-        SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked, decode_slack_text,
-        past_message,
+        CANCEL_ACTION_ID, Conversation, ConversationKind, DEDUP_CAPACITY, HISTORY_PAGE_LIMIT,
+        MAX_ATTACHMENTS, MAX_INBOUND_TEXT_BYTES, MAX_TRACKED_REACTIONS, OnceLock,
+        PROGRESS_MAX_CHARS, SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked,
+        decode_slack_text, past_message,
     };
     use crate::{
         config::{SlackExperience, TemplateOverrides},
@@ -4434,6 +4452,34 @@ mod driver_tests {
             .await,
         );
         assert_eq!(within.assets.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_refused_late_forward_never_becomes_a_fresh_request_once_dedup_forgets_its_message() {
+        let mut transport = transport(UNREACHABLE, SlackExperience::Agent);
+        request(accepted(&mut transport, &bare_forward()).await);
+        for index in 0..DEDUP_CAPACITY {
+            let chatter = json!({
+                "type": "message", "channel": CHANNEL, "channel_type": "channel",
+                "user": "U7CHAT", "ts": format!("1700000100.{index:06}"), "text": "chatter",
+            });
+            assert!(accepted(&mut transport, &chatter).await.is_none());
+        }
+        let files = Value::Array(
+            (0..=MAX_ATTACHMENTS)
+                .map(|index| {
+                    let mut file = photo()[0].clone();
+                    file["id"] = json!(format!("F{index}"));
+                    file
+                })
+                .collect(),
+        );
+        let mut oversized = bare_forward();
+        oversized["attachments"] = json!([message_unfurl(json!("a quoted answer"), files)]);
+
+        assert!(accepted(&mut transport, &oversized).await.is_none());
+        assert!(accepted(&mut transport, &bare_forward()).await.is_none());
+        assert!(transport.pending.is_empty());
     }
 
     #[tokio::test]
