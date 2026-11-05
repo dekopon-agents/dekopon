@@ -3614,7 +3614,7 @@ async fn check_binds_no_socket_and_reports_the_digests_boot_serves() {
         fs::read_to_string(example.join("secret-map.yaml.example"))
             .expect("example secret map")
             .replace(
-                "/home/xavier/.config/dekopon/api-token",
+                "/home/you/.config/dekopon/api-token",
                 &directory.path().join("api-token").display().to_string(),
             )
             .as_bytes(),

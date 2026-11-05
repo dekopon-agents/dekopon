@@ -8,7 +8,7 @@
 apiVersion: dekopon.dev/v1alpha1
 kind: Agent
 metadata:
-  name: xaviers-conditional-writer
+  name: conditional-writer
   labels:
     purpose: record-maintenance
 spec:

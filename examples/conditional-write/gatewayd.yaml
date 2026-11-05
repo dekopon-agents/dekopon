@@ -13,7 +13,7 @@ catalogPath: dekopon.yaml
 broker:
   # Must be the socketPath from broker.yaml. serverUid is the UID that owns the broker process;
   # the client verifies it before sending anything.
-  socketPath: /home/xavier/.local/run/dekopon/broker.sock
+  socketPath: /home/you/.local/run/dekopon/broker.sock
   serverUid: 501
 
 # Each adapter connects independently with bounded exponential recovery; a terminal failure
@@ -49,7 +49,7 @@ models:
 routes:
   - transport: workspace-slack
     conversation: { kind: [directMessage] }
-    agent: xaviers-conditional-writer
+    agent: conditional-writer
     # Asset references resolve automatically; attaching retains a file, while sending requires
     # a separately broker-authorized asset.send invocation.
     limits:
@@ -85,7 +85,7 @@ shutdownGraceMs: 120000
 # needs `telemetry`) every restart starts the window empty.
 metering:
   budgets:
-    xaviers-conditional-writer:
+    conditional-writer:
       meters:
       - {kind: rolling, limit: 200000, period: 5h}
   # restore:

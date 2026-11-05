@@ -5,21 +5,21 @@
 //! use dekopon_core::RiskLevel;
 //!
 //! let world = PolicyWorld::new(
-//!     ["cpetersen".parse::<PrincipalId>()?],
+//!     ["alice".parse::<PrincipalId>()?],
 //!     [(
 //!         "cli-probe.upper".parse::<CapabilityId>()?,
 //!         "cli-probe".parse::<ProviderId>()?,
 //!     )],
 //! )?;
 //! let engine = PolicyEngine::new(
-//!     r#"@id("cpetersen-may-cli-probe-upper")
-//!        permit(principal == Dekopon::Principal::"cpetersen",
+//!     r#"@id("alice-may-cli-probe-upper")
+//!        permit(principal == Dekopon::Principal::"alice",
 //!               action == Dekopon::Action::"cli-probe.upper",
 //!               resource == Dekopon::Provider::"cli-probe");"#,
 //!     &world,
 //! )?;
 //! let decision = engine.authorize(PolicyRequest {
-//!     principal: "cpetersen".parse()?,
+//!     principal: "alice".parse()?,
 //!     target: PolicyTarget::Capability {
 //!         capability: "cli-probe.upper".parse()?,
 //!         provider: "cli-probe".parse()?,

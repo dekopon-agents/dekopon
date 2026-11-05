@@ -16,10 +16,10 @@
 // This is checked before an attested `capabilities` answers and before any capability is
 // authorized, so a sender the owner never permitted to use this agent is refused before a model
 // call is paid for.
-@id("boss-may-prompt-conditional-writer")
-permit(principal == Dekopon::Principal::"cpetersen",
+@id("alice-may-prompt-conditional-writer")
+permit(principal == Dekopon::Principal::"alice",
        action == Dekopon::Action::"agent.prompt",
-       resource == Dekopon::Agent::"xaviers-conditional-writer")
+       resource == Dekopon::Agent::"conditional-writer")
 when { context has via && context.via == "dekopon-gatewayd" };
 
 // What that session may then reach. The two statements are independent: driving the agent implies
@@ -33,9 +33,9 @@ when { context has via && context.via == "dekopon-gatewayd" };
 // `context.agent` pins the surface to this one agent. A second agent added to the catalog later
 // starts with nothing, even under the same principal and the same gateway.
 @id("conditional-writer-surface")
-permit(principal == Dekopon::Principal::"cpetersen",
+permit(principal == Dekopon::Principal::"alice",
        action in [Dekopon::Action::"http-probe.fetch",
                   Dekopon::Action::"http-probe.conditional-write"],
        resource == Dekopon::Provider::"http-probe")
-when { context has agent && context.agent == "xaviers-conditional-writer"
+when { context has agent && context.agent == "conditional-writer"
     && context has via && context.via == "dekopon-gatewayd" };

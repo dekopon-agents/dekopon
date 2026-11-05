@@ -49,7 +49,7 @@ fn the_conditional_write_example_gives_the_model_explicit_standing_orders() {
 
     let agent = catalog
         .agent(
-            &"xaviers-conditional-writer"
+            &"conditional-writer"
                 .parse()
                 .expect("valid agent id"),
         )
