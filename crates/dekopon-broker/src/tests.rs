@@ -4631,6 +4631,7 @@ async fn relaxed_memory_survives_authority_changes_and_paranoid_does_not() {
 
 #[tokio::test]
 async fn the_legacy_surface_reproduces_the_released_bytes() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
     use sha2::Digest as _;
 
     let root = tempfile::tempdir().expect("tempdir");
@@ -4644,7 +4645,15 @@ async fn the_legacy_surface_reproduces_the_released_bytes() {
         .with_secret(true, Some("revision-a"))
         .build()
         .await;
-    // Recorded from the released broker; a legacy pointer can only be proved while these match.
+    let context = attested_agent_context(
+        "drn:slack:user:t0123abc:u9xyz",
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        ),
+    );
+    // The golden pins every encoder byte except provider digests, which production takes from deployed artifacts.
     for (memory_route, released) in [
         (
             false,
@@ -4655,7 +4664,48 @@ async fn the_legacy_surface_reproduces_the_released_bytes() {
             "7a8325d3119fb0d1730ece3ff3835b084f885b27e99e938f13693d633a268246",
         ),
     ] {
-        let digest = sha2::Sha256::digest(surface(&broker, memory_route));
+        let mut released_surface = surface(&broker, memory_route);
+        let effective = broker.effective_authority(&context, memory_route);
+        for (provider, released_digest) in [
+            (
+                "http-probe",
+                "3793561c425d317cf259a54555e4b85ec90f4464fd2edb0c5678c11fa8591eb1",
+            ),
+            (
+                "memory",
+                "c00baf58470ea726654e43a04d806760aa8f191d5c1c43839b9132eb10383422",
+            ),
+        ] {
+            let provider: ProviderId = provider.parse().expect("provider");
+            let current_digest = broker
+                .registry
+                .loaded_provider_metadata()
+                .find(|metadata| metadata.manifest.id == provider)
+                .map(|metadata| metadata.artifact_sha256)
+                .expect("the fixture artifact is loaded");
+            assert_eq!(current_digest.len(), released_digest.len());
+            let expected = effective
+                .iter()
+                .filter(|(_, set)| set.provider == provider)
+                .count();
+            let offsets = released_surface
+                .windows(current_digest.len())
+                .enumerate()
+                .filter_map(|(offset, bytes)| {
+                    (bytes == current_digest.as_bytes()).then_some(offset)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                offsets.len(),
+                expected,
+                "provider {provider}, memory route {memory_route}"
+            );
+            for offset in offsets {
+                released_surface[offset..offset + current_digest.len()]
+                    .copy_from_slice(released_digest.as_bytes());
+            }
+        }
+        let digest = sha2::Sha256::digest(released_surface);
         let digest = digest
             .iter()
             .map(|byte| format!("{byte:02x}"))
