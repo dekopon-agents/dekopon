@@ -4810,3 +4810,24 @@ async fn turns_that_alternate_a_fact_a_request_policy_reads_never_reuse_a_genera
         "returning never reopens the earlier generation"
     );
 }
+
+#[tokio::test]
+async fn an_http_method_case_change_rotates_paranoid_memory() {
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let permitted = [memory_policy().as_slice(), &fetch].concat();
+    let spelled = |index: usize, method: &str| {
+        let mut broker = SurfaceBroker::new(dirs[index].path(), &permitted)
+            .with_memory()
+            .with_identities([(MEMBER, "maintainer")]);
+        for (_, set) in &mut broker.constraints {
+            if let Some(http) = set.constraints.http.as_mut() {
+                http.allowed_methods = vec![method.to_owned()];
+            }
+        }
+        broker
+    };
+    let lowercase = paranoid_surface(&spelled(0, "get").build().await);
+    let uppercase = paranoid_surface(&spelled(1, "GET").build().await);
+    assert_ne!(lowercase, uppercase);
+}

@@ -82,20 +82,20 @@ cross-agent or cross-conversation memory.
 
 ## Durable memory
 
-For memory that outlives retention, the broker can host a storage provider on the three chat-memory
-routes. When Cedar grants all three to the sender, the gateway records each turn after the chat service accepted the answer,
-and the model may retrieve turns with `memory recent` and `memory search`; it can never reach the
-record route. Stored turns never enter a prompt on their own. Recording does not deduplicate, and
-there is no deletion, export or encryption at rest.
+For memory that outlives retention, the broker can host a storage provider on the three
+chat-memory routes. When Cedar grants all three to the sender, the gateway records each turn after
+the chat service accepted the answer, and the model may retrieve but never record turns. Stored
+turns never enter a prompt on their own. Recording does not deduplicate, and there is no deletion,
+export or encryption at rest.
 
-`continuityPolicy: paranoid` gives a sender's durable memory a new generation when their effective
-authority changes, even between turns whose GitHub facts or trigger a policy reads;
-`relaxed` never does.
+`continuityPolicy: paranoid` starts a new durable-memory generation when the sender's effective
+authority changes, even between turns whose GitHub facts or trigger a policy reads, though message
+and probe turns share one; `relaxed` never does.
 
 | `paranoid` [rotates](../crates/dekopon-broker/src/continuity.rs) on | Neither rotates on |
 |---|---|
 | capabilities, providers, storage access, HTTP authority, CA bytes | limits, timeouts, artifact digests, binding names, map revision |
-| applicable request policy, secret references, sinks | inapplicable policy and labels |
+| applicable request policy, secret references, sinks | inapplicable policy, labels |
 
 ## Memory never grants authority
 

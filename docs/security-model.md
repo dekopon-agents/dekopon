@@ -125,9 +125,9 @@ API offers on a granted model. The budget bounds the spend.
 - Gateway history in memory can reach swap and core dumps; the daemon controls neither.
 - Chat memory with `continuityPolicy: relaxed`, and shared, agent and space storage always, stay
   readable after the authority that wrote them changes. A secret reference cannot prove its upstream
-  account unchanged, and only broker memory rotates, not the journal or model context. To reset one
-  conversation, stop the broker and move its namespace's `current` file out of the storage root; the
-  old generation stays.
+  account unchanged; only broker memory rotates, not the journal or model context. To reset one
+  `paranoid` conversation, stop the broker, move its namespace's `current` file out of the storage
+  root and restart; the next turn starts empty, keeping the old generation.
 - A GitHub issue template can apply labels for an outsider, so never permit on a label. Logins are
   chosen by their owners; trust the numeric actor ID.
 - A GitHub webhook delivery carries no signed timestamp, so a captured delivery can be replayed.

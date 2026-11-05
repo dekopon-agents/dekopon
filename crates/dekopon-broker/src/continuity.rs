@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fmt, time::Duration};
 
 use dekopon_broker_host::BrokerHostLimits;
-use dekopon_capability::{EffectKind, ExecutionConstraints, SignedDownload};
+use dekopon_capability::{ExecutionConstraints, SignedDownload};
 use dekopon_core::SubjectKind;
 use dekopon_policy::{PolicyRequest, PolicyTarget, RequestOutcome};
 use dekopon_storage_host::{ContinuityCheck, LegacyContinuity, StorageLimits, UnprovenDisposition};
@@ -436,12 +436,16 @@ where
             .authorized_bindings(context, &effective_capabilities)
             .into_iter()
             .map(|(binding, capability)| {
-                let sorted = |values: &[String]| {
-                    values
-                        .iter()
-                        .map(|value| value.to_ascii_lowercase())
-                        .collect::<BTreeSet<_>>()
-                };
+                let hosts = binding
+                    .allowed_hosts
+                    .iter()
+                    .map(|host| host.to_ascii_lowercase())
+                    .collect::<BTreeSet<_>>();
+                let methods = binding
+                    .allowed_methods
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
                 let paths = binding
                     .allowed_paths
                     .iter()
@@ -458,8 +462,8 @@ where
                         capability.clone(),
                         binding.sink.to_string(),
                         binding.basic_username.clone(),
-                        sorted(&binding.allowed_hosts),
-                        sorted(&binding.allowed_methods),
+                        hosts,
+                        methods,
                         paths,
                         binding.allow_query,
                     ),
@@ -594,13 +598,7 @@ pub(super) fn encode_capability_identity(
 ) {
     encoded.text("capability", capability.as_str());
     encoded.text("provider", set.provider.as_str());
-    encoded.boolean(
-        "probeAdmitted",
-        match set.effect {
-            EffectKind::ReadOnly => true,
-            EffectKind::LocalWrite | EffectKind::ExternalWrite => false,
-        },
-    );
+    encoded.boolean("probeAdmitted", super::probe_admits(set.effect));
 }
 
 fn encode_trust_anchors(encoded: &mut AuthorityEncoder, bundles: &[Vec<u8>]) {
@@ -629,13 +627,9 @@ fn encode_authority_constraints(
         for host in &hosts {
             encoded.text("execution.http.allowedHost", host);
         }
-        let methods = http
-            .allowed_methods
-            .iter()
-            .map(|method| method.to_ascii_uppercase())
-            .collect::<BTreeSet<_>>();
+        let methods = http.allowed_methods.iter().collect::<BTreeSet<_>>();
         encoded.number("execution.http.allowedMethodCount", methods.len() as u128);
-        for method in &methods {
+        for method in methods {
             encoded.text("execution.http.allowedMethod", method);
         }
         encoded.boolean(

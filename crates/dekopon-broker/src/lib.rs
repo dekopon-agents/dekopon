@@ -1368,7 +1368,14 @@ fn probe_permits(context: &AuthenticatedContext, effect: EffectKind) -> bool {
     context
         .chat_scope()
         .is_none_or(|scope| scope.trigger != Trigger::Probe)
-        || effect == EffectKind::ReadOnly
+        || probe_admits(effect)
+}
+
+const fn probe_admits(effect: EffectKind) -> bool {
+    match effect {
+        EffectKind::ReadOnly => true,
+        EffectKind::LocalWrite | EffectKind::ExternalWrite => false,
+    }
 }
 
 fn validate_trusted_metadata(
