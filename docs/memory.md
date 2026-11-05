@@ -89,13 +89,13 @@ record route. Stored turns never enter a prompt on their own. Recording does not
 there is no deletion, export or encryption at rest.
 
 `continuityPolicy: paranoid` gives a sender's durable memory a new generation when their effective
-authority changes, even between turns whose GitHub facts or trigger a request policy reads;
+authority changes, even between turns whose GitHub facts or trigger a policy reads;
 `relaxed` never does.
 
 | `paranoid` [rotates](../crates/dekopon-broker/src/continuity.rs) on | Neither rotates on |
 |---|---|
 | capabilities, providers, storage access, HTTP authority, CA bytes | limits, timeouts, artifact digests, binding names, map revision |
-| applicable request policy, secret references and sinks | inapplicable policy and labels |
+| applicable request policy, secret references, sinks | inapplicable policy and labels |
 
 ## Memory never grants authority
 
