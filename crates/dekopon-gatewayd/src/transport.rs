@@ -70,6 +70,19 @@ impl InboundMessage {
     pub(crate) fn control_text(&self) -> &str {
         self.control_text.as_deref().unwrap_or(&self.text)
     }
+
+    pub(crate) fn absorb(&mut self, late: Self) {
+        let control = bound_inbound(&format!("{}\n{}", self.control_text(), late.control_text()));
+        self.text = bound_inbound(&format!("{}\n{}", self.text, late.text));
+        self.control_text = Some(control);
+        self.asset_overflow |= late.asset_overflow;
+        self.assets.extend(late.assets);
+    }
+
+    pub(crate) fn unheld(&self) {
+        self.receive_span
+            .record("drop.reason", "late-forward-unheld");
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,6 +193,7 @@ pub(crate) enum TransportEvent {
         identity: TransportIdentity,
     },
     Message(Box<InboundMessage>),
+    LateForward(Box<InboundMessage>),
     Delivery(Box<InboundMessage>, github::AdmissionTicket),
     CancelRequested(CancelRequest),
     FollowLeave {

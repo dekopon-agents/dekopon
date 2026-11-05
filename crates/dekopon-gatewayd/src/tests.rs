@@ -10675,6 +10675,258 @@ async fn a_live_slack_message_unfurl_forward_without_is_share_keeps_its_image_fo
     .await;
 }
 
+fn unfurled_forward(permalink: &str) -> Value {
+    json!({
+        "type": "message", "subtype": "message_changed", "hidden": true,
+        "channel": "d0123abc", "channel_type": "im", "ts": "1700000000.000009",
+        "message": {
+            "type": "message", "user": "u9xyz", "ts": "1700000000.000001",
+            "thread_ts": "1700000000.000001", "text": permalink,
+            "attachments": [{
+                "id": 1, "fallback": "[forwarded]", "is_msg_unfurl": true,
+                "is_reply_unfurl": false,
+                "from_url": "https://example.slack.com/archives/d0123abc/p1700000000000100",
+                "original_url": "https://example.slack.com/archives/d0123abc/p1700000000000100",
+                "author_id": "UBOT123", "author_name": "dekopon", "author_subname": "dekopon",
+                "author_link": "https://example.slack.com/team/UBOT123",
+                "author_icon": "https://example.invalid/avatar.png",
+                "channel_id": "d0123abc", "channel_team": "T0123ABC",
+                "ts": "1700000000.000100", "footer": "Direct message",
+                "mrkdwn_in": ["text"], "text": "the original answer",
+                "blocks": [{"type": "rich_text", "elements": []}],
+                "files": [{"id": "F-FORWARD", "name": "scene.png", "mimetype": "image/png",
+                    "size": 24, "url_private_download": "https://files.slack.com/f/F-FORWARD/scene.png"}]
+            }]
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_captured_late_forward_sequence_reaches_one_turn_through_the_serving_gateway() {
+    let permalink = "<https://example.slack.com/archives/d0123abc/p1700000000000100?thread_ts=1700000000.000100&amp;cid=d0123abc> What is in this image?";
+    let unfurled = unfurled_forward(permalink);
+    let socket = spawn_socket_mock(vec![
+        events_envelope(
+            "forward",
+            json!({
+                "type": "message", "channel": "d0123abc", "channel_type": "im",
+                "user": "u9xyz", "ts": "1700000000.000001", "text": permalink,
+            }),
+        ),
+        events_envelope("unfurl", unfurled),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport
+        .connect()
+        .await
+        .expect("connected Slack transport");
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    doc["routes"][0]["transport"] = json!("scientist-slack");
+    doc["routes"][0]["conversation"] = json!({"kind": ["directMessage"]});
+    doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
+    doc["transports"][0] = json!({"name": "scientist-slack", "kind": "slackSocketMode", "appTokenEnv": "APP", "botTokenEnv": "BOT"});
+    let config = resolved(directory.path(), &doc).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = InterruptibleModel::new([answer("The forward is a picture.")]);
+    let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
+    drivers.insert(
+        "scientist-slack".into(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    );
+    let (sender, receiver) = mpsc::channel(4);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(serve(
+        runner,
+        routes,
+        Arc::default(),
+        Arc::new(drivers),
+        Arc::default(),
+        receiver,
+        async move {
+            stopped.await.expect("shutdown sender stays alive");
+        },
+        Duration::from_secs(2),
+        crate::collection::Collector::new(&[], 4),
+    ));
+
+    let original = transport.next().await.expect("the forward message");
+    assert!(matches!(original, TransportEvent::Message(_)));
+    sender.send(original).await.expect("gateway receives");
+    models.wait_until_entered().await;
+    let late = transport.next().await.expect("the unfurl");
+    assert!(matches!(late, TransportEvent::LateForward(_)));
+    sender.send(late).await.expect("gateway receives");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while driver.replies().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the turn answers");
+    stop.send(()).expect("gateway still serving");
+    serving.await.expect("gateway stops");
+
+    assert_eq!(driver.replies(), ["The forward is a picture."]);
+    assert_eq!(models.interrupted.load(Ordering::SeqCst), 1);
+    assert_eq!(models.requests(), 2);
+    let answered = models
+        .prompt(1)
+        .iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, text)| text.clone())
+        .collect::<String>();
+    assert_eq!(
+        answered
+            .matches("[quoted Slack forward — author: \"UBOT123\"; channel: \"d0123abc\"; time: \"1700000000.000100\"]\nthe original answer")
+            .count(),
+        1,
+        "{answered}"
+    );
+    assert_eq!(answered.matches("chat-asset:1").count(), 1, "{answered}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_slack_forward_whose_unfurl_arrives_late_reaches_the_original_turn_once() {
+    struct ForwardImage(Arc<AtomicUsize>);
+    impl AssetFetcher for ForwardImage {
+        fn fetch(
+            &self,
+            source: &AssetSourceRef,
+            _max_bytes: u64,
+        ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+            assert!(
+                matches!(source, AssetSourceRef::Slack { file_id, .. } if file_id == "F-FORWARD")
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(b"\x89PNG\r\n\x1a\nforwarded pixels".to_vec()) })
+        }
+    }
+
+    let permalink = "<https://example.slack.com/archives/d0123abc/p1700000000000100?thread_ts=1700000000.000100&amp;cid=d0123abc> What is in this image?";
+    let unfurled = unfurled_forward(permalink);
+    let socket = spawn_socket_mock(vec![
+        events_envelope(
+            "forward",
+            json!({
+                "type": "message", "channel": "d0123abc", "channel_type": "im",
+                "user": "u9xyz", "ts": "1700000000.000001", "text": permalink,
+            }),
+        ),
+        events_envelope("unfurl", unfurled.clone()),
+        events_envelope("unfurl-again", unfurled),
+        events_envelope(
+            "next",
+            direct_message("u9xyz", "1700000000.000002", "thanks"),
+        ),
+    ]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport
+        .connect()
+        .await
+        .expect("connected Slack transport");
+    let original = next_message(&mut transport).await;
+    let TransportEvent::LateForward(late) =
+        tokio::time::timeout(Duration::from_secs(5), transport.next())
+            .await
+            .expect("the unfurl arrives")
+            .expect("a routable event")
+    else {
+        panic!("expected a late forward");
+    };
+    let after = next_message(&mut transport).await;
+    assert_eq!(
+        after.message_id,
+        MessageId::Native("1700000000.000002".into()),
+        "the repeated unfurl produced nothing"
+    );
+    assert!(original.assets.is_empty());
+    assert_eq!(late.message_id, original.message_id);
+
+    let mut route = persistent_route(
+        {
+            let mut model = model_config();
+            if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
+                *modalities = vec![crate::config::Modality::Image];
+            }
+            model
+        },
+        window(),
+    );
+    route.transport = original.transport.clone();
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: "forward-fetch".into(),
+                kind: "function".into(),
+                function: ModelFunctionCall {
+                    name: "fetch_chat_asset".into(),
+                    arguments: "{\"id\":1}".into(),
+                },
+            }],
+            None,
+        ),
+        answer("The image was inspected."),
+    ]);
+    models.capture_images.store(true, Ordering::SeqCst);
+    let mut runner = runner(broker, Arc::clone(&models), 4);
+    let fetches = Arc::new(AtomicUsize::new(0));
+    Arc::get_mut(&mut runner)
+        .expect("unique runner")
+        .asset_fetchers
+        .insert(
+            original.transport.clone(),
+            Arc::new(ForwardImage(Arc::clone(&fetches))) as Arc<dyn AssetFetcher>,
+        );
+    let driver = Arc::new(RecordingDriver::default());
+    let session = run_session(
+        Arc::clone(&runner),
+        route,
+        original,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    );
+    runner
+        .gate
+        .enrich(late)
+        .expect("the admitted turn holds the forwarded message");
+    tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("turn completed");
+
+    assert_eq!(driver.replies(), ["The image was inspected."]);
+    let first = models
+        .prompt(0)
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<String>();
+    assert!(
+        first.contains("[quoted Slack forward — author: \"UBOT123\"; channel: \"d0123abc\"; time: \"1700000000.000100\"]\nthe original answer"),
+        "{first}"
+    );
+    assert!(first.contains("chat-asset:1"), "{first}");
+    let last = models
+        .prompt(1)
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<String>();
+    assert_eq!(last.matches("[quoted Slack forward").count(), 1, "{last}");
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        models.image_bytes.lock().as_slice(),
+        [b"\x89PNG\r\n\x1a\nforwarded pixels"]
+    );
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one live forward scenario across private, shared and inaccessible fetches"
@@ -17088,6 +17340,8 @@ mod github_invocation;
 mod jobs_burn_in;
 #[path = "tests/jobs_e2e.rs"]
 mod jobs_e2e;
+#[path = "tests/late_forward.rs"]
+mod late_forward;
 #[path = "tests/memory.rs"]
 pub(crate) mod memory;
 #[path = "tests/memory_notice.rs"]
