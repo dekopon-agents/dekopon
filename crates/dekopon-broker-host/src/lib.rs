@@ -56,7 +56,10 @@ mod storage;
 mod test_component_memo;
 use clock::ClockState;
 pub use dekopon_broker_protocol::{Streams, UpcallStdin, UpcallStreams};
-pub use dekopon_http_host::{HttpRequestFacts, PolicyViolation, RequestAuthorizer};
+pub use dekopon_http_host::{
+    HttpRequestFacts, PolicyViolation, ReachableDestinationSettings, RequestAuthorizer,
+    reachable_destination_settings,
+};
 pub use http::{
     BoundCredential, HttpCallEvidence, HttpConfigurationError, HttpInvocation,
     NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts, destinations_cover,
@@ -187,6 +190,13 @@ pub enum CompiledCacheMode {
     #[default]
     Reader,
     Publisher,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HttpDestinationOptions<'a> {
+    pub plaintext_hosts: &'a PlaintextHosts,
+    pub extra_ca_bundles: &'a [Vec<u8>],
+    pub non_public_https: &'a [NonPublicHttpsAuthority],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1717,6 +1727,20 @@ impl BrokerProviderRegistry {
 
     pub fn set_assets(&mut self, directory: dekopon_http_host::asset::AssetDirectory) {
         self.assets = Some(directory);
+    }
+
+    #[must_use]
+    pub fn http_destination_options(&self) -> HttpDestinationOptions<'_> {
+        let runtime = &self
+            .providers
+            .first()
+            .expect("a registry is constructed with at least one provider")
+            .runtime;
+        HttpDestinationOptions {
+            plaintext_hosts: &runtime.plaintext_hosts,
+            extra_ca_bundles: &runtime.extra_ca_bundles,
+            non_public_https: &runtime.non_public_https,
+        }
     }
 
     #[must_use]

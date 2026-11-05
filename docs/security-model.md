@@ -66,8 +66,7 @@ probe can only read.
 
 ## Conversation memory as a trust surface
 
-Memory never grants authority ([memory](memory.md)): replayed and recalled text is prompt text, and
-each turn is authorized afresh. What memory widens is time and audience.
+Memory never grants authority ([memory](memory.md)). What it widens is time and audience.
 
 - **Time.** On a one-shot route an injected instruction dies with its session. With history it stays
   in every later prompt until the window, the idle timeout or retention drops it. Anything an agent
@@ -124,8 +123,11 @@ API offers on a granted model. The budget bounds the spend.
 - Whoever reads the telemetry store reads every conversation.
 - If something hostile already runs as root or as the broker's user, you've lost.
 - Gateway history in memory can reach swap and core dumps; the daemon controls neither.
-- Chat memory with `continuityPolicy: stable`, and shared, agent and space storage always, stay
-  readable after the capability, constraints or credential that wrote them change.
+- Chat memory with `continuityPolicy: relaxed`, and shared, agent and space storage always, stay
+  readable after the authority that wrote them changes. A secret reference cannot prove its upstream
+  account unchanged; only broker memory rotates, not the journal or model context. To reset one
+  `paranoid` conversation, stop the broker, move its namespace's `current` file out of the storage
+  root and restart; the next turn starts empty, keeping the old generation.
 - A GitHub issue template can apply labels for an outsider, so never permit on a label. Logins are
   chosen by their owners; trust the numeric actor ID.
 - A GitHub webhook delivery carries no signed timestamp, so a captured delivery can be replayed.

@@ -492,7 +492,7 @@ mod tests {
             "probe-transport",
             "c0123abc",
             "c0123abc:1712345678.000100",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             b"probe-authority".to_vec(),
         )
     }
@@ -511,7 +511,7 @@ mod tests {
             "probe-transport",
             "c0123abc",
             "c0123abc:1712345678.000100",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             b"probe-authority".to_vec(),
         )
     }

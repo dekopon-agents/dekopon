@@ -116,7 +116,7 @@ mod tests {
             "work",
             "c123",
             "c123:123.456",
-            ContinuityPolicy::Stable,
+            ContinuityPolicy::Relaxed,
             vec![],
         );
         drop(host.grant(request).unwrap());

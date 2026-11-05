@@ -5,7 +5,8 @@ use serde_json::json;
 use super::{
     AGENT_PROMPT_ACTION, DEFAULT_SECRET_USE_POLICY_ID, HttpRequestFacts, MAX_POLICY_BYTES,
     OpaqueBody, PolicyBuildError, PolicyContext, PolicyDecision, PolicyEngine, PolicyRequest,
-    PolicyTarget, PolicyWorld, RequestBody, SECRET_USE_ACTION, SecretSelection, UnresolvedKind,
+    PolicyTarget, PolicyWorld, RequestBody, RequestOutcome, SECRET_USE_ACTION, SecretSelection,
+    UnresolvedKind,
 };
 
 fn world() -> PolicyWorld {
@@ -1793,7 +1794,9 @@ fn every_family_sample_validates_strictly_against_the_schema() {
                 secret_request("cpetersen", context.clone()),
             ] {
                 assert!(
-                    engine.build_request(request.clone(), None).is_ok(),
+                    engine
+                        .build_request(request.clone(), super::RequestFacts::Absent)
+                        .is_ok(),
                     "{event}, stripped={stripped}"
                 );
                 assert!(
@@ -1804,7 +1807,10 @@ fn every_family_sample_validates_strictly_against_the_schema() {
                     engine.authorize_http(request.clone(), facts(Some(br#"{"text":"preserved"}"#)));
                 assert!(decision.allowed, "{event}, HTTP stripped={stripped}");
                 let (built, _) = engine
-                    .build_request(request, Some(facts(Some(br#"{"text":"preserved"}"#))))
+                    .build_request(
+                        request,
+                        super::RequestFacts::Known(facts(Some(br#"{"text":"preserved"}"#))),
+                    )
                     .unwrap();
                 let Some(cedar_policy::EvalResult::Record(http)) =
                     built.context().unwrap().get("request")
@@ -2118,4 +2124,170 @@ fn the_broker_permit_admits_only_a_default_selection_and_an_owner_forbid_still_r
     ));
     assert!(!refused.allowed, "{refused:?}");
     assert_eq!(refused.determining_policy_ids, ["narrow-token"]);
+}
+
+fn outcome(policies: &str, risk: RiskLevel, context: PolicyContext) -> RequestOutcome {
+    let mut request = capability_request("cpetersen", "cli-probe.upper", context);
+    if let PolicyTarget::Capability { risk: target, .. } = &mut request.target {
+        *target = risk;
+    }
+    PolicyEngine::new(policies, &world())
+        .expect("valid request policies")
+        .request_outcome(request)
+}
+
+const ALLOW: &str = r#"@id("allow") permit(principal, action, resource);"#;
+
+#[test]
+fn a_request_outcome_keeps_request_predicates_and_drops_policies_that_cannot_apply() {
+    let policies = format!(
+        r#"{ALLOW}
+        @id("post-fence") forbid(principal, action, resource)
+        when {{ context has request }}
+        when {{ context.request.method == "POST" }};
+        @id("other-agent") forbid(principal, action, resource)
+        when {{ context has request }}
+        when {{ context.agent == "other" && context.request.method == "GET" }};
+    "#
+    );
+    let RequestOutcome::Open {
+        permit_satisfied,
+        residuals,
+        ..
+    } = outcome(&policies, RiskLevel::Low, session())
+    else {
+        panic!("an unsatisfied request fence leaves the outcome open");
+    };
+    assert!(permit_satisfied);
+    // Golden bytes: a Cedar upgrade that changes residual encoding must fail here, not rotate silently.
+    assert_eq!(
+        residuals.into_iter().collect::<Vec<_>>(),
+        [
+            r#"{"effect":"forbid","principal":{"op":"All"},"action":{"op":"All"},"resource":{"op":"All"},"conditions":[{"kind":"when","body":{"&&":{"left":{"Value":true},"right":{"&&":{"left":{"Value":true},"right":{"&&":{"left":{"Value":true},"right":{"&&":{"left":{"Value":true},"right":{"==":{"left":{".":{"left":{"unknown":[{"Value":"request"}]},"attr":"method"}},"right":{"Value":"POST"}}}}}}}}}}}}]}"#
+        ]
+    );
+}
+
+#[test]
+fn a_label_change_alters_the_outcome_only_through_a_policy_that_reads_it() {
+    let method_only = format!(
+        r#"{ALLOW}
+        @id("post-fence") forbid(principal, action, resource)
+        when {{ context has request }}
+        when {{ context.request.method == "POST" }};
+    "#
+    );
+    assert_eq!(
+        outcome(&method_only, RiskLevel::Low, session()),
+        outcome(&method_only, RiskLevel::High, session())
+    );
+    let risk_fence = format!(
+        r#"{ALLOW}
+        @id("risk-fence") forbid(principal, action, resource)
+        when {{ context has request }}
+        when {{ context.risk == "High" }};
+    "#
+    );
+    assert!(matches!(
+        outcome(&risk_fence, RiskLevel::Low, session()),
+        RequestOutcome::Open { .. }
+    ));
+    assert_eq!(
+        outcome(&risk_fence, RiskLevel::High, session()),
+        RequestOutcome::Denied
+    );
+}
+
+#[test]
+fn an_erroring_request_policy_denies_rather_than_reading_as_false() {
+    let guarded = format!(
+        r#"{ALLOW}
+        @id("thread-fence") forbid(principal, action, resource)
+        when {{ context has request }}
+        when {{ context has conversation && context.conversation has thread && context.conversation.thread == "t" }};
+    "#
+    );
+    let unguarded = format!(
+        r#"{ALLOW}
+        @id("thread-fence") forbid(principal, action, resource)
+        when {{ context has request }}
+        when {{ context.conversation.thread == "t" }};
+    "#
+    );
+    assert!(matches!(
+        outcome(&guarded, RiskLevel::Low, session()),
+        RequestOutcome::Open { ref residuals, .. } if residuals.is_empty()
+    ));
+    assert_eq!(
+        outcome(&unguarded, RiskLevel::Low, session()),
+        RequestOutcome::Denied
+    );
+}
+
+fn routing_dependent(fence: &str) -> Vec<String> {
+    PolicyEngine::new(
+        &format!(
+            r#"{ALLOW}
+            @id("fence") forbid(principal, action, resource)
+            when {{ context has request }}
+            when {{ {fence} }};
+        "#
+        ),
+        &world(),
+    )
+    .expect("valid request fence")
+    .routing_dependent_policies()
+}
+
+#[test]
+fn routing_reads_are_found_however_the_context_is_reached() {
+    for fence in [
+        r#"context.request.method == "POST" && context.via == "gateway-b""#,
+        r#"context.request.method == "POST" && ({ routing: context }).routing.via == "gateway-b""#,
+        r#"context.request.method == "POST" && context == {}"#,
+        r#"context.request.method == "POST" && ip(context.via).isLoopback()"#,
+        r#"context.request.method == "POST" && context.conversation.container == "t0123""#,
+        r#"context.request.method == "POST" && context has github"#,
+    ] {
+        assert_eq!(routing_dependent(fence), ["fence"], "{fence}");
+    }
+    for fence in [
+        r#"context.request.method == "POST""#,
+        r#"context.request.method == "POST" && context.conversation.id == "c0123""#,
+    ] {
+        assert!(routing_dependent(fence).is_empty(), "{fence}");
+    }
+}
+
+#[test]
+fn a_membership_a_residual_still_tests_changes_the_request_outcome() {
+    let policies = format!(
+        r#"{ALLOW}
+        @id("selected-fence") forbid(principal, action, resource)
+        when {{ context has request }}
+        when {{
+            (if context.request.method == "POST" then principal
+             else Dekopon::Principal::"direct-caller") in Dekopon::Group::"restricted"
+        }};
+    "#
+    );
+    let outcome_in = |world: PolicyWorld| {
+        PolicyEngine::new(&policies, &world)
+            .expect("valid selector fence")
+            .request_outcome(capability_request(
+                "cpetersen",
+                "cli-probe.upper",
+                session(),
+            ))
+    };
+    let outside = outcome_in(world().with_group_members([(
+        "someone".parse().expect("principal"),
+        "restricted".parse().expect("group"),
+    )]));
+    let inside = outcome_in(world().with_group_members([(
+        "cpetersen".parse().expect("principal"),
+        "restricted".parse().expect("group"),
+    )]));
+    assert!(matches!(outside, RequestOutcome::Open { .. }));
+    assert_ne!(outside, inside);
 }

@@ -7,6 +7,27 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.85.0] - 2026-11-05
+
+### Added
+
+- chatMemory.continuityMigration keeps a released broker's memory when its authority is proved unchanged, refuses unproven conversations without resetting them unless onUnproven is fresh-epoch, and dekopon-brokerd check prints the digests it needs.
+
+### Changed
+
+- chatMemory.continuityPolicy takes relaxed or paranoid (the default); stable and authority-bound are refused, and entering relaxed after paranoid no longer reopens an earlier relaxed history.
+- The first start rewrites the storage layout so an earlier broker refuses the storage root instead of resetting memory.
+
+### Fixed
+
+- Raising storage, host or memory limits no longer starts paranoid broker chat memory over; it starts a new generation only when the sender's effective authority changes, now including request policy and reachable HTTP destination trust.
+
+## [dekopon-chart-0.72.0] - 2026-11-05
+
+### Changed
+
+- Chart 0.72.0 targets core v0.85.0 and renders the `v0.85.0` image tag.
+
 ## [0.84.2] - 2026-11-04
 
 ### Fixed

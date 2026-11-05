@@ -2,7 +2,7 @@
 
 An agent remembers a conversation by replaying its transcript into the next prompt. Summaries are
 written before they are needed, and the replayed history changes as rarely as possible, so the
-provider's prompt cache keeps matching. None of it is authority. The keys are in
+provider's prompt cache keeps matching. The keys are in
 [`config/memory.rs`](../crates/dekopon-gatewayd/src/config/memory.rs) and the route's `memory:`
 block in [`config.rs`](../crates/dekopon-gatewayd/src/config.rs).
 
@@ -78,21 +78,26 @@ locator, and is evicted with its record.
 `scope: privateConversation` gives each authenticated sender their own history in a
 conversation. `sharedConversation` drops the sender: everyone in that one group DM, channel or
 thread shares it, and one participant's earlier prompt and answer replay to all of them. It is never
-cross-agent or cross-conversation memory. A record replays only under the capability set it was
-written with, so a changed grant starts afresh.
+cross-agent or cross-conversation memory.
 
 ## Durable memory
 
-For memory that outlives retention, the broker can host a storage provider whose constraint sets
-carry the `chatMemoryRecord`, `chatMemoryRecent` and `chatMemorySearch` routes. When Cedar grants
-all three to the sender, the gateway records each turn after the chat service accepted the answer,
-and the model may retrieve turns with `memory recent` and `memory search`; it can never reach the
-record route. Stored turns never enter a prompt on their own. Recording does not deduplicate, and
-there is no deletion, export or encryption at rest.
+For memory that outlives retention, the broker can host a storage provider on the three
+chat-memory routes. When Cedar grants all three to the sender, the gateway records each turn after
+the chat service accepted the answer, and the model may retrieve but never record turns. Stored
+turns never enter a prompt on their own. Recording does not deduplicate, and there is no deletion,
+export or encryption at rest.
+
+`continuityPolicy: paranoid` starts a new durable-memory generation when the sender's effective
+authority changes, even between turns whose GitHub facts or trigger a policy reads, though message
+and probe turns share one; `relaxed` never does.
+
+| `paranoid` [rotates](../crates/dekopon-broker/src/continuity.rs) on | Neither rotates on |
+|---|---|
+| capabilities, providers, storage access, HTTP authority, CA bytes | limits, timeouts, artifact digests, binding names, map revision |
+| applicable request policy, secret references, sinks | inapplicable policy, labels |
 
 ## Memory never grants authority
 
 History, summaries, descriptions and pins never reach the broker as policy input; each later
-capability call is a fresh proposal authorized for the person asking now. The grant check compares
-capability identifiers only: tightening a capability's constraints or credential under the same
-identifier keeps the history, including what the agent read under the looser grant.
+capability call is a fresh proposal authorized for the person asking now.

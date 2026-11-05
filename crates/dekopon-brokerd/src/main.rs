@@ -570,11 +570,50 @@ struct CheckOutput {
     policy_digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identity_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuity: Option<ContinuityOutput>,
     ok: bool,
     problems: Vec<String>,
     warnings: Vec<String>,
     #[serde(rename = "peakRssBytes")]
     peak_rss_bytes: Option<u64>,
+}
+
+#[cfg(unix)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContinuityOutput {
+    legacy_authority_digest: String,
+    routing_dependent_policies: Vec<String>,
+    resolved_digest: String,
+    candidates: Vec<CandidateOutput>,
+}
+
+#[cfg(unix)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidateOutput {
+    configured: String,
+    resolved: String,
+}
+
+#[cfg(unix)]
+impl From<dekopon_broker::ContinuityReport> for ContinuityOutput {
+    fn from(report: dekopon_broker::ContinuityReport) -> Self {
+        Self {
+            legacy_authority_digest: report.legacy_authority_digest.to_string(),
+            routing_dependent_policies: report.routing_dependent_policies,
+            resolved_digest: report.current_resolved_digest.to_string(),
+            candidates: report
+                .candidates
+                .into_iter()
+                .map(|candidate| CandidateOutput {
+                    configured: candidate.configured.to_string(),
+                    resolved: candidate.resolved.to_string(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -590,6 +629,7 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
     let output = CheckOutput {
         policy_digest: report.policy_digest,
         identity_digest: report.identity_digest,
+        continuity: report.continuity.map(ContinuityOutput::from),
         ok: report.problems.is_empty(),
         problems: report
             .problems
@@ -622,6 +662,28 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
                     .as_ref()
                     .map(|digest| format!("identity.digest\t{digest}")),
             )
+            .chain(output.continuity.iter().flat_map(|continuity| {
+                [
+                    format!(
+                        "continuity.legacyAuthorityDigest\t{}",
+                        continuity.legacy_authority_digest
+                    ),
+                    format!("continuity.resolvedDigest\t{}", continuity.resolved_digest),
+                ]
+                .into_iter()
+                .chain(
+                    continuity
+                        .routing_dependent_policies
+                        .iter()
+                        .map(|policy| format!("continuity.routingDependent\t{policy}")),
+                )
+                .chain(continuity.candidates.iter().map(|candidate| {
+                    format!(
+                        "continuity.candidate\t{}\t{}",
+                        candidate.configured, candidate.resolved
+                    )
+                }))
+            }))
             .chain(output.ok.then(|| "ok".to_owned()))
             .collect::<Vec<_>>();
         lines.join("\n")
@@ -798,6 +860,7 @@ mod tests {
             let output = super::CheckOutput {
                 policy_digest: None,
                 identity_digest: None,
+                continuity: None,
                 ok: true,
                 problems: Vec::new(),
                 warnings: Vec::new(),

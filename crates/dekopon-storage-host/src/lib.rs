@@ -69,15 +69,69 @@ use key::{
     DOMAIN_RECORD_ID, commitment, random_bytes, token,
 };
 use layout::{Layout, scan_root_usage, scan_usage, usage_with_directory_entry};
-use namespace::{Namespace, NamespacePlan, Reset, deadline_after};
+use namespace::{ContinuityOutcome, Namespace, NamespacePlan, Reset, deadline_after};
 use quota::QuotaLedger;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ContinuityPolicy {
-    Stable,
+    Relaxed,
     #[default]
-    AuthorityBound,
+    Paranoid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContinuityCheck {
+    Absent,
+    DigestMismatch,
+    SpaceBound,
+    RoutingDependent,
+    IdOnlySubject,
+    NoCandidate,
+}
+
+impl ContinuityCheck {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::DigestMismatch => "digest-mismatch",
+            Self::SpaceBound => "space-bound",
+            Self::RoutingDependent => "routing-dependent",
+            Self::IdOnlySubject => "id-only-subject",
+            Self::NoCandidate => "no-candidate",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnprovenDisposition {
+    #[default]
+    Refuse,
+    FreshEpoch,
+}
+
+pub enum LegacyContinuity {
+    Unproven(ContinuityCheck),
+    Candidates(Vec<Vec<u8>>),
+}
+
+pub enum MemoryContinuity {
+    Relaxed,
+    Paranoid {
+        surface: Vec<u8>,
+        legacy: LegacyContinuity,
+        on_unproven: UnprovenDisposition,
+    },
+}
+
+pub(crate) enum Comparison {
+    Provider {
+        policy: ContinuityPolicy,
+        surface: Vec<u8>,
+    },
+    Memory(MemoryContinuity),
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -121,8 +175,7 @@ pub struct StorageGrantRequest {
     transport: String,
     channel: String,
     conversation: String,
-    continuity_policy: ContinuityPolicy,
-    authority_surface: Vec<u8>,
+    comparison: Comparison,
     shared_namespace: Option<ProviderId>,
     space_key: Option<dekopon_core::SpaceKey>,
 }
@@ -167,8 +220,10 @@ impl StorageGrantRequest {
             transport: transport.into(),
             channel: channel.into(),
             conversation: conversation.into(),
-            continuity_policy,
-            authority_surface,
+            comparison: Comparison::Provider {
+                policy: continuity_policy,
+                surface: authority_surface,
+            },
             shared_namespace: None,
             space_key: None,
         }
@@ -177,6 +232,12 @@ impl StorageGrantRequest {
     #[must_use]
     pub fn with_shared_namespace(mut self, namespace: Option<ProviderId>) -> Self {
         self.shared_namespace = namespace;
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory_continuity(mut self, continuity: MemoryContinuity) -> Self {
+        self.comparison = Comparison::Memory(continuity);
         self
     }
 
@@ -228,11 +289,8 @@ impl StorageGrantRequest {
     pub(crate) fn scope(&self) -> StorageScope {
         self.scope
     }
-    pub(crate) fn continuity_policy(&self) -> ContinuityPolicy {
-        self.continuity_policy
-    }
-    pub(crate) fn authority_surface(&self) -> &[u8] {
-        &self.authority_surface
+    pub(crate) const fn comparison(&self) -> &Comparison {
+        &self.comparison
     }
 }
 
@@ -508,6 +566,7 @@ impl StorageHost {
             self.inner.limits.startup_max_entries,
         )?;
         let reset = plan.take_reset();
+        let continuity = plan.take_continuity();
         if plan.maximum_generation_peak_bytes() > self.inner.limits.max_namespace_bytes {
             return Err(StorageHostError::QuotaExceeded);
         }
@@ -586,6 +645,24 @@ impl StorageHost {
             .commit();
         if let Some(cause) = reset {
             return Err(report_namespace_reset(cause, &namespace));
+        }
+        match continuity {
+            Some(ContinuityOutcome::Migrated) => tracing::info!(
+                event = "storage_continuity_migrated",
+                category = "storage",
+                storage.namespace = %namespace.base_token,
+                storage.generation = %namespace.generation_token,
+                "storage.continuity.migrated"
+            ),
+            Some(ContinuityOutcome::FreshEpoch { check }) => tracing::warn!(
+                event = "storage_continuity_fresh_epoch",
+                category = "storage",
+                storage.namespace = %namespace.base_token,
+                storage.generation = %namespace.generation_token,
+                storage.continuity.check = check.label(),
+                "storage.continuity.fresh_epoch"
+            ),
+            None => {}
         }
         Ok(StorageGrant {
             host_id: self.inner.id,
@@ -819,6 +896,8 @@ pub enum StorageHostError {
     StartupEntryLimit { count: u64, maximum: u64 },
     #[error("storage grant belongs to another host instance")]
     GrantHostMismatch,
+    #[error("broker memory continuity could not be proved: {}", check.label())]
+    ContinuityUnproven { check: ContinuityCheck },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -901,7 +980,9 @@ impl StorageHostError {
             Self::QuotaExceeded | Self::Arithmetic => StorageFailureClass::Quota,
             Self::Timeout => StorageFailureClass::Timeout,
             Self::Corrupt { .. } | Self::CorruptLayout { .. } => StorageFailureClass::Corrupt,
-            Self::PermissionDenied | Self::GrantHostMismatch => StorageFailureClass::Denied,
+            Self::PermissionDenied | Self::GrantHostMismatch | Self::ContinuityUnproven { .. } => {
+                StorageFailureClass::Denied
+            }
             _ => StorageFailureClass::Io,
         }
     }
