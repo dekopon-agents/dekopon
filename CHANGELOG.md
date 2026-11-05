@@ -7,6 +7,33 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.87.0] - 2026-11-05
+
+### Added
+
+- `indicators.strangers` in the gateway config sets the reply to an unmapped sender, `silent` or `{reply: "<text>"}`, per transport, conversation kind and route; omitted, it is "I only answer people my operator has let in. You're not on the list, so I'll pass."
+
+### Changed
+
+- The gateway's refusal, busy, failure, stop, collection and token-budget replies are reworded for any operator; every stop reply says "Anything I already did was not undone."
+- The PR-subscription and daily-digest wake prompts say "chat" instead of "Slack".
+- `dekopon-console` defaults to the model `gpt-6-luna`.
+- AGENTS.md and the README describe the reference deployment without personal detail, and AGENTS.md forbids shipping real names, hosts, paths or IDs from it.
+
+### Fixed
+
+- The conditional-write example, the PR summarizer chart values and the dekopon-policy rustdoc no longer name the maintainer's home paths, principal or host.
+- The default reply to an unmapped sender no longer names one household or claims the owner was notified; no notice was ever sent.
+- A sender refused by policy is no longer greeted by their principal ID in the conversation.
+- A stop word that cancels pending input or only jobs now answers with the route's `stopped` template instead of the built-in text.
+
+## [dekopon-chart-0.74.0] - 2026-11-05
+
+### Changed
+
+- Chart 0.74.0 targets core v0.87.0 and renders the `v0.87.0` image tag.
+- The PR summarizer/linter example values send broker telemetry to `http://otel-collector:4318`.
+
 ## [0.86.0] - 2026-11-05
 
 ### Added
