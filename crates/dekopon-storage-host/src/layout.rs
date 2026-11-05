@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::{StorageHostError, key::random_bytes};
 
 pub(crate) const ENTRY_CHARGE: u64 = 4_096;
-const LAYOUT_VERSION: &str = "dekopon.dev/provider-storage-layout/v1alpha1";
+const LAYOUT_VERSION: &str = "dekopon.dev/provider-storage-layout/v1alpha2";
+// The previous release refuses an unknown layout version at open, before any namespace is
+// selected, so this upgrade keeps it from rotating memory in pointers it cannot read.
+const LEGACY_LAYOUT_VERSION: &str = "dekopon.dev/provider-storage-layout/v1alpha1";
 const HARD_MAX_DIRECTORY_ENTRIES: u64 = 1_000_000;
 
 #[derive(Clone)]
@@ -75,6 +78,28 @@ pub(crate) fn usage_with_directory_entry(mut usage: Usage) -> Result<Usage, Stor
     Ok(usage)
 }
 
+fn is_temporary_name(name: &str) -> bool {
+    name.strip_prefix("tmp-").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn encode_layout(path: PathBuf) -> Result<Vec<u8>, StorageHostError> {
+    #[allow(
+        clippy::map_err_ignore,
+        reason = "serializing this owned one-string document has no failing case"
+    )]
+    let mut encoded = serde_json::to_vec(&LayoutDocument {
+        api_version: LAYOUT_VERSION.to_owned(),
+    })
+    .map_err(|_| StorageHostError::CorruptLayout { path })?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
 impl Layout {
     pub(crate) fn minimum_usage(root: &Path) -> Result<Usage, StorageHostError> {
         let document = LayoutDocument {
@@ -110,8 +135,14 @@ impl Layout {
         ensure_root_directory(root)?;
         let root = Directory::open_path(root, true)?;
         let corrupt_layout = |path: PathBuf| StorageHostError::CorruptLayout { path };
-        let initial_entries = root.entries_prefix(4)?;
-        if initial_entries.len() > 3 {
+        let mut initial_entries = root.entries_prefix(5)?;
+        let upgrade_temporaries = initial_entries
+            .iter()
+            .filter(|name| is_temporary_name(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        initial_entries.retain(|name| !is_temporary_name(name));
+        if initial_entries.len() > 3 || upgrade_temporaries.len() > 1 {
             return Err(corrupt_layout(root.path().to_path_buf()));
         }
         let has_layout = initial_entries.iter().any(|name| name == "layout");
@@ -123,8 +154,9 @@ impl Layout {
             return Err(corrupt_layout(root.path().to_path_buf()));
         }
         if !has_layout
-            && !(initial_entries.is_empty()
-                || initial_entries.as_slice() == ["writer.lock".to_owned()])
+            && (!upgrade_temporaries.is_empty()
+                || !(initial_entries.is_empty()
+                    || initial_entries.as_slice() == ["writer.lock".to_owned()]))
         {
             return Err(corrupt_layout(root.path().to_path_buf()));
         }
@@ -143,33 +175,37 @@ impl Layout {
             .map_err(|source| writer_lock_failure(&root, source))?;
 
         let namespaces = if has_layout {
+            // Only an interrupted layout upgrade leaves a root temporary, and only the writer-lock
+            // holder may remove it, or a second opener could delete a live writer's file.
+            for temporary in &upgrade_temporaries {
+                drop(root.open_private(temporary, false)?);
+                root.remove_file(temporary)?;
+                root.sync()?;
+            }
             let encoded = root.read_bounded("layout", 4_096)?;
             let document: LayoutDocument = serde_json::from_slice(&encoded).map_err(|error| {
                 crate::report_decode_failure("layout", &error);
                 corrupt_layout(root.diagnostic_child("layout"))
             })?;
-            if document.api_version != LAYOUT_VERSION {
-                return Err(corrupt_layout(root.diagnostic_child("layout")));
-            }
+            let upgrade = match document.api_version.as_str() {
+                LAYOUT_VERSION => false,
+                LEGACY_LAYOUT_VERSION => true,
+                _ => return Err(corrupt_layout(root.diagnostic_child("layout"))),
+            };
             let expected = ["layout", "namespaces", "writer.lock"];
             let retained = root.entries_prefix(expected.len() as u64 + 1)?;
             if retained.len() != expected.len() || retained.iter().map(String::as_str).ne(expected)
             {
                 return Err(corrupt_layout(root.path().to_path_buf()));
             }
-            root.open_directory("namespaces")?
+            let namespaces = root.open_directory("namespaces")?;
+            if upgrade {
+                root.replace_private("layout", &encode_layout(root.diagnostic_child("layout"))?)?;
+            }
+            namespaces
         } else {
             let namespaces = root.ensure_directory("namespaces")?;
-            let document = LayoutDocument {
-                api_version: LAYOUT_VERSION.to_owned(),
-            };
-            #[allow(
-                clippy::map_err_ignore,
-                reason = "serializing this owned one-string document has no failing case"
-            )]
-            let mut encoded = serde_json::to_vec(&document)
-                .map_err(|_| corrupt_layout(root.diagnostic_child("layout")))?;
-            encoded.push(b'\n');
+            let encoded = encode_layout(root.diagnostic_child("layout"))?;
             let mut file = root.create_private("layout")?;
             file.write_all(&encoded)
                 .and_then(|()| file.sync_all())

@@ -49,7 +49,7 @@ fn stdout_assets() -> (
 
 fn memory_config() -> ChatMemoryConfig {
     ChatMemoryConfig {
-        continuity_policy: ContinuityPolicy::AuthorityBound,
+        continuity_policy: ContinuityPolicy::Paranoid,
         enabled_agents: vec!["reviewer".parse().expect("agent")],
         max_lookback_turns: 200,
         max_recent_turns: 20,
@@ -59,6 +59,7 @@ fn memory_config() -> ChatMemoryConfig {
         max_turn_bytes: 32_768,
         compaction_target_bytes: 8_388_608,
         compaction_threshold_bytes: 12_582_912,
+        continuity_migration: None,
     }
 }
 
@@ -198,7 +199,15 @@ fn local_claim(transport: &str, conversation: &str) -> Attestation {
 }
 
 async fn smoke_memory_broker(root: &std::path::Path) -> Broker<InMemoryAuditLog> {
-    let storage = StorageHost::open(root, StorageLimits::default()).expect("storage");
+    smoke_memory_broker_with(root, StorageLimits::default(), memory_config()).await
+}
+
+async fn smoke_memory_broker_with(
+    root: &std::path::Path,
+    limits: StorageLimits,
+    memory: ChatMemoryConfig,
+) -> Broker<InMemoryAuditLog> {
+    let storage = StorageHost::open(root, limits).expect("storage");
     let registry = BrokerProviderRegistry::load_with_storage(
         [std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixture/memory-smoke-probe-provider.wasm")],
@@ -282,8 +291,137 @@ async fn smoke_memory_broker(root: &std::path::Path) -> Broker<InMemoryAuditLog>
         BrokerLimits::default(),
     )
     .expect("broker")
-    .with_chat_memory(memory_config())
+    .with_chat_memory(memory)
     .expect("exactly three routes")
+}
+
+fn local_delivery(sequence: u64) -> DeliveryIdentity {
+    DeliveryIdentity::Local {
+        transport: "local-dev".parse().expect("transport"),
+        conversation: "real-session".to_owned(),
+        boot_nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+        connection: 1,
+        sequence,
+    }
+}
+
+async fn record_marker(broker: &Broker<InMemoryAuditLog>, marker: &str, sequence: u64) {
+    let id = format!("record-{sequence}")
+        .parse::<InvocationId>()
+        .expect("id");
+    let recorded = broker
+        .record_delivered_turn(
+            &gateway(),
+            Some(&attestor_grant()),
+            &local_claim("local-dev", "real-session").bound_to(id.clone()),
+            DeliveredTurnRequest::new(
+                id,
+                TRACE_PARENT.parse().expect("trace"),
+                local_delivery(sequence),
+                marker.to_owned(),
+                DeliveredAnswer::accepted_by_transport("assistant".to_owned()),
+            ),
+        )
+        .await
+        .expect("record accounted");
+    assert_eq!(
+        recorded.outcome,
+        InvocationOutcome::Succeeded,
+        "{recorded:?}"
+    );
+}
+
+async fn recent_user(broker: &Broker<InMemoryAuditLog>, label: &str) -> serde_json::Value {
+    let claim = local_claim("local-dev", "real-session");
+    let peer = gateway();
+    let grant = attestor_grant();
+    let dekopon_broker_host::CommandRunOutcome::Proposed {
+        capability, input, ..
+    } = broker
+        .run_command(&peer, Some(&grant), Some(&claim), "smokerecent", &[], false)
+        .await
+        .expect("recent command")
+    else {
+        panic!("ordinary command must propose recent");
+    };
+    let id = format!("recent-{label}")
+        .parse::<InvocationId>()
+        .expect("id");
+    let (streams, stdout) = stdout_assets();
+    let result = broker
+        .invoke(
+            &peer,
+            Some(&grant),
+            Some(&claim.bound_to(id.clone())),
+            InvocationRequest {
+                id,
+                capability,
+                input,
+                trace_parent: TRACE_PARENT.parse().expect("trace"),
+                secret_use: None,
+            },
+            streams,
+        )
+        .await
+        .expect("recent accounted");
+    assert_eq!(
+        result.result.outcome,
+        InvocationOutcome::Succeeded,
+        "{result:?}"
+    );
+    let bytes = stdout.join().expect("stdout");
+    if bytes.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::from_slice::<serde_json::Value>(&bytes).expect("one row")["user"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn operational_changes_keep_paranoid_memory_across_restarts() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp
+        .path()
+        .canonicalize()
+        .expect("canonical tempdir")
+        .join("storage");
+    let limits = StorageLimits {
+        max_namespaces: 64,
+        ..StorageLimits::default()
+    };
+    let broker = smoke_memory_broker_with(&root, limits.clone(), memory_config()).await;
+    record_marker(&broker, "before-quota-change", 1).await;
+    assert_eq!(
+        recent_user(&broker, "baseline").await,
+        "before-quota-change"
+    );
+    drop(broker);
+
+    let raised = StorageLimits {
+        max_namespaces: 500,
+        ..limits
+    };
+    let broker = smoke_memory_broker_with(&root, raised.clone(), memory_config()).await;
+    assert_eq!(
+        recent_user(&broker, "namespaces").await,
+        "before-quota-change"
+    );
+    drop(broker);
+
+    let budget = StorageLimits {
+        max_root_bytes: raised.max_root_bytes / 2,
+        ..raised
+    };
+    let broker = smoke_memory_broker_with(&root, budget.clone(), memory_config()).await;
+    assert_eq!(recent_user(&broker, "bytes").await, "before-quota-change");
+    drop(broker);
+
+    let tuned = ChatMemoryConfig {
+        max_recent_turns: 10,
+        max_lookback_turns: 100,
+        ..memory_config()
+    };
+    let broker = smoke_memory_broker_with(&root, budget, tuned).await;
+    assert_eq!(recent_user(&broker, "tuning").await, "before-quota-change");
 }
 
 #[tokio::test(flavor = "multi_thread")]

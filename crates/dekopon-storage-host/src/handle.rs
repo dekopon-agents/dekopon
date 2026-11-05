@@ -735,7 +735,7 @@ mod tests {
                 "scientist-slack",
                 "c0123abc",
                 "c0123abc:1712345678.000100",
-                ContinuityPolicy::Stable,
+                ContinuityPolicy::Relaxed,
                 b"authority".to_vec(),
             ))
             .expect("grant");

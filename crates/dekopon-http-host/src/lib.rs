@@ -313,6 +313,42 @@ impl NonPublicHttpsAuthority {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReachableDestinationSettings {
+    pub plaintext_hosts: BTreeSet<String>,
+    pub non_public_https: BTreeSet<String>,
+}
+
+// Matches `plaintext_permitted` (bare host, any port) and `authority_matches` (bare allowed host is
+// HTTPS port 443), so a setting enters the projection whenever enforcement could consult it.
+#[must_use]
+pub fn reachable_destination_settings<'a>(
+    allowed: impl IntoIterator<Item = &'a str>,
+    plaintext_hosts: &PlaintextHosts,
+    non_public_https: &[NonPublicHttpsAuthority],
+) -> ReachableDestinationSettings {
+    let mut reachable = ReachableDestinationSettings::default();
+    for entry in allowed {
+        let entry = entry.trim().to_ascii_lowercase();
+        let (host, authority) = match entry.rsplit_once(':') {
+            Some((host, port)) if !host.ends_with(':') && port.parse::<u16>().is_ok() => {
+                (host.to_owned(), entry.clone())
+            }
+            Some(_) | None => (entry.clone(), format!("{entry}:{DEFAULT_HTTPS_PORT}")),
+        };
+        if plaintext_hosts.contains(&host) {
+            reachable.plaintext_hosts.insert(host);
+        }
+        if non_public_https
+            .iter()
+            .any(|configured| configured.authority == authority)
+        {
+            reachable.non_public_https.insert(authority);
+        }
+    }
+    reachable
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoopbackHttpsPin {
     authority: String,
@@ -2530,6 +2566,26 @@ mod tests {
         assert!(!is_forbidden_public_destination(
             "2606:4700:4700::1111".parse().expect("valid fixture")
         ));
+    }
+
+    #[test]
+    fn reachable_settings_follow_the_enforcing_destination_rules() {
+        let plaintext = PlaintextHosts::new(["rpi.lan", "other.lan"]).expect("plaintext hosts");
+        let non_public = ["api.example:8443", "other.example:8443"]
+            .map(|authority| super::NonPublicHttpsAuthority::new(authority).expect("authority"));
+        let reachable = super::reachable_destination_settings(
+            ["rpi.lan:8080", " API.example:8443 ", "bare.example"],
+            &plaintext,
+            &non_public,
+        );
+        assert_eq!(
+            reachable.plaintext_hosts.into_iter().collect::<Vec<_>>(),
+            ["rpi.lan"]
+        );
+        assert_eq!(
+            reachable.non_public_https.into_iter().collect::<Vec<_>>(),
+            ["api.example:8443"]
+        );
     }
 
     #[test]

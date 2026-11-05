@@ -65,9 +65,9 @@ fn request_at(
         "c0123abc",
         conversation,
         if scope == StorageScope::PrivateConversation {
-            ContinuityPolicy::AuthorityBound
+            ContinuityPolicy::Paranoid
         } else {
-            ContinuityPolicy::Stable
+            ContinuityPolicy::Relaxed
         },
         surface.to_vec(),
     )

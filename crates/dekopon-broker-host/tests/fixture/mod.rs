@@ -151,7 +151,7 @@ impl Default for FixtureHostBuilder {
             // Defaults to Stable, not the crate's own AuthorityBound default, because this harness
             // holds authority fixed, so Stable is the policy that keeps addressing one namespace if
             // that ever varies.
-            continuity: ContinuityPolicy::Stable,
+            continuity: ContinuityPolicy::Relaxed,
             scope: Scope::default(),
             // Left unset so build derives them from the host limits in force; a hardcoded default
             // here would duplicate a number this crate does not own and could drift out of sync.

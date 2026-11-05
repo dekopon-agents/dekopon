@@ -211,6 +211,7 @@ pub struct CheckReport {
     pub warnings: Vec<StartupWarning>,
     pub policy_digest: Option<String>,
     pub identity_digest: Option<String>,
+    pub continuity: Option<dekopon_broker::ContinuityReport>,
     private_sources: Vec<PathBuf>,
     pub peak_rss_bytes: Option<u64>,
 }
@@ -1327,6 +1328,10 @@ async fn prepare(
             .map_err(|error| vec![BrokerdError::Broker(error)])?,
         None => broker,
     };
+    report.continuity = broker
+        .continuity_report()
+        .filter(|_| !secrets_unchecked)
+        .cloned();
     let mut identities = BTreeMap::new();
     for identity in config.identities {
         identities.insert(

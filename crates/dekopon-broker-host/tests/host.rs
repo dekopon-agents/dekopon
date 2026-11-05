@@ -1776,7 +1776,7 @@ fn probe_storage_grant(invocation: &str, subject: &str) -> StorageGrantRequest {
         "probe-transport",
         "c0123abc",
         "c0123abc:1712345678.000100",
-        ContinuityPolicy::Stable,
+        ContinuityPolicy::Relaxed,
         b"probe-authority".to_vec(),
     )
 }
@@ -1850,7 +1850,7 @@ async fn a_grant_outside_the_configured_shared_namespace_never_runs() {
                     "probe-transport",
                     "c0123abc",
                     "c0123abc:1712345678.000100",
-                    ContinuityPolicy::Stable,
+                    ContinuityPolicy::Relaxed,
                     b"probe-authority".to_vec(),
                 )
                 .with_shared_namespace(granted.map(|name| name.parse().expect("namespace"))),
@@ -1972,7 +1972,7 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
                 "probe-transport",
                 "c0123abc",
                 "c0123abc:1712345678.000100",
-                ContinuityPolicy::Stable,
+                ContinuityPolicy::Relaxed,
                 b"probe-authority".to_vec(),
             ))
             .expect("grant");

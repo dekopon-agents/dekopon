@@ -280,7 +280,7 @@ fn the_declared_route_is_what_reserves_a_capability_not_its_spelling() {
 #[test]
 fn memory_composition_reserves_host_calls_and_pre_compaction_peak() {
     let memory = ChatMemoryConfig {
-        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::Paranoid,
         enabled_agents: vec!["reviewer".parse().expect("agent")],
         max_lookback_turns: 200,
         max_recent_turns: 20,
@@ -290,6 +290,7 @@ fn memory_composition_reserves_host_calls_and_pre_compaction_peak() {
         max_turn_bytes: 32_768,
         compaction_target_bytes: 8_388_608,
         compaction_threshold_bytes: 12_582_912,
+        continuity_migration: None,
     };
 
     let mut minimal = memory.clone();
@@ -520,7 +521,7 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
     assert_rotations(&storage, storage_mutations, encoded_storage);
 
     let memory = ChatMemoryConfig {
-        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::Paranoid,
         enabled_agents: vec![
             "reviewer".parse().expect("agent"),
             "other".parse().expect("agent"),
@@ -533,10 +534,11 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
         max_turn_bytes: 32_768,
         compaction_target_bytes: 8_388_608,
         compaction_threshold_bytes: 12_582_912,
+        continuity_migration: None,
     };
     let memory_mutations: &[Mutation<ChatMemoryConfig>] = &[
         ("continuityPolicy", |v| {
-            v.continuity_policy = dekopon_storage_host::ContinuityPolicy::Stable;
+            v.continuity_policy = dekopon_storage_host::ContinuityPolicy::Relaxed;
         }),
         ("maxLookbackTurns", |v| v.max_lookback_turns += 1),
         ("maxRecentTurns", |v| v.max_recent_turns += 1),
@@ -1928,7 +1930,7 @@ fn terminal_redirect_refusal_keeps_its_safe_label_detail_and_exit_three() {
 
 fn valid_memory_config() -> ChatMemoryConfig {
     ChatMemoryConfig {
-        continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::Paranoid,
         enabled_agents: vec!["reviewer".parse().expect("agent")],
         max_lookback_turns: 200,
         max_recent_turns: 20,
@@ -1938,6 +1940,7 @@ fn valid_memory_config() -> ChatMemoryConfig {
         max_turn_bytes: 32_768,
         compaction_target_bytes: 8_388_608,
         compaction_threshold_bytes: 12_582_912,
+        continuity_migration: None,
     }
 }
 
@@ -2523,6 +2526,10 @@ struct SurfaceBroker<'a> {
     secret_binding: Option<Option<&'a str>>,
     identities: Vec<(&'a str, &'a str)>,
     storage: bool,
+    storage_limits: dekopon_storage_host::StorageLimits,
+    memory_config: ChatMemoryConfig,
+    binding: super::SecretUseBinding,
+    groups: Vec<(&'a str, &'a str)>,
 }
 
 impl<'a> SurfaceBroker<'a> {
@@ -2568,7 +2575,36 @@ impl<'a> SurfaceBroker<'a> {
             secret_binding: None,
             identities: Vec::new(),
             storage: true,
+            storage_limits: dekopon_storage_host::StorageLimits::default(),
+            memory_config: valid_memory_config(),
+            binding: http_probe_binding(),
+            groups: Vec::new(),
         }
+    }
+
+    fn with_group_members(mut self, members: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        self.groups = members.into_iter().collect();
+        self
+    }
+
+    fn with_policy(mut self, policy: &str) -> Self {
+        self.policy.push_str(policy);
+        self
+    }
+
+    fn with_storage_limits(mut self, limits: dekopon_storage_host::StorageLimits) -> Self {
+        self.storage_limits = limits;
+        self
+    }
+
+    fn with_memory_config(mut self, config: ChatMemoryConfig) -> Self {
+        self.memory_config = config;
+        self
+    }
+
+    fn with_binding(mut self, binding: super::SecretUseBinding) -> Self {
+        self.binding = binding;
+        self
     }
 
     fn with_identities(mut self, identities: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
@@ -2603,7 +2639,7 @@ impl<'a> SurfaceBroker<'a> {
                     .canonicalize()
                     .expect("canonical tempdir")
                     .join("storage"),
-                dekopon_storage_host::StorageLimits::default(),
+                self.storage_limits.clone(),
             )
             .expect("storage")
         });
@@ -2627,7 +2663,13 @@ impl<'a> SurfaceBroker<'a> {
                 .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
         )
         .expect("world")
-        .with_secrets([SECRET_DRN.parse().expect("secret")]);
+        .with_secrets([SECRET_DRN.parse().expect("secret")])
+        .with_group_members(self.groups.iter().map(|(principal, group)| {
+            (
+                principal.parse().expect("principal"),
+                group.parse().expect("group"),
+            )
+        }));
         let mut broker = Broker::new(
             registry,
             "broker".parse().expect("principal"),
@@ -2644,14 +2686,12 @@ impl<'a> SurfaceBroker<'a> {
             BrokerLimits::default(),
         )?;
         if self.memory {
-            broker = broker.with_chat_memory(valid_memory_config())?;
+            broker = broker.with_chat_memory(self.memory_config)?;
         }
         if let Some(revision) = self.secret_binding {
-            let mut secrets = super::SecretCatalog::new(
-                vec![http_probe_binding()],
-                Arc::new(super::EmptySecretResolver),
-            )
-            .expect("binding");
+            let mut secrets =
+                super::SecretCatalog::new(vec![self.binding], Arc::new(super::EmptySecretResolver))
+                    .expect("binding");
             if let Some(revision) = revision {
                 secrets = secrets
                     .with_authority_revision(revision.to_owned())
@@ -2675,7 +2715,12 @@ fn surface(broker: &Broker<InMemoryAuditLog>, memory_route: bool) -> Vec<u8> {
         ),
     );
     broker
-        .canonical_authority_surface(&context, StorageInterface::Jsonl, memory_route)
+        .authority_surface_v1(
+            &context,
+            StorageInterface::Jsonl,
+            memory_route,
+            &broker.current_operational().expect("operational"),
+        )
         .expect("surface")
 }
 
@@ -4030,4 +4075,759 @@ async fn with_chat_memory_refuses_routes_whose_matching_risk_is_not_the_fixed_ri
         broker.with_chat_memory(valid_memory_config()),
         Err(BrokerBuildError::InvalidChatMemory)
     ));
+}
+
+const MEMBER: &str = "drn:slack:user:t0123abc:u9xyz";
+
+fn member_context() -> AuthenticatedContext {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    attested_agent_context(
+        MEMBER,
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Message,
+        ),
+    )
+}
+
+fn memory_broker(root: &std::path::Path) -> SurfaceBroker<'_> {
+    SurfaceBroker::new(root, &memory_policy())
+        .with_memory()
+        .with_identities([(MEMBER, "maintainer")])
+}
+
+fn paranoid_surface(broker: &Broker<InMemoryAuditLog>) -> Vec<u8> {
+    broker
+        .memory_surface_v2(&member_context())
+        .expect("paranoid surface")
+}
+
+fn memory_handle(
+    broker: &Broker<InMemoryAuditLog>,
+    capability: &str,
+) -> Result<dekopon_storage_host::StorageHandle, super::BrokerError> {
+    memory_handle_in(broker, &member_context(), capability)
+}
+
+fn memory_handle_in(
+    broker: &Broker<InMemoryAuditLog>,
+    context: &AuthenticatedContext,
+    capability: &str,
+) -> Result<dekopon_storage_host::StorageHandle, super::BrokerError> {
+    let request = dekopon_broker_protocol::InvocationRequest {
+        capability: capability.parse().expect("capability"),
+        ..invocation_with_input(serde_json::json!({}))
+    };
+    let set = broker
+        .constraints
+        .get(&request.capability)
+        .expect("constrained")
+        .clone();
+    let grant = broker
+        .prepare_storage_grant(context, &request, &set)?
+        .expect("a memory route prepares a grant")
+        .materialize()
+        .map_err(|source| super::BrokerError::Storage { source })?;
+    Ok(broker
+        .registry
+        .storage_host()
+        .expect("storage")
+        .begin(grant)
+        .expect("transaction"))
+}
+
+fn remembered_bytes(broker: &Broker<InMemoryAuditLog>) -> Result<u64, super::BrokerError> {
+    let mut handle = memory_handle(broker, "memory.chat.recent")?;
+    let size = handle.jsonl_size("turns.jsonl").unwrap_or(0);
+    handle.finish_read().expect("finish read");
+    Ok(size)
+}
+
+fn remember(broker: &Broker<InMemoryAuditLog>, line: &[u8]) {
+    let mut handle = memory_handle(broker, "memory.chat.record").expect("record grant");
+    let offset = handle.jsonl_size("turns.jsonl").unwrap_or(0);
+    handle
+        .jsonl_append("turns.jsonl", offset, line)
+        .expect("append");
+    handle.commit().expect("commit");
+}
+
+fn remember_as_released_broker(broker: &Broker<InMemoryAuditLog>, line: &[u8]) {
+    let context = member_context();
+    let capability: CapabilityId = "memory.chat.record".parse().expect("capability");
+    let set = broker.constraints.get(&capability).expect("record route");
+    let storage = set.constraints.storage.as_ref().expect("storage route");
+    let scope = context.chat_scope().expect("chat scope");
+    let surface = broker
+        .authority_surface_v1(
+            &context,
+            storage.interface,
+            true,
+            &broker.current_operational().expect("operational"),
+        )
+        .expect("v1 surface");
+    let request = dekopon_storage_host::StorageGrantRequest::new(
+        "released-record".parse().expect("invocation"),
+        capability.clone(),
+        set.provider.clone(),
+        storage.interface,
+        storage.access,
+        storage.scope,
+        "reviewer".parse().expect("agent"),
+        context.attested_subject().expect("subject").clone(),
+        scope.kind.to_string(),
+        scope.transport.to_string(),
+        scope.conversation.id.clone(),
+        scope.conversation.key(),
+        dekopon_storage_host::ContinuityPolicy::Paranoid,
+        surface,
+    )
+    .with_shared_namespace(storage.namespace.clone())
+    .with_space_key(context.space_binding().map(|binding| binding.key));
+    let host = broker.registry.storage_host().expect("storage");
+    let mut handle = host
+        .begin(host.grant(request).expect("released grant"))
+        .expect("released transaction");
+    handle
+        .jsonl_append("turns.jsonl", 0, line)
+        .expect("released append");
+    handle.commit().expect("released commit");
+}
+
+fn unproven(result: Result<u64, super::BrokerError>) -> dekopon_storage_host::ContinuityCheck {
+    match result {
+        Err(super::BrokerError::Storage {
+            source: dekopon_storage_host::StorageHostError::ContinuityUnproven { check },
+        }) => check,
+        other => panic!("expected an unproven continuity refusal, got {other:?}"),
+    }
+}
+
+fn migration(
+    authority: &super::ContinuityDigest,
+    resolved: &super::ContinuityDigest,
+    overrides: super::OperationalOverrides,
+) -> super::ContinuityMigration {
+    super::ContinuityMigration {
+        authority_digest: Some(authority.clone()),
+        candidates: vec![super::ContinuityCandidate {
+            resolved_digest: resolved.clone(),
+            overrides,
+        }],
+        ..super::ContinuityMigration::default()
+    }
+}
+
+fn report(broker: &Broker<InMemoryAuditLog>) -> super::ContinuityReport {
+    broker.continuity_report().expect("memory report").clone()
+}
+
+#[tokio::test]
+async fn the_paranoid_fingerprint_ignores_operational_artifact_and_unrelated_changes() {
+    let dirs = [(); 6].map(|()| tempfile::tempdir().expect("tempdir"));
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let permitted = [memory_policy().as_slice(), &fetch].concat();
+    let base = |index: usize| {
+        SurfaceBroker::new(dirs[index].path(), &permitted)
+            .with_memory()
+            .with_identities([(MEMBER, "maintainer")])
+            .with_secret(true, Some("revision-a"))
+    };
+    let baseline = paranoid_surface(&base(0).build().await);
+
+    let operational = base(1)
+        .with_storage_limits(dekopon_storage_host::StorageLimits {
+            max_namespaces: 500,
+            max_root_bytes: 1 << 28,
+            ..dekopon_storage_host::StorageLimits::default()
+        })
+        .with_memory_config(ChatMemoryConfig {
+            max_recent_turns: 10,
+            ..valid_memory_config()
+        })
+        .build()
+        .await;
+    let unrelated_policy = base(2)
+        .with_policy(
+            r#"@id("other-agent") forbid(principal, action, resource)
+            when { context has agent && context.agent == "someone-else" };"#,
+        )
+        .build()
+        .await;
+    let reordered = base(3)
+        .with_binding(super::SecretUseBinding {
+            binding_id: "renamed-binding".to_owned(),
+            ..http_probe_binding()
+        })
+        .with_secret(false, Some("revision-b"))
+        .build()
+        .await;
+    for (change, broker) in [
+        ("storage, memory and namespace tuning", operational),
+        ("another principal's policy", unrelated_policy),
+        ("binding label and map revision", reordered),
+    ] {
+        assert_eq!(
+            paranoid_surface(&broker),
+            baseline,
+            "{change} rotated memory"
+        );
+    }
+    let mut timeouts = base(4);
+    for (_, set) in &mut timeouts.constraints {
+        set.constraints.timeout_ms -= 1;
+        if let Some(http) = set.constraints.http.as_mut() {
+            http.max_response_bytes -= 1;
+            http.allowed_hosts.reverse();
+        }
+    }
+    assert_eq!(paranoid_surface(&timeouts.build().await), baseline);
+}
+
+#[tokio::test]
+async fn the_paranoid_fingerprint_follows_effective_authority() {
+    let dirs = [(); 7].map(|()| tempfile::tempdir().expect("tempdir"));
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let permitted = [memory_policy().as_slice(), &fetch].concat();
+    let base = |index: usize| {
+        SurfaceBroker::new(dirs[index].path(), &permitted)
+            .with_memory()
+            .with_identities([(MEMBER, "maintainer")])
+            .with_secret(true, None)
+    };
+    let baseline = paranoid_surface(&base(0).build().await);
+
+    let removed = SurfaceBroker::new(dirs[1].path(), &memory_policy())
+        .with_memory()
+        .with_identities([(MEMBER, "maintainer")])
+        .with_secret(true, None)
+        .build()
+        .await;
+    let mut narrowed = base(2);
+    for (_, set) in &mut narrowed.constraints {
+        if let Some(http) = set.constraints.http.as_mut() {
+            http.allow_plaintext_loopback = false;
+        }
+    }
+    let rebound = base(3)
+        .with_binding(super::SecretUseBinding {
+            allowed_paths: vec![dekopon_capability::HttpPathRule::Exact {
+                path: "/api/v1/other".to_owned(),
+            }],
+            ..http_probe_binding()
+        })
+        .build()
+        .await;
+    let path_fence = base(4)
+        .with_policy(
+            r#"@id("path-fence") forbid(principal, action, resource)
+            when { context has request }
+            when { context.request.url.path == "/api/v1/thing" };"#,
+        )
+        .build()
+        .await;
+    let risk_fence = |index: usize, risk: &str| {
+        base(index).with_policy(&format!(
+            r#"@id("risk-fence") forbid(principal, action, resource)
+            when {{ context has request }}
+            when {{ context.risk == "{risk}" }};"#
+        ))
+    };
+    let inapplicable = risk_fence(5, "High").build().await;
+    let applicable = risk_fence(6, "Low").build().await;
+    for (change, broker) in [
+        ("a removed capability", &removed),
+        ("plaintext loopback withdrawn", &narrowed.build().await),
+        ("a changed secret path", &rebound),
+        ("a request-only path forbid", &path_fence),
+    ] {
+        assert_ne!(
+            paranoid_surface(broker),
+            baseline,
+            "{change} did not rotate"
+        );
+    }
+    assert_eq!(
+        paranoid_surface(&inapplicable),
+        baseline,
+        "a risk fence that cannot apply"
+    );
+    assert_ne!(paranoid_surface(&applicable), baseline);
+}
+
+#[tokio::test]
+async fn a_released_memory_pointer_migrates_under_unchanged_authority_in_both_legacy_states() {
+    use dekopon_storage_host::StorageLimits;
+
+    let raised = StorageLimits {
+        max_namespaces: 500,
+        ..StorageLimits::default()
+    };
+    for (written_under, overrides) in [
+        (raised.clone(), super::OperationalOverrides::default()),
+        (
+            StorageLimits {
+                max_namespaces: 64,
+                ..raised.clone()
+            },
+            super::OperationalOverrides {
+                storage: super::StorageOverrides {
+                    max_namespaces: Some(64),
+                    ..super::StorageOverrides::default()
+                },
+                ..super::OperationalOverrides::default()
+            },
+        ),
+    ] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let released = memory_broker(root.path())
+            .with_storage_limits(written_under)
+            .build()
+            .await;
+        remember_as_released_broker(&released, br#"{"turn":"released"}"#);
+        drop(released);
+
+        let probe = memory_broker(root.path())
+            .with_storage_limits(raised.clone())
+            .with_memory_config(ChatMemoryConfig {
+                continuity_migration: Some(migration(
+                    &report(
+                        &memory_broker(tempfile::tempdir().expect("t").path())
+                            .build()
+                            .await,
+                    )
+                    .legacy_authority_digest,
+                    &report(
+                        &memory_broker(tempfile::tempdir().expect("t").path())
+                            .build()
+                            .await,
+                    )
+                    .current_resolved_digest,
+                    overrides.clone(),
+                )),
+                ..valid_memory_config()
+            })
+            .build()
+            .await;
+        let attested = report(&probe);
+        drop(probe);
+        let fixed = memory_broker(root.path())
+            .with_storage_limits(raised.clone())
+            .with_memory_config(ChatMemoryConfig {
+                continuity_migration: Some(migration(
+                    &attested.legacy_authority_digest,
+                    &attested.candidates[0].resolved,
+                    overrides,
+                )),
+                ..valid_memory_config()
+            })
+            .build()
+            .await;
+        assert_eq!(remembered_bytes(&fixed).expect("migrated"), 20);
+        drop(fixed);
+        let restarted = memory_broker(root.path())
+            .with_storage_limits(raised.clone())
+            .build()
+            .await;
+        assert_eq!(
+            remembered_bytes(&restarted).expect("migrated pointer needs no key"),
+            20
+        );
+    }
+}
+
+#[tokio::test]
+async fn migration_never_launders_an_authority_change_and_refuses_without_proof() {
+    use dekopon_storage_host::ContinuityCheck;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let permitted = [memory_policy().as_slice(), &fetch].concat();
+    let fetching = || {
+        SurfaceBroker::new(root.path(), &permitted)
+            .with_memory()
+            .with_identities([(MEMBER, "maintainer")])
+    };
+    let released = fetching().build().await;
+    remember_as_released_broker(&released, br#"{"turn":"released"}"#);
+    let attested = report(&released);
+    drop(released);
+    let current = migration(
+        &attested.legacy_authority_digest,
+        &attested.current_resolved_digest,
+        super::OperationalOverrides::default(),
+    );
+    let with = |migration: Option<super::ContinuityMigration>| ChatMemoryConfig {
+        continuity_migration: migration,
+        ..valid_memory_config()
+    };
+
+    let absent = fetching().build().await;
+    assert_eq!(unproven(remembered_bytes(&absent)), ContinuityCheck::Absent);
+    drop(absent);
+    let mut narrowed = fetching().with_memory_config(with(Some(current.clone())));
+    for (_, set) in &mut narrowed.constraints {
+        if let Some(http) = set.constraints.http.as_mut() {
+            http.allowed_methods = vec!["HEAD".to_owned()];
+        }
+    }
+    let narrowed = narrowed.build().await;
+    assert_eq!(
+        unproven(remembered_bytes(&narrowed)),
+        ContinuityCheck::NoCandidate
+    );
+    drop(narrowed);
+    let fenced = fetching()
+        .with_policy(
+            r#"@id("late-fence") forbid(principal, action, resource)
+            when { context has request }
+            when { context.request.method == "POST" };"#,
+        )
+        .with_memory_config(with(Some(current.clone())))
+        .build()
+        .await;
+    assert_eq!(
+        unproven(remembered_bytes(&fenced)),
+        ContinuityCheck::DigestMismatch
+    );
+    drop(fenced);
+    let accepted = fetching()
+        .with_memory_config(with(Some(current)))
+        .build()
+        .await;
+    assert_eq!(remembered_bytes(&accepted).expect("still provable"), 20);
+}
+
+#[tokio::test]
+async fn legacy_proof_refuses_space_routing_and_id_only_contexts() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+    use dekopon_storage_host::{ContinuityCheck, LegacyContinuity};
+
+    let digest = |broker: &Broker<InMemoryAuditLog>| {
+        let attested = report(broker);
+        migration(
+            &attested.legacy_authority_digest,
+            &attested.current_resolved_digest,
+            super::OperationalOverrides::default(),
+        )
+    };
+    let check = |broker: &Broker<InMemoryAuditLog>, context: &AuthenticatedContext| match broker
+        .legacy_continuity(context)
+        .expect("legacy proof")
+    {
+        LegacyContinuity::Unproven(check) => Some(check),
+        LegacyContinuity::Candidates(_) => None,
+    };
+    let attested = |root: &std::path::Path, build: fn(SurfaceBroker<'_>) -> SurfaceBroker<'_>| {
+        let root = root.to_path_buf();
+        async move {
+            let probe = build(memory_broker(&root)).build().await;
+            let migration = digest(&probe);
+            drop(probe);
+            build(memory_broker(&root))
+                .with_memory_config(ChatMemoryConfig {
+                    continuity_migration: Some(migration),
+                    ..valid_memory_config()
+                })
+                .build()
+                .await
+        }
+    };
+    let dirs = [(); 4].map(|()| tempfile::tempdir().expect("tempdir"));
+
+    let eligible = attested(dirs[0].path(), |broker| broker).await;
+    assert_eq!(check(&eligible, &member_context()), None);
+
+    let space = attested(dirs[1].path(), |broker| {
+        broker.with_identities([
+            (MEMBER, "maintainer"),
+            ("drn:slack:channel:t0123abc:c0123abc", "team-channel"),
+        ])
+    })
+    .await;
+    let as_direct_message = attested_agent_context(
+        MEMBER,
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::DirectMessage,
+            Trigger::Message,
+        ),
+    );
+    for context in [member_context(), as_direct_message] {
+        assert_eq!(check(&space, &context), Some(ContinuityCheck::SpaceBound));
+    }
+
+    let routing = attested(dirs[2].path(), |broker| {
+        broker.with_policy(
+            r#"@id("via-fence") forbid(principal, action, resource)
+            when { context has request }
+            when { context.request.method == "POST" && ({ routing: context }).routing.via == "other" };"#,
+        )
+    })
+    .await;
+    assert_eq!(
+        check(&routing, &member_context()),
+        Some(ContinuityCheck::RoutingDependent)
+    );
+
+    let id_only = attested(dirs[3].path(), |broker| broker.with_identities([])).await;
+    assert_eq!(
+        check(&id_only, &member_context()),
+        Some(ContinuityCheck::IdOnlySubject)
+    );
+}
+
+#[tokio::test]
+async fn an_unproven_pointer_starts_fresh_only_under_the_explicit_disposition() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let released = memory_broker(root.path()).build().await;
+    remember_as_released_broker(&released, br#"{"turn":"released"}"#);
+    drop(released);
+    let fresh = memory_broker(root.path())
+        .with_memory_config(ChatMemoryConfig {
+            continuity_migration: Some(super::ContinuityMigration {
+                on_unproven: dekopon_storage_host::UnprovenDisposition::FreshEpoch,
+                ..super::ContinuityMigration::default()
+            }),
+            ..valid_memory_config()
+        })
+        .build()
+        .await;
+    assert_eq!(remembered_bytes(&fresh).expect("fresh epoch"), 0);
+}
+
+#[tokio::test]
+async fn relaxed_memory_survives_authority_changes_and_paranoid_does_not() {
+    let relaxed = ChatMemoryConfig {
+        continuity_policy: dekopon_storage_host::ContinuityPolicy::Relaxed,
+        ..valid_memory_config()
+    };
+    for (config, expected) in [(relaxed, 22), (valid_memory_config(), 0)] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let before = memory_broker(root.path())
+            .with_memory_config(config.clone())
+            .build()
+            .await;
+        remember(&before, br#"{"turn":"remembered"}"#);
+        drop(before);
+        let widened = SurfaceBroker::new(
+            root.path(),
+            &[
+                memory_policy().as_slice(),
+                &[("cli-probe.upper", "cli-probe")],
+            ]
+            .concat(),
+        )
+        .with_memory()
+        .with_identities([(MEMBER, "maintainer")])
+        .with_memory_config(config)
+        .build()
+        .await;
+        assert_eq!(remembered_bytes(&widened).expect("read"), expected);
+    }
+}
+
+#[tokio::test]
+async fn the_legacy_surface_reproduces_the_released_bytes() {
+    use sha2::Digest as _;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let permitted = [
+        memory_policy().as_slice(),
+        &[("http-probe.fetch", "http-probe")],
+    ]
+    .concat();
+    let broker = SurfaceBroker::new(root.path(), &permitted)
+        .with_memory()
+        .with_secret(true, Some("revision-a"))
+        .build()
+        .await;
+    // Recorded from the released broker; a legacy pointer can only be proved while these match.
+    for (memory_route, released) in [
+        (
+            false,
+            "770427d39dffba4caffd6c8bcfa5a8791751b154e0133bf0c77ab1f242cc32de",
+        ),
+        (
+            true,
+            "7a8325d3119fb0d1730ece3ff3835b084f885b27e99e938f13693d633a268246",
+        ),
+    ] {
+        let digest = sha2::Sha256::digest(surface(&broker, memory_route));
+        let digest = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(digest, released, "memory route {memory_route}");
+    }
+}
+
+#[test]
+fn continuity_configuration_refuses_old_spellings_and_malformed_migrations() {
+    let parse = |extra: serde_json::Value| {
+        let mut config = serde_json::to_value(valid_memory_config()).expect("config");
+        config
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        serde_json::from_value::<ChatMemoryConfig>(config)
+    };
+    let digest = format!("sha256:{}", "0".repeat(64));
+    for spelling in ["relaxed", "paranoid"] {
+        parse(serde_json::json!({ "continuityPolicy": spelling })).expect(spelling);
+    }
+    for refused in [
+        serde_json::json!({ "continuityPolicy": "stable" }),
+        serde_json::json!({ "continuityPolicy": "authority-bound" }),
+        serde_json::json!({ "continuityMigration": { "authorityDigest": "sha256:ABC" } }),
+        serde_json::json!({ "continuityMigration": { "onUnproven": "reset" } }),
+        serde_json::json!({ "continuityMigration": { "candidates": [{
+            "resolvedDigest": digest, "overrides": { "storage": { "allowedHosts": ["x"] } }
+        }] } }),
+        serde_json::json!({ "continuityMigration": { "candidates": [{
+            "resolvedDigest": digest, "overrides": { "memory": { "enabledAgents": ["x"] } }
+        }] } }),
+        serde_json::json!({ "continuityMigration": { "candidates": [{
+            "resolvedDigest": digest, "overrides": { "hostLimits": { "allowedHosts": ["x"] } }
+        }] } }),
+    ] {
+        assert!(parse(refused.clone()).is_err(), "{refused}");
+    }
+    let unpaired = parse(serde_json::json!({
+        "continuityMigration": { "authorityDigest": digest }
+    }))
+    .expect("parses");
+    assert!(matches!(
+        unpaired.validate(&dekopon_storage_host::StorageLimits::default()),
+        Err(super::BrokerBuildError::InvalidChatMemory)
+    ));
+    let disposition = parse(serde_json::json!({
+        "continuityMigration": { "onUnproven": "fresh-epoch" }
+    }))
+    .expect("a disposition alone is valid");
+    disposition
+        .validate(&dekopon_storage_host::StorageLimits::default())
+        .expect("valid");
+}
+
+#[test]
+fn probe_admission_is_the_only_effect_authority_in_the_paranoid_fingerprint() {
+    let encode = |effect| {
+        let mut encoded = AuthorityEncoder::new();
+        super::continuity::encode_capability_identity(
+            &mut encoded,
+            &"cli-probe.upper".parse().expect("capability"),
+            &ConstraintSet {
+                effect,
+                ..cli_probe_set(
+                    dekopon_capability::EffectKind::ReadOnly,
+                    dekopon_core::RiskLevel::Low,
+                )
+            },
+        );
+        encoded.finish()
+    };
+    use dekopon_capability::EffectKind;
+    assert_ne!(
+        encode(EffectKind::ReadOnly),
+        encode(EffectKind::ExternalWrite)
+    );
+    assert_eq!(
+        encode(EffectKind::LocalWrite),
+        encode(EffectKind::ExternalWrite)
+    );
+}
+
+#[tokio::test]
+async fn a_membership_a_request_selector_tests_rotates_paranoid_memory() {
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let permitted = [memory_policy().as_slice(), &fetch].concat();
+    let fenced = |index: usize, member: &'static str, other: &'static str| {
+        SurfaceBroker::new(dirs[index].path(), &permitted)
+            .with_memory()
+            .with_identities([(MEMBER, "maintainer")])
+            .with_group_members([(member, "restricted"), (other, "elsewhere")])
+            .with_policy(
+                r#"@id("selected-fence") forbid(principal, action, resource)
+                when { context has request }
+                when {
+                    (if context.request.method == "POST" then principal
+                     else Dekopon::Principal::"someone") in Dekopon::Group::"restricted"
+                };"#,
+            )
+    };
+    let outside = paranoid_surface(&fenced(0, "someone", "maintainer").build().await);
+    let inside = paranoid_surface(&fenced(1, "maintainer", "someone").build().await);
+    assert_ne!(outside, inside);
+}
+
+#[tokio::test]
+async fn turns_that_alternate_a_fact_a_request_policy_reads_never_reuse_a_generation() {
+    use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let permitted = [memory_policy().as_slice(), &fetch].concat();
+    let broker = SurfaceBroker::new(root.path(), &permitted)
+        .with_memory()
+        .with_identities([(MEMBER, "maintainer")])
+        .with_policy(
+            r#"@id("wake-fence") forbid(principal, action, resource)
+            when { context has request }
+            when { context.trigger == "wake" && context.request.method == "POST" };"#,
+        )
+        .build()
+        .await;
+    let message = member_context();
+    let wake = attested_agent_context(
+        MEMBER,
+        chat_scope(
+            ChatTransportKind::Slack,
+            ConversationKind::Channel,
+            Trigger::Wake,
+        ),
+    );
+    let bytes = |context: &AuthenticatedContext| {
+        let mut handle =
+            memory_handle_in(&broker, context, "memory.chat.recent").expect("read grant");
+        let size = handle.jsonl_size("turns.jsonl").unwrap_or(0);
+        handle.finish_read().expect("finish read");
+        size
+    };
+    let mut writer = memory_handle_in(&broker, &message, "memory.chat.record").expect("record");
+    writer
+        .jsonl_append("turns.jsonl", 0, br#"{"turn":"message"}"#)
+        .expect("append");
+    writer.commit().expect("commit");
+    assert_eq!(bytes(&message), 19);
+    assert_eq!(bytes(&wake), 0, "the wake turn's request authority differs");
+    assert_eq!(
+        bytes(&message),
+        0,
+        "returning never reopens the earlier generation"
+    );
+}
+
+#[tokio::test]
+async fn an_http_method_case_change_rotates_paranoid_memory() {
+    let dirs = [(); 2].map(|()| tempfile::tempdir().expect("tempdir"));
+    let fetch = [("http-probe.fetch", "http-probe")];
+    let permitted = [memory_policy().as_slice(), &fetch].concat();
+    let spelled = |index: usize, method: &str| {
+        let mut broker = SurfaceBroker::new(dirs[index].path(), &permitted)
+            .with_memory()
+            .with_identities([(MEMBER, "maintainer")]);
+        for (_, set) in &mut broker.constraints {
+            if let Some(http) = set.constraints.http.as_mut() {
+                http.allowed_methods = vec![method.to_owned()];
+            }
+        }
+        broker
+    };
+    let lowercase = paranoid_surface(&spelled(0, "get").build().await);
+    let uppercase = paranoid_surface(&spelled(1, "GET").build().await);
+    assert_ne!(lowercase, uppercase);
 }
