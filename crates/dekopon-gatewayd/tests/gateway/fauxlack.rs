@@ -240,7 +240,7 @@ async fn an_unauthorized_participant_is_refused_before_the_observed_control_call
         .unwrap();
     assert_eq!(
         refused.thread().next_from("udekopon", WAIT).await.text,
-        "Sorry carol, you don't have permission for this agent."
+        "You don't have access to this agent. Rules are rules, and I don't write them."
     );
     assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 0);
     let control = server

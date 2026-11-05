@@ -764,7 +764,7 @@ async fn a_refusal_is_each_dialects_throttling_error_with_retry_after() {
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.starts_with("dekopon sandbox: "), "{message}");
     assert!(!message.contains("prompt is too long"), "{message}");
-    assert!(message.contains("can't run as is"), "{message}");
+    assert!(message.contains("Too big to run"), "{message}");
     assert_eq!(spans.outcomes(), ["refused"; 3]);
 }
 
