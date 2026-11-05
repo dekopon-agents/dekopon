@@ -1,17 +1,17 @@
 # Dekopon
 
-Dekopon runs AI agents on hardware you own and lets them act on real systems without ever holding
-the keys. An agent answers in Slack, Discord, Telegram or WhatsApp, works by writing short bash-like
-scripts, and reaches GitHub or any HTTP API through WebAssembly providers. A separate broker
-decides, for the person asking, what each command may do, and only the broker holds credentials. A
-prompt injection can still steer the model, but it reaches only what the broker allows the person
-who asked.
+Dekopon runs AI agents on hardware you own and lets them act on real systems without holding the
+keys. An agent answers in Slack, Discord, Telegram or WhatsApp, writes short bash-like scripts, and
+reaches GitHub or any HTTP API through WebAssembly providers. A separate broker decides, for the
+person asking, what each command may do, and only the broker holds credentials. A prompt injection
+can still steer the model, but it reaches only what the broker allows the person who asked.
 
 Install on [Kubernetes](docs/deploy.md#kubernetes), the preferred deployment, or [on a
 Mac](docs/deploy.md#mac) if you are moving from OpenClaw or Hermes.
 
 **Status:** pre-1.0, with breaking changes between releases. It runs the maintainer's Raspberry Pi,
-serving a family's chats; it makes no production-hardening claim. Both daemons are Unix-only.
+an integration and utility box for a few people, with no production-hardening claim. Both daemons
+are Unix-only.
 
 ## Four ideas
 
