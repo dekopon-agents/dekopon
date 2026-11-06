@@ -140,9 +140,9 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
     let store = Arc::clone(&runner.assets);
     // The chat's use claim and the admission travel with the native job, so an aborted caller
     // cannot release them while the append still runs.
-    drop(in_use);
-    drop(admission);
     let written = tokio::task::spawn_blocking(move || {
+        let _in_use = in_use;
+        let _admission = admission;
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = span.enter();
             let journal = journal?;

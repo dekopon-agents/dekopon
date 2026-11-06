@@ -215,7 +215,7 @@ impl RecordTicket {
 
 impl Drop for RecordTicket {
     fn drop(&mut self) {
-        if !self.settled && self.bound == 0 {
+        if !self.settled {
             let mut indeterminate = self.retention.indeterminate.lock();
             *indeterminate = indeterminate.saturating_add(self.bound);
         }
@@ -252,7 +252,7 @@ impl HistoryRetention {
                 match stems.get(stem).copied() {
                     Some(Claim::Reclaiming) => None,
                     claim => {
-                        if self.journal.reclaiming(stem) && stem.is_empty() {
+                        if self.journal.reclaiming(stem) {
                             stems.insert(stem.to_owned(), Claim::Reclaiming);
                             Some(ReclaimClaim {
                                 claims: Arc::clone(&self.claims),
@@ -328,7 +328,7 @@ impl HistoryRetention {
         let stem = stem.to_owned();
         blocking(move || journal.note_activity(&stem, at))
             .await
-            .unwrap_or(());
+            .map_err(|_unpublished| HistoryError::Clock)?;
         Ok(RecordTicket {
             _admission: admission,
             retention: Arc::clone(self),
@@ -512,7 +512,7 @@ impl HistoryRetention {
         let key = HistoryKey::new(claim.stem.clone()).map_err(|_invalid| JournalError::Corrupt)?;
         match (self.broker_reclaim(key).await?, mode) {
             (ChatReclaim::Reclaimed { .. }, Mode::Decide | Mode::Replay) => {}
-            (ChatReclaim::Busy, Mode::Decide | Mode::Replay) => {
+            (ChatReclaim::Busy, Mode::Decide) => {
                 let journal = Arc::clone(&self.journal);
                 blocking(move || {
                     journal.finish_reclaim_intent(&claim.stem)?;
@@ -522,6 +522,7 @@ impl HistoryRetention {
                 .await?;
                 return Ok(Reclaimed::Busy);
             }
+            (ChatReclaim::Busy, Mode::Replay) => return Err(HistoryError::ReplayBlocked),
         }
         let journal = Arc::clone(&self.journal);
         blocking(move || {
@@ -545,7 +546,7 @@ impl HistoryAdmission {
             });
         }
         let mut skipped = HashSet::new();
-        for _ in 0..=RECLAIMS_PER_PASS {
+        for _ in 0..RECLAIMS_PER_PASS {
             if retention.fits(growth).await? {
                 return Ok(());
             }
@@ -556,7 +557,11 @@ impl HistoryAdmission {
                 skipped.insert(candidate.name().to_owned());
             }
         }
-        Err(HistoryError::Exhausted)
+        if retention.fits(growth).await? {
+            Ok(())
+        } else {
+            Err(HistoryError::Exhausted)
+        }
     }
 }
 
@@ -570,7 +575,7 @@ impl HistoryRetention {
             .saturating_add(usage.chat_reserved)
             .saturating_add(*self.indeterminate.lock())
             .saturating_add(growth.history);
-        Ok(total <= self.budget && usage.root_free_bytes >= growth.history)
+        Ok(total <= self.budget && usage.root_free_bytes >= growth.broker)
     }
 
     #[cfg(test)]

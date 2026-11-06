@@ -571,7 +571,7 @@ impl Journal {
         // One record past twice the window lets projection see the count that forces a repack.
         let limit = NonZeroUsize::new(window.limits.max_turns.saturating_mul(2).saturating_add(1))
             .unwrap_or(NonZeroUsize::MIN);
-        let opened = if self.reclaiming(stem) && stem.is_empty() {
+        let opened = if self.reclaiming(stem) {
             Err(io::Error::from(io::ErrorKind::NotFound))
         } else {
             File::open(self.path(stem))
@@ -651,7 +651,7 @@ impl Journal {
         entry: &Entry<'_>,
     ) -> Result<Option<records::Header>, JournalError> {
         let _lock = self.lock.lock();
-        if self.reclaiming(stem) && stem.is_empty() {
+        if self.reclaiming(stem) {
             return Err(RECLAIMING);
         }
         let _assets = AssetSync(self);

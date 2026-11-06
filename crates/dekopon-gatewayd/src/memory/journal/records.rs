@@ -606,6 +606,7 @@ impl Journal {
         }) {
             return Ok(false);
         }
+        self.write_activity(stem, super::millis(std::time::SystemTime::now()))?;
         OpenOptions::new()
             .append(true)
             .open(self.path(stem))?

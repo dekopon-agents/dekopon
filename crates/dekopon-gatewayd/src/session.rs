@@ -4153,7 +4153,11 @@ async fn record_delivered_turn(
                         .map_err(|error| MemoryRecordFailure::Outcome(error.category()))?,
                 )
             }
-            None => None,
+            None => {
+                return Err(MemoryRecordFailure::Outcome(
+                    HistoryError::Unavailable.category(),
+                ));
+            }
         };
         let client = runner
             .broker

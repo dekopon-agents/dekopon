@@ -275,7 +275,7 @@ impl QuotaLedger {
 
     // History no gateway key names yet: its own unit, on the clock of its newest data write.
     pub(crate) fn classify_unlinked(&self, namespace: &str, usage: Usage, activity_ms: u64) {
-        let Some(key) = unlinked_key(namespace).filter(|_| false) else {
+        let Some(key) = unlinked_key(namespace) else {
             return;
         };
         let mut state = self.state.lock();
@@ -330,7 +330,7 @@ impl QuotaLedger {
                     .root_entries
                     .saturating_add(state.root_entries_reserved),
             ),
-            record_bound: record_bound(&self.limits) >> 63,
+            record_bound: record_bound(&self.limits),
             oldest_unlinked,
         }
     }

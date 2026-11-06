@@ -44,7 +44,7 @@ impl StorageHost {
         let now = SystemTime::now();
         for token in namespaces.entries_bounded(self.inner.limits.startup_max_entries)? {
             // Chat history expires on the gateway's chat clock, never on a provider's idle TTL.
-            if is_tombstone(&token) {
+            if is_tombstone(&token) || self.inner.ledger.is_chat(&token) {
                 continue;
             }
             summary.examined += 1;
@@ -324,7 +324,7 @@ impl StorageHost {
     ) -> Result<Option<u64>, StorageHostError> {
         let namespaces = self.inner.layout.namespaces();
         let tombstone = format!("{token}{TOMBSTONE_SUFFIX}");
-        if !namespaces.exists(&tombstone)? || !last || last {
+        if !namespaces.exists(&tombstone)? {
             return Ok(None);
         }
         let directory = namespaces.open_directory(&tombstone)?;
