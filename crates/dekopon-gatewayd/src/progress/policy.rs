@@ -80,7 +80,7 @@ fn final_delivery(terminal: Terminal, silent_until_success: bool) -> Terminal {
 
 struct TerminalRequest {
     terminal: Terminal,
-    done: oneshot::Sender<bool>,
+    done: oneshot::Sender<Delivery>,
 }
 
 #[derive(Default)]
@@ -185,15 +185,15 @@ impl ProgressPolicy {
         self.coordination.seal();
     }
 
-    pub(crate) async fn terminal(&mut self, terminal: Terminal) -> bool {
+    pub(crate) async fn terminal(&mut self, terminal: Terminal) -> Delivery {
         let Some(sender) = self.terminal.take() else {
-            return false;
+            return Delivery::NotDelivered;
         };
         let (done, wait) = oneshot::channel();
         let delivered = if sender.send(TerminalRequest { terminal, done }).is_ok() {
-            wait.await.unwrap_or(false)
+            wait.await.unwrap_or(Delivery::NotDelivered)
         } else {
-            false
+            Delivery::NotDelivered
         };
         // The worker holds the session span; joining it lets that span end at the reply.
         if let Some(worker) = self.worker.take()
@@ -361,8 +361,63 @@ struct Pending {
     counters: Arc<ProgressCounters>,
 }
 
-struct Delivered {
-    accepted: bool,
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Delivery {
+    NotDelivered,
+    Delivered,
+    MissingAttachments(Vec<usize>),
+    Partial { failed_attachments: Vec<usize> },
+}
+
+impl Delivery {
+    pub(crate) fn accepted(&self) -> bool {
+        match self {
+            Self::Delivered | Self::MissingAttachments(_) => true,
+            Self::Partial { .. } | Self::NotDelivered => false,
+        }
+    }
+
+    fn of(result: Result<(), TransportError>) -> Self {
+        match result {
+            Ok(()) => Self::Delivered,
+            Err(error) => {
+                tracing::error!(
+                    event = "gateway_reply_failed",
+                    category = error.category(),
+                    "gateway.reply.failed"
+                );
+                match error {
+                    TransportError::AttachmentsMissing { failed } => {
+                        Self::MissingAttachments(failed)
+                    }
+                    TransportError::PartialDelivery { failed_attachments } => {
+                        Self::Partial { failed_attachments }
+                    }
+                    TransportError::Attachment(_)
+                    | TransportError::AttachmentTask { .. }
+                    | TransportError::AssetType { .. }
+                    | TransportError::MissingCredential { .. }
+                    | TransportError::EmptyCredential { .. }
+                    | TransportError::NonUtf8Credential { .. }
+                    | TransportError::Request(_)
+                    | TransportError::Service { .. }
+                    | TransportError::AssetTooLarge { .. }
+                    | TransportError::AssetRefused { .. }
+                    | TransportError::DisallowedIntents
+                    | TransportError::Response
+                    | TransportError::MalformedResponse(_)
+                    | TransportError::ConnectTimeout
+                    | TransportError::RecoveryExhausted { .. }
+                    | TransportError::IdentityChanged
+                    | TransportError::Closed
+                    | TransportError::Io(_)
+                    | TransportError::InsecureSocket { .. }
+                    | TransportError::Subject(_)
+                    | TransportError::Entropy(_) => Self::NotDelivered,
+                }
+            }
+        }
+    }
 }
 
 impl Pending {
@@ -373,7 +428,7 @@ impl Pending {
         live
     }
 
-    async fn terminal(self, terminal: Terminal) -> Delivered {
+    async fn terminal(self, terminal: Terminal) -> Delivery {
         let terminal = final_delivery(terminal, self.inputs.silent_until_success);
         record_terminal(&terminal, &self.counters, 0, 0);
         let reply = match terminal {
@@ -384,22 +439,12 @@ impl Pending {
             Terminal::Failed(line) => Some(OutboundReply::text(line)),
             Terminal::Silent => None,
         };
-        let accepted = match reply {
-            Some(reply) => match self.inputs.driver.reply(&self.inputs.reply, reply).await {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::error!(
-                        event = "gateway_reply_failed",
-                        category = error.category(),
-                        "gateway.reply.failed"
-                    );
-                    false
-                }
-            },
-            None => false,
+        let delivered = match reply {
+            Some(reply) => Delivery::of(self.inputs.driver.reply(&self.inputs.reply, reply).await),
+            None => Delivery::NotDelivered,
         };
         self.coordination.finish();
-        Delivered { accepted }
+        delivered
     }
 }
 
@@ -952,7 +997,7 @@ impl Live {
         }
     }
 
-    async fn terminal(mut self, terminal: Terminal, text: StreamedText) -> Delivered {
+    async fn terminal(mut self, terminal: Terminal, text: StreamedText) -> Delivery {
         let terminal = final_delivery(terminal, self.silent_until_success);
         self.state.note = None;
         let generation = text.generation;
@@ -962,7 +1007,7 @@ impl Live {
         self.clear_status_text().await;
         record_terminal(&terminal, &self.counters, self.edits, self.keep_alives);
         let streamed = self.streamed_text();
-        let accepted = match terminal {
+        let delivered = match terminal {
             Terminal::Answered(reply) => self.finalize(reply, generation).await,
             Terminal::Failed(line) => match streamed {
                 Some(partial) => {
@@ -1010,7 +1055,7 @@ impl Live {
             }
             Terminal::Silent if self.silent_until_success => {
                 self.discard().await;
-                false
+                Delivery::NotDelivered
             }
             Terminal::Silent => {
                 match streamed.filter(|partial| !partial.is_empty()) {
@@ -1020,13 +1065,13 @@ impl Live {
                     }
                     None => self.discard().await,
                 }
-                false
+                Delivery::NotDelivered
             }
         };
         // Cleanup's Idle write must precede acknowledgment, which admits the conversation's next turn.
         self.cleanup().await;
         self.coordination.finish();
-        Delivered { accepted }
+        delivered
     }
 
     fn streamed_text(&self) -> Option<String> {
@@ -1039,7 +1084,7 @@ impl Live {
         })
     }
 
-    async fn finalize(&mut self, reply: OutboundReply, generation: u64) -> bool {
+    async fn finalize(&mut self, reply: OutboundReply, generation: u64) -> Delivery {
         if self.message.is_some()
             && self.counters.steers.load(Ordering::Relaxed) > self.steers_at_post
         {
@@ -1049,7 +1094,7 @@ impl Live {
         self.finalize_in_place(reply, generation).await
     }
 
-    async fn finalize_in_place(&mut self, reply: OutboundReply, generation: u64) -> bool {
+    async fn finalize_in_place(&mut self, reply: OutboundReply, generation: u64) -> Delivery {
         if let Some(message) = self.message.clone() {
             let driver = Arc::clone(&self.driver);
             let finalized = if self.streaming {
@@ -1075,7 +1120,7 @@ impl Live {
                         outcome = "ok",
                         "gateway.progress.rendered"
                     );
-                    return true;
+                    return Delivery::Delivered;
                 }
                 Some(Err(category)) => {
                     tracing::debug!(
@@ -1117,19 +1162,9 @@ impl Live {
         self.observe(outcome, "delete");
     }
 
-    async fn deliver(&mut self, reply: OutboundReply) -> bool {
+    async fn deliver(&mut self, reply: OutboundReply) -> Delivery {
         let driver = Arc::clone(&self.driver);
-        match driver.reply(&self.reply, reply).await {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::error!(
-                    event = "gateway_reply_failed",
-                    category = error.category(),
-                    "gateway.reply.failed"
-                );
-                false
-            }
-        }
+        Delivery::of(driver.reply(&self.reply, reply).await)
     }
 
     async fn cleanup(&mut self) {
@@ -1248,7 +1283,7 @@ async fn run(
             () = cancellation.cancelled() => {
                 let by = cancellation.source().unwrap_or(CancelSource::Operator);
                 let delivered = pending.terminal(Terminal::Stopped(StopCause::Cancelled(by))).await;
-                if delivered.accepted {
+                if delivered.accepted() {
                     crate::session::reply_delivered(crate::session::MessageOutcome::Cancelled);
                 }
                 return;
@@ -1294,7 +1329,7 @@ async fn run(
                 let by = cancellation.source().unwrap_or(CancelSource::Operator);
                 let latest = text.borrow_and_update().clone();
                 let delivered = surface.terminal(Terminal::Stopped(StopCause::Cancelled(by)), latest).await;
-                if delivered.accepted {
+                if delivered.accepted() {
                     crate::session::reply_delivered(crate::session::MessageOutcome::Cancelled);
                 }
                 return;
@@ -1333,8 +1368,8 @@ async fn run(
     coordination.finish();
 }
 
-fn acknowledge(done: oneshot::Sender<bool>, delivered: Delivered) {
-    if done.send(delivered.accepted).is_err() {
+fn acknowledge(done: oneshot::Sender<Delivery>, delivered: Delivery) {
+    if done.send(delivered).is_err() {
         tracing::debug!(
             event = "gateway_progress_terminal_unobserved",
             "gateway.progress.terminal.unobserved"

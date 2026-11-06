@@ -300,13 +300,20 @@ impl WhatsappDriver {
         Ok(url)
     }
 
-    pub(super) fn reply_failure(&self, error: TransportError, accepted: usize) -> TransportError {
+    pub(super) fn reply_failure(
+        &self,
+        error: TransportError,
+        accepted: usize,
+        unsent: std::ops::Range<usize>,
+    ) -> TransportError {
         if accepted == 0 {
             return error;
         }
         tracing::warn!(event = "gateway_whatsapp_reply_partial", transport = %self.transport,
             category = error.category(), delivered = accepted, "gateway.whatsapp.reply.partial");
-        TransportError::PartialDelivery
+        TransportError::PartialDelivery {
+            failed_attachments: unsent.collect(),
+        }
     }
 
     pub(super) async fn send_image(

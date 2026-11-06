@@ -158,6 +158,10 @@ mod tests {
     struct NoWrites;
     #[async_trait]
     impl ChatDriver for NoWrites {
+        fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+            dekopon_agent::attachment::AttachmentLimit::NONE
+        }
+
         async fn reply(&self, _: &ReplyTarget, _: OutboundReply) -> Result<(), TransportError> {
             panic!("connection recovery must never send a message")
         }

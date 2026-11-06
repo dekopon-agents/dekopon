@@ -179,27 +179,62 @@ pub trait GeneratedAssetStore: Send + Sync {
     fn delivery_failed(&self);
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AssetDeliveryDisposition {
     Abandoned,
     Failed,
     Delivered,
+    Partial { failed: Vec<usize> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Holding {
+    OneAtATime,
+    AllAtOnce { bytes: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachmentLimit {
+    count: u8,
+    holding: Holding,
+}
+impl AttachmentLimit {
+    pub const NONE: Self = Self::new(0, Holding::OneAtATime);
+
+    pub const fn new(count: u8, holding: Holding) -> Self {
+        Self { count, holding }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SendRefusal {
+    #[error("this reply already carries its limit of {limit} attachments")]
+    Allowance { limit: u8 },
+    #[error("this reply's attachments would exceed {} MiB", bytes / (1024 * 1024))]
+    ByteBudget { bytes: usize },
+    #[error("{0}")]
+    Storage(BlobError),
 }
 
 struct Queued {
     images: Vec<GeneratedImage>,
     ids: Vec<u64>,
     spent: u8,
+    bytes: usize,
     finished: bool,
 }
 pub struct ReplyAttachments {
-    limit: u8,
+    limit: AttachmentLimit,
     queued: Mutex<Queued>,
     registrar: Arc<dyn GeneratedAssetStore>,
     transport: String,
 }
 impl ReplyAttachments {
-    pub fn new(limit: u8, registrar: Arc<dyn GeneratedAssetStore>, transport: String) -> Self {
+    pub fn new(
+        limit: AttachmentLimit,
+        registrar: Arc<dyn GeneratedAssetStore>,
+        transport: String,
+    ) -> Self {
         Self {
             limit,
             registrar,
@@ -208,18 +243,44 @@ impl ReplyAttachments {
                 images: Vec::new(),
                 ids: Vec::new(),
                 spent: 0,
+                bytes: 0,
                 finished: false,
             }),
         }
     }
     pub fn remaining(&self) -> u8 {
-        self.limit.saturating_sub(self.queued.lock().spent)
+        self.limit.count.saturating_sub(self.queued.lock().spent)
     }
     pub fn has_queued(&self) -> bool {
         !self.queued.lock().images.is_empty()
     }
     pub fn take(&self) -> Vec<GeneratedImage> {
         std::mem::take(&mut self.queued.lock().images)
+    }
+    fn admit(&self, id: u64, image: GeneratedImage) -> Result<usize, SendRefusal> {
+        let decoded = match self.limit.holding {
+            Holding::OneAtATime => Ok(0),
+            Holding::AllAtOnce { .. } => image.decoded_len().map_err(SendRefusal::Storage),
+        };
+        let mut queued = self.queued.lock();
+        if queued.spent >= self.limit.count {
+            return Err(SendRefusal::Allowance {
+                limit: self.limit.count,
+            });
+        }
+        // The broker already spent this send's allowance, so a refusal below still costs a slot.
+        queued.spent += 1;
+        let bytes = match self.limit.holding {
+            Holding::OneAtATime => queued.bytes,
+            Holding::AllAtOnce { bytes } => decoded?
+                .checked_add(queued.bytes)
+                .filter(|total| *total <= bytes)
+                .ok_or(SendRefusal::ByteBudget { bytes })?,
+        };
+        queued.bytes = bytes;
+        queued.ids.push(id);
+        queued.images.push(image);
+        Ok(queued.ids.len())
     }
     #[expect(
         clippy::too_many_arguments,
@@ -241,33 +302,30 @@ impl ReplyAttachments {
             }
         }
         for id in sent {
-            match self.registrar.send(id) {
-                Ok(Some(image)) => {
-                    let mut queued = self.queued.lock();
-                    if queued.spent < self.limit {
-                        queued.spent += 1;
-                        queued.ids.push(id);
-                        queued.images.push(image);
-                    } else {
-                        tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = false, error = "turn send allowance exhausted" }, "agent.asset.send");
-                        note.push_str(
-                            "[gateway: turn send allowance exhausted; asset was not queued]\n",
-                        );
-                        self.registrar.delivery_failed();
+            let refusal = match self.registrar.send(id) {
+                Ok(Some(image)) => match self.admit(id, image) {
+                    Ok(position) => {
+                        note.push_str(&format!(
+                            "[gateway: chat-asset:{id} queued ({position} of {} for this reply); it is delivered after your final answer, so say it will be attached, not that it was sent]\n",
+                            self.limit.count
+                        ));
+                        continue;
                     }
-                }
-                Ok(None) => (),
+                    Err(refusal) => refusal,
+                },
+                Ok(None) => continue,
                 Err(error) => {
-                    tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = false, error = %error }, "agent.asset.send");
-                    note.push_str(&format!(
-                        "[gateway: chat-asset:{id} was not queued: {error}]\n"
-                    ));
                     let mut queued = self.queued.lock();
                     // This accepted send spent broker allowance even though no upload can start.
                     queued.spent = queued.spent.saturating_add(1);
-                    self.registrar.delivery_failed();
+                    SendRefusal::Storage(error)
                 }
-            }
+            };
+            tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = false, error = %refusal }, "agent.asset.send");
+            note.push_str(&format!(
+                "[gateway: chat-asset:{id} was not queued: {refusal}]\n"
+            ));
+            self.registrar.delivery_failed();
         }
         for (metadata, descriptor) in attached.into_iter().zip(descriptors) {
             match self.registrar.register(descriptor, &metadata, capability, invocation) {
@@ -286,15 +344,20 @@ impl ReplyAttachments {
             return;
         }
         queued.finished = true;
-        let error = match disposition {
-            AssetDeliveryDisposition::Abandoned => Some("turn ended before reply"),
-            AssetDeliveryDisposition::Failed => Some("delivery failed"),
-            AssetDeliveryDisposition::Delivered => None,
-        };
-        for id in &queued.ids {
-            tracing::info!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = !matches!(disposition, AssetDeliveryDisposition::Abandoned), error }, "agent.asset.send");
+        let mut undelivered = false;
+        for (index, id) in queued.ids.iter().enumerate() {
+            let error = match &disposition {
+                AssetDeliveryDisposition::Abandoned => Some("turn ended before reply"),
+                AssetDeliveryDisposition::Failed => Some("delivery failed"),
+                AssetDeliveryDisposition::Delivered => None,
+                AssetDeliveryDisposition::Partial { failed } => {
+                    failed.contains(&index).then_some("upload failed")
+                }
+            };
+            undelivered |= error.is_some();
+            tracing::info!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = error.is_none(), error }, "agent.asset.send");
         }
-        if disposition != AssetDeliveryDisposition::Delivered && !queued.ids.is_empty() {
+        if undelivered {
             self.registrar.delivery_failed();
         }
     }
@@ -658,7 +721,11 @@ mod tests {
             .set_default();
         {
             let store = Arc::new(Store(std::sync::atomic::AtomicUsize::new(0)));
-            let queue = ReplyAttachments::new(1, Arc::<Store>::clone(&store), "local".into());
+            let queue = ReplyAttachments::new(
+                AttachmentLimit::new(1, Holding::OneAtATime),
+                Arc::<Store>::clone(&store),
+                "local".into(),
+            );
             let blob = DiskBlob::from_bytes(b"mp4\0frames").unwrap();
             let metadata = NewAsset {
                 descriptor: 0,
@@ -687,7 +754,11 @@ mod tests {
             assert_eq!(images[0].media_type(), "video/mp4");
             assert_eq!(images[0].bytes().unwrap(), b"mp4\0frames");
             queue.finish(AssetDeliveryDisposition::Delivered);
-            let cancelled = ReplyAttachments::new(1, store, "local".into());
+            let cancelled = ReplyAttachments::new(
+                AttachmentLimit::new(1, Holding::OneAtATime),
+                store,
+                "local".into(),
+            );
             cancelled.receive(vec![], vec![], vec![], vec![7], "", "");
             cancelled.finish(AssetDeliveryDisposition::Abandoned);
         }
@@ -712,6 +783,46 @@ mod tests {
                 )
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn an_all_at_once_reply_refuses_the_send_that_crosses_its_byte_budget() {
+        struct Store;
+        impl GeneratedAssetStore for Store {
+            fn register(
+                &self,
+                _: OwnedFd,
+                _: &NewAsset,
+                _: &str,
+                _: &str,
+            ) -> Result<u64, BlobError> {
+                unreachable!()
+            }
+            fn remove(&self, _: u64) -> Result<(), BlobError> {
+                unreachable!()
+            }
+            fn send(&self, _: u64) -> Result<Option<GeneratedImage>, BlobError> {
+                unreachable!()
+            }
+            fn delivery_failed(&self) {}
+        }
+        let six = || GeneratedImage::from_png(b"sixsix".to_vec()).unwrap();
+        let queue = ReplyAttachments::new(
+            AttachmentLimit::new(10, Holding::AllAtOnce { bytes: 10 }),
+            Arc::new(Store),
+            "discord".into(),
+        );
+        assert_eq!(queue.admit(1, six()), Ok(1));
+        assert_eq!(
+            queue.admit(2, six()),
+            Err(SendRefusal::ByteBudget { bytes: 10 })
+        );
+        assert_eq!(queue.take().len(), 1);
+        assert_eq!(
+            queue.remaining(),
+            8,
+            "the refused send still spent its allowance"
         );
     }
 

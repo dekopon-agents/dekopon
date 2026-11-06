@@ -540,6 +540,11 @@ impl GithubTransport {
 struct GithubDriver;
 #[async_trait]
 impl ChatDriver for GithubDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        // Replies are discarded, so a send would vanish rather than reach anyone.
+        dekopon_agent::attachment::AttachmentLimit::NONE
+    }
+
     async fn reply(
         &self,
         _target: &ReplyTarget,
@@ -618,6 +623,14 @@ impl ChatTransport for GithubTransport {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn github_offers_no_attachment_sends() {
+        assert_eq!(
+            GithubDriver.attachments_per_reply(),
+            dekopon_agent::attachment::AttachmentLimit::NONE
+        );
+    }
     use axum::body::Body;
     use serde_json::json;
 

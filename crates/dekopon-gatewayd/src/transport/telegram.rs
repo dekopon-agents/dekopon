@@ -847,6 +847,14 @@ fn bounded(text: &str) -> String {
 
 #[async_trait]
 impl ChatDriver for TelegramDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        // Each photo is its own message, so the count bounds how many messages one reply posts.
+        dekopon_agent::attachment::AttachmentLimit::new(
+            4,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         target: &ReplyTarget,
@@ -867,6 +875,10 @@ impl ChatDriver for TelegramDriver {
         };
         let (chat_id, reply_to, message_thread_id) = (*chat_id, *reply_to, *message_thread_id);
         if !images.is_empty() {
+            let total = images.len();
+            let unsent = |sent: usize| TransportError::PartialDelivery {
+                failed_attachments: (sent..total).collect(),
+            };
             let caption_fits = text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
             let caption = footer.and_then(|footer| {
                 crate::progress::Footer::caption(
@@ -877,11 +889,11 @@ impl ChatDriver for TelegramDriver {
                 )
             });
             let caption_footer = caption.as_ref().and(footer);
-            let mut accepted = false;
+            let mut sent = 0;
             while let Some(read) = images.next().await {
                 let (index, image) = match read {
                     Ok(read) => read,
-                    Err(_) if accepted => return Err(TransportError::PartialDelivery),
+                    Err(_) if sent > 0 => return Err(unsent(sent)),
                     Err(error) => return Err(error),
                 };
                 let caption = (index == 0 && caption_fits)
@@ -890,13 +902,13 @@ impl ChatDriver for TelegramDriver {
                     .send_photo(chat_id, reply_to, message_thread_id, caption, image)
                     .await
                 {
-                    Ok(()) => accepted = true,
-                    Err(_) if accepted => return Err(TransportError::PartialDelivery),
+                    Ok(()) => sent += 1,
+                    Err(_) if sent > 0 => return Err(unsent(sent)),
                     Err(error) => return Err(error),
                 }
             }
             if caption_fits && (footer.is_none() || caption.is_some()) {
-                return accepted.then_some(()).ok_or(TransportError::Response);
+                return (sent > 0).then_some(()).ok_or(TransportError::Response);
             }
             if caption_fits {
                 reply.text.clear();
@@ -971,7 +983,11 @@ impl TelegramDriver {
                     accepted = true;
                     delivered = true;
                 }
-                Err(_) if accepted => return Err(TransportError::PartialDelivery),
+                Err(_) if accepted => {
+                    return Err(TransportError::PartialDelivery {
+                        failed_attachments: Vec::new(),
+                    });
+                }
                 Err(error) => return Err(error),
             }
         }

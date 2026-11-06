@@ -706,6 +706,14 @@ impl SteerAck for WhatsappDriver {
 
 #[async_trait]
 impl ChatDriver for WhatsappDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        // Each image is its own message, so the count bounds how many messages one reply posts.
+        dekopon_agent::attachment::AttachmentLimit::new(
+            4,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         target: &ReplyTarget,
@@ -740,16 +748,17 @@ impl ChatDriver for WhatsappDriver {
             )
         });
         let caption_text = caption.as_deref().unwrap_or(&text);
+        let total = images.len();
         let mut accepted = 0_usize;
         while let Some(read) = images.next().await {
             let (index, image) = match read {
                 Ok(read) => read,
-                Err(error) => return Err(self.reply_failure(error, accepted)),
+                Err(error) => return Err(self.reply_failure(error, accepted, accepted..total)),
             };
             let caption =
                 (caption_fits && index == 0 && !caption_text.is_empty()).then_some(caption_text);
             if let Err(error) = self.send_image(recipient, caption, image).await {
-                return Err(self.reply_failure(error, accepted));
+                return Err(self.reply_failure(error, accepted, accepted..total));
             }
             accepted += 1;
         }
@@ -764,7 +773,7 @@ impl ChatDriver for WhatsappDriver {
         ) {
             match self.send_text(recipient, &chunk).await {
                 Ok(()) => accepted += 1,
-                Err(error) => return Err(self.reply_failure(error, accepted)),
+                Err(error) => return Err(self.reply_failure(error, accepted, total..total)),
             }
         }
         (accepted > 0).then_some(()).ok_or(TransportError::Response)

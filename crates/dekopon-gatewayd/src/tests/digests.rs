@@ -375,3 +375,68 @@ async fn a_digest_is_one_bounded_threaded_slack_post_without_native_mentions() {
     assert!(text.len() <= 1900);
     assert!(text.contains("octocat"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_digest_turn_refuses_asset_sends_and_records_no_dispatch() {
+    let (capture, _guard) = capture_spans();
+    let directory = temporary();
+    let (broker, _observed) = stub_broker_assets(
+        directory.path(),
+        vec![
+            plain_response(probe_listing()),
+            plain_response(upper_proposal("kitty")),
+            asset_response(b"\x89PNG\r\n\x1a\nkitty pixels", "image/png"),
+            plain_response(upper_proposal("send")),
+            queued_response(1),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([
+        script_call("probe upper --text kitty"),
+        script_call("probe upper --text send"),
+        answer("Nothing changed today."),
+    ]);
+    let http = spawn_http_mock(slack_handler(Vec::new()));
+    let transport = slack_with(
+        &http.base,
+        SlackExperience::Classic,
+        LivenessConfig::default(),
+    );
+    let mut message = subscriptions::subscription_wake();
+    message.message_id = MessageId::Wake {
+        id: WakeId(1),
+        notice: "digest".into(),
+        origin: crate::wake::WakeOrigin::Digest,
+    };
+    let mut bound = route(model_config());
+    bound.transport = message.transport.clone();
+    bound.wakes = true;
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        bound,
+        message,
+        transport.driver(),
+    )
+    .await;
+
+    let tool = tool_message(&models, 2);
+    assert!(
+        tool.lines().any(|line| line
+            == "[gateway: chat-asset:1 was not queued: this reply already carries its limit of 0 attachments]"),
+        "{tool}"
+    );
+    assert!(
+        http.calls()
+            .iter()
+            .all(|(path, _)| path == "/api/chat.postMessage"),
+        "a digest posts text only"
+    );
+    assert!(
+        capture
+            .events_where(
+                "dekopon_agent::audit",
+                &[("audit.event", "agent.asset.send"), ("dispatched", "true")]
+            )
+            .is_empty()
+    );
+}

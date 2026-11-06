@@ -30,8 +30,6 @@ use tokio::{
     task::{AbortHandle, JoinSet},
 };
 
-pub(crate) const MAX_SENDS_PER_TURN: u8 = 4;
-
 use crate::{
     conversation::ConversationKey,
     transport::{AssetFetcher, MediaRefusal},
@@ -2234,7 +2232,9 @@ pub(crate) mod retention_tests {
     }
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use dekopon_agent::attachment::{ChatAssetInputs, GeneratedAssetStore, ReplyAttachments};
+    use dekopon_agent::attachment::{
+        AttachmentLimit, ChatAssetInputs, GeneratedAssetStore, Holding, ReplyAttachments,
+    };
     use serde_json::json;
 
     fn test_grant() -> crate::memory::record::GrantDigest {
@@ -4389,7 +4389,7 @@ pub(crate) mod retention_tests {
         );
         assert_eq!(store.retention.lock().bytes, png.len());
         let slot = ReplyAttachments::new(
-            MAX_SENDS_PER_TURN,
+            AttachmentLimit::new(4, Holding::OneAtATime),
             Arc::<SessionAssets>::clone(&session),
             "local".to_owned(),
         );
@@ -4399,7 +4399,7 @@ pub(crate) mod retention_tests {
         assert_eq!(slot.take().pop().unwrap().bytes().unwrap(), png);
         slot.finish(dekopon_agent::attachment::AssetDeliveryDisposition::Delivered);
         let next = ReplyAttachments::new(
-            MAX_SENDS_PER_TURN,
+            AttachmentLimit::new(4, Holding::OneAtATime),
             Arc::<SessionAssets>::clone(&session),
             "local".to_owned(),
         );
@@ -4543,7 +4543,7 @@ pub(crate) mod retention_tests {
             .set_default();
         let session = session(store(1024), access("one"));
         let slot = ReplyAttachments::new(
-            MAX_SENDS_PER_TURN,
+            AttachmentLimit::new(4, Holding::OneAtATime),
             Arc::<SessionAssets>::clone(&session),
             "local".to_owned(),
         );
@@ -4589,26 +4589,36 @@ pub(crate) mod retention_tests {
     }
 
     #[tokio::test]
-    async fn fourth_send_fits_fifth_refuses_and_a_new_turn_has_fresh_allowance() {
+    async fn the_tenth_send_queues_the_eleventh_refuses_and_a_new_turn_has_fresh_allowance() {
+        let limit = AttachmentLimit::new(10, Holding::OneAtATime);
         let session = session(store(1024), access("one"));
         let slot = ReplyAttachments::new(
-            MAX_SENDS_PER_TURN,
+            limit,
             Arc::<SessionAssets>::clone(&session),
-            "local".to_owned(),
+            "slack".to_owned(),
         );
-        for index in 0..5 {
+        for index in 1..=11 {
             let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
             let id = session
                 .register(fd, &metadata, "asset.attach", "invocation")
                 .unwrap();
             let note = slot.receive(vec![], vec![], vec![], vec![id], "asset.send", "send");
-            assert_eq!(note.is_empty(), index < 4);
+            let expected = if index <= 10 {
+                format!(
+                    "[gateway: chat-asset:{id} queued ({index} of 10 for this reply); it is delivered after your final answer, so say it will be attached, not that it was sent]\n"
+                )
+            } else {
+                format!(
+                    "[gateway: chat-asset:{id} was not queued: this reply already carries its limit of 10 attachments]\n"
+                )
+            };
+            assert_eq!(note, expected);
         }
         assert_eq!(slot.remaining(), 0);
-        assert_eq!(slot.take().len(), 4);
+        assert_eq!(slot.take().len(), 10);
         slot.finish(dekopon_agent::attachment::AssetDeliveryDisposition::Delivered);
-        let next = ReplyAttachments::new(MAX_SENDS_PER_TURN, session, "local".to_owned());
-        assert_eq!(next.remaining(), 4);
+        let next = ReplyAttachments::new(limit, session, "slack".to_owned());
+        assert_eq!(next.remaining(), 10);
     }
 
     #[tokio::test]
@@ -4631,13 +4641,17 @@ pub(crate) mod retention_tests {
             let id = session
                 .register(fd, &metadata, "asset.attach", "invocation")
                 .unwrap();
-            let slot = ReplyAttachments::new(MAX_SENDS_PER_TURN, session, "local".to_owned());
+            let slot = ReplyAttachments::new(
+                AttachmentLimit::new(4, Holding::OneAtATime),
+                session,
+                "local".to_owned(),
+            );
             slot.receive(vec![], vec![], vec![], vec![id], "asset.send", "send");
             if disposition != AssetDeliveryDisposition::Abandoned {
                 drop(slot.take());
             }
-            slot.finish(disposition);
-            slot.finish(disposition);
+            slot.finish(disposition.clone());
+            slot.finish(disposition.clone());
             drop(slot);
             assert_eq!(
                 capture
@@ -4646,7 +4660,7 @@ pub(crate) mod retention_tests {
                     .count(),
                 1
             );
-            let dispatched = disposition != AssetDeliveryDisposition::Abandoned;
+            let dispatched = disposition == AssetDeliveryDisposition::Delivered;
             assert!(capture.text().contains(&format!("dispatched={dispatched}")));
             match disposition {
                 AssetDeliveryDisposition::Abandoned => {
@@ -4656,6 +4670,7 @@ pub(crate) mod retention_tests {
                     assert!(capture.text().contains("delivery failed"))
                 }
                 AssetDeliveryDisposition::Delivered => assert!(!capture.text().contains("error=")),
+                AssetDeliveryDisposition::Partial { .. } => unreachable!(),
             }
             assert_eq!(
                 store.take_delivery_notice(&access).is_some(),

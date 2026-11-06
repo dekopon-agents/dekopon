@@ -450,7 +450,7 @@ async fn upload_success_is_not_delivery_and_later_failures_are_partial() {
             .await
             .expect_err("failure");
         assert_eq!(
-            matches!(error, TransportError::PartialDelivery),
+            matches!(error, TransportError::PartialDelivery { .. }),
             fail_at >= 2,
             "failure at {fail_at}: {error}"
         );
@@ -661,7 +661,7 @@ async fn malformed_upload_or_message_success_is_not_delivery() {
             .await
             .expect_err("not delivery");
         assert!(error.to_string().contains(reason), "{error}");
-        assert!(!matches!(error, TransportError::PartialDelivery));
+        assert!(!matches!(error, TransportError::PartialDelivery { .. }));
         peer.finish().await;
     }
 }

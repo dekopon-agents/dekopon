@@ -7,7 +7,7 @@ use std::{
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, SessionInvoker, ShellRuntime,
-    attachment::{ChatAssetInputs, ReplyAttachments},
+    attachment::{AttachmentLimit, ChatAssetInputs, ReplyAttachments},
     meta::{
         AgentConfigView, EffectiveCapabilityView, MemoryConfigView, SessionConfigView, SkillView,
     },
@@ -328,7 +328,7 @@ pub async fn open_agent_with_assets(
         .map_err(SessionError::Leg)?;
     Ok(leg
         .with_provider_attachments(Arc::new(ReplyAttachments::new(
-            0,
+            AttachmentLimit::NONE,
             Arc::<assets::ConsoleAssets>::clone(&store),
             "console (no delivery)".to_owned(),
         )))
