@@ -676,6 +676,8 @@ impl Journal {
                 .mode(0o700)
                 .create(parent)?;
         }
+        // The clock moves before the record lands: a crash between them can only delay expiry.
+        self.write_activity(stem, millis(entry.at))?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -715,7 +717,6 @@ impl Journal {
             File::open(parent)?.sync_all()?;
         }
         File::open(&self.dir)?.sync_all()?;
-        self.write_activity(stem, millis(entry.at))?;
         tracing::info!(
             event = "gateway_memory_published",
             memory.record.id = record.id.0.get(),

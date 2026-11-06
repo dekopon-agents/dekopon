@@ -4147,7 +4147,9 @@ async fn record_delivered_turn(
                 let key = HistoryKey::new(stem.to_owned())
                     .map_err(|_invalid| MemoryRecordFailure::Outcome("history-key"))?;
                 turn = turn.with_history(key);
-                Some((history, admission))
+                // The clock moves before the broker write: a failed record only delays expiry.
+                history.note_activity(stem, SystemTime::now()).await;
+                Some(admission)
             }
             None => None,
         };
@@ -4159,13 +4161,10 @@ async fn record_delivered_turn(
             .record_delivered_turn(claim, turn)
             .await
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
+        drop(admission);
         memory_record_outcome_category(&result).map_or(Ok(()), |category| {
             Err(MemoryRecordFailure::Outcome(category))
-        })?;
-        if let Some((history, _admission)) = admission {
-            history.note_activity(stem, SystemTime::now()).await;
-        }
-        Ok(())
+        })
     }
     .await;
     if let Err(error) = result {
