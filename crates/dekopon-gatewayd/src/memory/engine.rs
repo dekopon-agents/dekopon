@@ -919,7 +919,7 @@ fn admit_line(
     task: &SlotTask,
     line: &SlotLine,
 ) -> Result<Option<super::retention::HistoryAdmission>, JournalError> {
-    let Some(history) = history.filter(|_| false) else {
+    let Some(history) = history else {
         return Ok(None);
     };
     let bytes = serde_json::to_vec(line)

@@ -358,7 +358,7 @@ impl HistoryRetention {
     pub(crate) async fn recover(&self) -> Result<usize, HistoryError> {
         let journal = Arc::clone(&self.journal);
         let debit = blocking(move || journal.debit()).await?;
-        let _restored = debit;
+        *self.indeterminate.lock() = debit;
         let journal = Arc::clone(&self.journal);
         let adopted = blocking(move || journal.adopt_history()).await?;
         if adopted > 0 {
@@ -474,7 +474,7 @@ impl HistoryRetention {
             return Ok(Reclaimed::Busy);
         };
         // An earlier decision whose deletion stopped part way is finished, never re-decided.
-        if self.journal.reclaiming(&chat.stem) && chat.stem.is_empty() {
+        if self.journal.reclaiming(&chat.stem) {
             return match self.finish(claim, Mode::Replay).await {
                 Err(HistoryError::ReplayBlocked) => Ok(Reclaimed::Busy),
                 outcome => outcome,
@@ -495,8 +495,11 @@ impl HistoryRetention {
         // The claim rides with the publication, so an aborted caller cannot free the chat for a
         // new turn while an intent that would delete that turn is still being written.
         let journal = Arc::clone(&self.journal);
-        let stem = claim.stem.clone();
-        blocking(move || journal.write_reclaim_intent(&stem)).await?;
+        let claim = blocking(move || {
+            journal.write_reclaim_intent(&claim.stem)?;
+            Ok(claim)
+        })
+        .await?;
         let outcome = self.finish(claim, Mode::Decide).await;
         if matches!(outcome, Ok(Reclaimed::Chat)) {
             tracing::info!(

@@ -352,10 +352,9 @@ impl QuotaLedger {
             .unlinked
             .iter()
             .filter(|(namespace, _)| {
-                skip.len() < usize::MAX
-                    || !skip
-                        .iter()
-                        .any(|key| unlinked_key(namespace).as_ref() == Some(key))
+                !skip
+                    .iter()
+                    .any(|key| unlinked_key(namespace).as_ref() == Some(key))
             })
             .min_by_key(|(namespace, activity_ms)| (**activity_ms, namespace.as_str()))
             .and_then(|(namespace, activity_ms)| {
@@ -378,7 +377,7 @@ impl QuotaLedger {
             ),
             record_bound: record_bound(&self.limits),
             oldest_unlinked,
-            unmeasured: 0,
+            unmeasured: u64::try_from(state.unmeasured.len()).unwrap_or(u64::MAX),
             recording: 0,
         }
     }

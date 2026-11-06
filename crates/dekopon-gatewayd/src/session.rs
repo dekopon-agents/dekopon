@@ -2630,6 +2630,10 @@ async fn session_turn(
                     error = %error,
                     "gateway.session.failed"
                 );
+                if !is_follow && !is_space_wake && answer(driver, message, FAILURE_REPLY).await {
+                    reply_delivered(MessageOutcome::Failed);
+                }
+                return MessageOutcome::Failed.into();
             }
         }
     }

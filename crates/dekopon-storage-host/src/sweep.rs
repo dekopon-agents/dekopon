@@ -401,8 +401,7 @@ impl StorageHost {
         let namespaces = self.inner.layout.namespaces();
         let maximum = self.inner.limits.startup_max_entries;
         let tombstone = format!("{token}{TOMBSTONE_SUFFIX}");
-        remove_tree(namespaces, &tombstone, maximum)?;
-        let removal = Ok(());
+        let removal = remove_tree(namespaces, &tombstone, maximum);
         let removed = !namespaces.exists(&tombstone)?;
         let after = if removed {
             Usage::default()
@@ -514,17 +513,19 @@ pub(crate) struct Legacy {
 // its files, so the current generation's newest data mtime is the newest recorded turn. Without
 // one, the adoption time is persisted once so a restart never moves the clock.
 fn legacy_clock(base: &Directory, token: &str, maximum: u64) -> Result<u64, StorageHostError> {
-    if base.exists(ADOPTED)? && token.is_empty() {
+    if base.exists(ADOPTED)? {
         return std::str::from_utf8(&base.read_bounded(ADOPTED, 32)?)
             .ok()
             .and_then(|text| text.parse().ok())
             .ok_or_else(|| base.corrupt(ADOPTED, "adoption-time"));
     }
+    let generation = crate::namespace::current_generation(base, token)?;
     let mut newest = None;
-    let mut remaining = maximum;
-    for name in base.entries_bounded(maximum)? {
-        if is_token(&name) {
-            newest_in(base, &name, &mut remaining, &mut newest)?;
+    if base.exists(&generation)? {
+        let generation = base.open_directory(&generation)?;
+        if generation.exists("data")? {
+            let mut remaining = maximum;
+            newest_in(&generation, "data", &mut remaining, &mut newest)?;
         }
     }
     if let Some(newest) = newest {
