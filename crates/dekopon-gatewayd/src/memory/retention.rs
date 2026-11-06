@@ -183,7 +183,7 @@ impl HistoryRetention {
 
     fn try_reclaim(&self, stem: &str) -> Option<ReclaimClaim> {
         let mut stems = self.claims.stems.lock();
-        if matches!(stems.get(stem), Some(Claim::Reclaiming)) {
+        if stems.contains_key(stem) {
             return None;
         }
         stems.insert(stem.to_owned(), Claim::Reclaiming);
