@@ -1,126 +1,189 @@
-# Approach note: chat-history retention (22-memory-unify/memory/history-retention)
+# Approach note: chat-history retention (22-memory-unify/memory/history-retention), r2
 
-Temporary review note; it is deleted before the ready-for-review push. Base `4d1a4d5` (v0.87.0).
+Temporary review note, deleted before the ready-for-review push. Base `4d1a4d5` (v0.87.0).
+Coordinator decisions applied: `storage.maxNamespaces` stays; defaults are 20,000,000,000 bytes and 90 days.
 
-## Conflicts between the brief and the code at base, with the reading I follow
+## Conflicts with the code at base, and the reading followed
 
-1. **Reads reset the broker clock.** `NamespacePlan::apply` touches `last-used` on every grant
-   (`dekopon-storage-host/src/namespace.rs:367`), including the read-only
-   `chatMemoryRecent`/`chatMemorySearch` grants. Reading: touch only on write-access grants. This also
-   changes `idle-ttl` for other providers to "idle since last write grant"; no deployed provider uses
-   `idle-ttl` with read-only grants.
-2. **Wakes never reach the broker store.** `record_delivered_turn` skips wakes
-   (`dekopon-gatewayd/src/session.rs:4098`), so a broker copy has no wake entries. Reading: each store's
-   copy keeps its own last-append clock. The gateway copy's clock includes wakes. Both copies sit under
-   the same budget and the same 90 days, so deleting one never puts the other outside the policy.
-   I do not link the two copies: the identities differ (the gateway stem drops or keeps the sender per
-   route `scope`; the broker namespace hashes the canonical subject), and the brief forbids merging them.
-3. **The gateway's whole-file expiry runs on file mtime** at the largest route `forgetAfterMs`
-   (`memory/journal.rs:873`). Every record-age or agent-cap rewrite and every summary-slot write
-   renames the file, which resets that mtime. Reading: the new chat-idle clock replaces this whole-file
-   sweep. Record-level eviction (`maxAgeMs`, `maxBytesPerAgent`, `forgetAfterMs` recall horizon)
-   stays as is.
-4. **Record-age eviction empties a journal long before 90 days** with the 7-day defaults, and that
-   would lose the chat clock. Reading: the clock lives in its own marker, not in the records.
-5. **`storage.maxNamespaces` is the chat admission ceiling** (`quota.rs:104`) and counts every
-   provider's namespaces. Reading: delete the key. `maxRootBytes` and `startupMaxEntries` already
-   bound the ledger and the restart scan, since each namespace costs at least seven entries.
-   **This is a config-key deletion**, the one contract decision below.
+1. **Wakes never reach the broker store** (`session.rs:4098`). A broker copy therefore cannot
+   advance its own clock on a wake. Reading: the gateway propagates wake activity to the broker
+   (see the activity flow below).
+2. **Broker recording precedes journal persistence.** `session.rs:3749` records the turn, then
+   `memory/generation.rs:154` appends it to the journal. Reading: one admission covers both writes
+   and runs before the first of them.
+3. **The gateway's whole-file sweep runs on file mtime** at the largest `forgetAfterMs`
+   (`journal.rs:873`). Record-age and agent-cap eviction rename the file and so reset that mtime;
+   summary slots append in place. Reading: whole-chat expiry uses the newest record's `at_ms`
+   instead. Record-level eviction (`maxAgeMs`, `maxBytesPerAgent`, `forgetAfterMs` recall) is unchanged.
+4. **`maxNamespaces` counts every provider** (`quota.rs:81`). Reading: chat-memory namespaces leave
+   its count and admission. Non-chat providers keep the ceiling. Root bytes and entries still cover
+   both classes.
 
-## Design
+## Identity: the retention key
 
-**One budget, stated once, owned by the gateway.** The gateway owns the chat: it appends both copies'
-source turns and is the only caller of `chatMemoryRecord`. New keys sit beside the existing record-level keys:
+A chat's **retention key** is the digest the gateway already uses for its journal stem,
+`ConversationKey::absorb` (`conversation.rs:91`). Its inputs are the agent, transport, workspace,
+channel and thread, plus the subject's canonical DRN for `privateConversation` and nothing for
+`sharedConversation`. The function moves to `dekopon-core` beside `SpaceKey`, so both daemons compute
+the same key.
 
-```yaml
-memory:
-  retention:
-    maxAgeMs: 604800000          # existing, record-level
-    maxBytesPerAgent: 67108864   # existing, record-level
-    maxHistoryBytes: 20000000000 # new: journal + summaries + broker chat memory, all agents
-    maxChatIdleMs: 7776000000    # new: whole-chat expiry after the latest append
-```
+- The broker derives the key from the request's authenticated attestation (subject, agent, claim
+  conversation). From the gateway it takes only the route's audience, private or shared, as a new
+  `audience` field on `DeliveredTurnRequest` and on the activity request.
+- The key groups storage for lifecycle only. Each broker namespace keeps its own identity, token,
+  scope and grants; nothing is merged or widened. In a private chat the key includes the subject,
+  so one person's activity never keeps another person's copy alive. In a shared chat the gateway
+  already replays one history to every participant, and its per-subject broker namespaces share
+  that chat's lifetime.
+- On a chat-memory grant the broker writes a `chat` file holding the key into the namespace base
+  (rewritten if the audience changes; last writer wins).
 
-The broker gets no budget key. Its storage limits stay resource bounds, and the chart and homelab
-must size `maxRootBytes` and the PVC to hold the broker's share plus other providers.
+## Clocks (persisted; reads, scans and failed writes never advance them)
 
-**Clocks.**
-- Gateway: an empty `<agent>/<stem>.active` file whose mtime is set at each successful `append`,
-  including wakes. Rewrites, summary slots, reads and sweeps leave it alone. At first boot after
-  rollout, a chat without the file takes its newest record's `at_ms`, so existing history enters the
-  policy rather than being purged.
-- Broker: the existing `last-used` marker, touched only on write grants. Existing namespaces keep
-  their current mtime.
+- **Gateway:** the newest record's `at_ms` in the chat's journal file. Wakes append records like any
+  turn. Evicting old records leaves the newest in place. Summaries, pins and choices do not change
+  `at_ms`. No marker file is added.
+- **Broker:** a new `activity` file per chat-memory namespace, set only when a history append
+  succeeds. `StorageHandle` notes a committed `jsonl_append`/write and sets `activity` at
+  finalization, under the base lease it already holds. `last-used` and every non-chat provider's
+  `idle-ttl` keep today's semantics.
+- **Activity flow:**
+  - Every successful record advances `activity`.
+  - For a wake, the gateway sends `ChatActivity { attestation, audience }` after the journal
+    append. The broker advances `activity` on each namespace linked to that key, under each one's
+    lease, and creates nothing.
+  - A failed propagation leaves the broker copy older until the next activity reaches it.
 
-**Accounting.** The gateway keeps an in-memory index, rebuilt at boot from one directory scan:
-stem → (bytes of its journal, seal and follow files; last append). It is kept current under the
-journal's existing `lock`. The broker keeps the same for chat-memory namespaces only. A namespace
-counts as chat memory when its identity file names the configured `chatMemory` provider with a
-conversation scope. The index is built by the root scan `StorageHost::open` already runs and updated
-by `account_finish`/`account_sweep`. Turso, python and every other provider namespace are never in
-this index, so they are never candidates. Assets keep their existing lifetime: they leave with their
-record through `sync_assets` and are not counted.
+## Accounting and bounds
 
-**One new broker-protocol operation**, gateway → broker over the existing daemon connection:
+- **Budget owner:** one gateway `HistoryBudget`. A `parking_lot` mutex guards
+  {gateway bytes, broker bytes, reserved}. A `Semaphore(1)` serializes reclamation across awaits.
+- **Gateway index:** stem → (journal-file bytes plus a fixed per-chat charge, newest `at_ms`). It is
+  kept under the journal `lock`, and only journal files count. Seals and follow markers are excluded
+  and keep their own lifecycle owners. Assets leave through the existing `sync_assets`.
+- **Gateway bounds:**
+  - The per-chat charge (4 KiB) prices metadata even when the transcript holds 0 bytes.
+  - A constant cap of 65,536 journal chats (the broker's `maxNamespaces` ceiling) bounds the index
+    and the boot scan. Creating a chat at the cap reclaims the least-recently-active eligible chat
+    instead of refusing.
+  - A boot scan that finds more than the cap fails fast, naming the directory.
+  - A chat whose records are all evicted loses its file, so its index entry goes with it.
+- **Broker index:** retention key → {namespaces, bytes, newest `activity`}, for chat-class
+  namespaces only. A namespace is chat-class when it has a `chat` file. Chat-class namespaces skip
+  `reserve_namespace`'s count but still reserve root bytes and entries.
+  - `StorageHost::open` takes the chat-memory provider id. On first boot it adopts legacy
+    namespaces of that provider in one move: each gets `chat` set to its own namespace token
+    (a group of one) and `activity` set to its `last-used` mtime. They then fall under the policy
+    with no purge.
+  - The index is rebuilt by the root scan `open` already performs, which `startupMaxEntries` bounds.
+
+## Admission (all history growth goes through the budget owner)
+
+1. Before the broker record (or the journal append, if the route has no chat memory), the session
+   computes `need` = estimated journal record bytes + the encoded `DeliveredTurnRequest` bytes the
+   broker will append.
+   - If `need > maxHistoryBytes`, the result is `HistoryBudget::TooLarge`, decided before any
+     reclamation or write.
+   - Otherwise the session takes a `Reservation` (RAII) that also marks its stem busy.
+2. Summary slots, pins and choices take their own reservation, in async context, before the
+   blocking journal write. Broker-only routes reserve the broker estimate only.
+3. **Settling:**
+   - The journal write settles to the file's actual size change.
+   - Every broker response in this family carries the broker's total chat-class bytes, taken from
+     the existing `account_finish`/`account_sweep` hooks. Partial failures are therefore counted as
+     retained.
+   - A broker overrun above the estimate is counted when it settles and reclaimed before the next
+     admission. It is bounded by `maxWriteBytesPerInvocation`.
+4. If no candidate in either store can be reclaimed, admission returns `HistoryBudget::Exhausted`.
+   The turn is still answered; the existing record/append failure WARN carries the category.
+
+## Reclamation: whole chats across both stores, LRA
 
 ```text
-ReclaimChatHistory { throughMs: Option<u64> }
-  -> ChatHistory { bytes: u64, oldestMs: Option<u64>, reclaimedBytes: u64 }
+ChatHistory { after: Option<Cursor>, reclaim: Option<{ key, notAfterMs }> }
+  -> ChatHistoryReport { bytes, reclaimed: { bytes, namespaces, leased }, next: Option<{ key, activityMs }> }
 ```
 
-With `throughMs`, the broker deletes its single least-recently-active chat-memory namespace whose
-`last-used` ≤ `throughMs`, skipping any it cannot lease. Without it, the call only reports. The
-gateway cannot name a namespace. Deletion reuses `sweep_one`'s sequence: namespace mutex and
-`base.lock` `try_lock` (busy means skip), the bounded tree removal and `account_sweep`.
+- **One loop, bounded per pass:**
+  - The gateway compares its oldest eligible chat with the broker's `next` and picks the older key.
+  - It reclaims that key in both stores: its journal file, if any, then `reclaim` for the key at
+    the broker.
+  - The cursor (activity time, key) only moves forward, so the pass terminates.
+  - A pass also stops when a reclaim frees nothing and neither store has a further candidate.
+- **Pressure** reclaims until the reservation fits, even for chats younger than 90 days.
+- **Idle expiry** (cutoff = now − `maxChatIdleMs`) uses the same loop with "activity < cutoff" as its
+  stop. It runs at boot and in `maintain` after each append, with no new scheduler.
+- **Active use is skipped in both modes:**
+  - The gateway skips busy stems.
+  - The broker revalidates each namespace under its namespace mutex and `base.lock` `try_lock`. A
+    leased namespace, or one whose `activity` is newer than `notAfterMs`, is skipped and counted in
+    `leased`.
+  - A partly reclaimed chat stays in the index with its remaining namespaces.
 
-**Admission** (gateway, before `Journal::append`, serialized by one async owner of the budget):
-1. Take `need` as the encoded record bytes plus the delivered-turn bytes the broker will append.
-   If `need > maxHistoryBytes`, fail with `HistoryBudget::TooLarge` and delete nothing.
-2. While `journal + broker.bytes + need > maxHistoryBytes`, reclaim whichever store holds the older
-   least-recently-active eligible chat, comparing the gateway's oldest against the broker's
-   `oldestMs`. On the gateway, eligible excludes the appending stem and stems with a session in
-   flight.
-3. With nothing eligible, fail with `HistoryBudget::Exhausted`. Both failures surface through the
-   existing append-failure path: the turn is answered and a WARN carries the category. No new
-   refusal reaches the chat.
+## Interrupted deletion
 
-**Inactivity expiry** runs on the gateway's existing triggers, boot and `maintain` after each append,
-with no new scheduler. It removes gateway chats idle past `maxChatIdleMs`, then calls
-`ReclaimChatHistory { throughMs: now - maxChatIdleMs }` until `oldestMs` is newer.
+- **Broker:** before any destructive step, and under the existing locks, write and fsync a
+  `reclaiming` file in the base.
+  - Removal order: data, then `current`, `activity`, `chat`, `last-used`, then `identity`, then
+    `base.lock`, then `reclaiming`, then the directory.
+  - The `StorageHost::open` scan and `NamespacePlan::prepare` both finish any base holding
+    `reclaiming` before admitting use, whatever its age or the current pressure.
+  - Until the final step the `reclaiming` file keeps the residue identifiable and lockable, so
+    `prepare` never sees the markerless state it rejects (`namespace.rs:230`).
+- **Gateway:** a chat is removed by one atomic unlink of its journal file, so it is either present or
+  gone. The existing boot-time `attach_assets` → `sync_assets` reclaims its derived assets.
 
-**Crash and restart.** A gateway chat is removed journal, seal and follow files first, `.active` last,
-so an interrupted delete is finished by the next pass. A broker namespace keeps the existing
-`sweep_one` order, adjusted so `last-used` goes after the data: a crash leaves a marker-bearing
-residue that the next request reclaims, never a markerless base that `prepare` reports as corrupt.
-Both indexes are rebuilt from disk at boot, so no ledger file is added.
+## Authorization
 
-**Evidence.** Each reclaim emits one record: `gateway.history.reclaimed` /
-`storage.history.reclaimed`, with `reason` = `idle` | `budget`, bytes, record or file counts and
-the cutoff in ms. No bodies, no namespace values.
+`ChatHistory` and `ChatActivity` are accepted only from the gateway peer that passes the existing
+reconciliation-owner check (`server.rs:526`: mapped peer, attestor grant, `RECONCILIATION_OWNER`,
+coordination `owns(uid)`). Any other mapped peer gets `ERROR_UNAUTHENTICATED` before the history index
+is touched. These are daemon-level requests, unreachable from provider invocations, guests or upcalls.
+Namespace classification and selection stay broker-side. A test covers the denied peer.
 
-## Ship order
+## Config, ship order, evidence
 
-The wire change is one new `BrokerRequest` variant and one response. Gateway and broker run from one
-image (`dekopon.image`, `deployment.yaml:378,405`), so they ship in one release. Deleting
-`maxNamespaces` means homelab `host.yaml` must drop the key in the same rollout that pins this
-release, because `deny_unknown_fields` refuses it. The rest is the coordinator's to schedule:
-continuity fix (shipped as #937), then capacity reconciliation, then enabling.
+- **Config:** `memory.retention.maxHistoryBytes` (default 20,000,000,000) and
+  `memory.retention.maxChatIdleMs` (default 7,776,000,000) in the gateway config, stated once.
+  The broker gets no budget key.
+- **Ship order:**
+  - The wire changes are one field on `DeliveredTurnRequest` and two daemon operations. Gateway and
+    broker share one image (`_helpers.tpl:828`), so they ship in one release.
+  - Homelab config changes nothing in its keys. The writer reconciles PVC capacity with 20 GB
+    before enabling.
+  - The continuity fix (#937) is already in base.
+- **Evidence:** one record per reclaim, `history.reclaimed`, with `reason` (`idle` | `budget` |
+  `capacity`), bytes, namespace/record counts, leased skips and the cutoff in ms. No bodies, keys
+  or values.
 
-## Tests (synthetic; the crate's existing journal and storage harnesses)
+## Tests (synthetic, on the existing journal, storage-host and brokerd harnesses)
 
-- Gateway: 90-day expiry; a late wake resets the clock; a recall does not; the clock survives
-  reopen; record-age eviction still trims an active chat.
-- Budget: the least-recently-active chat goes first even when younger than 90 days; a broker chat
-  older than every gateway chat is reclaimed first; 600 small chats are admitted under the budget;
-  a turso namespace survives; an oversized record returns `TooLarge` with nothing deleted.
-- Concurrency: a leased namespace is skipped and the next one taken; a reclaim racing an append
-  under real threads; a crash at each removal step, then reopen, finishes the delete.
+- **Expiry:** a chat expires after 90 days; a day-89 wake keeps both copies; a recall or search
+  resets nothing; a failed append resets nothing; the clocks survive restart; record-age eviction
+  still trims an active chat.
+- **Pressure:**
+  - The least-recently-active chat is reclaimed in both stores even when younger than 90 days.
+  - A broker-only chat older than every journal chat goes first.
+  - 600 small chats are admitted under the budget.
+  - A turso namespace survives and still counts against `maxNamespaces`.
+  - `TooLarge` deletes nothing.
+- **Concurrency and recovery:**
+  - A leased namespace is skipped and the pass ends when only leased chats remain.
+  - A reclaim races an append on real threads.
+  - A crash after each removal step, followed by reopen or prepare, finishes the deletion.
+  - A non-owner peer is refused.
 
-## Decisions for the owner
+## r1 resolution
 
-1. **Delete `storage.maxNamespaces`** (recommended) rather than keep a count ceiling beside the
-   byte budget. The alternative keeps the key and exempts chat-memory namespaces from it, which is
-   a second meaning for one key.
-2. **Defaults** for the two new keys: the owner's 20 GB / 90 days (recommended). Below that, the
-   budget does not bind until the PVCs are sized, and the homelab writer reconciles capacity
-   before enabling.
+| Finding | Change |
+|---|---|
+| F1 | `maxNamespaces` kept for non-chat namespaces; chat-class namespaces skip only its count; no homelab key change. |
+| F2 | New `activity` marker set only on a committed chat append at handle finalization; `last-used` and `idle-ttl` unchanged. |
+| F3 | Shared retention key derived from authenticated identity, with an audience bit; `chat` link; wake activity propagated; whole-chat reclaim by key in both stores. |
+| F4 | One reservation before the first write of either store, including broker-only routes and later summary/pin/choice growth; settled from actual sizes; `TooLarge` decided first. |
+| F5 | Fixed per-chat charge, a constant chat cap with LRA reclaim at the cap, a bounded boot scan, and no zero-byte markers. |
+| F6 | Seals and follow markers excluded; only journal files and their records and summaries are reclaimed. |
+| F7 | Persistent `reclaiming` state finished at open and at prepare; atomic unlink on the gateway. |
+| F8 | Reconciliation-owner check on both new operations; denied-peer test. |
+| F9 | Forward-only cursor, a reclaim result that counts leased skips, a bounded pass, `Exhausted` on no progress, and revalidation under lease. |
+| Taste | Summary slots append in place (conflict 3); image reference is `_helpers.tpl:828`. |
