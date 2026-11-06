@@ -78,7 +78,7 @@ cross-agent or cross-conversation memory.
 
 ## Durable memory
 
-The broker can host a storage provider on the three chat-memory routes. When Cedar grants all three to the sender, the gateway records each turn after
+The broker can host a storage provider on the chat-memory routes. When Cedar grants all three to the sender, the gateway records each turn after
 the chat service accepted the answer, and the model may retrieve but never record turns. Stored
 turns never enter a prompt on their own. Recording does not deduplicate, and there is no export or
 encryption at rest.
@@ -94,7 +94,7 @@ and probe turns share one; `relaxed` never does.
 
 ## Retention
 
-One byte budget spans journals and broker chat memory. A chat idle for the window, counting
+One byte budget spans journals and durable memory. A chat idle for the window, counting
 wakes but not reads, expires whole. Over budget, the least-recently-active chat leaves both stores,
 skipping chats in use, or the write is refused. Deletion is permanent.
 
