@@ -315,6 +315,24 @@ fn remove_tree(parent: &Directory, name: &str, maximum: u64) -> Result<(), Stora
     parent.sync()
 }
 
+// A tombstone is a namespace already renamed out of its token; nothing else can open it, so a
+// restart finishes its removal before any grant.
+pub(crate) fn finish_tombstones(
+    namespaces: &Directory,
+    maximum: u64,
+) -> Result<(), StorageHostError> {
+    for name in namespaces.entries_bounded(maximum)? {
+        if is_tombstone(&name) {
+            remove_tree(namespaces, &name, maximum)?;
+            tracing::info!(
+                event = "storage_history_tombstone_finished",
+                "storage.history.tombstone.finished"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn chat_namespaces(
     namespaces: &Directory,
     maximum: u64,

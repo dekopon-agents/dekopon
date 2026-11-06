@@ -230,9 +230,9 @@ impl HistoryRetention {
             let Some(_claim) = self.try_reclaim(&stem) else {
                 continue;
             };
-            let journal = Arc::clone(&self.journal);
-            blocking(move || journal.finish_reclaim_intent(&stem)).await?;
-            finished += 1;
+            if self.finish(&stem).await? == Reclaimed::Chat {
+                finished += 1;
+            }
         }
         Ok(finished)
     }

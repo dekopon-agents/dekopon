@@ -476,6 +476,7 @@ impl StorageHost {
             return Err(StorageHostError::QuotaExceeded);
         }
         let layout = Layout::open(&root)?;
+        sweep::finish_tombstones(layout.namespaces(), limits.startup_max_entries)?;
         let (usage, namespace_count) = scan_root_usage(&layout, limits.startup_max_entries)?;
         if usage.bytes > limits.max_root_bytes {
             return Err(StorageHostError::QuotaExceeded);
