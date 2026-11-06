@@ -16,6 +16,8 @@ use crate::config::ResolvedBroker;
 
 // Bounds one admission or expiry pass however activity moves while it runs.
 const RECLAIMS_PER_PASS: usize = 64;
+// Boot runs a full expiry pass; after that a turn's persistence runs one at most this often.
+const EXPIRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Error)]
 pub(crate) enum HistoryError {
@@ -29,6 +31,14 @@ pub(crate) enum HistoryError {
     Journal(#[from] JournalError),
     #[error("a chat-history task stopped")]
     Task,
+    #[error("the chat clock could not be published before a history write")]
+    Clock,
+    #[error("a chat has an unfinished reclaim and cannot be used until it completes")]
+    Pending,
+    #[error("an unfinished reclaim could not complete because part of the chat is in use")]
+    ReplayBlocked,
+    #[error("chat history needs a conversation journal to keep its budget and clock")]
+    Unavailable,
 }
 
 impl HistoryError {
@@ -39,6 +49,10 @@ impl HistoryError {
             Self::Broker => "history-broker",
             Self::Journal(_) => "history-journal",
             Self::Task => "history-task",
+            Self::Clock => "history-clock",
+            Self::Pending => "history-pending",
+            Self::ReplayBlocked => "history-replay-blocked",
+            Self::Unavailable => "history-unavailable",
         }
     }
 }
@@ -48,6 +62,50 @@ pub(crate) enum Reclaimed {
     Chat,
     Busy,
     Active,
+}
+
+// History growth counts against the whole budget; broker growth must also fit the broker's root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Growth {
+    pub history: u64,
+    pub broker: u64,
+}
+
+impl Growth {
+    pub(crate) const fn journal(bytes: u64) -> Self {
+        Self {
+            history: bytes,
+            broker: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    Decide,
+    Replay,
+}
+
+#[derive(Clone, Debug)]
+enum Candidate {
+    Chat(HistoryChat),
+    Unlinked { key: HistoryKey, activity_ms: u64 },
+}
+
+impl Candidate {
+    const fn activity_ms(&self) -> u64 {
+        match self {
+            Self::Chat(chat) => chat.activity_ms,
+            Self::Unlinked { activity_ms, .. } => *activity_ms,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Chat(chat) => &chat.stem,
+            Self::Unlinked { key, .. } => key.as_str(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,12 +187,39 @@ pub(crate) struct HistoryRetention {
     idle: Duration,
     admission: Arc<tokio::sync::Mutex<()>>,
     claims: Arc<Claims>,
+    // Broker recordings whose outcome never arrived: their whole bound stays spent.
+    indeterminate: Mutex<u64>,
+    expired_at: Mutex<std::time::Instant>,
 }
 
 #[must_use = "admission serializes history writes only while it is held"]
 pub(crate) struct HistoryAdmission {
     retention: Arc<HistoryRetention>,
     _turn: OwnedMutexGuard<()>,
+}
+
+// Holds admission across one broker recording; dropped unsettled, its bound stays debited.
+#[must_use = "a recording's allowance is released only by settling its outcome"]
+pub(crate) struct RecordTicket {
+    _admission: HistoryAdmission,
+    retention: Arc<HistoryRetention>,
+    bound: u64,
+    settled: bool,
+}
+
+impl RecordTicket {
+    pub(crate) fn answered(mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for RecordTicket {
+    fn drop(&mut self) {
+        if !self.settled && self.bound == 0 {
+            let mut indeterminate = self.retention.indeterminate.lock();
+            *indeterminate = indeterminate.saturating_add(self.bound);
+        }
+    }
 }
 
 impl HistoryRetention {
@@ -151,33 +236,51 @@ impl HistoryRetention {
             idle,
             admission: Arc::new(tokio::sync::Mutex::new(())),
             claims: Arc::default(),
+            indeterminate: Mutex::new(0),
+            expired_at: Mutex::new(std::time::Instant::now()),
         })
     }
 
-    pub(crate) async fn begin_use(&self, stem: &str) -> HistoryUse {
+    // A chat with a published reclaim is finished before anyone may use it again.
+    pub(crate) async fn begin_use(&self, stem: &str) -> Result<HistoryUse, HistoryError> {
         loop {
             let changed = self.claims.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            {
+            let pending = {
                 let mut stems = self.claims.stems.lock();
                 match stems.get(stem).copied() {
-                    None => {
-                        stems.insert(stem.to_owned(), Claim::Used(NonZeroUsize::MIN));
-                        break;
+                    Some(Claim::Reclaiming) => None,
+                    claim => {
+                        if self.journal.reclaiming(stem) && stem.is_empty() {
+                            stems.insert(stem.to_owned(), Claim::Reclaiming);
+                            Some(ReclaimClaim {
+                                claims: Arc::clone(&self.claims),
+                                stem: stem.to_owned(),
+                            })
+                        } else {
+                            let count = match claim {
+                                Some(Claim::Used(count)) => count.saturating_add(1),
+                                Some(Claim::Reclaiming) | None => NonZeroUsize::MIN,
+                            };
+                            stems.insert(stem.to_owned(), Claim::Used(count));
+                            return Ok(HistoryUse {
+                                claims: Arc::clone(&self.claims),
+                                stem: stem.to_owned(),
+                            });
+                        }
                     }
-                    Some(Claim::Used(count)) => {
-                        stems.insert(stem.to_owned(), Claim::Used(count.saturating_add(1)));
-                        break;
-                    }
-                    Some(Claim::Reclaiming) => {}
                 }
+            };
+            match pending {
+                Some(claim) => match self.finish(claim, Mode::Replay).await {
+                    Ok(Reclaimed::Chat) => {}
+                    Ok(Reclaimed::Busy | Reclaimed::Active) | Err(_) => {
+                        return Err(HistoryError::Pending);
+                    }
+                },
+                None => changed.await,
             }
-            changed.await;
-        }
-        HistoryUse {
-            claims: Arc::clone(&self.claims),
-            stem: stem.to_owned(),
         }
     }
 
@@ -200,16 +303,38 @@ impl HistoryRetention {
         }
     }
 
-    pub(crate) async fn note_activity(&self, stem: &str, at: SystemTime) {
+    // A broker recording proceeds only once its whole bound fits and the chat's clock is
+    // durably ahead of it.
+    pub(crate) async fn begin_record(
+        self: &Arc<Self>,
+        stem: &str,
+        at: SystemTime,
+    ) -> Result<RecordTicket, HistoryError> {
+        let admission = self.admit().await;
+        if self.journal.reclaiming(stem) {
+            return Err(HistoryError::Pending);
+        }
+        let bound = self.usage().await?.record_bound;
+        admission
+            .ensure(
+                stem,
+                Growth {
+                    history: bound.saturating_add(super::journal::SIDECAR_BYTES),
+                    broker: bound,
+                },
+            )
+            .await?;
         let journal = Arc::clone(&self.journal);
         let stem = stem.to_owned();
-        let noted = tokio::task::spawn_blocking(move || journal.note_activity(&stem, at)).await;
-        if !matches!(noted, Ok(Ok(()))) {
-            tracing::warn!(
-                event = "gateway_history_activity_failed",
-                "gateway.history.activity.failed"
-            );
-        }
+        blocking(move || journal.note_activity(&stem, at))
+            .await
+            .unwrap_or(());
+        Ok(RecordTicket {
+            _admission: admission,
+            retention: Arc::clone(self),
+            bound,
+            settled: false,
+        })
     }
 
     // Boot replays every intent before any session can claim its chat.
@@ -227,33 +352,79 @@ impl HistoryRetention {
         let intents = blocking(move || journal.reclaim_intents()).await?;
         let mut finished = 0;
         for stem in intents {
-            let Some(_claim) = self.try_reclaim(&stem) else {
+            let Some(claim) = self.try_reclaim(&stem) else {
                 continue;
             };
-            if self.finish(&stem).await? == Reclaimed::Chat {
+            if self.finish(claim, Mode::Replay).await? == Reclaimed::Chat {
                 finished += 1;
             }
         }
         Ok(finished)
     }
 
+    pub(crate) async fn expire_due(&self, now: SystemTime) -> Result<usize, HistoryError> {
+        {
+            let mut expired_at = self.expired_at.lock();
+            if expired_at.elapsed() < EXPIRY_INTERVAL {
+                return Ok(0);
+            }
+            *expired_at = std::time::Instant::now();
+        }
+        self.expire(now).await
+    }
+
     pub(crate) async fn expire(&self, now: SystemTime) -> Result<usize, HistoryError> {
         let _turn = self.admission.lock().await;
         let cutoff_ms =
             millis(now).saturating_sub(u64::try_from(self.idle.as_millis()).unwrap_or(u64::MAX));
-        let journal = Arc::clone(&self.journal);
-        let chats = blocking(move || journal.history_chats()).await?;
         let mut expired = 0;
-        for chat in chats
-            .into_iter()
-            .take_while(|chat| chat.activity_ms < cutoff_ms)
-            .take(RECLAIMS_PER_PASS)
-        {
-            if self.reclaim(&chat, Reason::Idle { cutoff_ms }).await? == Reclaimed::Chat {
+        let mut skipped = HashSet::new();
+        for _ in 0..RECLAIMS_PER_PASS {
+            let Some(candidate) = self.oldest(None, &skipped).await? else {
+                break;
+            };
+            if candidate.activity_ms() >= cutoff_ms {
+                break;
+            }
+            if self.reclaim(&candidate, Reason::Idle { cutoff_ms }).await? == Reclaimed::Chat {
                 expired += 1;
+            } else {
+                skipped.insert(candidate.name().to_owned());
             }
         }
         Ok(expired)
+    }
+
+    // The least recently active of the gateway's chats and the broker's unlinked units.
+    async fn oldest(
+        &self,
+        admitting: Option<&str>,
+        skipped: &HashSet<String>,
+    ) -> Result<Option<Candidate>, HistoryError> {
+        let journal = Arc::clone(&self.journal);
+        let mut excluded = skipped.clone();
+        if let Some(stem) = admitting {
+            excluded.insert(stem.to_owned());
+        }
+        let chat = blocking(move || journal.oldest_chat(&excluded))
+            .await?
+            .map(Candidate::Chat);
+        let unlinked = self
+            .usage()
+            .await?
+            .oldest_unlinked
+            .filter(|unlinked| !skipped.contains(unlinked.history.as_str()))
+            .map(|unlinked| Candidate::Unlinked {
+                key: unlinked.history,
+                activity_ms: unlinked.activity_ms,
+            });
+        Ok(match (chat, unlinked) {
+            (Some(chat), Some(unlinked)) if unlinked.activity_ms() < chat.activity_ms() => {
+                Some(unlinked)
+            }
+            (Some(chat), _) => Some(chat),
+            (None, unlinked) => unlinked,
+        })
     }
 
     async fn usage(&self) -> Result<HistoryUsage, HistoryError> {
@@ -267,16 +438,23 @@ impl HistoryRetention {
             .map_err(|_failed| HistoryError::Broker)
     }
 
-    async fn reclaim(&self, chat: &HistoryChat, reason: Reason) -> Result<Reclaimed, HistoryError> {
-        let Some(_claim) = self.try_reclaim(&chat.stem) else {
+    async fn reclaim(
+        &self,
+        candidate: &Candidate,
+        reason: Reason,
+    ) -> Result<Reclaimed, HistoryError> {
+        let chat = match candidate {
+            Candidate::Unlinked { key, .. } => return self.reclaim_unlinked(key).await,
+            Candidate::Chat(chat) => chat,
+        };
+        let Some(claim) = self.try_reclaim(&chat.stem) else {
             return Ok(Reclaimed::Busy);
         };
         let journal = Arc::clone(&self.journal);
-        let current = blocking(move || journal.history_chats()).await?;
-        let activity_ms = current
-            .iter()
-            .find(|found| found.stem == chat.stem)
-            .map_or(0, |found| found.activity_ms);
+        let stem = chat.stem.clone();
+        let activity_ms = blocking(move || journal.activity(&stem))
+            .await?
+            .unwrap_or(0);
         let active = match reason {
             Reason::Idle { cutoff_ms } => activity_ms >= cutoff_ms,
             Reason::Budget => activity_ms > chat.activity_ms,
@@ -287,7 +465,7 @@ impl HistoryRetention {
         let journal = Arc::clone(&self.journal);
         let stem = chat.stem.clone();
         blocking(move || journal.write_reclaim_intent(&stem)).await?;
-        let outcome = self.finish(&chat.stem).await;
+        let outcome = self.finish(claim, Mode::Decide).await;
         if matches!(outcome, Ok(Reclaimed::Chat)) {
             tracing::info!(
                 event = "gateway_history_reclaimed",
@@ -299,36 +477,58 @@ impl HistoryRetention {
         outcome
     }
 
-    // The broker copy goes first, then the transcript, then the intent: a crash between any two
-    // steps leaves the intent, and replaying it finishes the same steps.
-    async fn finish(&self, stem: &str) -> Result<Reclaimed, HistoryError> {
-        let key = HistoryKey::new(stem.to_owned()).map_err(|_invalid| JournalError::Corrupt)?;
+    async fn reclaim_unlinked(&self, key: &HistoryKey) -> Result<Reclaimed, HistoryError> {
+        let Some(_claim) = self.try_reclaim(key.as_str()) else {
+            return Ok(Reclaimed::Busy);
+        };
+        match self.broker_reclaim(key.clone()).await? {
+            ChatReclaim::Reclaimed { .. } => {
+                tracing::info!(
+                    event = "gateway_history_reclaimed",
+                    reason = "unlinked",
+                    "gateway.history.reclaimed"
+                );
+                Ok(Reclaimed::Chat)
+            }
+            ChatReclaim::Busy => Ok(Reclaimed::Busy),
+        }
+    }
+
+    async fn broker_reclaim(&self, key: HistoryKey) -> Result<ChatReclaim, HistoryError> {
         let client = self
             .broker
             .leg_client()
-            .map_err(|_unreachable| HistoryError::Broker);
-        let reclaimed = match client {
-            Ok(client) => client
-                .reclaim_chat(key)
-                .await
-                .map_err(|_failed| HistoryError::Broker),
-            Err(error) => Err(error),
-        };
-        match reclaimed {
-            Ok(ChatReclaim::Reclaimed { .. }) => {}
-            Ok(ChatReclaim::Busy) => {
+            .map_err(|_unreachable| HistoryError::Broker)?;
+        client
+            .reclaim_chat(key)
+            .await
+            .map_err(|_failed| HistoryError::Broker)
+    }
+
+    // The broker copy goes first, then the transcript, then the intent: a crash between any two
+    // steps leaves the intent, and replaying it finishes the same steps. Until the intent is gone
+    // the chat stays claimed by the intent itself, whatever this call returns.
+    async fn finish(&self, claim: ReclaimClaim, mode: Mode) -> Result<Reclaimed, HistoryError> {
+        let key = HistoryKey::new(claim.stem.clone()).map_err(|_invalid| JournalError::Corrupt)?;
+        match (self.broker_reclaim(key).await?, mode) {
+            (ChatReclaim::Reclaimed { .. }, Mode::Decide | Mode::Replay) => {}
+            (ChatReclaim::Busy, Mode::Decide | Mode::Replay) => {
                 let journal = Arc::clone(&self.journal);
-                let stem = stem.to_owned();
-                blocking(move || journal.finish_reclaim_intent(&stem)).await?;
+                blocking(move || {
+                    journal.finish_reclaim_intent(&claim.stem)?;
+                    drop(claim);
+                    Ok(())
+                })
+                .await?;
                 return Ok(Reclaimed::Busy);
             }
-            Err(error) => return Err(error),
         }
         let journal = Arc::clone(&self.journal);
-        let stem = stem.to_owned();
         blocking(move || {
-            journal.remove_history(&stem)?;
-            journal.finish_reclaim_intent(&stem)
+            journal.remove_history(&claim.stem)?;
+            journal.finish_reclaim_intent(&claim.stem)?;
+            drop(claim);
+            Ok(())
         })
         .await?;
         Ok(Reclaimed::Chat)
@@ -336,39 +536,46 @@ impl HistoryRetention {
 }
 
 impl HistoryAdmission {
-    pub(crate) async fn ensure(&self, stem: &str, need: u64) -> Result<(), HistoryError> {
+    pub(crate) async fn ensure(&self, stem: &str, growth: Growth) -> Result<(), HistoryError> {
         let retention = &self.retention;
-        if need > retention.budget {
+        if growth.history > retention.budget {
             return Err(HistoryError::TooLarge {
-                need,
+                need: growth.history,
                 budget: retention.budget,
             });
         }
         let mut skipped = HashSet::new();
         for _ in 0..=RECLAIMS_PER_PASS {
-            let usage = retention.usage().await?;
-            let journal = Arc::clone(&retention.journal);
-            let journal_bytes = blocking(move || journal.history_bytes()).await?;
-            let total = journal_bytes
-                .saturating_add(usage.chat_used)
-                .saturating_add(usage.chat_reserved)
-                .saturating_add(need);
-            if total <= retention.budget && usage.root_free_bytes >= need {
+            if retention.fits(growth).await? {
                 return Ok(());
             }
-            let journal = Arc::clone(&retention.journal);
-            let chats = blocking(move || journal.history_chats()).await?;
-            let Some(candidate) = chats
-                .into_iter()
-                .find(|chat| chat.stem != stem && !skipped.contains(&chat.stem))
-            else {
+            let Some(candidate) = retention.oldest(Some(stem), &skipped).await? else {
                 return Err(HistoryError::Exhausted);
             };
             if retention.reclaim(&candidate, Reason::Budget).await? != Reclaimed::Chat {
-                skipped.insert(candidate.stem);
+                skipped.insert(candidate.name().to_owned());
             }
         }
         Err(HistoryError::Exhausted)
+    }
+}
+
+impl HistoryRetention {
+    async fn fits(&self, growth: Growth) -> Result<bool, HistoryError> {
+        let usage = self.usage().await?;
+        let journal = Arc::clone(&self.journal);
+        let journal_bytes = blocking(move || journal.history_bytes()).await?;
+        let total = journal_bytes
+            .saturating_add(usage.chat_used)
+            .saturating_add(usage.chat_reserved)
+            .saturating_add(*self.indeterminate.lock())
+            .saturating_add(growth.history);
+        Ok(total <= self.budget && usage.root_free_bytes >= growth.history)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claimed(&self, stem: &str) -> bool {
+        self.claims.stems.lock().contains_key(stem)
     }
 }
 

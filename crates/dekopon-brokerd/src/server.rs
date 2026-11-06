@@ -858,6 +858,8 @@ where
                     chat_reserved: 0,
                     root_free_bytes: u64::MAX,
                     root_free_entries: u64::MAX,
+                    record_bound: 0,
+                    oldest_unlinked: None,
                 },
                 |host| {
                     let usage = host.history_usage();
@@ -866,6 +868,13 @@ where
                         chat_reserved: usage.chat_reserved,
                         root_free_bytes: usage.root_free_bytes,
                         root_free_entries: usage.root_free_entries,
+                        record_bound: usage.record_bound,
+                        oldest_unlinked: usage.oldest_unlinked.map(|unlinked| {
+                            dekopon_broker_protocol::UnlinkedHistory {
+                                history: unlinked.key,
+                                activity_ms: unlinked.activity_ms,
+                            }
+                        }),
                     }
                 },
             );

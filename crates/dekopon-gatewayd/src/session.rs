@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use crate::memory::retention::HistoryError;
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, BudgetLimit, CancelSource, IdSequence, ProgressEvent, ProgressSink,
     ShellRuntime,
@@ -1282,9 +1283,6 @@ impl CancelOutcome {
 }
 
 pub(crate) struct PendingNotice(StopCause);
-
-// Storage framing a delivered turn adds beyond its text: record envelope, index line, entry charge.
-const DELIVERED_TURN_OVERHEAD: u64 = 8 * 1024;
 
 pub(crate) struct SessionRunner {
     pub broker: ResolvedBroker,
@@ -2622,7 +2620,15 @@ async fn session_turn(
     let mut deferred = Deferred::default();
     // Held from before the first history read through deferred persistence.
     if let Some(history) = runner.history.as_ref() {
-        deferred.history = Some(history.begin_use(&key.journal_stem()).await);
+        match history.begin_use(&key.journal_stem()).await {
+            Ok(in_use) => deferred.history = Some(in_use),
+            // The journal refuses this chat's reads and writes until its reclaim completes.
+            Err(error) => tracing::warn!(
+                event = "gateway_history_use_refused",
+                category = error.category(),
+                "gateway.history.use.refused"
+            ),
+        }
     }
     let mut recalled_journal = None;
     let (mut seeded, cache_key, conversation_lease, asset_access, delta) = match window {
@@ -4135,21 +4141,17 @@ async fn record_delivered_turn(
             user,
             assistant,
         );
-        let admission = match runner.history.as_ref() {
+        let ticket = match runner.history.as_ref() {
             Some(history) => {
-                let admission = history.admit().await;
-                let need = (turn.user().len() + turn.assistant().as_str().len()) as u64
-                    + DELIVERED_TURN_OVERHEAD;
-                admission
-                    .ensure(stem, need)
-                    .await
-                    .map_err(|error| MemoryRecordFailure::Outcome(error.category()))?;
                 let key = HistoryKey::new(stem.to_owned())
                     .map_err(|_invalid| MemoryRecordFailure::Outcome("history-key"))?;
                 turn = turn.with_history(key);
-                // The clock moves before the broker write: a failed record only delays expiry.
-                history.note_activity(stem, SystemTime::now()).await;
-                Some(admission)
+                Some(
+                    history
+                        .begin_record(stem, SystemTime::now())
+                        .await
+                        .map_err(|error| MemoryRecordFailure::Outcome(error.category()))?,
+                )
             }
             None => None,
         };
@@ -4157,11 +4159,14 @@ async fn record_delivered_turn(
             .broker
             .leg_client()
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
+        // An error leaves the ticket unsettled, so the recording's bound stays spent.
         let result = client
             .record_delivered_turn(claim, turn)
             .await
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
-        drop(admission);
+        if let Some(ticket) = ticket {
+            ticket.answered();
+        }
         memory_record_outcome_category(&result).map_or(Ok(()), |category| {
             Err(MemoryRecordFailure::Outcome(category))
         })

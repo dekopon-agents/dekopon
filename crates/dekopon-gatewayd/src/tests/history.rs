@@ -1,12 +1,13 @@
 use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
 use dekopon_core::history::HistoryKey;
 use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
+use std::fs::File;
 
 use super::*;
 use crate::memory::{
     journal::{Entry, Journal, Keep},
     record::GrantDigest,
-    retention::{HistoryError, HistoryRetention},
+    retention::{Growth, HistoryError, HistoryRetention},
 };
 
 const OLDER: &str = "assistant/1111111111111111111111111111111111111111111111111111111111111111";
@@ -74,8 +75,6 @@ impl Stores {
         self.storage().join("namespaces").join(token)
     }
 
-    // Both copies of a chat: the broker namespace through the real storage host, the transcript
-    // through the real journal.
     fn record(&self, journal: &Journal, stem: &str, conversation: &str, at: SystemTime) {
         let host = StorageHost::open(self.storage(), StorageLimits::default()).unwrap();
         let grant = host
@@ -109,7 +108,32 @@ impl Stores {
             .expect("within the agent cap");
     }
 
+    fn transcript(&self, journal: &Journal, stem: &str, at: SystemTime) {
+        let turn = captured("synthetic question", Some("synthetic answer"));
+        journal
+            .append(
+                stem,
+                &Entry {
+                    at,
+                    grant: &GrantDigest::of(&["probe.read".to_owned()]),
+                    captured: &turn,
+                    keep: Keep::Everything,
+                    plan: None,
+                    attachments: Default::default(),
+                    arrivals: &[],
+                    inventory: &[],
+                    next_asset_id: 1,
+                },
+            )
+            .unwrap()
+            .expect("within the agent cap");
+    }
+
     async fn start_broker(&mut self) -> ResolvedBroker {
+        self.start_broker_with(StorageLimits::default()).await
+    }
+
+    async fn start_broker_with(&mut self, limits: StorageLimits) -> ResolvedBroker {
         let socket = self.directory.path().join("broker.sock");
         let config_path = self.directory.path().join("broker.json");
         let policy_path = self.directory.path().join("policies.cedar");
@@ -118,7 +142,7 @@ impl Stores {
             r#"@id("prompt") permit(principal, action == Dekopon::Action::"agent.prompt", resource);"#,
         )
         .unwrap();
-        let mut storage = serde_json::to_value(StorageLimits::default()).unwrap();
+        let mut storage = serde_json::to_value(limits).unwrap();
         storage["rootPath"] = json!(self.storage());
         fs::write(
             &config_path,
@@ -181,7 +205,7 @@ impl Stores {
         }
     }
 
-    fn transcript(&self, stem: &str) -> PathBuf {
+    fn transcript_path(&self, stem: &str) -> PathBuf {
         self.journal_dir().join(format!("{stem}.jsonl"))
     }
 
@@ -194,13 +218,13 @@ impl Stores {
     }
 
     fn assert_present(&self, stem: &str, conversation: &str) {
-        assert!(self.transcript(stem).exists(), "{stem} transcript");
+        assert!(self.transcript_path(stem).exists(), "{stem} transcript");
         assert!(self.activity(stem).exists(), "{stem} clock");
         assert!(self.namespace_exists(conversation), "{stem} broker copy");
     }
 
     fn assert_gone(&self, stem: &str, conversation: &str) {
-        assert!(!self.transcript(stem).exists(), "{stem} transcript");
+        assert!(!self.transcript_path(stem).exists(), "{stem} transcript");
         assert!(!self.activity(stem).exists(), "{stem} clock");
         assert!(!self.intent(stem).exists(), "{stem} intent");
         assert!(!self.namespace_exists(conversation), "{stem} broker copy");
@@ -268,13 +292,19 @@ async fn two_chats_in_both_stores_are_reclaimed_one_at_a_time() {
     let history = HistoryRetention::new(Arc::clone(&journal), broker.clone(), budget, IDLE);
 
     let admission = history.admit().await;
-    admission.ensure("assistant/new", 2).await.unwrap();
+    admission
+        .ensure("assistant/new", Growth::journal(2))
+        .await
+        .unwrap();
     drop(admission);
     stores.assert_gone(OLDER, "c-older");
     stores.assert_present(NEWER, "c-newer");
 
     let admission = history.admit().await;
-    admission.ensure("assistant/new", budget).await.unwrap();
+    admission
+        .ensure("assistant/new", Growth::journal(budget))
+        .await
+        .unwrap();
     drop(admission);
     stores.assert_gone(NEWER, "c-newer");
     assert_eq!(used(&journal, &broker).await, 0);
@@ -288,16 +318,21 @@ async fn a_chat_in_use_is_skipped_and_the_next_one_reclaimed() {
     let total = used(&journal, &broker).await;
     let history = HistoryRetention::new(Arc::clone(&journal), broker.clone(), total + 1, IDLE);
 
-    let in_use = history.begin_use(OLDER).await;
+    let in_use = history.begin_use(OLDER).await.unwrap();
     let admission = history.admit().await;
-    admission.ensure("assistant/new", 2).await.unwrap();
+    admission
+        .ensure("assistant/new", Growth::journal(2))
+        .await
+        .unwrap();
     drop(admission);
     stores.assert_present(OLDER, "c-older");
     stores.assert_gone(NEWER, "c-newer");
 
     let admission = history.admit().await;
     assert!(matches!(
-        admission.ensure("assistant/new", total + 1).await,
+        admission
+            .ensure("assistant/new", Growth::journal(total + 1))
+            .await,
         Err(HistoryError::Exhausted)
     ));
     drop(admission);
@@ -346,7 +381,7 @@ async fn a_reclaim_interrupted_at_any_step_finishes_at_the_next_boot() {
             }
         }
         if matches!(crash, Crash::AfterTranscript | Crash::AfterClock) {
-            fs::remove_file(stores.transcript(OLDER)).unwrap();
+            fs::remove_file(stores.transcript_path(OLDER)).unwrap();
         }
         if matches!(crash, Crash::AfterClock) {
             fs::remove_file(stores.activity(OLDER)).unwrap();
@@ -385,7 +420,7 @@ async fn a_chat_idle_past_the_window_expires_and_a_late_append_keeps_it() {
     let broker = stores.start_broker().await;
     let history = HistoryRetention::new(Arc::clone(&journal), broker, BUDGET, IDLE);
 
-    let read = history.begin_use(NEWER).await;
+    let read = history.begin_use(NEWER).await.unwrap();
     drop(read);
     assert_eq!(history.expire(start + IDLE).await.unwrap(), 0);
     assert_eq!(
@@ -445,4 +480,319 @@ fn a_measured_turn_bounds_the_bytes_its_append_writes() {
     let measured = crate::memory::journal::measure(&entry).unwrap();
     journal.append(OLDER, &entry).unwrap().unwrap();
     assert!(measured >= journal.history_bytes().unwrap());
+}
+
+fn stem(index: usize) -> String {
+    format!("assistant/{index:064x}")
+}
+
+#[tokio::test]
+async fn a_pass_reclaims_at_most_sixty_four_chats_then_checks_once_more() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    let start = SystemTime::now() - Duration::from_secs(3600);
+    for index in 0..65 {
+        stores.transcript(
+            &journal,
+            &stem(index),
+            start + Duration::from_secs(index as u64),
+        );
+    }
+    let broker = stores.start_broker().await;
+    let budget = used(&journal, &broker).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, budget, IDLE);
+
+    let admission = history.admit().await;
+    assert!(matches!(
+        admission
+            .ensure("assistant/new", Growth::journal(budget))
+            .await,
+        Err(HistoryError::Exhausted)
+    ));
+    drop(admission);
+    let left = (0..65)
+        .filter(|index| stores.transcript_path(&stem(*index)).exists())
+        .count();
+    assert_eq!(left, 1, "one pass reclaims at most 64 chats");
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn a_journal_append_does_not_need_broker_root_space() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    stores.transcript(&journal, OLDER, SystemTime::now());
+    let probe = stores.start_broker().await;
+    let usage = probe.leg_client().unwrap().history_usage().await.unwrap();
+    stores.stop_broker().await;
+    let used_root = StorageLimits::default().max_root_bytes - usage.root_free_bytes;
+    let tight = StorageLimits {
+        max_root_bytes: used_root + 1,
+        max_namespace_bytes: used_root + 1,
+        max_file_bytes: used_root + 1,
+        ..StorageLimits::default()
+    };
+    let broker = stores.start_broker_with(tight).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, BUDGET, IDLE);
+
+    let admission = history.admit().await;
+    admission
+        .ensure("assistant/new", Growth::journal(4_096))
+        .await
+        .unwrap();
+    drop(admission);
+    assert!(
+        stores.transcript_path(OLDER).exists(),
+        "no chat was reclaimed"
+    );
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn a_broker_recording_waits_for_a_published_clock() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    stores.transcript(&journal, OLDER, SystemTime::now());
+    fs::remove_file(stores.activity(OLDER)).unwrap();
+    fs::create_dir(stores.activity(OLDER)).unwrap();
+    let broker = stores.start_broker().await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, BUDGET, IDLE);
+
+    assert!(matches!(
+        history.begin_record(OLDER, SystemTime::now()).await,
+        Err(HistoryError::Clock)
+    ));
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn a_recording_bound_larger_than_the_budget_is_refused() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    let broker = stores.start_broker().await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, 10_000, IDLE);
+
+    assert!(matches!(
+        history.begin_record(OLDER, SystemTime::now()).await,
+        Err(HistoryError::TooLarge { .. })
+    ));
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn an_unanswered_recording_keeps_its_bound_spent() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    let broker = stores.start_broker().await;
+    let bound = broker
+        .leg_client()
+        .unwrap()
+        .history_usage()
+        .await
+        .unwrap()
+        .record_bound;
+    let budget = 2 * bound - 1;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, budget, IDLE);
+
+    let answered = history
+        .begin_record(OLDER, SystemTime::now())
+        .await
+        .unwrap();
+    answered.answered();
+    let unanswered = history
+        .begin_record(OLDER, SystemTime::now())
+        .await
+        .unwrap();
+    drop(unanswered);
+    assert!(matches!(
+        history.begin_record(NEWER, SystemTime::now()).await,
+        Err(HistoryError::Exhausted)
+    ));
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn a_chat_with_an_unfinished_reclaim_stays_fenced_until_it_completes() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    stores.record(&journal, OLDER, "c-older", SystemTime::now());
+    journal.write_reclaim_intent(OLDER).unwrap();
+    let broker = stores.start_broker().await;
+    stores.stop_broker().await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, BUDGET, IDLE);
+
+    assert!(matches!(
+        history.begin_use(OLDER).await,
+        Err(HistoryError::Pending)
+    ));
+    stores.transcript(&journal, NEWER, SystemTime::now());
+    let turn = captured("late question", Some("late answer"));
+    assert!(
+        journal
+            .append(
+                OLDER,
+                &Entry {
+                    at: SystemTime::now(),
+                    grant: &GrantDigest::of(&["probe.read".to_owned()]),
+                    captured: &turn,
+                    keep: Keep::Everything,
+                    plan: None,
+                    attachments: Default::default(),
+                    arrivals: &[],
+                    inventory: &[],
+                    next_asset_id: 1,
+                },
+            )
+            .is_err(),
+        "no new history lands on a chat being reclaimed"
+    );
+
+    let broker = stores.start_broker().await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, BUDGET, IDLE);
+    drop(history.begin_use(OLDER).await.unwrap());
+    stores.assert_gone(OLDER, "c-older");
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn a_replay_blocked_by_a_leased_member_fails_boot_and_keeps_its_intent() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    stores.record(&journal, OLDER, "c-older", SystemTime::now());
+    stores.record(&journal, OLDER, "c-older-second", SystemTime::now());
+    journal.write_reclaim_intent(OLDER).unwrap();
+    let lease = File::open(stores.broker_namespace("c-older-second").join("base.lock")).unwrap();
+    lease.lock().unwrap();
+    let broker = stores.start_broker().await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, BUDGET, IDLE);
+
+    assert!(matches!(
+        history.recover().await,
+        Err(HistoryError::ReplayBlocked)
+    ));
+    assert!(stores.intent(OLDER).exists());
+    assert!(stores.transcript_path(OLDER).exists());
+    drop(lease);
+    history.recover().await.unwrap();
+    stores.assert_gone(OLDER, "c-older");
+    assert!(!stores.namespace_exists("c-older-second"));
+    stores.stop_broker().await;
+}
+
+#[test]
+fn a_summary_line_moves_the_chat_clock() {
+    let stores = Stores::new();
+    let journal = stores.journal();
+    let start = SystemTime::now() - Duration::from_secs(3600);
+    let turn = captured("synthetic question", Some("synthetic answer"));
+    let plan = crate::memory::record::SummaryPlan {
+        model: "summary".to_owned(),
+        parts: vec![std::num::NonZeroU32::new(8).unwrap()],
+        max_input_bytes: std::num::NonZeroU32::new(1024).unwrap(),
+    };
+    let header = journal
+        .append(
+            OLDER,
+            &Entry {
+                at: start,
+                grant: &GrantDigest::of(&["probe.read".to_owned()]),
+                captured: &turn,
+                keep: Keep::Everything,
+                plan: Some(plan),
+                attachments: Default::default(),
+                arrivals: &[],
+                inventory: &[],
+                next_asset_id: 1,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let before = journal.activity(OLDER).unwrap().unwrap();
+    let written = journal
+        .write_slot(
+            OLDER,
+            crate::memory::record::SlotLine {
+                at_ms: 1,
+                record: header.id,
+                part: std::num::NonZeroU8::MIN,
+                slot: crate::memory::record::Slot::Running,
+                subject: crate::memory::record::Subject::Record,
+            },
+        )
+        .unwrap();
+    assert!(written);
+    assert!(journal.activity(OLDER).unwrap().unwrap() > before);
+}
+
+#[tokio::test]
+async fn an_aborted_persistence_keeps_the_chat_claimed_until_its_native_job_ends() {
+    let mut stores = Stores::new();
+    let journal_dir = stores.journal_dir();
+    let broker = stores.start_broker().await;
+    let runner =
+        super::journaled_runner(broker.clone(), Arc::new(ModelScript::new([])), &journal_dir);
+    let journal = Arc::clone(runner.journal.as_ref().unwrap());
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, BUDGET, IDLE);
+    let deferred = crate::memory::generation::Deferred {
+        corrupt: Some(crate::memory::journal::CorruptStem(OLDER.to_owned())),
+        history: Some(history.begin_use(OLDER).await.unwrap()),
+        ..Default::default()
+    };
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+    let held_journal = Arc::clone(&journal);
+    let blocker = tokio::task::spawn_blocking(move || {
+        let _held = held_journal.hold_io_for_test();
+        locked.send(()).unwrap();
+        unblock
+            .recv_timeout(Duration::from_secs(10))
+            .expect("journal lock released");
+    });
+    ready.await.unwrap();
+    let drained = {
+        let runner = Arc::clone(&runner);
+        tokio::spawn(async move { crate::memory::generation::drain(&runner, deferred).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drained.abort();
+    assert!(drained.await.unwrap_err().is_cancelled());
+    assert!(history.claimed(OLDER), "the native job still owns the chat");
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while history.claimed(OLDER) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the claim ends with the native job");
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn an_unreadable_chat_marker_is_its_own_unit_and_reclaimed_under_pressure() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    stores.record(&journal, OLDER, "c-older", SystemTime::now());
+    fs::remove_file(stores.transcript_path(OLDER)).unwrap();
+    fs::remove_file(stores.activity(OLDER)).unwrap();
+    fs::write(
+        stores.broker_namespace("c-older").join("chat"),
+        b"not a key",
+    )
+    .unwrap();
+    let broker = stores.start_broker().await;
+    let total = used(&journal, &broker).await;
+    assert!(total > 0, "the unit's bytes stay counted");
+    let history = HistoryRetention::new(Arc::clone(&journal), broker.clone(), total + 1, IDLE);
+
+    let admission = history.admit().await;
+    admission
+        .ensure("assistant/new", Growth::journal(2))
+        .await
+        .unwrap();
+    drop(admission);
+    assert!(!stores.namespace_exists("c-older"));
+    assert_eq!(used(&journal, &broker).await, 0);
+    stores.stop_broker().await;
 }

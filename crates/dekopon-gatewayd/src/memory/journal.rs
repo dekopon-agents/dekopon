@@ -37,6 +37,11 @@ const FOLLOW_EXTENSION: &str = "followed";
 const ACTIVITY_EXTENSION: &str = "activity";
 const RECLAIM_EXTENSION: &str = "reclaim";
 const MAX_SIDECAR_BYTES: u64 = 512;
+pub(crate) const SIDECAR_BYTES: u64 = MAX_SIDECAR_BYTES;
+// A chat with a published reclaim takes no new history until the reclaim completes.
+const RECLAIMING: JournalError = JournalError::Io {
+    kind: io::ErrorKind::ResourceBusy,
+};
 const MAX_FOLLOW_BYTES: u64 = 4096;
 const MAX_SEAL_BYTES: u64 = 4096;
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -65,7 +70,7 @@ impl JournalError {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct CorruptStem(String);
+pub(crate) struct CorruptStem(pub(crate) String);
 
 #[derive(Debug)]
 pub(crate) enum RecallFailure {
@@ -566,7 +571,12 @@ impl Journal {
         // One record past twice the window lets projection see the count that forces a repack.
         let limit = NonZeroUsize::new(window.limits.max_turns.saturating_mul(2).saturating_add(1))
             .unwrap_or(NonZeroUsize::MIN);
-        let mut snapshot = match File::open(self.path(stem)) {
+        let opened = if self.reclaiming(stem) && stem.is_empty() {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        } else {
+            File::open(self.path(stem))
+        };
+        let mut snapshot = match opened {
             Ok(file) => walk::window(file, limit).map_err(failed)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Recalled {
@@ -641,6 +651,9 @@ impl Journal {
         entry: &Entry<'_>,
     ) -> Result<Option<records::Header>, JournalError> {
         let _lock = self.lock.lock();
+        if self.reclaiming(stem) && stem.is_empty() {
+            return Err(RECLAIMING);
+        }
         let _assets = AssetSync(self);
         let path = self.path(stem);
         let next_record_id = match File::open(&path) {
@@ -738,11 +751,50 @@ impl Journal {
 
     pub(crate) fn note_activity(&self, stem: &str, at: SystemTime) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
+        if self.reclaiming(stem) {
+            return Err(RECLAIMING);
+        }
         self.write_activity(stem, millis(at))
     }
 
-    // The clock only moves forward, and only a committed history write moves it: record eviction,
-    // summary slots, pins and reads never call this.
+    pub(crate) fn reclaiming(&self, stem: &str) -> bool {
+        self.sidecar(stem, RECLAIM_EXTENSION).exists()
+    }
+
+    pub(crate) fn activity(&self, stem: &str) -> Result<Option<u64>, JournalError> {
+        Ok(
+            read_sidecar::<Activity>(&self.sidecar(stem, ACTIVITY_EXTENSION))?
+                .map(|activity| activity.committed_ms),
+        )
+    }
+
+    // One pass over the clocks keeps only the oldest, so memory stays constant however many chats
+    // exist.
+    pub(crate) fn oldest_chat(
+        &self,
+        excluded: &std::collections::HashSet<String>,
+    ) -> Result<Option<HistoryChat>, JournalError> {
+        let mut oldest: Option<HistoryChat> = None;
+        for (stem, path) in self.sidecars(ACTIVITY_EXTENSION)? {
+            if excluded.contains(&stem) {
+                continue;
+            }
+            let Ok(Some(activity)) = read_sidecar::<Activity>(&path) else {
+                continue;
+            };
+            let candidate = HistoryChat {
+                stem,
+                activity_ms: activity.committed_ms,
+            };
+            if oldest.as_ref().is_none_or(|best| {
+                (candidate.activity_ms, &candidate.stem) < (best.activity_ms, &best.stem)
+            }) {
+                oldest = Some(candidate);
+            }
+        }
+        Ok(oldest)
+    }
+
     fn write_activity(&self, stem: &str, at_ms: u64) -> Result<(), JournalError> {
         let path = self.sidecar(stem, ACTIVITY_EXTENSION);
         let committed_ms = match read_sidecar::<Activity>(&path) {
@@ -753,28 +805,6 @@ impl Journal {
         let bytes = serde_json::to_vec(&Activity { committed_ms })
             .map_err(|_unencodable| JournalError::Corrupt)?;
         write_sidecar(&path, &bytes)
-    }
-
-    pub(crate) fn history_chats(&self) -> Result<Vec<HistoryChat>, JournalError> {
-        let mut chats = Vec::new();
-        for (stem, path) in self.sidecars(ACTIVITY_EXTENSION)? {
-            match read_sidecar::<Activity>(&path) {
-                Ok(Some(activity)) => chats.push(HistoryChat {
-                    stem,
-                    activity_ms: activity.committed_ms,
-                }),
-                Ok(None) => {}
-                Err(JournalError::Corrupt) => tracing::warn!(
-                    event = "gateway_history_activity_unreadable",
-                    "gateway.history.activity.unreadable"
-                ),
-                Err(error) => return Err(error),
-            }
-        }
-        chats.sort_by(|left, right| {
-            (left.activity_ms, &left.stem).cmp(&(right.activity_ms, &right.stem))
-        });
-        Ok(chats)
     }
 
     pub(crate) fn history_bytes(&self) -> Result<u64, JournalError> {
@@ -1234,10 +1264,16 @@ fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<(), JournalError> {
     let parent = path.parent().ok_or(JournalError::Io {
         kind: io::ErrorKind::InvalidInput,
     })?;
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(parent)?;
+    if !parent.exists() {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+        // A new agent directory is durable only once the journal directory's entry is synced.
+        if let Some(journal) = parent.parent() {
+            File::open(journal)?.sync_all()?;
+        }
+    }
     let temporary = path.with_extension("tmp");
     let mut file = OpenOptions::new()
         .create(true)

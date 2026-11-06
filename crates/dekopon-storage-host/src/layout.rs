@@ -44,6 +44,7 @@ pub(crate) struct EntryMetadata {
     pub(crate) kind: EntryKind,
     pub(crate) len: u64,
     pub(crate) nlink: u64,
+    pub(crate) modified_ms: u64,
 }
 
 #[derive(Debug)]
@@ -361,6 +362,10 @@ impl Directory {
             kind,
             len: stat.st_size.try_into().unwrap_or(u64::MAX),
             nlink: stat.st_nlink as u64,
+            modified_ms: u64::try_from(stat.st_mtime)
+                .unwrap_or(0)
+                .saturating_mul(1_000)
+                .saturating_add(u64::try_from(stat.st_mtime_nsec as i64).unwrap_or(0) / 1_000_000),
         }))
     }
 

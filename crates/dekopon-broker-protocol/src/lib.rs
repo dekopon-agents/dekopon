@@ -1442,13 +1442,23 @@ pub enum BrokerResponse {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HistoryUsage {
     pub chat_used: u64,
     pub chat_reserved: u64,
     pub root_free_bytes: u64,
     pub root_free_entries: u64,
+    pub record_bound: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_unlinked: Option<UnlinkedHistory>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UnlinkedHistory {
+    pub history: dekopon_core::history::HistoryKey,
+    pub activity_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -318,6 +318,7 @@ where
         ),
         None => None,
     };
+    let engine_history = history.clone();
     let thread_owner = threads::Owner::new(shell_threads);
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
@@ -387,7 +388,7 @@ where
             .map_err(GatewaydError::Proxy)?;
     }
     if let Some((sender, dispatcher)) = engine {
-        dispatcher.start(
+        dispatcher.with_history(engine_history).start(
             generation.clone(),
             models,
             Arc::clone(&thread_owner),

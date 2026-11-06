@@ -4504,6 +4504,12 @@ async fn stub_broker_assets(
             else {
                 return;
             };
+            if let Some(answer) = history_answer(&request.request) {
+                let _ = stream
+                    .write_frame(&answer, &[], FrameLimits::default())
+                    .await;
+                continue;
+            }
             let (response, descriptors) =
                 dekopon_test_support::next_broker_reply(&request, &mut responses).unwrap();
             let _ = observed.send(request);
@@ -4522,6 +4528,64 @@ async fn stub_broker_assets(
         },
         receiver,
     )
+}
+
+// The chat-history budget's own requests are answered here, outside a test's scripted replies.
+fn history_answer(request: &BrokerRequest) -> Option<ResponseEnvelope> {
+    let response = match request {
+        BrokerRequest::HistoryUsage => dekopon_broker_protocol::BrokerResponse::History {
+            usage: dekopon_broker_protocol::HistoryUsage {
+                root_free_bytes: u64::MAX,
+                root_free_entries: u64::MAX,
+                record_bound: 64 * 1024,
+                ..Default::default()
+            },
+        },
+        BrokerRequest::ReclaimChat { .. } => {
+            dekopon_broker_protocol::BrokerResponse::ChatReclaimed {
+                outcome: dekopon_broker_protocol::ChatReclaim::Reclaimed {
+                    namespaces: 0,
+                    bytes: 0,
+                },
+            }
+        }
+        BrokerRequest::Capabilities { .. }
+        | BrokerRequest::Run { .. }
+        | BrokerRequest::Invoke { .. }
+        | BrokerRequest::RecordDeliveredTurn { .. }
+        | BrokerRequest::UpcallResult { .. }
+        | BrokerRequest::PrepareGeneration { .. }
+        | BrokerRequest::CommitGeneration { .. }
+        | BrokerRequest::AbortGeneration { .. }
+        | BrokerRequest::ObserveGeneration => return None,
+    };
+    Some(ResponseEnvelope {
+        api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha3,
+        response,
+    })
+}
+
+// A runner whose chat history is admitted against the default budget through `broker`.
+fn with_history(mut runner: Arc<SessionRunner>, journal: &Path) -> Arc<SessionRunner> {
+    let history_journal = match runner.journal.as_ref() {
+        Some(journal) => Arc::clone(journal),
+        None => Arc::new(
+            crate::journal::Journal::open(
+                journal,
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+            )
+            .unwrap(),
+        ),
+    };
+    let retention = crate::memory::retention::HistoryRetention::new(
+        history_journal,
+        runner.broker.clone(),
+        20_000_000_000,
+        Duration::from_secs(90 * 24 * 60 * 60),
+    );
+    Arc::get_mut(&mut runner).expect("a fresh runner").history = Some(retention);
+    runner
 }
 
 fn route(model: ModelConfig) -> crate::routes::BoundRoute {
@@ -5696,6 +5760,44 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_recording_without_a_history_budget_never_reaches_the_broker() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            memory_surface_response(),
+            ResponseEnvelope::invocation(
+                record_result(InvocationOutcome::Succeeded, None),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([answer("An answer with no journal.")]);
+    let driver = Arc::new(RecordingDriver::default());
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("record this"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(driver.replies(), ["An answer with no journal."]);
+    assert!(matches!(
+        observed.recv().await.expect("surface request").request,
+        BrokerRequest::Capabilities { .. }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "a recording no budget admitted is refused before the broker"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_retried() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
@@ -5709,7 +5811,10 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
     .await;
     let models = ModelScript::new([answer("The exact accepted answer.")]);
     let driver = Arc::new(RecordingDriver::default());
-    let runner = runner(broker, Arc::clone(&models), 4);
+    let runner = with_history(
+        runner(broker, Arc::clone(&models), 4),
+        &directory.path().join("history"),
+    );
 
     run_session(
         runner,
@@ -5832,7 +5937,10 @@ async fn denied_failed_and_storage_record_results_are_terminal_without_retry() {
         let driver = Arc::new(RecordingDriver::default());
 
         run_session(
-            runner(broker, Arc::clone(&models), 4),
+            with_history(
+                runner(broker, Arc::clone(&models), 4),
+                &directory.path().join("history"),
+            ),
             route(model_config()),
             message("record this once"),
             Arc::clone(&driver) as Arc<dyn ChatDriver>,

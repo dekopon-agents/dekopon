@@ -481,6 +481,10 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
                 },
                 "a question".to_owned(),
                 DeliveredAnswer::accepted_by_transport("an answer".to_owned()),
+            )
+            .with_history(
+                dekopon_core::history::HistoryKey::new("assistant/synthetic".to_owned())
+                    .expect("history key"),
             ),
         )
         .await

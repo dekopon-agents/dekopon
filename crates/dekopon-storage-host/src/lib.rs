@@ -151,12 +151,20 @@ impl fmt::Debug for StorageScopeCommitment {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HistoryUsage {
     pub chat_used: u64,
     pub chat_reserved: u64,
     pub root_free_bytes: u64,
     pub root_free_entries: u64,
+    pub record_bound: u64,
+    pub oldest_unlinked: Option<UnlinkedHistory>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnlinkedHistory {
+    pub key: HistoryKey,
+    pub activity_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -488,10 +496,15 @@ impl StorageHost {
             "storage.namespace.capacity"
         );
         let ledger = QuotaLedger::new(limits.clone(), usage);
-        for (namespace, key, usage) in
+        for (namespace, class, usage) in
             sweep::chat_namespaces(layout.namespaces(), limits.startup_max_entries)?
         {
-            ledger.classify_chat(&namespace, key, usage);
+            match class {
+                sweep::ChatClass::Linked(key) => ledger.classify_chat(&namespace, key, usage),
+                sweep::ChatClass::Unlinked(activity_ms) => {
+                    ledger.classify_unlinked(&namespace, usage, activity_ms);
+                }
+            }
         }
         #[allow(
             clippy::map_err_ignore,
@@ -568,6 +581,8 @@ impl StorageHost {
         let deadline = deadline_after(self.inner.limits.lock_timeout_ms)?;
         let namespace_lock = namespace_lock(&self.inner.namespace_locks, &base);
         let _namespace = lock_before(&namespace_lock, deadline)?;
+        // A token whose earlier reclaim stopped after its rename is finished before it is reused.
+        self.finish_tombstone(&base, false)?;
         let mut namespace_reservation = Some({
             // The observation lock is dropped before any base lease wait, preserving concurrency
             // between distinct namespaces.

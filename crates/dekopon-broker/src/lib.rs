@@ -1625,6 +1625,11 @@ pub enum BrokerBuildError {
     InvalidAttestorScope { scope: String },
     #[error("chat-memory bounds do not compose with provider/storage ceilings")]
     InvalidChatMemory,
+    #[error("chat history recorded without a key could not be measured")]
+    UnlinkedHistory {
+        #[source]
+        source: dekopon_storage_host::StorageHostError,
+    },
     #[error(
         "chatMemory is configured but no constraint set declares route: {}; the surface is all \
          three roles — chatMemoryRecord, chatMemoryRecent, chatMemorySearch — with exactly one \
@@ -2020,6 +2025,15 @@ where
         if declared != routed {
             return Err(BrokerBuildError::InvalidChatMemory);
         }
+        let owner = self
+            .constraints
+            .routed(CapabilityRoute::ChatMemoryRecord)
+            .and_then(|(_, set)| set.constraints.storage.as_ref())
+            .and_then(|storage| storage.namespace.clone())
+            .unwrap_or_else(|| provider.clone());
+        storage_host
+            .adopt_unlinked_history(&owner)
+            .map_err(|source| BrokerBuildError::UnlinkedHistory { source })?;
         self.chat_memory = Some(config);
         #[allow(
             clippy::map_err_ignore,
@@ -2761,6 +2775,9 @@ where
             .or_else(|| {
                 if !attestation.binds(&turn.id) {
                     Some(unevaluated_refusal(CHAT_REFUSAL))
+                } else if turn.history.is_none() {
+                    // Only the gateway's chat-history budget may admit a recording.
+                    Some(unevaluated_refusal("history-key-required"))
                 } else if self.memory_surface(&context, &attestation.agent).is_none() {
                     Some(unevaluated_refusal("memory-unavailable"))
                 } else if !turn.is_bounded()
