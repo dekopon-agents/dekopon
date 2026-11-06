@@ -6,6 +6,7 @@ use std::{
 };
 
 use dekopon_broker_protocol::{ChatReclaim, HistoryUsage};
+use dekopon_core::history::HistoryKey;
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedMutexGuard};
@@ -301,10 +302,18 @@ impl HistoryRetention {
     // The broker copy goes first, then the transcript, then the intent: a crash between any two
     // steps leaves the intent, and replaying it finishes the same steps.
     async fn finish(&self, stem: &str) -> Result<Reclaimed, HistoryError> {
-        let reclaimed: Result<ChatReclaim, HistoryError> = Ok(ChatReclaim::Reclaimed {
-            namespaces: 0,
-            bytes: 0,
-        });
+        let key = HistoryKey::new(stem.to_owned()).map_err(|_invalid| JournalError::Corrupt)?;
+        let client = self
+            .broker
+            .leg_client()
+            .map_err(|_unreachable| HistoryError::Broker);
+        let reclaimed = match client {
+            Ok(client) => client
+                .reclaim_chat(key)
+                .await
+                .map_err(|_failed| HistoryError::Broker),
+            Err(error) => Err(error),
+        };
         match reclaimed {
             Ok(ChatReclaim::Reclaimed { .. }) => {}
             Ok(ChatReclaim::Busy) => {
