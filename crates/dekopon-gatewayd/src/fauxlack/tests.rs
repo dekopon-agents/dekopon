@@ -276,3 +276,17 @@ async fn progress_driver_and_reply_observe_completed_answers_and_generated_files
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn fauxlack_carries_ten_attachments_held_in_memory() {
+    let chat = Fauxlack::from_manifest(TEAM).unwrap();
+    let transport = crate::transport::fauxlack::FauxlackTransport::new(
+        "chat".into(),
+        chat.server("acme"),
+        "udekopon".into(),
+    );
+    assert_eq!(
+        transport.driver().attachments_per_reply(),
+        dekopon_agent::attachment::AttachmentLimit::new(10, crate::transport::HELD_REPLY)
+    );
+}

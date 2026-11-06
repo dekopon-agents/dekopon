@@ -12136,6 +12136,72 @@ async fn slack_uploads_each_attachment_then_shares_them_once_without_sending_the
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn each_chat_driver_declares_its_attachments_per_reply() {
+    use crate::transport::HELD_REPLY;
+    use dekopon_agent::attachment::{AttachmentLimit, Holding};
+    let endpoint = "http://127.0.0.1:9";
+    let one_at_a_time = |count| AttachmentLimit::new(count, Holding::OneAtATime);
+    let cases: [(&str, Arc<dyn ChatDriver>, AttachmentLimit); 5] = [
+        ("slack", slack(endpoint).driver(), one_at_a_time(10)),
+        (
+            "discord",
+            discord(endpoint).driver(),
+            AttachmentLimit::new(10, HELD_REPLY),
+        ),
+        ("telegram", telegram(endpoint).driver(), one_at_a_time(4)),
+        (
+            "whatsapp",
+            whatsapp_transport(
+                "wa",
+                "127.0.0.1:0".parse().unwrap(),
+                endpoint,
+                "secret",
+                LivenessSettings::default(),
+            )
+            .driver(),
+            one_at_a_time(4),
+        ),
+        (
+            "local",
+            crate::transport::local::LocalTransport::new(
+                "dev".to_owned(),
+                temporary().path().join("dev.sock"),
+                LivenessSettings::default(),
+            )
+            .driver(),
+            AttachmentLimit::new(10, HELD_REPLY),
+        ),
+    ];
+    for (name, driver, limit) in cases {
+        assert_eq!(driver.attachments_per_reply(), limit, "{name}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_reply_whose_every_upload_fails_is_not_delivered_and_shares_nothing() {
+    let api = spawn_http_mock(|path, _body| match path {
+        "/api/files.getUploadURLExternal" => json!({"ok": false, "error": "internal_error"}),
+        other => panic!("nothing is shared or posted after every upload failed: {other}"),
+    });
+    let error = slack(&api.base)
+        .driver()
+        .reply(
+            &ReplyTarget::Slack {
+                channel: "d0123abc".to_owned(),
+                thread_ts: None,
+            },
+            OutboundReply::with_images("two kittens", generated_images(2)),
+        )
+        .await
+        .expect_err("no upload succeeded");
+    assert!(
+        matches!(error, TransportError::Service { .. }),
+        "the first upload's own failure is reported: {error:?}"
+    );
+    assert_eq!(api.calls().len(), 2, "each upload was attempted once");
+}
+
 #[test]
 fn slack_generated_upload_urls_are_origin_bounded() {
     use crate::transport::slack::is_slack_upload_url;
