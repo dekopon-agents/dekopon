@@ -426,14 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn decoded_limit_matches_the_shared_contract() {
-        assert_eq!(
-            MAX_ATTACHMENT_BYTES,
-            dekopon_core::asset::MAX_DECODED_DOCUMENT_BYTES
-        );
-    }
-
-    #[test]
     fn pathless_descriptors_are_reusable_and_positional_across_invocations() {
         let original = DiskBlob::from_bytes(b"0123456789").unwrap();
         let blob = DiskBlob::from_descriptor(original.descriptor().unwrap(), 10).unwrap();

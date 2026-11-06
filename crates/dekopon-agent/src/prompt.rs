@@ -57,6 +57,8 @@ pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 
 pub const DECLINE_REPLY_TOOL_NAME: &str = "decline_chat_reply";
 
+pub const MAX_REQUEST_ASSET_BYTES: usize = 40 * 1024 * 1024;
+
 const MAX_TOOL_CALLS_PER_TURN: usize = 10;
 
 const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_process::DEFAULT_MAX_OUTPUT_BYTES;
@@ -1865,9 +1867,10 @@ fn fetch_asset_into(
         (None, false)
     };
     let bytes = text.as_ref().map_or(asset.data.len(), String::len);
-    if bytes > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES.saturating_sub(asset_bytes.total) {
+    if bytes > MAX_REQUEST_ASSET_BYTES.saturating_sub(asset_bytes.total) {
         let reason = format!(
-            "chat-asset:{id} will not be shown: the model request would exceed the 40 MiB decoded asset limit. Say that chat-asset:{id} went unseen."
+            "chat-asset:{id} will not be shown: the model request would exceed the {} MiB decoded asset limit. Say that chat-asset:{id} went unseen.",
+            MAX_REQUEST_ASSET_BYTES / (1024 * 1024)
         );
         tracing::info!(
             target: "dekopon_agent::audit",
