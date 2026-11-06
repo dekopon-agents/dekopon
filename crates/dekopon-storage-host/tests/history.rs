@@ -78,7 +78,7 @@ fn chat_history_is_admitted_past_the_namespace_ceiling_and_reclaimed_one_chat_at
         host.grant(request("python", StorageScope::Agent, "unused")),
         Err(StorageHostError::QuotaExceeded)
     ));
-    let recorded = host.history_usage(&[]).chat_used;
+    let recorded = host.history_usage(&[], &[]).chat_used;
     assert!(recorded > 0);
 
     let outcome = host.reclaim_chat(&key("assistant/first")).unwrap();
@@ -87,7 +87,7 @@ fn chat_history_is_admitted_past_the_namespace_ceiling_and_reclaimed_one_chat_at
     };
     assert_eq!(reclaimed.namespaces, 1);
     assert_eq!(
-        host.history_usage(&[]).chat_used,
+        host.history_usage(&[], &[]).chat_used,
         recorded - reclaimed.bytes
     );
     let namespaces = root.join("namespaces");
@@ -98,7 +98,7 @@ fn chat_history_is_admitted_past_the_namespace_ceiling_and_reclaimed_one_chat_at
     drop(host);
     let reopened = open(&root, limits);
     assert_eq!(
-        reopened.history_usage(&[]).chat_used,
+        reopened.history_usage(&[], &[]).chat_used,
         recorded - reclaimed.bytes
     );
     assert!(
@@ -115,7 +115,7 @@ fn a_chat_with_an_open_handle_is_busy_and_keeps_every_byte() {
     let root = temporary.path().canonicalize().unwrap().join("storage");
     let host = open(&root, StorageLimits::default());
     let token = record(&host, "c-busy", "assistant/busy");
-    let before = host.history_usage(&[]).chat_used;
+    let before = host.history_usage(&[], &[]).chat_used;
     let grant = host
         .grant(
             request("memory-chat", StorageScope::PrivateConversation, "c-busy")
@@ -129,7 +129,7 @@ fn a_chat_with_an_open_handle_is_busy_and_keeps_every_byte() {
     );
     assert!(root.join("namespaces").join(&token).exists());
     drop(handle);
-    assert_eq!(host.history_usage(&[]).chat_used, before);
+    assert_eq!(host.history_usage(&[], &[]).chat_used, before);
 }
 
 #[test]
@@ -184,13 +184,13 @@ fn history_recorded_without_a_key_counts_and_is_reclaimable_as_its_own_unit() {
     drop(host);
 
     let host = open(&root, StorageLimits::default());
-    assert_eq!(host.history_usage(&[]).chat_used, 0);
+    assert_eq!(host.history_usage(&[], &[]).chat_used, 0);
     assert_eq!(
         host.adopt_unlinked_history(&"memory-chat".parse().unwrap())
             .unwrap(),
         1
     );
-    let usage = host.history_usage(&[]);
+    let usage = host.history_usage(&[], &[]);
     assert!(usage.chat_used > 0);
     let unlinked = usage.oldest_unlinked.expect("the legacy unit is offered");
     assert_eq!(unlinked.key.as_str(), format!("unlinked/{token}"));
@@ -198,8 +198,8 @@ fn history_recorded_without_a_key_counts_and_is_reclaimable_as_its_own_unit() {
         panic!("an idle unit is reclaimed");
     };
     assert_eq!(reclaimed.namespaces, 1);
-    assert_eq!(host.history_usage(&[]).chat_used, 0);
-    assert!(host.history_usage(&[]).oldest_unlinked.is_none());
+    assert_eq!(host.history_usage(&[], &[]).chat_used, 0);
+    assert!(host.history_usage(&[], &[]).oldest_unlinked.is_none());
 }
 
 #[test]
@@ -207,9 +207,9 @@ fn the_record_bound_covers_a_new_namespace_and_its_first_turn() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().canonicalize().unwrap().join("storage");
     let host = open(&root, StorageLimits::default());
-    let bound = host.history_usage(&[]).record_bound;
+    let bound = host.history_usage(&[], &[]).record_bound;
     record(&host, "c-bound", "assistant/bound");
-    let grown = host.history_usage(&[]).chat_used;
+    let grown = host.history_usage(&[], &[]).chat_used;
     assert!(grown > 8 * 4_096, "a new namespace costs its entry charges");
     assert!(bound >= grown, "bound {bound} below growth {grown}");
 }
@@ -231,7 +231,7 @@ fn a_tombstone_left_by_a_failed_removal_is_finished_by_the_next_reclaim_or_grant
     };
     assert_eq!(reclaimed.namespaces, 1);
     assert!(!tombstone.exists());
-    assert_eq!(host.history_usage(&[]).chat_used, 0);
+    assert_eq!(host.history_usage(&[], &[]).chat_used, 0);
 
     let again = record(&host, "c-stuck", "assistant/stuck");
     std::fs::rename(namespaces.join(&again), &tombstone).unwrap();
@@ -276,15 +276,15 @@ fn history_that_cannot_be_measured_keeps_the_budget_unknown_until_it_can() {
     let root = temporary.path().canonicalize().unwrap().join("storage");
     let host = open(&root, StorageLimits::default());
     let token = record(&host, "c-unmeasured", "assistant/unmeasured");
-    let recorded = host.history_usage(&[]).chat_used;
+    let recorded = host.history_usage(&[], &[]).chat_used;
     drop(host);
     let stray = root.join("namespaces").join(&token).join("stray");
     std::os::unix::fs::symlink("/nonexistent", &stray).unwrap();
 
     let host = open(&root, StorageLimits::default());
-    assert_eq!(host.history_usage(&[]).unmeasured, 1);
+    assert_eq!(host.history_usage(&[], &[]).unmeasured, 1);
     std::fs::remove_file(&stray).unwrap();
-    let usage = host.history_usage(&[]);
+    let usage = host.history_usage(&[], &[]);
     assert_eq!(usage.unmeasured, 0);
     assert_eq!(usage.chat_used, recorded);
 }
@@ -300,9 +300,9 @@ fn a_busy_oldest_unit_does_not_hide_the_next_one() {
     let host = open(&root, StorageLimits::default());
     host.adopt_unlinked_history(&"memory-chat".parse().unwrap())
         .unwrap();
-    let oldest = host.history_usage(&[]).oldest_unlinked.unwrap().key;
+    let oldest = host.history_usage(&[], &[]).oldest_unlinked.unwrap().key;
     let next = host
-        .history_usage(std::slice::from_ref(&oldest))
+        .history_usage(std::slice::from_ref(&oldest), &[])
         .oldest_unlinked
         .expect("the next unit is offered");
     assert_ne!(next.key, oldest);
@@ -357,9 +357,9 @@ fn a_legacy_clock_reads_only_the_current_generation_and_keeps_its_adoption_time(
 
     let provider = "memory-chat".parse().unwrap();
     let host = open(&root, StorageLimits::default());
-    let empty = host.history_usage(&[]).root_free_bytes;
+    let empty = host.history_usage(&[], &[]).root_free_bytes;
     host.adopt_unlinked_history(&provider).unwrap();
-    let adopted = host.history_usage(&[]).oldest_unlinked.unwrap();
+    let adopted = host.history_usage(&[], &[]).oldest_unlinked.unwrap();
     assert!(
         adopted.activity_ms >= started,
         "a retired generation's data is not the unit's clock"
@@ -368,17 +368,164 @@ fn a_legacy_clock_reads_only_the_current_generation_and_keeps_its_adoption_time(
     std::thread::sleep(std::time::Duration::from_millis(20));
     let host = open(&root, StorageLimits::default());
     host.adopt_unlinked_history(&provider).unwrap();
-    let again = host.history_usage(&[]).oldest_unlinked.unwrap();
+    let again = host.history_usage(&[], &[]).oldest_unlinked.unwrap();
     assert_eq!(again.activity_ms, adopted.activity_ms);
     let ChatReclaimOutcome::Reclaimed(_) = host.reclaim_chat(&again.key).unwrap() else {
         panic!("an idle unit is reclaimed");
     };
-    let reclaimed = host.history_usage(&[]).root_free_bytes;
+    let reclaimed = host.history_usage(&[], &[]).root_free_bytes;
     drop(host);
-    let fresh = open(&root, StorageLimits::default()).history_usage(&[]);
+    let fresh = open(&root, StorageLimits::default()).history_usage(&[], &[]);
     assert_eq!(
         reclaimed, fresh.root_free_bytes,
         "the adoption time was charged"
     );
     assert!(fresh.root_free_bytes > empty);
+}
+
+fn stray(root: &std::path::Path, token: &str) -> std::path::PathBuf {
+    let stray = root.join("namespaces").join(token).join("stray");
+    std::os::unix::fs::symlink("/nonexistent", &stray).unwrap();
+    stray
+}
+
+#[test]
+fn a_chat_with_an_unmeasured_member_is_not_reclaimed_until_every_member_can_be() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let host = open(&root, StorageLimits::default());
+    let first = record(&host, "c-first", "assistant/split");
+    let second = record(&host, "c-second", "assistant/split");
+    drop(host);
+    let stray = stray(&root, &second);
+
+    let host = open(&root, StorageLimits::default());
+    assert!(matches!(
+        host.reclaim_chat(&key("assistant/split")).unwrap(),
+        ChatReclaimOutcome::Busy
+    ));
+    assert!(root.join("namespaces").join(&first).exists());
+    assert!(root.join("namespaces").join(&second).exists());
+    std::fs::remove_file(&stray).unwrap();
+    let ChatReclaimOutcome::Reclaimed(reclaimed) =
+        host.reclaim_chat(&key("assistant/split")).unwrap()
+    else {
+        panic!("a measurable chat is reclaimed");
+    };
+    assert_eq!(reclaimed.namespaces, 2);
+}
+
+#[test]
+fn a_repaired_namespace_is_charged_to_the_root_and_reclaims_cleanly() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let host = open(&root, StorageLimits::default());
+    let token = record(&host, "c-repaired", "assistant/repaired");
+    drop(host);
+    let stray = stray(&root, &token);
+    let host = open(&root, StorageLimits::default());
+    std::fs::remove_file(&stray).unwrap();
+    assert_eq!(host.history_usage(&[], &[]).unmeasured, 0);
+    drop(host);
+    let fresh = open(&root, StorageLimits::default()).history_usage(&[], &[]);
+
+    let stray = self::stray(&root, &token);
+    let host = open(&root, StorageLimits::default());
+    std::fs::remove_file(&stray).unwrap();
+    assert_eq!(
+        host.history_usage(&[], &[]).root_free_bytes,
+        fresh.root_free_bytes,
+        "repair charges what a fresh scan counts"
+    );
+    assert!(matches!(
+        host.reclaim_chat(&key("assistant/repaired")).unwrap(),
+        ChatReclaimOutcome::Reclaimed(_)
+    ));
+}
+
+#[test]
+fn a_marker_found_on_repair_takes_precedence_over_legacy_adoption() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let host = open(&root, StorageLimits::default());
+    let token = record(&host, "c-marked", "assistant/marked");
+    drop(host);
+    let stray = stray(&root, &token);
+
+    let host = open(&root, StorageLimits::default());
+    host.adopt_unlinked_history(&"memory-chat".parse().unwrap())
+        .unwrap();
+    std::fs::remove_file(&stray).unwrap();
+    let usage = host.history_usage(&[], &[]);
+    assert_eq!(usage.unmeasured, 0);
+    assert!(
+        usage.oldest_unlinked.is_none(),
+        "the chat is not a legacy unit"
+    );
+    let ChatReclaimOutcome::Reclaimed(reclaimed) =
+        host.reclaim_chat(&key("assistant/marked")).unwrap()
+    else {
+        panic!("the marked chat is reclaimed");
+    };
+    assert_eq!(reclaimed.namespaces, 1);
+}
+
+#[test]
+fn a_read_bound_to_a_chat_keeps_the_units_clock_until_the_chat_takes_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let host = open(&root, StorageLimits::default());
+    let token = record_unlinked(&host, "c-legacy");
+    drop(host);
+    let provider = "memory-chat".parse().unwrap();
+    let host = open(&root, StorageLimits::default());
+    host.adopt_unlinked_history(&provider).unwrap();
+    let adopted = host.history_usage(&[], &[]).oldest_unlinked.unwrap();
+    assert_eq!(adopted.kind, dekopon_storage_host::LegacyKind::Unit);
+
+    let read = host
+        .prepare_grant(
+            StorageGrantRequest::new(
+                "history-read".parse().unwrap(),
+                "memory-chat.recent".parse().unwrap(),
+                "memory-chat".parse().unwrap(),
+                StorageInterface::Jsonl,
+                StorageAccess::ReadOnly,
+                StorageScope::PrivateConversation,
+                "assistant".parse().unwrap(),
+                "drn:slack:user:t0123abc:u0123abc".parse().unwrap(),
+                "slack",
+                "example-slack",
+                "c0123abc",
+                "c-legacy",
+                ContinuityPolicy::Relaxed,
+                b"surface".to_vec(),
+            )
+            .with_history(Some(key("assistant/legacy"))),
+        )
+        .unwrap();
+    assert_eq!(read.namespace(), token);
+    drop(host.begin(read.materialize().unwrap()).unwrap());
+    let bound = host.history_usage(&[], &[]).oldest_unlinked.unwrap();
+    assert_eq!(bound.key, key("assistant/legacy"));
+    assert_eq!(bound.kind, dekopon_storage_host::LegacyKind::Chat);
+    assert_eq!(bound.activity_ms, adopted.activity_ms);
+    drop(host);
+
+    let host = open(&root, StorageLimits::default());
+    host.adopt_unlinked_history(&provider).unwrap();
+    let reopened = host.history_usage(&[], &[]).oldest_unlinked.unwrap();
+    assert_eq!(reopened.key, key("assistant/legacy"));
+    assert_eq!(reopened.activity_ms, adopted.activity_ms);
+    assert!(
+        host.history_usage(&[], &[key("assistant/legacy")])
+            .oldest_unlinked
+            .is_none()
+    );
+    let ChatReclaimOutcome::Reclaimed(reclaimed) =
+        host.reclaim_chat(&key("assistant/legacy")).unwrap()
+    else {
+        panic!("the bound unit leaves with its chat");
+    };
+    assert_eq!(reclaimed.namespaces, 1);
 }

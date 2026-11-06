@@ -801,6 +801,7 @@ async fn a_fired_digest_cannot_write_and_can_decline_after_reads() {
         serde_json::from_value(json!([row["subject"]])).unwrap(),
         serde_json::from_value(row["agent"].clone()).unwrap(),
         ChatScopeClaim {
+            history: None,
             transport: serde_json::from_value(row["transport"].clone()).unwrap(),
             kind: serde_json::from_value(row["kind"].clone()).unwrap(),
             conversation: serde_json::from_value(row["conversation"].clone()).unwrap(),

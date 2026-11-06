@@ -1533,6 +1533,7 @@ fn chat_slots_render_the_attested_scope_in_each_transport_s_api_form() {
     let scope =
         |kind, conversation_kind, container: Option<&str>, id: &str, thread: Option<&str>| {
             ChatScopeClaim {
+                history: None,
                 participant: None,
                 github: None,
                 transport: "family-chat".parse().expect("transport"),
@@ -2237,6 +2238,7 @@ fn chat_scope(
     trigger: dekopon_broker_protocol::Trigger,
 ) -> dekopon_broker_protocol::ChatScopeClaim {
     dekopon_broker_protocol::ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "scientist-slack".parse().expect("transport"),

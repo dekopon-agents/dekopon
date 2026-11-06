@@ -167,6 +167,13 @@ pub struct HistoryUsage {
 pub struct UnlinkedHistory {
     pub key: HistoryKey,
     pub activity_ms: u64,
+    pub kind: LegacyKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyKind {
+    Unit,
+    Chat,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -503,14 +510,22 @@ impl StorageHost {
             sweep::chat_namespaces(layout.namespaces(), limits.startup_max_entries)?
         {
             match measured {
-                Some((sweep::ChatClass::Linked(key), usage)) => {
+                sweep::Scan::Measured((sweep::ChatClass::Linked(key, clock), usage)) => {
                     ledger.classify_chat(&namespace, key, usage);
+                    if let Some(activity_ms) = clock {
+                        ledger.keep_clock(&namespace, activity_ms);
+                    }
                 }
-                Some((sweep::ChatClass::Unlinked(activity_ms, adopted), usage)) => {
-                    ledger.charge_root(adopted);
+                sweep::Scan::Measured((
+                    sweep::ChatClass::Unlinked(activity_ms, adopted),
+                    usage,
+                )) => {
+                    ledger.charge(&namespace, adopted);
                     ledger.classify_unlinked(&namespace, usage, activity_ms);
                 }
-                None => ledger.mark_unmeasured(&namespace, quota::Remeasure::Chat),
+                sweep::Scan::Unmeasured(obligation) => {
+                    ledger.mark_unmeasured(&namespace, obligation);
+                }
             }
         }
         #[allow(
@@ -566,6 +581,36 @@ impl StorageHost {
 
     pub fn grant(&self, request: StorageGrantRequest) -> Result<StorageGrant, StorageHostError> {
         self.prepare_grant(request)?.materialize()
+    }
+
+    // A grant naming a chat joins its namespace to that chat; a legacy unit's clock goes with it.
+    fn classify_grant(
+        &self,
+        request: &StorageGrantRequest,
+        base: &str,
+        usage: layout::Usage,
+    ) -> Option<u64> {
+        let key = request.history()?;
+        let binding = self.inner.ledger.clock_to_bind(base);
+        self.inner.ledger.classify_chat(base, key.clone(), usage);
+        binding
+    }
+
+    fn bind_clock(
+        &self,
+        base: &str,
+        directory: &layout::Directory,
+        binding: Option<u64>,
+    ) -> Result<(), StorageHostError> {
+        if let Some(activity_ms) = binding {
+            let grown = sweep::bind_clock(
+                directory,
+                activity_ms,
+                self.inner.limits.startup_max_entries,
+            )?;
+            self.inner.ledger.charge(base, grown);
+        }
+        Ok(())
     }
 
     fn materialize_grant(
@@ -680,11 +725,7 @@ impl StorageHost {
                 return Err(error);
             }
         };
-        if let Some(key) = request.history() {
-            self.inner
-                .ledger
-                .classify_chat(&base, key.clone(), before_namespace);
-        }
+        let binding = self.classify_grant(&request, &base, before_namespace);
         if let Err(error) = housekeeping_reservation.commit(before_namespace, after_namespace) {
             namespace_reservation
                 .take()
@@ -696,6 +737,7 @@ impl StorageHost {
             .take()
             .expect("namespace reservation")
             .commit();
+        self.bind_clock(&base, &base_directory, binding)?;
         if let Some(cause) = reset {
             return Err(report_namespace_reset(cause, &namespace));
         }

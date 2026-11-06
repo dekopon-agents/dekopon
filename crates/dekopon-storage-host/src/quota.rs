@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use dekopon_core::{ProviderId, history::HistoryKey};
 
 use crate::{
-    HistoryUsage, StorageHostError, StorageLimits, UnlinkedHistory,
+    HistoryUsage, LegacyKind, StorageHostError, StorageLimits, UnlinkedHistory,
     layout::{ENTRY_CHARGE, Usage},
 };
 
@@ -29,16 +29,36 @@ struct LedgerState {
     active_invocations: u64,
     chat: BTreeMap<String, HistoryKey>,
     chat_used: u64,
-    unlinked: BTreeMap<String, u64>,
+    // Legacy clocks: a unit's own, or one a chat keeps until the gateway takes it over.
+    clocks: BTreeMap<String, u64>,
     unmeasured: BTreeMap<String, Remeasure>,
 }
 
 // Known or suspected history whose scan failed: it keeps the chat budget unknown until it is
-// measured, because an omitted namespace is not zero bytes.
-#[derive(Clone, Debug)]
-pub(crate) enum Remeasure {
-    Chat,
-    Unlinked(ProviderId),
+// measured, because an omitted namespace is not zero bytes. Its membership is kept apart from
+// its measurement, so a chat with an unmeasured member is never reported reclaimed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Remeasure {
+    pub marker: Option<HistoryKey>,
+    pub legacy: Option<ProviderId>,
+    // Root usage already charged for the namespace when its scan failed.
+    pub charged: Usage,
+}
+
+impl LedgerState {
+    // Measuring a namespace replaces what the root was charged for it while it was unmeasured.
+    fn settle(&mut self, namespace: &str, measured: Usage) {
+        if let Some(obligation) = self.unmeasured.remove(namespace) {
+            self.root_used = self
+                .root_used
+                .saturating_add(measured.bytes)
+                .saturating_sub(obligation.charged.bytes);
+            self.root_entries = self
+                .root_entries
+                .saturating_add(measured.entries)
+                .saturating_sub(obligation.charged.entries);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -240,7 +260,7 @@ impl QuotaLedger {
         state.charge_chat(namespace, 0, bytes);
         if removed {
             state.chat.remove(namespace);
-            state.unlinked.remove(namespace);
+            state.clocks.remove(namespace);
             state.unmeasured.remove(namespace);
         }
         let generation_prefix = format!("{namespace}/");
@@ -277,11 +297,35 @@ impl QuotaLedger {
     // same hooks that charge the root.
     pub(crate) fn classify_chat(&self, namespace: &str, key: HistoryKey, usage: Usage) {
         let mut state = self.state.lock();
-        state.unlinked.remove(namespace);
-        state.unmeasured.remove(namespace);
+        state.settle(namespace, usage);
         if state.chat.insert(namespace.to_owned(), key).is_none() {
             state.chat_used = state.chat_used.saturating_add(usage.bytes);
         }
+    }
+
+    pub(crate) fn keep_clock(&self, namespace: &str, activity_ms: u64) {
+        self.state
+            .lock()
+            .clocks
+            .insert(namespace.to_owned(), activity_ms);
+    }
+
+    pub(crate) fn clock_to_bind(&self, namespace: &str) -> Option<u64> {
+        let state = self.state.lock();
+        let unit = unlinked_key(namespace)?;
+        (state.chat.get(namespace) == Some(&unit))
+            .then(|| state.clocks.get(namespace).copied())
+            .flatten()
+    }
+
+    pub(crate) fn supersede(&self, keys: &[HistoryKey]) {
+        let mut state = self.state.lock();
+        let LedgerState { chat, clocks, .. } = &mut *state;
+        clocks.retain(|namespace, _| {
+            chat.get(namespace).is_none_or(|key| {
+                unlinked_key(namespace).as_ref() == Some(key) || !keys.contains(key)
+            })
+        });
     }
 
     // History no gateway key names yet: its own unit, on the clock of its newest data write.
@@ -290,30 +334,50 @@ impl QuotaLedger {
             return;
         };
         let mut state = self.state.lock();
-        state.unmeasured.remove(namespace);
+        state.settle(namespace, usage);
         if state.chat.insert(namespace.to_owned(), key).is_none() {
             state.chat_used = state.chat_used.saturating_add(usage.bytes);
         }
-        state.unlinked.insert(namespace.to_owned(), activity_ms);
+        state.clocks.insert(namespace.to_owned(), activity_ms);
     }
 
-    // Bytes written outside any grant, such as a persisted adoption time; charged before the
-    // unit is classified so the chat counter takes them from its usage.
-    pub(crate) fn charge_root(&self, grown: Usage) {
+    // Bytes written outside any grant, such as a persisted adoption time.
+    pub(crate) fn charge(&self, namespace: &str, grown: Usage) {
         let mut state = self.state.lock();
         state.root_used = state.root_used.saturating_add(grown.bytes);
         state.root_entries = state.root_entries.saturating_add(grown.entries);
+        state.charge_chat(namespace, grown.bytes, 0);
     }
 
+    // A second discovery obligation for the same namespace joins the first.
     pub(crate) fn mark_unmeasured(&self, namespace: &str, remeasure: Remeasure) {
+        let mut state = self.state.lock();
+        let obligation = state
+            .unmeasured
+            .entry(namespace.to_owned())
+            .or_insert(Remeasure {
+                charged: remeasure.charged,
+                ..Remeasure::default()
+            });
+        obligation.marker = obligation.marker.take().or(remeasure.marker);
+        obligation.legacy = obligation.legacy.take().or(remeasure.legacy);
+    }
+
+    pub(crate) fn measured(&self, namespace: &str, usage: Usage) {
+        self.state.lock().settle(namespace, usage);
+    }
+
+    pub(crate) fn is_unmeasured(&self, namespace: &str) -> bool {
+        self.state.lock().unmeasured.contains_key(namespace)
+    }
+
+    // A namespace whose marker could not be read may belong to any chat.
+    pub(crate) fn membership_unknown(&self) -> bool {
         self.state
             .lock()
             .unmeasured
-            .insert(namespace.to_owned(), remeasure);
-    }
-
-    pub(crate) fn measured(&self, namespace: &str) {
-        self.state.lock().unmeasured.remove(namespace);
+            .values()
+            .any(|obligation| obligation.marker.is_none() && obligation.legacy.is_none())
     }
 
     pub(crate) fn unmeasured(&self) -> Vec<(String, Remeasure)> {
@@ -330,13 +394,25 @@ impl QuotaLedger {
     }
 
     pub(crate) fn chat_namespaces(&self, key: &HistoryKey) -> Vec<String> {
-        self.state
-            .lock()
+        let state = self.state.lock();
+        let measured = state
             .chat
             .iter()
             .filter(|(_, linked)| *linked == key)
-            .map(|(namespace, _)| namespace.clone())
-            .collect()
+            .map(|(namespace, _)| namespace.clone());
+        let unmeasured = state
+            .unmeasured
+            .iter()
+            .filter(|(namespace, obligation)| {
+                obligation.marker.as_ref() == Some(key)
+                    || (obligation.legacy.is_some()
+                        && unlinked_key(namespace).as_ref() == Some(key))
+            })
+            .map(|(namespace, _)| namespace.clone());
+        let mut members = measured.chain(unmeasured).collect::<Vec<_>>();
+        members.sort();
+        members.dedup();
+        members
     }
 
     pub(crate) fn history_usage(&self, skip: &[HistoryKey]) -> HistoryUsage {
@@ -349,19 +425,22 @@ impl QuotaLedger {
                 total.saturating_add(*reserved)
             });
         let oldest_unlinked = state
-            .unlinked
+            .clocks
             .iter()
-            .filter(|(namespace, _)| {
-                !skip
-                    .iter()
-                    .any(|key| unlinked_key(namespace).as_ref() == Some(key))
+            .filter_map(|(namespace, activity_ms)| {
+                let key = state.chat.get(namespace)?;
+                let kind = if unlinked_key(namespace).as_ref() == Some(key) {
+                    LegacyKind::Unit
+                } else {
+                    LegacyKind::Chat
+                };
+                (!skip.contains(key)).then_some((namespace, key, *activity_ms, kind))
             })
-            .min_by_key(|(namespace, activity_ms)| (**activity_ms, namespace.as_str()))
-            .and_then(|(namespace, activity_ms)| {
-                Some(UnlinkedHistory {
-                    key: unlinked_key(namespace)?,
-                    activity_ms: *activity_ms,
-                })
+            .min_by_key(|(namespace, _, activity_ms, _)| (*activity_ms, namespace.as_str()))
+            .map(|(_, key, activity_ms, kind)| UnlinkedHistory {
+                key: key.clone(),
+                activity_ms,
+                kind,
             });
         HistoryUsage {
             chat_used: state.chat_used,

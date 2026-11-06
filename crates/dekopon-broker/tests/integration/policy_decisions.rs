@@ -88,6 +88,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
         dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
         agent("some-agent"),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: "scientist-slack".parse::<TransportId>().expect("transport"),
@@ -228,6 +229,7 @@ async fn a_conversation_the_senders_service_cannot_produce_is_refused() {
         dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
         agent("some-agent"),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: "elote-logs".parse::<TransportId>().expect("transport"),
@@ -315,6 +317,7 @@ fn channel_claim(
         dekopon_core::AttestedSubject::one(subject).expect("one-form subject"),
         agent("some-agent"),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: "chat".parse().expect("transport"),

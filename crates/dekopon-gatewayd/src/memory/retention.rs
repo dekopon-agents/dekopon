@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use dekopon_broker_protocol::{ChatReclaim, HistoryUsage};
+use dekopon_broker_protocol::{ChatReclaim, HistoryUsage, LegacyKind};
 use dekopon_core::history::HistoryKey;
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -190,10 +190,26 @@ pub(crate) struct HistoryRetention {
     idle: Duration,
     admission: Arc<tokio::sync::Mutex<()>>,
     claims: Arc<Claims>,
-    // Broker recordings whose outcome never arrived: their whole bound stays spent until the broker
-    // reports none in flight, across gateway restarts.
-    indeterminate: Mutex<u64>,
+    debit: Arc<Mutex<Debit>>,
+    recordings: std::sync::atomic::AtomicU64,
     expired_at: Mutex<std::time::Instant>,
+}
+
+// Broker recordings whose outcome never arrived keep their whole bound spent, across gateway
+// restarts, until the broker reports none in flight.
+#[derive(Default)]
+struct Debit {
+    indeterminate: u64,
+    in_flight: Option<(u64, u64)>,
+}
+
+impl Debit {
+    const fn total(&self) -> u64 {
+        match self.in_flight {
+            Some((_, bound)) => self.indeterminate.saturating_add(bound),
+            None => self.indeterminate,
+        }
+    }
 }
 
 #[must_use = "admission serializes history writes only while it is held"]
@@ -202,36 +218,32 @@ pub(crate) struct HistoryAdmission {
     _turn: OwnedMutexGuard<()>,
 }
 
-// Holds admission across one broker recording; dropped unsettled, its bound stays debited.
+// Holds admission across one broker recording; dropped unanswered, its bound stays debited.
 #[must_use = "a recording's allowance is released only by settling its outcome"]
 pub(crate) struct RecordTicket {
     _admission: HistoryAdmission,
     retention: Arc<HistoryRetention>,
-    bound: u64,
-    settled: bool,
+    recording: u64,
 }
 
 impl RecordTicket {
-    pub(crate) async fn answered(mut self) {
-        self.settled = true;
-        let journal = Arc::clone(&self.retention.journal);
-        let remaining = *self.retention.indeterminate.lock();
+    pub(crate) async fn answered(self) {
+        let recording = self.recording;
+        let settled = self
+            .retention
+            .update_debit(move |debit| {
+                if debit.in_flight.is_some_and(|(id, _)| id == recording) {
+                    debit.in_flight = None;
+                }
+            })
+            .await;
         // A debit that cannot be lowered stays persisted, which only overstates use.
-        if let Err(error) = blocking(move || journal.write_debit(remaining)).await {
+        if let Err(error) = settled {
             tracing::warn!(
                 event = "gateway_history_debit_failed",
                 category = error.category(),
                 "gateway.history.debit.failed"
             );
-        }
-    }
-}
-
-impl Drop for RecordTicket {
-    fn drop(&mut self) {
-        if !self.settled {
-            let mut indeterminate = self.retention.indeterminate.lock();
-            *indeterminate = indeterminate.saturating_add(self.bound);
         }
     }
 }
@@ -250,7 +262,8 @@ impl HistoryRetention {
             idle,
             admission: Arc::new(tokio::sync::Mutex::new(())),
             claims: Arc::default(),
-            indeterminate: Mutex::new(0),
+            debit: Arc::default(),
+            recordings: std::sync::atomic::AtomicU64::new(0),
             expired_at: Mutex::new(std::time::Instant::now()),
         })
     }
@@ -328,7 +341,7 @@ impl HistoryRetention {
         if self.journal.reclaiming(stem) {
             return Err(HistoryError::Pending);
         }
-        let bound = self.usage(Vec::new()).await?.record_bound;
+        let bound = self.usage(Vec::new(), Vec::new()).await?.record_bound;
         admission
             .ensure(
                 stem,
@@ -343,22 +356,53 @@ impl HistoryRetention {
         blocking(move || journal.note_activity(&stem, at))
             .await
             .map_err(|_unpublished| HistoryError::Clock)?;
-        let debit = self.indeterminate.lock().saturating_add(bound);
-        let journal = Arc::clone(&self.journal);
-        blocking(move || journal.write_debit(debit)).await?;
+        let recording = self
+            .recordings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.update_debit(move |debit| {
+            if let Some((_, abandoned)) = debit.in_flight.replace((recording, bound)) {
+                debit.indeterminate = debit.indeterminate.saturating_add(abandoned);
+            }
+        })
+        .await?;
         Ok(RecordTicket {
             _admission: admission,
             retention: Arc::clone(self),
-            bound,
-            settled: false,
+            recording,
         })
+    }
+
+    // Every change is applied and written under one lock on a blocking thread, so a write that
+    // outlives its cancelled caller still writes the current debit, never a stale one.
+    async fn update_debit(
+        &self,
+        change: impl FnOnce(&mut Debit) + Send + 'static,
+    ) -> Result<(), HistoryError> {
+        let debit = Arc::clone(&self.debit);
+        let journal = Arc::clone(&self.journal);
+        blocking(move || {
+            let mut debit = debit.lock();
+            let before = debit.total();
+            change(&mut debit);
+            if debit.total() == before {
+                return Ok(());
+            }
+            journal.write_debit(debit.total())
+        })
+        .await
     }
 
     // Boot replays every intent before any session can claim its chat.
     pub(crate) async fn recover(&self) -> Result<usize, HistoryError> {
         let journal = Arc::clone(&self.journal);
-        let debit = blocking(move || journal.debit()).await?;
-        *self.indeterminate.lock() = debit;
+        let persisted = blocking(move || journal.debit()).await?;
+        self.update_debit(move |debit| {
+            *debit = Debit {
+                indeterminate: persisted,
+                in_flight: None,
+            };
+        })
+        .await?;
         let journal = Arc::clone(&self.journal);
         let adopted = blocking(move || journal.adopt_history()).await?;
         if adopted > 0 {
@@ -421,6 +465,35 @@ impl HistoryRetention {
         admitting: Option<&str>,
         skipped: &HashSet<String>,
     ) -> Result<Option<Candidate>, HistoryError> {
+        let skip = skipped
+            .iter()
+            .filter_map(|name| HistoryKey::new(name.clone()).ok())
+            .collect::<Vec<_>>();
+        let mut superseded = Vec::new();
+        let mut unlinked = None;
+        for _ in 0..RECLAIMS_PER_PASS {
+            let oldest = self
+                .usage(skip.clone(), std::mem::take(&mut superseded))
+                .await?
+                .oldest_unlinked;
+            match oldest {
+                Some(legacy) if legacy.kind == LegacyKind::Chat => {
+                    self.take_clock(&legacy.history, legacy.activity_ms).await?;
+                    superseded.push(legacy.history);
+                }
+                Some(legacy) => {
+                    unlinked = Some(Candidate::Unlinked {
+                        key: legacy.history,
+                        activity_ms: legacy.activity_ms,
+                    });
+                    break;
+                }
+                None => break,
+            }
+        }
+        if !superseded.is_empty() {
+            self.usage(skip, superseded).await?;
+        }
         let journal = Arc::clone(&self.journal);
         let mut excluded = skipped.clone();
         if let Some(stem) = admitting {
@@ -429,18 +502,6 @@ impl HistoryRetention {
         let chat = blocking(move || journal.oldest_chat(&excluded))
             .await?
             .map(Candidate::Chat);
-        let skip = skipped
-            .iter()
-            .filter_map(|name| HistoryKey::new(name.clone()).ok())
-            .collect();
-        let unlinked =
-            self.usage(skip)
-                .await?
-                .oldest_unlinked
-                .map(|unlinked| Candidate::Unlinked {
-                    key: unlinked.history,
-                    activity_ms: unlinked.activity_ms,
-                });
         Ok(match (chat, unlinked) {
             (Some(chat), Some(unlinked)) if unlinked.activity_ms() < chat.activity_ms() => {
                 Some(unlinked)
@@ -450,13 +511,32 @@ impl HistoryRetention {
         })
     }
 
-    async fn usage(&self, skip: Vec<HistoryKey>) -> Result<HistoryUsage, HistoryError> {
+    // A legacy namespace bound to a chat by a read hands its clock to the chat; the chat's own
+    // newer clock wins, and a chat being reclaimed keeps its fence.
+    async fn take_clock(&self, key: &HistoryKey, activity_ms: u64) -> Result<(), HistoryError> {
+        let journal = Arc::clone(&self.journal);
+        let stem = key.as_str().to_owned();
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(activity_ms);
+        match blocking(move || journal.note_activity(&stem, at)).await {
+            Ok(())
+            | Err(HistoryError::Journal(JournalError::Io {
+                kind: std::io::ErrorKind::ResourceBusy,
+            })) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn usage(
+        &self,
+        skip: Vec<HistoryKey>,
+        superseded: Vec<HistoryKey>,
+    ) -> Result<HistoryUsage, HistoryError> {
         let client = self
             .broker
             .leg_client()
             .map_err(|_unreachable| HistoryError::Broker)?;
         client
-            .history_usage(skip)
+            .history_usage(skip, superseded)
             .await
             .map_err(|_failed| HistoryError::Broker)
     }
@@ -602,23 +682,24 @@ impl HistoryAdmission {
 
 impl HistoryRetention {
     async fn fits(&self, growth: Growth) -> Result<bool, HistoryError> {
-        let usage = self.usage(Vec::new()).await?;
+        let usage = self.usage(Vec::new(), Vec::new()).await?;
         if usage.unmeasured > 0 {
             return Err(HistoryError::Unmeasured);
         }
-        // Admission is held, so no recording of ours is in flight: none in flight means every
-        // debited recording has landed in the broker's own count.
-        if usage.recording == 0 && *self.indeterminate.lock() > 0 {
-            let journal = Arc::clone(&self.journal);
-            blocking(move || journal.write_debit(0)).await?;
-            *self.indeterminate.lock() = 0;
+        // Admission is held, so no recording of ours is live. The broker counts a recording from
+        // before its connection is read is checked and charges it before counting it out, and
+        // refuses one whose gateway has left, so none in flight means every debit is covered.
+        if usage.recording == 0 {
+            self.update_debit(|debit| *debit = Debit::default()).await?;
         }
         let journal = Arc::clone(&self.journal);
-        let journal_bytes = blocking(move || journal.history_bytes()).await?;
+        let debit = Arc::clone(&self.debit);
+        let (journal_bytes, debited) =
+            blocking(move || Ok((journal.history_bytes()?, debit.lock().total()))).await?;
         let total = journal_bytes
             .saturating_add(usage.chat_used)
             .saturating_add(usage.chat_reserved)
-            .saturating_add(*self.indeterminate.lock())
+            .saturating_add(debited)
             .saturating_add(growth.history);
         Ok(total <= self.budget && usage.root_free_bytes >= growth.broker)
     }

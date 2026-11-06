@@ -317,6 +317,7 @@ pub(crate) async fn run(
             subjects: AttestedSubject::configured(file.subject.clone()),
             agent: file.agent.clone(),
             scope: Some(ChatScopeClaim {
+                history: None,
                 participant: None,
                 github: None,
                 transport: file.scope.transport.clone(),

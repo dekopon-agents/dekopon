@@ -142,6 +142,7 @@ fn chat_claim(canonical: &str, agent_id: &str) -> Attestation {
         dekopon_core::AttestedSubject::one(subject(canonical)).expect("one-form subject"),
         agent(agent_id),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: "scientist-slack"

@@ -88,6 +88,7 @@ async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
 
 fn slack_scope() -> ChatScopeClaim {
     ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "chat".parse().expect("transport"),
@@ -108,6 +109,7 @@ fn slack_scope() -> ChatScopeClaim {
 
 fn fauxlack_scope() -> ChatScopeClaim {
     ChatScopeClaim {
+        history: None,
         kind: ChatTransportKind::Fauxlack,
         conversation: Conversation {
             kind: ConversationKind::Thread,
@@ -174,6 +176,7 @@ async fn decisions_record_both_principals_and_attested_coordinates() {
     tracing_subscriber::registry().with(captured.clone()).init();
     let (broker, audit) = broker_fixture().await;
     let github = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "github".parse().expect("transport"),

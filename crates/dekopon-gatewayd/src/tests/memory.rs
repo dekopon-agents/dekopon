@@ -629,6 +629,8 @@ async fn shutdown_aborts_summaries_within_the_drain() {
         SystemTime::now(),
     )
     .unwrap();
+    let mut boot = boot;
+    crate::memory::engine::settle_boot(&journal, None, std::mem::take(&mut boot.transitions));
     assert_eq!(boot.requeued, 1);
     assert_eq!(boot.tasks.len(), 1);
     assert_eq!(boot.tasks[0].stem, stem);
@@ -989,6 +991,8 @@ async fn an_unloadable_journal_resets_with_one_startup_record() {
         SystemTime::now(),
     )
     .unwrap();
+    let mut boot = boot;
+    crate::memory::engine::settle_boot(&journal, None, std::mem::take(&mut boot.transitions));
     assert!(!journal_path(directory.path(), &unloadable).exists());
     assert!(!journal_path(directory.path(), &crashed).exists());
     assert_eq!(

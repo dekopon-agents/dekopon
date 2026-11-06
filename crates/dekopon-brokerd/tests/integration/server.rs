@@ -307,6 +307,7 @@ async fn console_real_scope_capabilities_name_the_sandbox_remedy() {
         dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
         agent("chat-agent"),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: "scientist-slack".parse().expect("transport"),
@@ -1207,6 +1208,7 @@ when { context.via == "caller" && context.agent == "chat-agent" };"#;
             dekopon_core::AttestedSubject::github_repository("owner", repo, id).unwrap(),
             agent("chat-agent"),
             ChatScopeClaim {
+                history: None,
                 participant: None,
                 github: None,
                 transport: "github".parse().unwrap(),
@@ -1280,6 +1282,7 @@ async fn mismatched_smoke_delivery_reaches_broker_denial_not_duplicate_socket_ca
         dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
         agent("chat-agent"),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: "console-smoke".parse().expect("transport"),
@@ -1932,6 +1935,7 @@ async fn real_broker_probe_child_and_probe_started_job_refuse_write_on_same_leg(
             dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
             agent("chat-agent"),
             ChatScopeClaim {
+                history: None,
                 participant: None,
                 github: None,
                 transport: "scientist-slack".parse().unwrap(),
@@ -2021,6 +2025,7 @@ async fn real_broker_refuses_probe_and_job_child_writes_during_spawn_upcalls() {
             dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
             agent("chat-agent"),
             ChatScopeClaim {
+                history: None,
                 participant: None,
                 github: None,
                 transport: "scientist-slack".parse().unwrap(),
@@ -2636,6 +2641,7 @@ async fn a_console_scope_refusal_answers_before_the_guest_parses() {
         dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
         agent("chat-agent"),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: "scientist-slack".parse().unwrap(),

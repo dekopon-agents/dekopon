@@ -86,6 +86,7 @@ fn agent() -> dekopon_core::AgentId {
 
 fn scope() -> ChatScopeClaim {
     ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "scientist-slack".parse().expect("valid transport fixture"),
@@ -901,6 +902,7 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
     }
 
     let oversized = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         conversation: conversation(
@@ -1596,6 +1598,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         ChatTransportKind::Fauxlack
     );
     let fauxlack = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "chat".parse().unwrap(),
@@ -1638,10 +1641,12 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         .is_canonical_for(&fauxlack)
     );
     assert!(!delivery.is_canonical_for(&ChatScopeClaim {
+        history: None,
         kind: ChatTransportKind::Slack,
         ..fauxlack
     }));
     let slack = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "scientist-slack".parse().expect("transport"),
@@ -1680,6 +1685,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     );
 
     let discord = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "discord".parse().expect("transport"),
@@ -1689,6 +1695,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         trigger: Trigger::Message,
     };
     let discord_thread = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "discord".parse().expect("transport"),
@@ -1722,6 +1729,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     }
 
     let telegram = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "tg".parse().expect("transport"),
@@ -1764,6 +1772,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     }
 
     let telegram_max = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "tg".parse().expect("transport"),
@@ -1788,6 +1797,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     );
 
     let whatsapp = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "support-whatsapp".parse().expect("transport"),
@@ -1830,6 +1840,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     }
 
     let local = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "dev".parse().expect("transport"),
@@ -2155,6 +2166,7 @@ fn a_claim_binds_to_its_proposal_and_holds_no_identifier_without_one() {
             dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),
             agent(),
             ChatScopeClaim {
+                history: None,
                 participant: None,
                 github: None,
                 conversation: conversation(

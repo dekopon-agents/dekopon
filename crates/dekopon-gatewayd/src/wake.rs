@@ -284,6 +284,7 @@ impl Anchor {
             self.subject.clone(),
             self.agent.clone(),
             ChatScopeClaim {
+                history: None,
                 participant: None,
                 github: None,
                 transport: self.transport.clone(),

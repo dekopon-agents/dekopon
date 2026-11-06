@@ -1079,7 +1079,8 @@ fn boot_overflow_preserves_a_finalized_middle_slot_and_counts_only_pending_slots
         Slot::Queued,
     ];
     journal.append_record(STEM, &second, Vec::new()).unwrap();
-    let boot = journal.load_summary_tasks(1.try_into().unwrap()).unwrap();
+    let mut boot = journal.load_summary_tasks(1.try_into().unwrap()).unwrap();
+    crate::memory::engine::settle_boot(&journal, None, std::mem::take(&mut boot.transitions));
     assert_eq!(boot.tasks.len(), 1);
     assert_eq!(boot.overflowed, 2);
     let snapshot = journal.record_snapshot(STEM, true).unwrap().unwrap();

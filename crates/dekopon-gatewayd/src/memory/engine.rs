@@ -214,6 +214,21 @@ pub(crate) fn spawn(
 }
 
 impl Sender {
+    pub(crate) async fn settle_boot(&self, lines: Vec<super::journal::records::BootLine>) {
+        let journal = Arc::clone(&self.journal);
+        let history = self.history.clone();
+        if tokio::task::spawn_blocking(move || settle_boot(&journal, history.as_ref(), lines))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                event = "gateway_memory_summary_write_failed",
+                reason = "task",
+                "gateway.memory.summary.write.failed"
+            );
+        }
+    }
+
     pub(crate) fn stop(&self) {
         self.cancel.send_replace(true);
     }
@@ -916,7 +931,7 @@ const SUMMARY_LINE_FRAMING: u64 = 64;
 // Callers run on blocking threads, so admission is awaited in place.
 fn admit_line(
     history: Option<&Arc<super::retention::HistoryRetention>>,
-    task: &SlotTask,
+    stem: &str,
     line: &SlotLine,
 ) -> Result<Option<super::retention::HistoryAdmission>, JournalError> {
     let Some(history) = history else {
@@ -929,7 +944,7 @@ fn admit_line(
         .block_on(async {
             let admission = history.admit().await;
             admission
-                .ensure(&task.stem, super::retention::Growth::journal(bytes))
+                .ensure(stem, super::retention::Growth::journal(bytes))
                 .await
                 .map(|()| Some(admission))
         })
@@ -937,8 +952,8 @@ fn admit_line(
             tracing::warn!(
                 event = "gateway_memory_summary_write_failed",
                 reason = error.category(),
-                memory.record.id = task.record.0.get(),
-                memory.summary.part = task.part.get(),
+                memory.record.id = line.record.0.get(),
+                memory.summary.part = line.part.get(),
                 "gateway.memory.summary.write.failed"
             );
             JournalError::Io {
@@ -974,7 +989,7 @@ pub(crate) fn write_slot(
 ) -> Result<bool, JournalError> {
     let to = slot.clone();
     let line = slot_line(task, slot);
-    let _admission = admit_line(history, task, &line)?;
+    let _admission = admit_line(history, &task.stem, &line)?;
     let written = match (task.subject, turn) {
         (Subject::Asset(_), Some(turn)) => journal.write_pending_slot_for(&task.stem, line, turn),
         (Subject::Record, Some(turn)) => journal.write_slot_for(&task.stem, line, turn),
@@ -1026,6 +1041,27 @@ fn io_failure(error: JournalError) -> SummaryFailure {
     }
 }
 
+// Boot found these transitions before chat history could admit them; each is admitted and
+// written now, or left unwritten.
+pub(crate) fn settle_boot(
+    journal: &Journal,
+    history: Option<&Arc<super::retention::HistoryRetention>>,
+    lines: Vec<super::journal::records::BootLine>,
+) {
+    for boot in lines {
+        let written = admit_line(history, &boot.stem, &boot.line).and_then(|_admission| {
+            journal.write_pending_slot_for(&boot.stem, boot.line, boot.turn)
+        });
+        if let Err(error) = written {
+            tracing::warn!(
+                event = "gateway_memory_summary_write_failed",
+                reason = error.label(),
+                "gateway.memory.summary.write.failed"
+            );
+        }
+    }
+}
+
 fn mark_later(
     journal: &Journal,
     history: Option<&Arc<super::retention::HistoryRetention>>,
@@ -1059,7 +1095,7 @@ fn mark_later(
         };
         let to = error_slot(kind, detail);
         let line = slot_line(&later, to.clone());
-        let _admission = admit_line(history, &later, &line)?;
+        let _admission = admit_line(history, &task.stem, &line)?;
         if journal.write_pending_slot_for(&task.stem, line, head.header.turn)? {
             transition(&later, &slots[usize::from(part.get() - 1)], &to);
             match kind {

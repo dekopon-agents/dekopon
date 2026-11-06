@@ -2618,6 +2618,10 @@ async fn session_turn(
         MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Job { .. } => None,
     };
     let mut deferred = Deferred::default();
+    let leg = match HistoryKey::new(key.journal_stem()) {
+        Ok(history) => leg.with_history(history),
+        Err(_invalid) => leg,
+    };
     // Held from before the first history read through deferred persistence.
     if let Some(history) = runner.history.as_ref() {
         match history.begin_use(&key.journal_stem()).await {
@@ -4077,6 +4081,7 @@ fn chat_claim_for(
         subject,
         route.agent.clone(),
         ChatScopeClaim {
+            history: None,
             participant: None,
             transport,
             kind: message.transport_kind,

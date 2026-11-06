@@ -397,6 +397,18 @@ impl BrokerLeg {
         self
     }
 
+    #[must_use]
+    pub fn with_history(mut self, history: dekopon_core::history::HistoryKey) -> Self {
+        if let Some(scope) = self
+            .attestation
+            .as_mut()
+            .and_then(|claim| claim.scope.as_mut())
+        {
+            scope.history = Some(history);
+        }
+        self
+    }
+
     pub fn with_cancel_signal(mut self, signal: CancelSignal) -> Self {
         self.cancel = signal;
         self
@@ -2530,6 +2542,7 @@ mod tests {
                     let directory = private_broker_directory();
                     let (listener, socket) = listen(directory.path());
                     let scope = ChatScopeClaim {
+                        history: None,
                         participant: None,
                         github: None,
                         transport: "scientist-slack".parse().expect("transport"),
@@ -2598,6 +2611,7 @@ mod tests {
                     let directory = private_broker_directory();
                     let (listener, socket) = listen(directory.path());
                     let scope = ChatScopeClaim {
+                        history: None,
                         participant: None,
                         github: None,
                         transport: "scientist-slack".parse().expect("transport"),

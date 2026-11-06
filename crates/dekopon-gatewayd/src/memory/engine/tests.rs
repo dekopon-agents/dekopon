@@ -288,7 +288,8 @@ async fn summary_errors_map_to_slot_failures() {
     assert!(failed(&slots[1], SummaryFailure::Empty));
     assert_eq!(slots[2], Slot::Running);
     assert_eq!(script.calls.load(Ordering::Relaxed), 3);
-    let boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
+    let mut boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
+    crate::memory::engine::settle_boot(&journal, None, std::mem::take(&mut boot.transitions));
     assert_eq!(boot.requeued, 1);
     assert_eq!(boot.tasks.len(), 1);
     assert_eq!(boot.tasks[0].part.get(), 3);
@@ -555,7 +556,8 @@ fn boot_enqueues_only_the_lowest_queued_part() {
             },
         )
         .unwrap();
-    let boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
+    let mut boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
+    crate::memory::engine::settle_boot(&journal, None, std::mem::take(&mut boot.transitions));
     assert_eq!(boot.requeued, 1);
     assert_eq!(boot.tasks.len(), 1);
     assert_eq!(boot.tasks[0].part.get(), 2);
@@ -584,7 +586,8 @@ fn a_file_that_crashed_the_last_boot_is_reset_first() {
     let (dir, journal) = journal();
     journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
     std::fs::write(dir.path().join("loading.marker"), STEM).unwrap();
-    let boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
+    let mut boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
+    crate::memory::engine::settle_boot(&journal, None, std::mem::take(&mut boot.transitions));
     assert_eq!(boot.reset, 1);
     assert_eq!(boot.crashed_files, 1);
     assert!(boot.tasks.is_empty());
@@ -1015,7 +1018,8 @@ async fn recovery_skips_a_finalized_middle_part_and_resumes_later_queued_work() 
         Slot::Queued,
     ];
     journal.append_record(STEM, &record, Vec::new()).unwrap();
-    let boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
+    let mut boot = journal.load_summary_tasks(64.try_into().unwrap()).unwrap();
+    crate::memory::engine::settle_boot(&journal, None, std::mem::take(&mut boot.transitions));
     let (resources, script) = resources(
         Arc::clone(&journal),
         [Action::Text("first"), Action::Text("third")],

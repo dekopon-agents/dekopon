@@ -49,6 +49,20 @@ impl DescriptorStream {
         }
     }
 
+    // Reads nothing: a peek that finds the stream's end means the peer has closed it.
+    #[must_use]
+    pub fn peer_gone(&self) -> bool {
+        match rustix::net::recv(
+            &self.stream,
+            &mut [0_u8; 1],
+            RecvFlags::PEEK | RecvFlags::DONTWAIT,
+        ) {
+            Ok((0, _)) => true,
+            Ok(_) | Err(rustix::io::Errno::AGAIN) => false,
+            Err(_) => true,
+        }
+    }
+
     pub async fn peer_disconnected(&self) {
         let mut byte = [0_u8; 1];
         loop {

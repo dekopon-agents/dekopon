@@ -1311,6 +1311,14 @@ pub(crate) struct Boot {
     pub crashed_files: u32,
     pub overflowed: u32,
     pub tasks: Vec<crate::memory::engine::SlotTask>,
+    // Written once chat history can admit them, never by the scan that found them.
+    pub transitions: Vec<BootLine>,
+}
+
+pub(crate) struct BootLine {
+    pub stem: String,
+    pub turn: TurnId,
+    pub line: SlotLine,
 }
 
 impl Journal {
@@ -1323,7 +1331,8 @@ impl Journal {
         queue: NonZeroUsize,
     ) -> Result<(Self, Boot), JournalError> {
         let journal = Self::create(dir, max_age, retention, seal_retention)?;
-        let boot = journal.load_summary_tasks(queue)?;
+        let mut boot = journal.load_summary_tasks(queue)?;
+        crate::memory::engine::settle_boot(&journal, None, std::mem::take(&mut boot.transitions));
         Ok((journal, boot))
     }
 
@@ -1386,9 +1395,8 @@ impl Journal {
                 let loaded = self.record_snapshot(&stem, true);
                 match loaded {
                     Ok(Some(snapshot)) => {
-                        let mut append = OpenOptions::new().append(true).open(&path)?;
                         for head in snapshot.records {
-                            boot_record(&mut append, &stem, &head, queue, &mut boot)?;
+                            boot_record(&stem, &head, queue, &mut boot)?;
                         }
                     }
                     Ok(None) => {}
@@ -1405,7 +1413,6 @@ impl Journal {
 }
 
 fn boot_record(
-    append: &mut File,
     stem: &str,
     head: &Head,
     queue: NonZeroUsize,
@@ -1419,8 +1426,10 @@ fn boot_record(
                 .ok_or(JournalError::Corrupt)?;
         match slot {
             Slot::Running => {
-                append_boot_slot(
-                    append,
+                boot_line(
+                    boot,
+                    stem,
+                    head,
                     SlotLine {
                         at_ms,
                         record: head.header.id,
@@ -1447,8 +1456,10 @@ fn boot_record(
                         u8::try_from(index + 1).map_err(|_invalid| JournalError::Corrupt)?,
                     )
                     .ok_or(JournalError::Corrupt)?;
-                    append_boot_slot(
-                        append,
+                    boot_line(
+                        boot,
+                        stem,
+                        head,
                         SlotLine {
                             at_ms,
                             record: head.header.id,
@@ -1481,8 +1492,10 @@ fn boot_record(
                     u8::try_from(index + 1).map_err(|_invalid| JournalError::Corrupt)?,
                 )
                 .ok_or(JournalError::Corrupt)?;
-                append_boot_slot(
-                    append,
+                boot_line(
+                    boot,
+                    stem,
+                    head,
                     SlotLine {
                         at_ms,
                         record: head.header.id,
@@ -1501,10 +1514,12 @@ fn boot_record(
     Ok(())
 }
 
-fn append_boot_slot(file: &mut File, line: SlotLine) -> Result<(), JournalError> {
-    let mut bytes = serde_json::to_vec(&SummaryLine { s: line }).map_err(corrupt)?;
-    bytes.push(b'\n');
-    file.write_all(&bytes)?;
+fn boot_line(boot: &mut Boot, stem: &str, head: &Head, line: SlotLine) -> Result<(), JournalError> {
+    boot.transitions.push(BootLine {
+        stem: stem.to_owned(),
+        turn: head.header.turn,
+        line,
+    });
     Ok(())
 }
 

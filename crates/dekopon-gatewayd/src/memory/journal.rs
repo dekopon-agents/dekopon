@@ -250,6 +250,8 @@ pub(crate) struct Journal {
     seal_retention: Duration,
     lock: Mutex<()>,
     assets: Mutex<Option<std::sync::Weak<Mutex<crate::asset::Retention>>>>,
+    #[cfg(test)]
+    debit_gate: Mutex<Option<DebitGate>>,
 }
 
 impl Journal {
@@ -312,6 +314,8 @@ impl Journal {
             seal_retention,
             lock: Mutex::new(()),
             assets: Mutex::new(None),
+            #[cfg(test)]
+            debit_gate: Mutex::new(None),
         })
     }
 
@@ -889,6 +893,19 @@ impl Journal {
     }
 
     pub(crate) fn write_debit(&self, bytes: u64) -> Result<(), JournalError> {
+        #[cfg(test)]
+        let gate = self.debit_gate.lock().take();
+        #[cfg(test)]
+        if let Some((release, written)) = gate {
+            let _released = release.recv();
+            let result = self.write_debit_now(bytes);
+            let _signalled = written.send(());
+            return result;
+        }
+        self.write_debit_now(bytes)
+    }
+
+    fn write_debit_now(&self, bytes: u64) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
         let path = self.dir.join(DEBIT_FILE);
         if bytes == 0 {
@@ -1447,7 +1464,17 @@ fn expired(evicted: &[RecordId], reason: Expiry) {
 }
 
 #[cfg(test)]
+pub(crate) type DebitGate = (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+);
+
+#[cfg(test)]
 impl Journal {
+    pub(crate) fn hold_next_debit_for_test(&self, gate: DebitGate) {
+        *self.debit_gate.lock() = Some(gate);
+    }
+
     pub(crate) fn hold_io_for_test(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.lock.lock()
     }

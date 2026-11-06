@@ -1364,6 +1364,7 @@ mod typed_fact_tests {
             dekopon_core::AttestedSubject::github_repository("owner", "repo", 1).unwrap(),
             "reviewer".parse().unwrap(),
             ChatScopeClaim {
+                history: None,
                 participant: None,
                 transport: "github".parse().unwrap(),
                 kind: ChatTransportKind::Github,

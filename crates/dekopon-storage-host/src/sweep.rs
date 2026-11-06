@@ -235,74 +235,98 @@ fn remove_entry(
 
 impl StorageHost {
     // Units in `skip` are left for the caller's next candidate, so a busy oldest unit cannot hide
-    // a reclaimable one behind it.
+    // a reclaimable one behind it; `superseded` chats have taken their legacy clock over.
     #[must_use]
-    pub fn history_usage(&self, skip: &[HistoryKey]) -> crate::HistoryUsage {
+    pub fn history_usage(
+        &self,
+        skip: &[HistoryKey],
+        superseded: &[HistoryKey],
+    ) -> crate::HistoryUsage {
+        self.inner.ledger.supersede(superseded);
         self.remeasure();
+        // Loaded before the ledger: a recording counted out by then has already been charged.
+        let recording = self.inner.recording.load(Ordering::Acquire);
         let mut usage = self.inner.ledger.history_usage(skip);
-        usage.recording = self.inner.recording.load(Ordering::Acquire);
+        usage.recording = recording;
         usage
     }
 
-    // Counts a delivered-turn recording from the moment the broker accepts it until it finishes,
-    // so a debit the gateway holds is released only once no recording can still land.
+    // Counts a delivered-turn recording from the moment the broker accepts it until it finishes.
     pub fn begin_recording(&self) -> Recording {
         self.inner.recording.fetch_add(1, Ordering::AcqRel);
         Recording { host: self.clone() }
     }
 
-    // A namespace whose grant is in progress is measured on a later call instead.
+    // A namespace whose grant is in progress is measured on a later call instead. A valid marker
+    // decides first, so a namespace never turns legacy while it names a chat.
     fn remeasure(&self) {
         let namespaces = self.inner.layout.namespaces();
         let maximum = self.inner.limits.startup_max_entries;
-        for (token, remeasure) in self.inner.ledger.unmeasured() {
+        for (token, obligation) in self.inner.ledger.unmeasured() {
             let mutex = crate::namespace_lock(&self.inner.namespace_locks, &token);
             let Some(_guard) = mutex.try_lock() else {
                 continue;
             };
-            if !matches!(namespaces.exists(&token), Ok(true)) {
-                if matches!(namespaces.exists(&token), Ok(false)) {
-                    self.inner.ledger.measured(&token);
+            match namespaces.exists(&token) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.inner.ledger.measured(&token, Usage::default());
+                    continue;
                 }
-                continue;
+                Err(_unreadable) => continue,
             }
-            let measured = match &remeasure {
-                Remeasure::Chat => chat_namespace(namespaces, &token, maximum),
-                Remeasure::Unlinked(provider) => {
-                    unlinked_unit(namespaces, &token, provider, maximum).map(|legacy| {
-                        legacy.map(|legacy| {
-                            (
-                                ChatClass::Unlinked(legacy.activity_ms, legacy.adopted),
-                                legacy.usage,
-                            )
-                        })
-                    })
-                }
+            let measured = match chat_namespace(namespaces, &token, maximum) {
+                Ok(None) => match &obligation.legacy {
+                    Some(provider) => unlinked_unit(namespaces, &token, provider, maximum)
+                        .map(|legacy| legacy.map(Legacy::measured)),
+                    None => Ok(None),
+                },
+                found => found,
             };
             match measured {
-                Ok(Some((ChatClass::Linked(key), usage))) => {
-                    self.inner.ledger.classify_chat(&token, key, usage);
+                Ok(Some((class, usage))) => self.classify(&token, class, usage),
+                Ok(None) => {
+                    if let Ok(usage) = plain_usage(namespaces, &token, maximum) {
+                        self.inner.ledger.measured(&token, usage);
+                    }
                 }
-                Ok(Some((ChatClass::Unlinked(activity_ms, adopted), usage))) => {
-                    self.inner.ledger.charge_root(adopted);
-                    self.inner
-                        .ledger
-                        .classify_unlinked(&token, usage, activity_ms);
-                }
-                Ok(None) => self.inner.ledger.measured(&token),
                 Err(_unmeasured) => {}
+            }
+        }
+    }
+
+    fn classify(&self, token: &str, class: ChatClass, usage: Usage) {
+        match class {
+            ChatClass::Linked(key, clock) => {
+                self.inner.ledger.classify_chat(token, key, usage);
+                if let Some(activity_ms) = clock {
+                    self.inner.ledger.keep_clock(token, activity_ms);
+                }
+            }
+            ChatClass::Unlinked(activity_ms, _adopted) => {
+                self.inner
+                    .ledger
+                    .classify_unlinked(token, usage, activity_ms);
             }
         }
     }
 
     // Every namespace linked to the key is leased before any is touched, so a busy member leaves
     // the whole chat intact.
+    // A member that cannot be measured, or a namespace whose chat is unknown, refuses the whole
+    // reclaim before anything is deleted.
     pub fn reclaim_chat(&self, key: &HistoryKey) -> Result<ChatReclaimOutcome, StorageHostError> {
         let namespaces = self.inner.layout.namespaces();
-        let mutexes = self
-            .inner
-            .ledger
-            .chat_namespaces(key)
+        self.remeasure();
+        let members = self.inner.ledger.chat_namespaces(key);
+        if self.inner.ledger.membership_unknown()
+            || members
+                .iter()
+                .any(|token| self.inner.ledger.is_unmeasured(token))
+        {
+            return Ok(ChatReclaimOutcome::Busy);
+        }
+        let mutexes = members
             .into_iter()
             .map(|token| {
                 let mutex = crate::namespace_lock(&self.inner.namespace_locks, &token);
@@ -428,9 +452,18 @@ impl StorageHost {
             if !is_token(&token) || self.inner.ledger.is_chat(&token) {
                 continue;
             }
+            let legacy_obligation = Remeasure {
+                legacy: Some(provider.clone()),
+                charged: plain_usage(namespaces, &token, maximum).unwrap_or_default(),
+                ..Remeasure::default()
+            };
+            if self.inner.ledger.is_unmeasured(&token) {
+                self.inner.ledger.mark_unmeasured(&token, legacy_obligation);
+                continue;
+            }
             match unlinked_unit(namespaces, &token, provider, maximum) {
                 Ok(Some(legacy)) => {
-                    self.inner.ledger.charge_root(legacy.adopted);
+                    self.inner.ledger.charge(&token, legacy.adopted);
                     self.inner
                         .ledger
                         .classify_unlinked(&token, legacy.usage, legacy.activity_ms);
@@ -444,9 +477,7 @@ impl StorageHost {
                         storage.check = %error.class(),
                         "storage.history.namespace.unmeasured"
                     );
-                    self.inner
-                        .ledger
-                        .mark_unmeasured(&token, Remeasure::Unlinked(provider.clone()));
+                    self.inner.ledger.mark_unmeasured(&token, legacy_obligation);
                 }
             }
         }
@@ -509,15 +540,69 @@ pub(crate) struct Legacy {
     pub adopted: Usage,
 }
 
+impl Legacy {
+    fn measured(self) -> Measured {
+        (
+            ChatClass::Unlinked(self.activity_ms, self.adopted),
+            self.usage,
+        )
+    }
+}
+
+fn plain_usage(
+    namespaces: &Directory,
+    token: &str,
+    maximum: u64,
+) -> Result<Usage, StorageHostError> {
+    usage_with_directory_entry(scan_usage(&namespaces.open_directory(token)?, maximum)?)
+}
+
+fn marker_of(namespaces: &Directory, token: &str) -> Option<HistoryKey> {
+    let bytes = namespaces
+        .open_directory(token)
+        .ok()?
+        .read_bounded(HISTORY_MARKER, 4_096)
+        .ok()?;
+    HistoryKey::new(String::from_utf8(bytes).ok()?).ok()
+}
+
+fn persisted_clock(base: &Directory) -> Result<Option<u64>, StorageHostError> {
+    if !base.exists(ADOPTED)? {
+        return Ok(None);
+    }
+    std::str::from_utf8(&base.read_bounded(ADOPTED, 32)?)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .map(Some)
+        .ok_or_else(|| base.corrupt(ADOPTED, "adoption-time"))
+}
+
+// A unit bound to a chat by a read keeps its clock on disk, so a restart before the gateway has
+// taken the clock over still offers it.
+pub(crate) fn bind_clock(
+    base: &Directory,
+    activity_ms: u64,
+    maximum: u64,
+) -> Result<Usage, StorageHostError> {
+    if base.exists(ADOPTED)? {
+        return Ok(Usage::default());
+    }
+    let before = usage_with_directory_entry(scan_usage(base, maximum)?)?;
+    base.replace_private(ADOPTED, activity_ms.to_string().as_bytes())?;
+    let after = usage_with_directory_entry(scan_usage(base, maximum)?)?;
+    Ok(Usage {
+        bytes: after.bytes.saturating_sub(before.bytes),
+        entries: after.entries.saturating_sub(before.entries),
+        files: after.files.saturating_sub(before.files),
+    })
+}
+
 // Appends and record-time compaction are the only writes under a generation and reads never touch
 // its files, so the current generation's newest data mtime is the newest recorded turn. Without
 // one, the adoption time is persisted once so a restart never moves the clock.
 fn legacy_clock(base: &Directory, token: &str, maximum: u64) -> Result<u64, StorageHostError> {
-    if base.exists(ADOPTED)? {
-        return std::str::from_utf8(&base.read_bounded(ADOPTED, 32)?)
-            .ok()
-            .and_then(|text| text.parse().ok())
-            .ok_or_else(|| base.corrupt(ADOPTED, "adoption-time"));
+    if let Some(adopted) = persisted_clock(base)? {
+        return Ok(adopted);
     }
     let generation = crate::namespace::current_generation(base, token)?;
     let mut newest = None;
@@ -605,8 +690,13 @@ pub(crate) fn finish_tombstones(
 pub(crate) type Measured = (ChatClass, Usage);
 
 pub(crate) enum ChatClass {
-    Linked(HistoryKey),
+    Linked(HistoryKey, Option<u64>),
     Unlinked(u64, Usage),
+}
+
+pub(crate) enum Scan {
+    Measured(Measured),
+    Unmeasured(Remeasure),
 }
 
 // A base that cannot be measured is returned unmeasured: it may hold chat history, so the budget
@@ -614,14 +704,14 @@ pub(crate) enum ChatClass {
 pub(crate) fn chat_namespaces(
     namespaces: &Directory,
     maximum: u64,
-) -> Result<Vec<(String, Option<Measured>)>, StorageHostError> {
+) -> Result<Vec<(String, Scan)>, StorageHostError> {
     let mut found = Vec::new();
     for token in namespaces.entries_bounded(maximum)? {
         if !is_token(&token) {
             continue;
         }
         match chat_namespace(namespaces, &token, maximum) {
-            Ok(Some(measured)) => found.push((token, Some(measured))),
+            Ok(Some(measured)) => found.push((token, Scan::Measured(measured))),
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
@@ -630,7 +720,12 @@ pub(crate) fn chat_namespaces(
                     storage.check = %error.class(),
                     "storage.history.namespace.unmeasured"
                 );
-                found.push((token, None));
+                let obligation = Remeasure {
+                    marker: marker_of(namespaces, &token),
+                    legacy: None,
+                    charged: plain_usage(namespaces, &token, maximum).unwrap_or_default(),
+                };
+                found.push((token, Scan::Unmeasured(obligation)));
             }
         }
     }
@@ -664,16 +759,10 @@ fn chat_namespace(
         .and_then(|value| HistoryKey::new(value).ok());
     Ok(Some(match key {
         Some(key) => (
-            ChatClass::Linked(key),
+            ChatClass::Linked(key, persisted_clock(&base)?),
             usage_with_directory_entry(scan_usage(&base, maximum)?)?,
         ),
-        None => {
-            let legacy = legacy_unit(&base, token, maximum)?;
-            (
-                ChatClass::Unlinked(legacy.activity_ms, legacy.adopted),
-                legacy.usage,
-            )
-        }
+        None => legacy_unit(&base, token, maximum)?.measured(),
     }))
 }
 
@@ -737,7 +826,7 @@ mod tests {
                 .unwrap();
         }
         handle.commit().unwrap();
-        assert!(host.history_usage(&[]).chat_used > 0);
+        assert!(host.history_usage(&[], &[]).chat_used > 0);
 
         REMOVALS_BEFORE_FAILURE.with(|left| left.set(Some(4)));
         assert!(host.reclaim_chat(&key).is_err());
@@ -746,6 +835,6 @@ mod tests {
             host.reclaim_chat(&key).unwrap(),
             ChatReclaimOutcome::Reclaimed(_)
         ));
-        assert_eq!(host.history_usage(&[]).chat_used, 0);
+        assert_eq!(host.history_usage(&[], &[]).chat_used, 0);
     }
 }

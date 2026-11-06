@@ -854,7 +854,6 @@ fn read_pointer(
     Ok(scheme.map(|scheme| (scheme, document)))
 }
 
-// The generation a grant would select: the pointer's epoch, or the relaxed stable generation.
 pub(crate) fn current_generation(
     base_directory: &Directory,
     base_token: &str,

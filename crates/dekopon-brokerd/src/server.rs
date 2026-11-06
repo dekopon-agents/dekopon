@@ -851,12 +851,12 @@ where
                 response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
             }
         }
-        BrokerRequest::HistoryUsage { skip } => {
+        BrokerRequest::HistoryUsage { skip, superseded } => {
             // A stale scan may remeasure history on disk, so it runs off the connection's thread.
             let measured = match broker.history_store() {
                 None => None,
                 Some(host) => Some(
-                    tokio::task::spawn_blocking(move || host.history_usage(&skip))
+                    tokio::task::spawn_blocking(move || host.history_usage(&skip, &superseded))
                         .await
                         .map_err(|_stopped| ConnectionError::InvalidRequest)?,
                 ),
@@ -882,6 +882,14 @@ where
                         dekopon_broker_protocol::UnlinkedHistory {
                             history: unlinked.key,
                             activity_ms: unlinked.activity_ms,
+                            kind: match unlinked.kind {
+                                dekopon_storage_host::LegacyKind::Unit => {
+                                    dekopon_broker_protocol::LegacyKind::Unit
+                                }
+                                dekopon_storage_host::LegacyKind::Chat => {
+                                    dekopon_broker_protocol::LegacyKind::Chat
+                                }
+                            },
                         }
                     }),
                     unmeasured: usage.unmeasured,
@@ -955,6 +963,11 @@ where
         }
         BrokerRequest::RecordDeliveredTurn { attestation, turn } => {
             let _recording = broker.history_store().map(|host| host.begin_recording());
+            // A gateway that left before this frame was read has released its debit, so the
+            // recording it abandoned must not land.
+            if stream.peer_gone() {
+                return Err(ConnectionError::PeerGone);
+            }
             if !claim_is_valid(Some(&attestation), Some(&turn.id)) || !turn.is_bounded() {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
@@ -1191,6 +1204,8 @@ enum ConnectionError {
     },
     #[error("response write failed")]
     Write(#[source] ProtocolError),
+    #[error("the peer left before its recording was read")]
+    PeerGone,
 }
 
 impl ConnectionError {
@@ -1201,7 +1216,8 @@ impl ConnectionError {
             | Self::InvalidRequest
             | Self::CapacityExhausted { .. }
             | Self::Broker { .. }
-            | Self::Write(_) => None,
+            | Self::Write(_)
+            | Self::PeerGone => None,
         }
     }
 
@@ -1217,6 +1233,7 @@ impl ConnectionError {
             Self::CapacityExhausted { .. } => "broker-capacity-exhausted",
             Self::Broker { .. } => "broker",
             Self::Write(_) => "response-write",
+            Self::PeerGone => "peer-gone",
         }
     }
 }
@@ -1601,6 +1618,94 @@ mod generation_tests {
     }
 
     #[tokio::test]
+    async fn a_recording_whose_gateway_left_before_it_was_read_is_refused() {
+        use dekopon_broker_protocol::{
+            Attestation, ChatScopeClaim, ChatTransportKind, Conversation, ConversationKind,
+            DeliveredAnswer, DeliveredTurnRequest, DeliveryIdentity, Trigger,
+        };
+        let fixture = ManagedBroker::gateway();
+        fixture.publish_lock('1');
+        let (active, report) =
+            crate::tests::candidate_or_refusal(&fixture.config(), Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let coordination = Coordination::new(fixture.config(), active.unwrap());
+        let active = coordination.active();
+        let owner = active.ready.identities[&crate::current_uid()].clone();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let uid = client.peer_cred().unwrap().uid();
+        let identities = BTreeMap::from([(uid, owner)]);
+        let limits = FrameLimits::default();
+        let attestation = Attestation::for_chat(
+            dekopon_core::AttestedSubject::one("drn:slack:user:t0123abc:u0123abc".parse().unwrap())
+                .unwrap(),
+            "assistant".parse().unwrap(),
+            ChatScopeClaim {
+                transport: "dev".parse().unwrap(),
+                kind: ChatTransportKind::Local,
+                conversation: Conversation {
+                    kind: ConversationKind::DirectMessage,
+                    container: None,
+                    id: "dev".to_owned(),
+                    thread: None,
+                },
+                trigger: Trigger::Message,
+                delivery: None,
+                participant: None,
+                github: None,
+                history: None,
+            },
+        );
+        let turn = DeliveredTurnRequest::new(
+            "abandoned-record".parse().unwrap(),
+            "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+                .parse()
+                .unwrap(),
+            DeliveryIdentity::Local {
+                transport: "dev".parse().unwrap(),
+                conversation: "dev".to_owned(),
+                boot_nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+                connection: 1,
+                sequence: 1,
+            },
+            "synthetic".to_owned(),
+            DeliveredAnswer::accepted_by_transport("answer".to_owned()),
+        )
+        .with_history(
+            dekopon_core::history::HistoryKey::new("assistant/abandoned".to_owned()).unwrap(),
+        );
+        write_frame(
+            &mut client,
+            &RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha2,
+                request: BrokerRequest::RecordDeliveredTurn { attestation, turn },
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+        drop(client);
+
+        let served = handle(
+            server,
+            &active.ready.broker,
+            &identities,
+            limits,
+            Some(&coordination),
+        )
+        .await;
+        assert!(
+            matches!(served, Err(ConnectionError::PeerGone)),
+            "{served:?}"
+        );
+        let usage = active
+            .ready
+            .broker
+            .history_store()
+            .map(|host| host.history_usage(&[], &[]));
+        assert!(usage.is_none_or(|usage| usage.chat_used == 0 && usage.recording == 0));
+    }
+
+    #[tokio::test]
     async fn only_the_reconciliation_owner_can_read_or_reclaim_chat_history() {
         let fixture = ManagedBroker::gateway();
         fixture.publish_lock('1');
@@ -1628,7 +1733,10 @@ mod generation_tests {
                     &coordination,
                     stranger.clone(),
                     owner.clone(),
-                    BrokerRequest::HistoryUsage { skip: Vec::new() },
+                    BrokerRequest::HistoryUsage {
+                        skip: Vec::new(),
+                        superseded: Vec::new(),
+                    },
                 )
                 .await,
             );
@@ -1641,7 +1749,10 @@ mod generation_tests {
                 &coordination,
                 owner.clone(),
                 strangers[0].clone(),
-                BrokerRequest::HistoryUsage { skip: Vec::new() }
+                BrokerRequest::HistoryUsage {
+                    skip: Vec::new(),
+                    superseded: Vec::new()
+                }
             )
             .await,
             BrokerResponse::History { .. }

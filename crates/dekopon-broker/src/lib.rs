@@ -3326,13 +3326,21 @@ where
             Some(memory) => grant_request.with_memory_continuity(memory),
             None => grant_request,
         };
-        // Only `record_delivered_turn` builds a record proposal, and only it sets `history`.
-        let history = (set.route == CapabilityRoute::ChatMemoryRecord)
-            .then(|| request.input.get("history").cloned())
-            .flatten()
-            .map(serde_json::from_value::<dekopon_core::history::HistoryKey>)
-            .transpose()
-            .map_err(|_invalid| BrokerError::InvalidMemoryInput)?;
+        // Only `record_delivered_turn` builds a record proposal, and only it sets `history`; a
+        // read binds to the chat the gateway attested, before any history is exposed.
+        let history = if set.route == CapabilityRoute::ChatMemoryRecord {
+            request
+                .input
+                .get("history")
+                .cloned()
+                .map(serde_json::from_value::<dekopon_core::history::HistoryKey>)
+                .transpose()
+                .map_err(|_invalid| BrokerError::InvalidMemoryInput)?
+        } else if set.route.is_chat_memory_retrieval() {
+            scope.history.clone()
+        } else {
+            None
+        };
         host.prepare_grant(grant_request.with_history(history))
             .map(Some)
             .map_err(|source| BrokerError::Storage { source })
@@ -4745,6 +4753,7 @@ fn is_console_smoke_literal(scope: &ChatScopeClaim) -> bool {
         participant: _,
         github,
         trigger,
+        history: _,
     } = scope;
     *kind == ChatTransportKind::Local
         && *conversation_kind == ConversationKind::DirectMessage

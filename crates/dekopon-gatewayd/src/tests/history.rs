@@ -282,7 +282,7 @@ async fn used(journal: &Arc<Journal>, broker: &ResolvedBroker) -> u64 {
     let usage = broker
         .leg_client()
         .unwrap()
-        .history_usage(Vec::new())
+        .history_usage(Vec::new(), Vec::new())
         .await
         .unwrap();
     journal.history_bytes().unwrap() + usage.chat_used
@@ -531,7 +531,7 @@ async fn a_journal_append_does_not_need_broker_root_space() {
     let usage = probe
         .leg_client()
         .unwrap()
-        .history_usage(Vec::new())
+        .history_usage(Vec::new(), Vec::new())
         .await
         .unwrap();
     stores.stop_broker().await;
@@ -775,7 +775,6 @@ async fn an_unreadable_chat_marker_is_its_own_unit_and_reclaimed_under_pressure(
     stores.stop_broker().await;
 }
 
-// Answers the budget's own requests from `usage`, so a test can hold a recording in flight.
 #[allow(
     clippy::let_underscore_must_use,
     reason = "the socket is test-owned; a failed reply shows up as the test's own broker error"
@@ -982,7 +981,7 @@ async fn a_busy_oldest_legacy_unit_does_not_hide_the_next_one() {
     let oldest = broker
         .leg_client()
         .unwrap()
-        .history_usage(Vec::new())
+        .history_usage(Vec::new(), Vec::new())
         .await
         .unwrap()
         .oldest_unlinked
@@ -1082,5 +1081,174 @@ async fn a_summary_transition_waits_for_room_or_is_not_written() {
     };
     assert!(written.is_err(), "a full budget refuses the start line");
     assert_eq!(journal.history_bytes().unwrap(), full);
+    stores.stop_broker().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_settlement_never_overwrites_a_later_debit() {
+    let stores = Stores::new();
+    let journal = stores.journal();
+    let usage = Arc::new(parking_lot::Mutex::new(
+        dekopon_broker_protocol::HistoryUsage {
+            root_free_bytes: u64::MAX,
+            root_free_entries: u64::MAX,
+            record_bound: 1_000,
+            recording: 1,
+            ..Default::default()
+        },
+    ));
+    let broker = usage_broker(stores.directory.path(), usage).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, BUDGET, IDLE);
+    let first = history
+        .begin_record(OLDER, SystemTime::now())
+        .await
+        .unwrap();
+    let (release, gate) = std::sync::mpsc::sync_channel::<()>(1);
+    let (written, settled) = std::sync::mpsc::sync_channel::<()>(1);
+    journal.hold_next_debit_for_test((gate, written));
+    let settling = tokio::spawn(first.answered());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    settling.abort();
+    assert!(settling.await.unwrap_err().is_cancelled());
+
+    let second = {
+        let history = Arc::clone(&history);
+        tokio::spawn(async move { history.begin_record(NEWER, SystemTime::now()).await })
+    };
+    // Fixed, the later recording waits for the held write; broken, it writes first.
+    let _raced = tokio::time::timeout(Duration::from_secs(2), async {
+        while journal.activity(NEWER).unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    })
+    .await;
+    release.send(()).unwrap();
+    let second = second.await.unwrap().unwrap();
+    tokio::task::spawn_blocking(move || settled.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the held write finishes");
+    assert_eq!(
+        journal.debit().unwrap(),
+        1_000,
+        "the live recording stays debited"
+    );
+    second.answered().await;
+}
+
+#[tokio::test]
+async fn a_legacy_namespace_bound_by_a_read_hands_over_its_clock_and_stays_claimed() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    stores.record(&journal, OLDER, "c-older", SystemTime::now());
+    fs::remove_file(stores.transcript_path(OLDER)).unwrap();
+    fs::remove_file(stores.activity(OLDER)).unwrap();
+    let legacy_ms =
+        crate::memory::journal::millis(SystemTime::now() - Duration::from_secs(10 * 24 * 3600));
+    let adopted = stores.broker_namespace("c-older").join("adopted");
+    fs::write(&adopted, legacy_ms.to_string()).unwrap();
+    fs::set_permissions(&adopted, fs::Permissions::from_mode(0o600)).unwrap();
+    let broker = stores.start_broker().await;
+    let total = used(&journal, &broker).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, total + 1, IDLE);
+
+    let in_use = history.begin_use(OLDER).await.unwrap();
+    let admission = history.admit().await;
+    assert!(matches!(
+        admission.ensure("assistant/new", Growth::journal(2)).await,
+        Err(HistoryError::Exhausted)
+    ));
+    drop(admission);
+    assert!(
+        stores.namespace_exists("c-older"),
+        "the reading turn keeps it"
+    );
+    assert_eq!(journal.activity(OLDER).unwrap(), Some(legacy_ms));
+    drop(in_use);
+
+    let admission = history.admit().await;
+    admission
+        .ensure("assistant/new", Growth::journal(2))
+        .await
+        .unwrap();
+    drop(admission);
+    assert!(!stores.namespace_exists("c-older"));
+    stores.stop_broker().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_boot_transition_waits_for_room_or_is_not_written() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    let turn = captured("synthetic question", Some("synthetic answer"));
+    let header = journal
+        .append(
+            OLDER,
+            &Entry {
+                at: SystemTime::now(),
+                grant: &GrantDigest::of(&["probe.read".to_owned()]),
+                captured: &turn,
+                keep: Keep::Everything,
+                plan: Some(crate::memory::record::SummaryPlan {
+                    model: "summary".to_owned(),
+                    parts: vec![std::num::NonZeroU32::new(8).unwrap()],
+                    max_input_bytes: std::num::NonZeroU32::new(1024).unwrap(),
+                }),
+                attachments: Default::default(),
+                arrivals: &[],
+                inventory: &[],
+                next_asset_id: 1,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    journal
+        .write_slot(
+            OLDER,
+            crate::memory::record::SlotLine {
+                at_ms: 1,
+                record: header.id,
+                part: std::num::NonZeroU8::MIN,
+                slot: crate::memory::record::Slot::Running,
+                subject: crate::memory::record::Subject::Record,
+            },
+        )
+        .unwrap();
+    let before = journal.history_bytes().unwrap();
+    drop(journal);
+
+    let (journal, boot) = Journal::boot(
+        &stores.journal_dir(),
+        IDLE,
+        IDLE,
+        IDLE,
+        std::num::NonZeroUsize::new(64).unwrap(),
+        SystemTime::now(),
+    )
+    .unwrap();
+    let journal = Arc::new(journal);
+    assert_eq!(boot.transitions.len(), 1, "the running slot is requeued");
+    assert_eq!(
+        journal.history_bytes().unwrap(),
+        before,
+        "boot writes nothing"
+    );
+    let broker = stores.start_broker().await;
+    let full = used(&journal, &broker).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, full, IDLE);
+    {
+        let journal = Arc::clone(&journal);
+        tokio::task::spawn_blocking(move || {
+            crate::memory::engine::settle_boot(&journal, Some(&history), boot.transitions);
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        journal.history_bytes().unwrap(),
+        before,
+        "a full budget refuses it"
+    );
     stores.stop_broker().await;
 }

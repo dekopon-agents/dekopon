@@ -2150,6 +2150,7 @@ async fn authorize_github_fixture(
         inbound.subject,
         "reviewer".parse().unwrap(),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: inbound.transport.parse().unwrap(),
@@ -4835,6 +4836,7 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
         inbound.subject.clone(),
         "reviewer".parse().expect("agent"),
         dekopon_broker_protocol::ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: "support-whatsapp".parse().expect("transport"),
@@ -17737,6 +17739,7 @@ async fn a_slack_mention_resumes_with_authorized_stay_and_survives_restart() {
         message.subject.clone(),
         route.agent.clone(),
         dekopon_broker_protocol::ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: message.transport.parse().unwrap(),

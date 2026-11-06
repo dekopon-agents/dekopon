@@ -227,6 +227,7 @@ pub async fn connect(
 #[must_use]
 pub fn smoke_claim() -> ChatScopeClaim {
     ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "console-smoke".parse().unwrap_or_else(|_| unreachable!()),

@@ -306,6 +306,8 @@ pub struct ChatScopeClaim {
     pub participant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<dekopon_core::github::GithubBatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<dekopon_core::history::HistoryKey>,
 }
 
 impl fmt::Debug for ChatScopeClaim {
@@ -907,6 +909,8 @@ pub enum BrokerRequest {
     HistoryUsage {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         skip: Vec<dekopon_core::history::HistoryKey>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        superseded: Vec<dekopon_core::history::HistoryKey>,
     },
     ReclaimChat {
         history: dekopon_core::history::HistoryKey,
@@ -1464,6 +1468,15 @@ pub struct HistoryUsage {
 pub struct UnlinkedHistory {
     pub history: dekopon_core::history::HistoryKey,
     pub activity_ms: u64,
+    pub kind: LegacyKind,
+}
+
+// A unit is reclaimed under its own key; a chat's clock is handed to the gateway first.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LegacyKind {
+    Unit,
+    Chat,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2171,11 +2184,12 @@ impl BrokerClient {
     pub async fn history_usage(
         &self,
         skip: Vec<dekopon_core::history::HistoryKey>,
+        superseded: Vec<dekopon_core::history::HistoryKey>,
     ) -> Result<HistoryUsage, ClientError> {
         match self
             .exchange(RequestEnvelope {
                 api_version: ProtocolVersion::V1Alpha3,
-                request: BrokerRequest::HistoryUsage { skip },
+                request: BrokerRequest::HistoryUsage { skip, superseded },
             })
             .await?
         {

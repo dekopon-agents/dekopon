@@ -454,7 +454,10 @@ where
     }
 }
 
-async fn enqueue_boot(sender: &memory::engine::Sender, boot: memory::journal::records::Boot) {
+async fn enqueue_boot(sender: &memory::engine::Sender, mut boot: memory::journal::records::Boot) {
+    sender
+        .settle_boot(std::mem::take(&mut boot.transitions))
+        .await;
     let enqueued = boot.tasks.len();
     for task in boot.tasks {
         sender.enqueue(task).await;

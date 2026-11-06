@@ -123,6 +123,7 @@ async fn a_job_leg_authorization_records_its_trigger() {
     }))
     .await;
     let scope = ChatScopeClaim {
+        history: None,
         participant: None,
         github: None,
         transport: "slack".parse().expect("transport"),

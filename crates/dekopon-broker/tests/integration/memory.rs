@@ -157,6 +157,7 @@ fn claim_for(conversation: &str) -> Attestation {
         .expect("one-form subject"),
         "reviewer".parse::<AgentId>().expect("agent"),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: "scientist-slack".parse::<TransportId>().expect("transport"),
@@ -182,6 +183,7 @@ fn local_claim(transport: &str, conversation: &str) -> Attestation {
         .expect("subject"),
         "reviewer".parse().expect("agent"),
         ChatScopeClaim {
+            history: None,
             participant: None,
             github: None,
             transport: transport.parse().expect("transport"),
@@ -336,7 +338,14 @@ async fn record_marker(broker: &Broker<InMemoryAuditLog>, marker: &str, sequence
 }
 
 async fn recent_user(broker: &Broker<InMemoryAuditLog>, label: &str) -> serde_json::Value {
-    let claim = local_claim("local-dev", "real-session");
+    recent_user_as(broker, label, local_claim("local-dev", "real-session")).await
+}
+
+async fn recent_user_as(
+    broker: &Broker<InMemoryAuditLog>,
+    label: &str,
+    claim: Attestation,
+) -> serde_json::Value {
     let peer = gateway();
     let grant = attestor_grant();
     let dekopon_broker_host::CommandRunOutcome::Proposed {
@@ -378,6 +387,31 @@ async fn recent_user(broker: &Broker<InMemoryAuditLog>, label: &str) -> serde_js
         return serde_json::Value::Null;
     }
     serde_json::from_slice::<serde_json::Value>(&bytes).expect("one row")["user"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_memory_read_binds_its_namespace_to_the_attested_chat() {
+    let directory = tempfile::tempdir().expect("storage root");
+    let root = directory
+        .path()
+        .canonicalize()
+        .expect("root")
+        .join("storage");
+    let broker = smoke_memory_broker(&root).await;
+    record_marker(&broker, "bound", 1).await;
+    let mut claim = local_claim("local-dev", "real-session");
+    if let Some(scope) = claim.scope.as_mut() {
+        scope.history = Some(
+            dekopon_core::history::HistoryKey::new("reviewer/read".to_owned())
+                .expect("history key"),
+        );
+    }
+    assert_eq!(recent_user_as(&broker, "bound", claim).await, "bound");
+    let markers = std::fs::read_dir(root.join("namespaces"))
+        .expect("namespaces")
+        .filter_map(|entry| std::fs::read(entry.expect("entry").path().join("chat")).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(markers, [b"reviewer/read".to_vec()]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
