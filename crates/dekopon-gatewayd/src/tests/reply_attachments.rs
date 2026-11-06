@@ -219,7 +219,7 @@ async fn a_failed_upload_mid_group_marks_only_that_asset_undispatched() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_denied_send_is_noted_and_never_dispatched() {
+async fn an_unknown_sent_asset_is_noted_and_never_dispatched() {
     let (capture, _guard) = capture_spans();
     let slack = SlackStandIn::start(None);
     let directory = temporary();
@@ -252,4 +252,113 @@ async fn a_denied_send_is_noted_and_never_dispatched() {
     );
     assert_eq!(dispatched(&capture, "true"), ids([1]));
     assert_eq!(dispatched(&capture, "false"), ids([99]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_the_broker_denies_is_never_queued() {
+    let (capture, _guard) = capture_spans();
+    let slack = SlackStandIn::start(None);
+    let directory = temporary();
+    let mut replies = five_image_broker_replies();
+    replies.pop();
+    replies.push(plain_response(ResponseEnvelope::invocation(
+        record_result(InvocationOutcome::Denied, Some("asset.send is not granted")),
+        Vec::new(),
+        Vec::new(),
+        vec![1],
+    )));
+    let (broker, _observed) = stub_broker_assets(directory.path(), replies).await;
+    let models = five_image_models(Some("No kittens."));
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        run_session(
+            runner(broker, Arc::clone(&models), 4),
+            route(model_config()),
+            slack_inbound(),
+            crate::tests::slack(&slack.mock.base).driver(),
+        ),
+    )
+    .await
+    .expect("session finishes");
+
+    assert!(!tool_message(&models, 2).contains("queued"));
+    assert!(slack.completions().is_empty(), "nothing is shared");
+    assert_eq!(slack.calls_to("/api/chat.postMessage").len(), 1);
+    assert!(dispatched(&capture, "true").is_empty());
+}
+
+fn telegram_inbound() -> InboundMessage {
+    let mut inbound = message("draw three kittens");
+    inbound.reply = ReplyTarget::Telegram {
+        chat_id: 42,
+        reply_to: None,
+        message_thread_id: None,
+    };
+    inbound
+}
+
+fn three_image_broker_replies() -> Vec<(ResponseEnvelope, Vec<std::os::fd::OwnedFd>)> {
+    let mut replies = five_image_broker_replies();
+    replies.truncate(1 + 2 * 3);
+    replies.push(plain_response(upper_proposal("send")));
+    replies.push(queued_response_of(vec![1, 2, 3]));
+    replies
+}
+
+fn three_image_models(answer_text: &str) -> Arc<ModelScript> {
+    let create = (1..=3)
+        .map(|index| format!("probe upper --text 'image {index}'"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ModelScript::new([
+        script_call(&create),
+        script_call("probe upper --text send"),
+        answer(answer_text),
+    ])
+}
+
+async fn run_three_images_on_telegram(accepted_photos: usize, answer_text: &str) -> CaptureLayer {
+    let (capture, _guard) = capture_spans();
+    let photos = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let http = spawn_http_mock(move |path, _body| {
+        let photo = path.contains("sendPhoto");
+        let index = photos.fetch_add(usize::from(photo), std::sync::atomic::Ordering::SeqCst);
+        if photo && index < accepted_photos {
+            json!({
+                "ok": true,
+                "result": {"message_id": 12, "chat": {"id": 42}, "photo": [{"file_id": "photo"}]}
+            })
+        } else {
+            json!({"ok": false, "description": "rejected"})
+        }
+    });
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker_assets(directory.path(), three_image_broker_replies()).await;
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        run_session(
+            runner(broker, three_image_models(answer_text), 4),
+            route(model_config()),
+            telegram_inbound(),
+            crate::tests::telegram(&http.base).driver(),
+        ),
+    )
+    .await
+    .expect("session finishes");
+    capture
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_failure_after_every_photo_still_records_each_photo_dispatched() {
+    let capture = run_three_images_on_telegram(3, &"x".repeat(1_100)).await;
+    assert_eq!(dispatched(&capture, "true"), ids(1..=3));
+    assert!(dispatched(&capture, "false").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_photo_failure_after_an_earlier_photo_records_only_the_delivered_one() {
+    let capture = run_three_images_on_telegram(1, "Three kittens.").await;
+    assert_eq!(dispatched(&capture, "true"), ids([1]));
+    assert_eq!(dispatched(&capture, "false"), ids([2, 3]));
 }

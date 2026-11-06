@@ -3662,9 +3662,13 @@ async fn session_turn(
     }
     attachments.finish(match (&outcome, delivery) {
         (Ok(_), Delivery::Delivered) => AssetDeliveryDisposition::Delivered,
-        (Ok(_), Delivery::MissingAttachments(failed)) => {
-            AssetDeliveryDisposition::Partial { failed }
-        }
+        (Ok(_), Delivery::MissingAttachments(failed))
+        | (
+            Ok(_),
+            Delivery::Partial {
+                failed_attachments: failed,
+            },
+        ) => AssetDeliveryDisposition::Partial { failed },
         (Ok(_), Delivery::NotDelivered) => AssetDeliveryDisposition::Failed,
         (Err(_), _) => AssetDeliveryDisposition::Abandoned,
     });

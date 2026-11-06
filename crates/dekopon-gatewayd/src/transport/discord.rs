@@ -1153,7 +1153,11 @@ impl ChatDriver for DiscordDriver {
             };
             match result {
                 Ok(()) => accepted = true,
-                Err(_) if accepted => return Err(TransportError::PartialDelivery),
+                Err(_) if accepted => {
+                    return Err(TransportError::PartialDelivery {
+                        failed_attachments: Vec::new(),
+                    });
+                }
                 Err(error) => return Err(error),
             }
         }

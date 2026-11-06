@@ -726,8 +726,8 @@ pub enum TransportError {
     Response,
     #[error("chat service response was not valid JSON")]
     MalformedResponse(#[source] serde_json::Error),
-    #[error("chat service accepted only part of a split answer")]
-    PartialDelivery,
+    #[error("chat service accepted only part of the reply")]
+    PartialDelivery { failed_attachments: Vec<usize> },
     #[error("chat service posted the reply without {} of its attachments", failed.len())]
     AttachmentsMissing { failed: Vec<usize> },
     #[error("chat transport connection attempt exceeded its deadline")]
@@ -768,7 +768,7 @@ impl TransportError {
             Self::DisallowedIntents => "disallowed-intents",
             Self::Response => "response",
             Self::MalformedResponse(_) => "malformed-response",
-            Self::PartialDelivery => "partial-delivery",
+            Self::PartialDelivery { .. } => "partial-delivery",
             Self::AttachmentsMissing { .. } => "attachments-missing",
             Self::Closed => "closed",
             Self::ConnectTimeout => "connect-timeout",

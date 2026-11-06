@@ -2052,7 +2052,7 @@ impl PermanentReactionError {
             | TransportError::DisallowedIntents
             | TransportError::Response
             | TransportError::MalformedResponse(_)
-            | TransportError::PartialDelivery
+            | TransportError::PartialDelivery { .. }
             | TransportError::AttachmentsMissing { .. }
             | TransportError::ConnectTimeout
             | TransportError::RecoveryExhausted { .. }

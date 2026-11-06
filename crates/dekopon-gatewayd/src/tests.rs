@@ -4409,7 +4409,9 @@ impl ChatDriver for PartialDeliveryDriver {
         _target: &ReplyTarget,
         _reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        Err(TransportError::PartialDelivery)
+        Err(TransportError::PartialDelivery {
+            failed_attachments: Vec::new(),
+        })
     }
 }
 
@@ -13269,7 +13271,7 @@ async fn discord_posts_every_attachment_on_the_first_bounded_multipart_message()
         )
         .await
         .expect_err("the second chunk fails after the attachments were accepted");
-    assert!(matches!(error, TransportError::PartialDelivery));
+    assert!(matches!(error, TransportError::PartialDelivery { .. }));
 
     let calls = http.calls();
     assert_eq!(calls.len(), 2);
@@ -14152,8 +14154,51 @@ async fn telegram_reports_partial_delivery_when_long_image_text_fails_after_the_
         )
         .await
         .expect_err("the photo succeeded before the text failed");
-    assert!(matches!(error, TransportError::PartialDelivery));
+    assert!(
+        matches!(&error, TransportError::PartialDelivery { failed_attachments } if failed_attachments.is_empty()),
+        "the photo was delivered: {error:?}"
+    );
     assert_eq!(http.calls().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_names_the_unsent_photos_when_one_fails_after_an_earlier_photo() {
+    let photos = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let http = spawn_http_mock(move |path, _body| {
+        let photo = photos.fetch_add(
+            usize::from(path.contains("sendPhoto")),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if path.contains("sendPhoto") && photo == 0 {
+            json!({
+                "ok": true,
+                "result": {"message_id": 12, "chat": {"id": 42}, "photo": [{"file_id": "photo"}]}
+            })
+        } else {
+            json!({"ok": false, "description": "photo rejected"})
+        }
+    });
+    let error = telegram(&http.base)
+        .driver()
+        .reply(
+            &ReplyTarget::Telegram {
+                chat_id: 42,
+                reply_to: None,
+                message_thread_id: None,
+            },
+            OutboundReply::with_images("three kittens", generated_images(3)),
+        )
+        .await
+        .expect_err("the second photo fails after the first was delivered");
+    assert!(
+        matches!(&error, TransportError::PartialDelivery { failed_attachments } if failed_attachments == &[1, 2]),
+        "{error:?}"
+    );
+    assert_eq!(
+        http.calls().len(),
+        2,
+        "no photo is attempted after the failure"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

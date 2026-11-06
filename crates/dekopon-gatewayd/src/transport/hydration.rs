@@ -63,6 +63,10 @@ impl ImageQueue {
         self.images.is_empty()
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.images.len()
+    }
+
     pub(super) async fn next(&mut self) -> Option<Result<(usize, HydratedImage), TransportError>> {
         let image = self.images.pop_front()?;
         let index = self.next;

@@ -204,9 +204,6 @@ impl AttachmentLimit {
     pub const fn new(count: u8, holding: Holding) -> Self {
         Self { count, holding }
     }
-    pub const fn count(&self) -> u8 {
-        self.count
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

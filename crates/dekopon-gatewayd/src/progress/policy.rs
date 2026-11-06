@@ -366,13 +366,14 @@ pub(crate) enum Delivery {
     NotDelivered,
     Delivered,
     MissingAttachments(Vec<usize>),
+    Partial { failed_attachments: Vec<usize> },
 }
 
 impl Delivery {
     pub(crate) fn accepted(&self) -> bool {
         match self {
             Self::Delivered | Self::MissingAttachments(_) => true,
-            Self::NotDelivered => false,
+            Self::Partial { .. } | Self::NotDelivered => false,
         }
     }
 
@@ -389,6 +390,9 @@ impl Delivery {
                     TransportError::AttachmentsMissing { failed } => {
                         Self::MissingAttachments(failed)
                     }
+                    TransportError::PartialDelivery { failed_attachments } => {
+                        Self::Partial { failed_attachments }
+                    }
                     TransportError::Attachment(_)
                     | TransportError::AttachmentTask { .. }
                     | TransportError::AssetType { .. }
@@ -402,7 +406,6 @@ impl Delivery {
                     | TransportError::DisallowedIntents
                     | TransportError::Response
                     | TransportError::MalformedResponse(_)
-                    | TransportError::PartialDelivery
                     | TransportError::ConnectTimeout
                     | TransportError::RecoveryExhausted { .. }
                     | TransportError::IdentityChanged
