@@ -436,6 +436,7 @@ fn config_problems(
             | dekopon_gatewayd::GatewaydError::TransportTask(_)
             | dekopon_gatewayd::GatewaydError::TransportsLost
             | dekopon_gatewayd::GatewaydError::Journal { .. }
+            | dekopon_gatewayd::GatewaydError::History { .. }
             | dekopon_gatewayd::GatewaydError::CacheKeySecret(_)
             | dekopon_gatewayd::GatewaydError::WakeStore(_)
             | dekopon_gatewayd::GatewaydError::Proxy(_)

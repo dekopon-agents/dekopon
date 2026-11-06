@@ -44,7 +44,7 @@ use std::{
 };
 
 use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
-use dekopon_core::{AgentId, CapabilityId, InvocationId, ProviderId, Subject};
+use dekopon_core::{AgentId, CapabilityId, InvocationId, ProviderId, Subject, history::HistoryKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -61,7 +61,7 @@ mod vfs;
 pub use config::{StorageConfigError, StorageLimits};
 pub use handle::StorageHandle;
 pub use jsonl::JsonlChunk;
-pub use sweep::{RetentionPolicies, SweepSummary};
+pub use sweep::{ChatReclaim, ChatReclaimOutcome, RetentionPolicies, SweepSummary};
 pub use vfs::{Durability, FileStat, OpenOptions};
 
 use key::{
@@ -70,7 +70,7 @@ use key::{
 };
 use layout::{Layout, scan_root_usage, scan_usage, usage_with_directory_entry};
 use namespace::{ContinuityOutcome, Namespace, NamespacePlan, Reset, deadline_after};
-use quota::QuotaLedger;
+use quota::{NamespaceClass, QuotaLedger};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -151,6 +151,14 @@ impl fmt::Debug for StorageScopeCommitment {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HistoryUsage {
+    pub chat_used: u64,
+    pub chat_reserved: u64,
+    pub root_free_bytes: u64,
+    pub root_free_entries: u64,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageEvidence {
@@ -178,6 +186,7 @@ pub struct StorageGrantRequest {
     comparison: Comparison,
     shared_namespace: Option<ProviderId>,
     space_key: Option<dekopon_core::SpaceKey>,
+    history: Option<HistoryKey>,
 }
 
 impl fmt::Debug for StorageGrantRequest {
@@ -226,6 +235,7 @@ impl StorageGrantRequest {
             },
             shared_namespace: None,
             space_key: None,
+            history: None,
         }
     }
 
@@ -245,6 +255,16 @@ impl StorageGrantRequest {
     pub fn with_space_key(mut self, key: Option<dekopon_core::SpaceKey>) -> Self {
         self.space_key = key;
         self
+    }
+
+    #[must_use]
+    pub fn with_history(mut self, key: Option<HistoryKey>) -> Self {
+        self.history = key;
+        self
+    }
+
+    pub(crate) const fn history(&self) -> Option<&HistoryKey> {
+        self.history.as_ref()
     }
 
     pub(crate) fn scope_values(&self) -> Vec<String> {
@@ -467,6 +487,11 @@ impl StorageHost {
             "storage.namespace.capacity"
         );
         let ledger = QuotaLedger::new(limits.clone(), usage);
+        for (namespace, key, usage) in
+            sweep::chat_namespaces(layout.namespaces(), limits.startup_max_entries)?
+        {
+            ledger.classify_chat(&namespace, key, usage);
+        }
         #[allow(
             clippy::map_err_ignore,
             reason = "the discarded value is the rejected raw-entropy Vec<u8> itself, whose only \
@@ -547,15 +572,16 @@ impl StorageHost {
             // between distinct namespaces.
             let _observation = self.inner.namespace_observation_lock.lock();
             let observed_namespaces = self
-                .inner
-                .layout
-                .namespaces()
-                .entries_bounded(self.inner.limits.startup_max_entries)?
+                .namespace_entries()?
                 .into_iter()
                 .collect::<BTreeSet<_>>();
+            let class = match request.history() {
+                Some(_) => NamespaceClass::ChatHistory,
+                None => NamespaceClass::Provider,
+            };
             self.inner
                 .ledger
-                .reserve_namespace(base.clone(), observed_namespaces)?
+                .reserve_namespace(base.clone(), observed_namespaces, class)?
         });
         // Rescanning here would race another namespace's commit, publishing a stale lower total
         // after that commit releases its reservation.
@@ -571,19 +597,17 @@ impl StorageHost {
             return Err(StorageHostError::QuotaExceeded);
         }
         let before_namespace = plan.before_usage();
-        let housekeeping_reservation = self
-            .inner
-            .ledger
-            .reserve_root(plan.reserved_bytes(), plan.reserved_entries())?;
+        let housekeeping_reservation = self.inner.ledger.reserve_root(
+            &base,
+            plan.reserved_bytes(),
+            plan.reserved_entries(),
+        )?;
         // This critical section must stay free of lease waits, or it would serialize an unrelated
         // namespace behind a blocked lease.
         let _observation = self.inner.namespace_observation_lock.lock();
-        self.inner.ledger.observe_namespaces(
-            self.inner
-                .layout
-                .namespaces()
-                .entries_bounded(self.inner.limits.startup_max_entries)?,
-        );
+        self.inner
+            .ledger
+            .observe_namespaces(self.namespace_entries()?);
         let namespace = match plan.apply(self.inner.layout.namespaces(), deadline) {
             Ok(namespace) => namespace,
             Err(error) => {
@@ -632,6 +656,11 @@ impl StorageHost {
                 return Err(error);
             }
         };
+        if let Some(key) = request.history() {
+            self.inner
+                .ledger
+                .classify_chat(&base, key.clone(), before_namespace);
+        }
         if let Err(error) = housekeeping_reservation.commit(before_namespace, after_namespace) {
             namespace_reservation
                 .take()
@@ -688,6 +717,16 @@ impl StorageHost {
     #[must_use]
     pub fn limits(&self) -> &StorageLimits {
         &self.inner.limits
+    }
+
+    fn namespace_entries(&self) -> Result<Vec<String>, StorageHostError> {
+        let mut entries = self
+            .inner
+            .layout
+            .namespaces()
+            .entries_bounded(self.inner.limits.startup_max_entries)?;
+        entries.retain(|name| !sweep::is_tombstone(name));
+        Ok(entries)
     }
 }
 

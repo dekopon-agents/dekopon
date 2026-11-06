@@ -1,13 +1,31 @@
 use std::{collections::BTreeMap, fs::TryLockError, time::SystemTime};
 
 use dekopon_capability::{StorageRetention, StorageScope};
-use dekopon_core::ProviderId;
+use dekopon_core::{ProviderId, history::HistoryKey};
 
 use crate::{
     StorageHost, StorageHostError,
-    layout::{Directory, EntryKind, scan_usage, usage_with_directory_entry},
-    namespace::{is_token, marker_time, read_identity},
+    layout::{Directory, EntryKind, Usage, scan_usage, usage_with_directory_entry},
+    namespace::{HISTORY_MARKER, is_token, marker_time, read_identity},
 };
+
+const TOMBSTONE_SUFFIX: &str = ".reclaiming";
+
+pub(crate) fn is_tombstone(name: &str) -> bool {
+    name.ends_with(TOMBSTONE_SUFFIX)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChatReclaim {
+    pub namespaces: u64,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatReclaimOutcome {
+    Reclaimed(ChatReclaim),
+    Busy,
+}
 
 pub type RetentionPolicies = BTreeMap<(ProviderId, StorageScope), StorageRetention>;
 
@@ -25,6 +43,9 @@ impl StorageHost {
         let mut summary = SweepSummary::default();
         let now = SystemTime::now();
         for token in namespaces.entries_bounded(self.inner.limits.startup_max_entries)? {
+            if is_tombstone(&token) {
+                continue;
+            }
             summary.examined += 1;
             match self.sweep_one(&token, policies, now) {
                 Ok(true) => summary.deleted += 1,
@@ -204,4 +225,116 @@ fn remove_entry(
         }
         _ => Err(parent.corrupt(name, "sweep-entry")),
     }
+}
+
+impl StorageHost {
+    #[must_use]
+    pub fn history_usage(&self) -> crate::HistoryUsage {
+        self.inner.ledger.history_usage()
+    }
+
+    // Every namespace linked to the key is leased before any is touched, so a busy member leaves
+    // the whole chat intact.
+    pub fn reclaim_chat(&self, key: &HistoryKey) -> Result<ChatReclaimOutcome, StorageHostError> {
+        let namespaces = self.inner.layout.namespaces();
+        let mutexes = self
+            .inner
+            .ledger
+            .chat_namespaces(key)
+            .into_iter()
+            .map(|token| {
+                let mutex = crate::namespace_lock(&self.inner.namespace_locks, &token);
+                (token, mutex)
+            })
+            .collect::<Vec<_>>();
+        let mut held = Vec::new();
+        for (token, mutex) in &mutexes {
+            let Some(guard) = mutex.try_lock() else {
+                return Ok(ChatReclaimOutcome::Busy);
+            };
+            if !namespaces.exists(token)? {
+                held.push((token, guard, None));
+                continue;
+            }
+            let base = namespaces.open_directory(token)?;
+            let lease = base.open_private("base.lock", false)?;
+            match lease.try_lock() {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => return Ok(ChatReclaimOutcome::Busy),
+                Err(TryLockError::Error(source)) => return Err(base.io_error(source)),
+            }
+            if !namespaces.retains_child(token, &base)? {
+                return Ok(ChatReclaimOutcome::Busy);
+            }
+            held.push((token, guard, Some((base, lease))));
+        }
+        let mut reclaimed = ChatReclaim::default();
+        for (token, _guard, leased) in held {
+            let Some((base, _lease)) = leased else {
+                self.inner
+                    .ledger
+                    .account_sweep(token, Usage::default(), Usage::default(), true)?;
+                continue;
+            };
+            let before = usage_with_directory_entry(scan_usage(
+                &base,
+                self.inner.limits.startup_max_entries,
+            )?)?;
+            let tombstone = format!("{token}{TOMBSTONE_SUFFIX}");
+            {
+                let _observation = self.inner.namespace_observation_lock.lock();
+                namespaces.rename_to(token, namespaces, &tombstone)?;
+                namespaces.sync()?;
+            }
+            remove_tree(
+                namespaces,
+                &tombstone,
+                self.inner.limits.startup_max_entries,
+            )?;
+            self.inner
+                .ledger
+                .account_sweep(token, before, Usage::default(), true)?;
+            reclaimed.namespaces += 1;
+            reclaimed.bytes = reclaimed.bytes.saturating_add(before.bytes);
+        }
+        if reclaimed.namespaces > 0 {
+            tracing::info!(
+                event = "storage_history_reclaimed",
+                storage.namespaces = reclaimed.namespaces,
+                bytes = reclaimed.bytes,
+                "storage.history.reclaimed"
+            );
+        }
+        Ok(ChatReclaimOutcome::Reclaimed(reclaimed))
+    }
+}
+
+fn remove_tree(parent: &Directory, name: &str, maximum: u64) -> Result<(), StorageHostError> {
+    let mut remaining = maximum;
+    remove_entry(parent, name, &mut remaining)?;
+    parent.sync()
+}
+
+pub(crate) fn chat_namespaces(
+    namespaces: &Directory,
+    maximum: u64,
+) -> Result<Vec<(String, HistoryKey, Usage)>, StorageHostError> {
+    let mut found = Vec::new();
+    for token in namespaces.entries_bounded(maximum)? {
+        if !is_token(&token) {
+            continue;
+        }
+        let base = namespaces.open_directory(&token)?;
+        if !base.exists(HISTORY_MARKER)? {
+            continue;
+        }
+        let bytes = base.read_bounded(HISTORY_MARKER, 4_096)?;
+        let key = String::from_utf8(bytes)
+            .ok()
+            .and_then(|value| HistoryKey::new(value).ok())
+            .ok_or_else(|| base.corrupt(HISTORY_MARKER, "history-marker"))?;
+        let usage = usage_with_directory_entry(scan_usage(&base, maximum)?)?;
+        found.push((token, key, usage));
+    }
+    Ok(found)
 }

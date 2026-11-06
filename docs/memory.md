@@ -2,9 +2,7 @@
 
 An agent remembers a conversation by replaying its transcript into the next prompt. Summaries are
 written before they are needed, and the replayed history changes as rarely as possible, so the
-provider's prompt cache keeps matching. The keys are in
-[`config/memory.rs`](../crates/dekopon-gatewayd/src/config/memory.rs) and the route's `memory:`
-block in [`config.rs`](../crates/dekopon-gatewayd/src/config.rs).
+provider's prompt cache keeps matching.
 
 ## The journal and its summaries
 
@@ -48,26 +46,24 @@ lets the model provider link a conversation's turns.
 
 ## Reading back and pinning
 
-`read_memory_record` returns any rung of a retained record, the original included, in bounded byte
-ranges. `set_memory_pin` fixes the rung a record or attachment replays at; `clear_memory_pin`
-removes it. A pin survives restarts but forces nothing: a repack can still step a pinned record
-down. Reads are refused once a record has expired or its grant changed.
+The model can read any rung of a retained record and pin the rung a record or attachment replays
+at. A pin survives restarts but forces nothing: a repack can still step a pinned record down. Reads
+are refused once a record has expired or its grant changed.
 
 ## The decider
 
 `selection: {decider: …}` adds a second opinion to the ladder. At most once per turn, the gateway
-asks a broker capability where the oldest undecided older record should start. It sees metadata only
-(whether bash ran, outcome, exit status, age, size, pin), never text, and may choose only that
+asks a broker capability where the oldest undecided older record should start. It sees metadata only,
+never text, and may choose only that
 record's summaries or metadata. The broker authorizes the call like any other. The choice applies at
 the next repack; a refusal or invalid answer leaves the ladder in charge.
 
 ## Attachment summaries
 
-`summaries.attachments` turns on images, documents or both: the gateway describes
-each attached file it still holds, after the reply, through the summary model, and downloads nothing
+With attachment summaries on, the gateway describes each attached file it still holds, after the reply, through the summary model, and downloads nothing
 for it. The attachment then replays as its description. Pinned to `native`, an image or binary
 document replays as the file itself when the replying model accepts it; text documents have no
-native rung and open with `fetch_chat_asset`.
+native rung.
 
 The file reaches the summary model without the replying model asking. The description is untrusted
 text that replays to everyone the history replays to, never carries the file's name or platform
@@ -82,11 +78,10 @@ cross-agent or cross-conversation memory.
 
 ## Durable memory
 
-For memory that outlives retention, the broker can host a storage provider on the three
-chat-memory routes. When Cedar grants all three to the sender, the gateway records each turn after
+The broker can host a storage provider on the three chat-memory routes. When Cedar grants all three to the sender, the gateway records each turn after
 the chat service accepted the answer, and the model may retrieve but never record turns. Stored
-turns never enter a prompt on their own. Recording does not deduplicate, and there is no deletion,
-export or encryption at rest.
+turns never enter a prompt on their own. Recording does not deduplicate, and there is no export or
+encryption at rest.
 
 `continuityPolicy: paranoid` starts a new durable-memory generation when the sender's effective
 authority changes, even between turns whose GitHub facts or trigger a policy reads, though message
@@ -96,6 +91,12 @@ and probe turns share one; `relaxed` never does.
 |---|---|
 | capabilities, providers, storage access, HTTP authority, CA bytes | limits, timeouts, artifact digests, binding names, map revision |
 | applicable request policy, secret references, sinks | inapplicable policy, labels |
+
+## Retention
+
+One byte budget spans journals and broker chat memory. A chat idle for the window, counting
+wakes but not reads, expires whole. Over budget, the least-recently-active chat leaves both stores,
+skipping chats in use, or the write is refused. Deletion is permanent.
 
 ## Memory never grants authority
 

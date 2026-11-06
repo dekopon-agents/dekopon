@@ -34,6 +34,9 @@ use crate::{
 const EXTENSION: &str = "jsonl";
 const SEAL_EXTENSION: &str = "sealed";
 const FOLLOW_EXTENSION: &str = "followed";
+const ACTIVITY_EXTENSION: &str = "activity";
+const RECLAIM_EXTENSION: &str = "reclaim";
+const MAX_SIDECAR_BYTES: u64 = 512;
 const MAX_FOLLOW_BYTES: u64 = 4096;
 const MAX_SEAL_BYTES: u64 = 4096;
 const WHATSAPP_MEDIA_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -217,6 +220,14 @@ impl Entry<'_> {
         }
         Ok((record, arrived))
     }
+}
+
+// The highest record id gives the longest header, so the measure bounds the appended bytes.
+pub(crate) fn measure(entry: &Entry<'_>) -> Result<u64, JournalError> {
+    let (record, arrived) = entry.record(RecordId(NonZeroU64::MAX))?;
+    let mut size = records::Counted(0);
+    records::encode_record(&mut size, &record, arrived)?;
+    Ok(size.0.saturating_add(MAX_SIDECAR_BYTES))
 }
 
 // Writers hold `lock`; readers open their own descriptor and never take it, because every rewrite
@@ -704,6 +715,7 @@ impl Journal {
             File::open(parent)?.sync_all()?;
         }
         File::open(&self.dir)?.sync_all()?;
+        self.write_activity(stem, millis(entry.at))?;
         tracing::info!(
             event = "gateway_memory_published",
             memory.record.id = record.id.0.get(),
@@ -715,6 +727,156 @@ impl Journal {
             "gateway.memory.published"
         );
         Ok(Some(header))
+    }
+
+    fn sidecar(&self, stem: &str, extension: &str) -> PathBuf {
+        self.dir.join(format!("{stem}.{extension}"))
+    }
+
+    pub(crate) fn note_activity(&self, stem: &str, at: SystemTime) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        self.write_activity(stem, millis(at))
+    }
+
+    // The clock only moves forward, and only a committed history write moves it: record eviction,
+    // summary slots, pins and reads never call this.
+    fn write_activity(&self, stem: &str, at_ms: u64) -> Result<(), JournalError> {
+        let path = self.sidecar(stem, ACTIVITY_EXTENSION);
+        let committed_ms = match read_sidecar::<Activity>(&path) {
+            Ok(Some(activity)) => activity.committed_ms.max(at_ms),
+            Ok(None) | Err(JournalError::Corrupt) => at_ms,
+            Err(error) => return Err(error),
+        };
+        let bytes = serde_json::to_vec(&Activity { committed_ms })
+            .map_err(|_unencodable| JournalError::Corrupt)?;
+        write_sidecar(&path, &bytes)
+    }
+
+    pub(crate) fn history_chats(&self) -> Result<Vec<HistoryChat>, JournalError> {
+        let mut chats = Vec::new();
+        for (stem, path) in self.sidecars(ACTIVITY_EXTENSION)? {
+            match read_sidecar::<Activity>(&path) {
+                Ok(Some(activity)) => chats.push(HistoryChat {
+                    stem,
+                    activity_ms: activity.committed_ms,
+                }),
+                Ok(None) => {}
+                Err(JournalError::Corrupt) => tracing::warn!(
+                    event = "gateway_history_activity_unreadable",
+                    "gateway.history.activity.unreadable"
+                ),
+                Err(error) => return Err(error),
+            }
+        }
+        chats.sort_by(|left, right| {
+            (left.activity_ms, &left.stem).cmp(&(right.activity_ms, &right.stem))
+        });
+        Ok(chats)
+    }
+
+    pub(crate) fn history_bytes(&self) -> Result<u64, JournalError> {
+        let mut bytes = 0_u64;
+        for entry in fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if !is_agent_directory(&path) {
+                continue;
+            }
+            for file in fs::read_dir(path)? {
+                let file = file?;
+                let path = file.path();
+                if is_journal_file(&path) || is_sidecar(&path, ACTIVITY_EXTENSION) {
+                    bytes = bytes.saturating_add(file.metadata()?.len());
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
+    // A transcript written before chat clocks existed takes its newest record's time, so existing
+    // history enters the policy rather than escaping it.
+    pub(crate) fn adopt_history(&self) -> Result<usize, JournalError> {
+        let _lock = self.lock.lock();
+        let mut adopted = 0;
+        for entry in fs::read_dir(&self.dir)? {
+            let directory = entry?.path();
+            if !is_agent_directory(&directory) {
+                continue;
+            }
+            let Some(agent) = directory.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let agent = agent.to_owned();
+            for file in fs::read_dir(&directory)? {
+                let path = file?.path();
+                if !is_journal_file(&path) || path.with_extension(ACTIVITY_EXTENSION).exists() {
+                    continue;
+                }
+                let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let newest = match records::scan_path(&path) {
+                    Ok(snapshot) => snapshot.records.last().map(|head| head.header.at_ms),
+                    Err(JournalError::Corrupt) => None,
+                    Err(error) => return Err(error),
+                };
+                let at_ms = match newest {
+                    Some(at_ms) => at_ms,
+                    None => millis(fs::metadata(&path)?.modified()?),
+                };
+                self.write_activity(&format!("{agent}/{name}"), at_ms)?;
+                adopted += 1;
+            }
+        }
+        Ok(adopted)
+    }
+
+    pub(crate) fn write_reclaim_intent(&self, stem: &str) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        write_sidecar(&self.sidecar(stem, RECLAIM_EXTENSION), stem.as_bytes())
+    }
+
+    pub(crate) fn reclaim_intents(&self) -> Result<Vec<String>, JournalError> {
+        Ok(self
+            .sidecars(RECLAIM_EXTENSION)?
+            .into_iter()
+            .map(|(stem, _)| stem)
+            .collect())
+    }
+
+    // Seals and follow markers keep their own lifecycle; only the transcript and its clock go.
+    pub(crate) fn remove_history(&self, stem: &str) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        let _assets = AssetSync(self);
+        unlink_synced(&self.path(stem))?;
+        unlink_synced(&self.sidecar(stem, ACTIVITY_EXTENSION))
+    }
+
+    pub(crate) fn finish_reclaim_intent(&self, stem: &str) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        unlink_synced(&self.sidecar(stem, RECLAIM_EXTENSION))
+    }
+
+    fn sidecars(&self, extension: &str) -> Result<Vec<(String, PathBuf)>, JournalError> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let directory = entry?.path();
+            if !is_agent_directory(&directory) {
+                continue;
+            }
+            let Some(agent) = directory.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let agent = agent.to_owned();
+            for file in fs::read_dir(&directory)? {
+                let path = file?.path();
+                if is_sidecar(&path, extension)
+                    && let Some(name) = path.file_stem().and_then(|name| name.to_str())
+                {
+                    found.push((format!("{agent}/{name}"), path.clone()));
+                }
+            }
+        }
+        Ok(found)
     }
 
     pub(crate) fn maintain(&self, stem: &str, now: SystemTime, next_asset_id: u64) {
@@ -1024,6 +1186,79 @@ fn is_journal_file(path: &Path) -> bool {
             .is_some_and(|stem| {
                 stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryChat {
+    pub stem: String,
+    pub activity_ms: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Activity {
+    committed_ms: u64,
+}
+
+fn is_sidecar(path: &Path, extension: &str) -> bool {
+    path.extension().is_some_and(|found| found == extension)
+        && path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|stem| {
+                stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+}
+
+fn read_sidecar<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, JournalError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_SIDECAR_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SIDECAR_BYTES {
+        return Err(JournalError::Corrupt);
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_invalid| JournalError::Corrupt)
+}
+
+// Temporary file, fsync, rename, then the directory: a crash leaves the old or the new sidecar.
+fn write_sidecar(path: &Path, bytes: &[u8]) -> Result<(), JournalError> {
+    let parent = path.parent().ok_or(JournalError::Io {
+        kind: io::ErrorKind::InvalidInput,
+    })?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
+    let temporary = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn unlink_synced(path: &Path) -> Result<(), JournalError> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn read_follow_marker(path: &Path) -> io::Result<Option<FollowMarker>> {

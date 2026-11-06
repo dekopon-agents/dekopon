@@ -512,13 +512,7 @@ where
             return Err(ConnectionError::InvalidRequest);
         }
     };
-    let generation_request = matches!(
-        request.request,
-        BrokerRequest::PrepareGeneration { .. }
-            | BrokerRequest::CommitGeneration { .. }
-            | BrokerRequest::AbortGeneration { .. }
-            | BrokerRequest::ObserveGeneration
-    );
+    let generation_request = request.request.is_reconciliation_only();
     if generation_request != (request.api_version == ProtocolVersion::V1Alpha3) {
         return refuse_invalid_claim(&mut stream, limits).await;
     }
@@ -857,6 +851,73 @@ where
                 response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
             }
         }
+        BrokerRequest::HistoryUsage => {
+            let usage = broker.history_store().map_or(
+                dekopon_broker_protocol::HistoryUsage {
+                    chat_used: 0,
+                    chat_reserved: 0,
+                    root_free_bytes: u64::MAX,
+                    root_free_entries: u64::MAX,
+                },
+                |host| {
+                    let usage = host.history_usage();
+                    dekopon_broker_protocol::HistoryUsage {
+                        chat_used: usage.chat_used,
+                        chat_reserved: usage.chat_reserved,
+                        root_free_bytes: usage.root_free_bytes,
+                        root_free_entries: usage.root_free_entries,
+                    }
+                },
+            );
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::History { usage },
+            }
+        }
+        BrokerRequest::ReclaimChat { history } => {
+            let outcome = match broker.history_store() {
+                None => Ok(dekopon_storage_host::ChatReclaimOutcome::Reclaimed(
+                    dekopon_storage_host::ChatReclaim::default(),
+                )),
+                Some(host) => tokio::task::spawn_blocking(move || host.reclaim_chat(&history))
+                    .await
+                    .unwrap_or(Err(dekopon_storage_host::StorageHostError::Io)),
+            };
+            let outcome = match outcome {
+                Ok(dekopon_storage_host::ChatReclaimOutcome::Reclaimed(reclaimed)) => {
+                    dekopon_broker_protocol::ChatReclaim::Reclaimed {
+                        namespaces: reclaimed.namespaces,
+                        bytes: reclaimed.bytes,
+                    }
+                }
+                Ok(dekopon_storage_host::ChatReclaimOutcome::Busy) => {
+                    dekopon_broker_protocol::ChatReclaim::Busy
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "broker_history_reclaim_failed",
+                        storage.check = %error.class(),
+                        error = %dekopon_core::error_chain(&error),
+                        "broker.history.reclaim.failed"
+                    );
+                    return stream
+                        .write_frame(
+                            &ResponseEnvelope::error(
+                                dekopon_broker_protocol::ERROR_STORAGE_IO,
+                                "chat history could not be reclaimed",
+                            ),
+                            &[],
+                            limits,
+                        )
+                        .await
+                        .map_err(ConnectionError::Write);
+                }
+            };
+            ResponseEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                response: dekopon_broker_protocol::BrokerResponse::ChatReclaimed { outcome },
+            }
+        }
         BrokerRequest::UpcallResult { .. } => {
             tracing::warn!(
                 event = "broker_request_frame_invalid",
@@ -1014,7 +1075,9 @@ impl Upcaller<'_> {
             | BrokerRequest::PrepareGeneration { .. }
             | BrokerRequest::CommitGeneration { .. }
             | BrokerRequest::AbortGeneration { .. }
-            | BrokerRequest::ObserveGeneration => Err(UpcallError::UnexpectedRequest),
+            | BrokerRequest::ObserveGeneration
+            | BrokerRequest::HistoryUsage
+            | BrokerRequest::ReclaimChat { .. } => Err(UpcallError::UnexpectedRequest),
         }
     }
 }
@@ -1211,7 +1274,9 @@ impl ReceivedRequest {
             | BrokerRequest::PrepareGeneration { .. }
             | BrokerRequest::CommitGeneration { .. }
             | BrokerRequest::AbortGeneration { .. }
-            | BrokerRequest::ObserveGeneration => {
+            | BrokerRequest::ObserveGeneration
+            | BrokerRequest::HistoryUsage
+            | BrokerRequest::ReclaimChat { .. } => {
                 if !descriptors.is_empty() {
                     return Err(ProtocolError::UnexpectedDescriptors);
                 }
@@ -1513,6 +1578,66 @@ mod generation_tests {
                 Some(crate::current_uid().to_string().as_str())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn only_the_reconciliation_owner_can_read_or_reclaim_chat_history() {
+        let fixture = ManagedBroker::gateway();
+        fixture.publish_lock('1');
+        let (active, report) =
+            crate::tests::candidate_or_refusal(&fixture.config(), Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let coordination = Coordination::new(fixture.config(), active.unwrap());
+        let owner = coordination.active().ready.identities[&crate::current_uid()].clone();
+        let strangers = [
+            peer("caller", None),
+            peer(
+                "dekopon-console",
+                Some(AttestorGrant {
+                    namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
+                }),
+            ),
+        ];
+        let history = || BrokerRequest::ReclaimChat {
+            history: dekopon_core::history::HistoryKey::new("assistant/c0123abc".to_owned())
+                .unwrap(),
+        };
+        for stranger in &strangers {
+            unauthenticated(
+                exchange(
+                    &coordination,
+                    stranger.clone(),
+                    owner.clone(),
+                    BrokerRequest::HistoryUsage,
+                )
+                .await,
+            );
+            unauthenticated(
+                exchange(&coordination, stranger.clone(), owner.clone(), history()).await,
+            );
+        }
+        assert!(matches!(
+            exchange(
+                &coordination,
+                owner.clone(),
+                strangers[0].clone(),
+                BrokerRequest::HistoryUsage
+            )
+            .await,
+            BrokerResponse::History { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &coordination,
+                owner.clone(),
+                strangers[0].clone(),
+                history()
+            )
+            .await,
+            BrokerResponse::ChatReclaimed {
+                outcome: dekopon_broker_protocol::ChatReclaim::Reclaimed { namespaces: 0, .. }
+            }
+        ));
     }
 
     #[tokio::test]

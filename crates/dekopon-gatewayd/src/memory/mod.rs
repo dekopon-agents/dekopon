@@ -4,3 +4,4 @@ pub(crate) mod generation;
 pub(crate) mod journal;
 pub(crate) mod project;
 pub(crate) mod record;
+pub(crate) mod retention;

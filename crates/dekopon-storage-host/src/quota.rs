@@ -1,7 +1,9 @@
 use parking_lot::Mutex;
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::{StorageHostError, StorageLimits, layout::Usage};
+use dekopon_core::history::HistoryKey;
+
+use crate::{HistoryUsage, StorageHostError, StorageLimits, layout::Usage};
 
 #[derive(Debug)]
 pub(crate) struct QuotaLedger {
@@ -22,6 +24,28 @@ struct LedgerState {
     namespace_reserved: BTreeMap<String, u64>,
     open_handles: u64,
     active_invocations: u64,
+    chat: BTreeMap<String, HistoryKey>,
+    chat_used: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NamespaceClass {
+    Provider,
+    ChatHistory,
+}
+
+fn base_of(namespace: &str) -> &str {
+    namespace
+        .split_once('/')
+        .map_or(namespace, |(base, _)| base)
+}
+
+impl LedgerState {
+    fn charge_chat(&mut self, namespace: &str, grown: u64, shrunk: u64) {
+        if self.chat.contains_key(base_of(namespace)) {
+            self.chat_used = self.chat_used.saturating_add(grown).saturating_sub(shrunk);
+        }
+    }
 }
 
 impl QuotaLedger {
@@ -38,6 +62,7 @@ impl QuotaLedger {
 
     pub(crate) fn reserve_root(
         self: &Arc<Self>,
+        namespace: &str,
         bytes: u64,
         entries: u64,
     ) -> Result<RootReservation, StorageHostError> {
@@ -67,6 +92,7 @@ impl QuotaLedger {
             .ok_or(StorageHostError::Arithmetic)?;
         Ok(RootReservation {
             ledger: Arc::clone(self),
+            namespace: namespace.to_owned(),
             bytes,
             entries,
             finalized: false,
@@ -82,12 +108,18 @@ impl QuotaLedger {
         self: &Arc<Self>,
         namespace: String,
         observed: std::collections::BTreeSet<String>,
+        class: NamespaceClass,
     ) -> Result<NamespaceReservation, StorageHostError> {
         let mut state = self.state.lock();
         // Observations can race another namespace's creation; unioning stays conservative, while
         // replacing the set with a stale snapshot could admit the root above maxNamespaces.
         state.namespace_slots.extend(observed);
-        if state.namespace_slots.contains(&namespace)
+        let counted = match class {
+            NamespaceClass::Provider => true,
+            NamespaceClass::ChatHistory => false,
+        };
+        if !counted
+            || state.namespace_slots.contains(&namespace)
             || state.pending_namespace_slots.contains(&namespace)
         {
             return Ok(NamespaceReservation {
@@ -100,6 +132,7 @@ impl QuotaLedger {
         let count = state
             .namespace_slots
             .union(&state.pending_namespace_slots)
+            .filter(|slot| !state.chat.contains_key(slot.as_str()))
             .count() as u64;
         if count >= self.limits.max_namespaces {
             drop(state);
@@ -172,6 +205,10 @@ impl QuotaLedger {
             .root_entries
             .checked_sub(entries)
             .ok_or(StorageHostError::Arithmetic)?;
+        state.charge_chat(namespace, 0, bytes);
+        if removed {
+            state.chat.remove(namespace);
+        }
         let generation_prefix = format!("{namespace}/");
         state
             .namespace_used
@@ -200,6 +237,49 @@ impl QuotaLedger {
     pub(crate) fn release_handle(&self) {
         let mut state = self.state.lock();
         state.open_handles = state.open_handles.saturating_sub(1);
+    }
+
+    // `usage` is the namespace's retained usage at classification; later growth is charged by the
+    // same hooks that charge the root.
+    pub(crate) fn classify_chat(&self, namespace: &str, key: HistoryKey, usage: Usage) {
+        let mut state = self.state.lock();
+        if state.chat.insert(namespace.to_owned(), key).is_none() {
+            state.chat_used = state.chat_used.saturating_add(usage.bytes);
+        }
+    }
+
+    pub(crate) fn chat_namespaces(&self, key: &HistoryKey) -> Vec<String> {
+        self.state
+            .lock()
+            .chat
+            .iter()
+            .filter(|(_, linked)| *linked == key)
+            .map(|(namespace, _)| namespace.clone())
+            .collect()
+    }
+
+    pub(crate) fn history_usage(&self) -> HistoryUsage {
+        let state = self.state.lock();
+        let chat_reserved = state
+            .namespace_reserved
+            .iter()
+            .filter(|(namespace, _)| state.chat.contains_key(base_of(namespace)))
+            .fold(0_u64, |total, (_, reserved)| {
+                total.saturating_add(*reserved)
+            });
+        HistoryUsage {
+            chat_used: state.chat_used,
+            chat_reserved,
+            root_free_bytes: self
+                .limits
+                .max_root_bytes
+                .saturating_sub(state.root_used.saturating_add(state.root_reserved)),
+            root_free_entries: self.limits.startup_max_entries.saturating_sub(
+                state
+                    .root_entries
+                    .saturating_add(state.root_entries_reserved),
+            ),
+        }
     }
 }
 
@@ -236,6 +316,7 @@ impl Drop for NamespaceReservation {
 #[derive(Debug)]
 pub(crate) struct RootReservation {
     ledger: Arc<QuotaLedger>,
+    namespace: String,
     bytes: u64,
     entries: u64,
     finalized: bool,
@@ -277,6 +358,11 @@ impl RootReservation {
         };
         state.root_used = root_used;
         state.root_entries = root_entries;
+        state.charge_chat(
+            &self.namespace,
+            byte_growth,
+            before.bytes.saturating_sub(after.bytes),
+        );
         release_root_locked(&mut state, self.bytes, self.entries);
         self.finalized = true;
         Ok(())
@@ -382,6 +468,12 @@ impl Reservation {
                 .root_entries
                 .saturating_sub(old_entries - final_usage.entries)
         };
+        let namespace = self.namespace.clone();
+        state.charge_chat(
+            &namespace,
+            final_usage.bytes.saturating_sub(old),
+            old.saturating_sub(final_usage.bytes),
+        );
         state
             .namespace_used
             .insert(self.namespace.clone(), final_usage.bytes);
@@ -483,7 +575,11 @@ mod tests {
             unlocked_at_event: Arc::clone(&unlocked_at_event),
         });
         let result = tracing::subscriber::with_default(subscriber, || {
-            ledger.reserve_namespace("new".to_owned(), BTreeSet::from(["existing".to_owned()]))
+            ledger.reserve_namespace(
+                "new".to_owned(),
+                BTreeSet::from(["existing".to_owned()]),
+                super::NamespaceClass::Provider,
+            )
         });
         assert!(matches!(result, Err(StorageHostError::QuotaExceeded)));
         assert!(unlocked_at_event.load(Ordering::SeqCst));

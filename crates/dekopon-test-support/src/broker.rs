@@ -178,7 +178,9 @@ pub fn next_broker_reply(
         | BrokerResponse::Invocation { .. }
         | BrokerResponse::Upcall { .. }
         | BrokerResponse::Error { .. }
-        | BrokerResponse::Generation { .. }) => {
+        | BrokerResponse::Generation { .. }
+        | BrokerResponse::History { .. }
+        | BrokerResponse::ChatReclaimed { .. }) => {
             return Some((
                 ResponseEnvelope {
                     api_version: response.api_version,

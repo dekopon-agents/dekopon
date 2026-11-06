@@ -1163,6 +1163,7 @@ fn reload_reason(problem: &GatewaydError) -> &'static str {
         | GatewaydError::TransportsLost
         | GatewaydError::AssetStore { .. }
         | GatewaydError::Journal { .. }
+        | GatewaydError::History { .. }
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
@@ -1222,6 +1223,7 @@ pub(crate) fn reload_problem(problem: &GatewaydError) -> String {
         | GatewaydError::TransportsLost
         | GatewaydError::AssetStore { .. }
         | GatewaydError::Journal { .. }
+        | GatewaydError::History { .. }
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
@@ -1249,6 +1251,7 @@ fn reload_entries(problem: &GatewaydError) -> Vec<(&'static str, String)> {
         | GatewaydError::TransportsLost
         | GatewaydError::AssetStore { .. }
         | GatewaydError::Journal { .. }
+        | GatewaydError::History { .. }
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)

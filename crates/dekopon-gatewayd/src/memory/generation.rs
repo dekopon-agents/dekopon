@@ -37,6 +37,7 @@ pub(crate) struct Deferred {
     pub pins: Vec<PinLine>,
     pub choice: Option<ChoiceLine>,
     pub record: Option<PostReply>,
+    pub history: Option<crate::memory::retention::HistoryUse>,
 }
 
 pub(crate) fn plan(route: &BoundRoute) -> Option<SummaryPlan> {
@@ -99,6 +100,15 @@ pub(crate) async fn drain(runner: &SessionRunner, deferred: Deferred) {
         .instrument(tracing::info_span!("memory.persist"))
         .await;
     runner.assets.finish_publications().await;
+    if let Some(history) = runner.history.as_ref()
+        && let Err(error) = history.expire(SystemTime::now()).await
+    {
+        tracing::warn!(
+            event = "gateway_history_expiry_failed",
+            category = error.category(),
+            "gateway.history.expiry.failed"
+        );
+    }
 }
 
 struct Persisted {
@@ -116,7 +126,9 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
         pins,
         choice,
         record,
+        history: _in_use,
     } = deferred;
+    let (record, _admission) = admit(runner, record).await;
     if record.is_none() {
         for pin in &pins {
             pin_dropped(pin.record, pin.subject, "turn-not-persisted");
@@ -252,4 +264,55 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
             );
         }
     }
+}
+
+// The admission is held across the append so no other history write lands between the check and
+// this one.
+async fn admit(
+    runner: &SessionRunner,
+    record: Option<PostReply>,
+) -> (
+    Option<PostReply>,
+    Option<crate::memory::retention::HistoryAdmission>,
+) {
+    let (history, reply) = match (runner.history.as_ref(), record) {
+        (Some(history), Some(reply)) => (history, reply),
+        (_, record) => return (record, None),
+    };
+    let admission = history.admit().await;
+    let store = Arc::clone(&runner.assets);
+    let measured = tokio::task::spawn_blocking(move || {
+        let grant = GrantDigest::of(&reply.granted);
+        let inventory = store.inventory(&reply.access);
+        let need = journal::measure(&journal::Entry {
+            at: SystemTime::now(),
+            grant: &grant,
+            captured: &reply.captured,
+            arrivals: &reply.arrivals,
+            attachments: reply.attachments,
+            keep: reply.keep,
+            plan: reply.plan.clone(),
+            inventory: &inventory,
+            next_asset_id: reply.access.next_asset_id(),
+        });
+        (reply, need)
+    })
+    .await;
+    let failure = match measured {
+        Ok((reply, Ok(need))) => {
+            let stem = reply.key.journal_stem();
+            match admission.ensure(&stem, need).await {
+                Ok(()) => return (Some(reply), Some(admission)),
+                Err(error) => error.category(),
+            }
+        }
+        Ok((_, Err(error))) => error.label(),
+        Err(_stopped) => "task",
+    };
+    tracing::warn!(
+        event = "gateway_journal_append_failed",
+        reason = failure,
+        "gateway.journal.append.failed"
+    );
+    (None, None)
 }

@@ -696,6 +696,8 @@ pub struct DeliveredTurnRequest {
     user: String,
     #[serde(deserialize_with = "deserialize_delivered_answer")]
     assistant: DeliveredAnswer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<dekopon_core::history::HistoryKey>,
 }
 
 impl fmt::Debug for DeliveredTurnRequest {
@@ -725,7 +727,14 @@ impl DeliveredTurnRequest {
             delivery,
             user,
             assistant,
+            history: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_history(mut self, history: dekopon_core::history::HistoryKey) -> Self {
+        self.history = Some(history);
+        self
     }
 
     #[must_use]
@@ -895,6 +904,10 @@ pub enum BrokerRequest {
         digest: String,
     },
     ObserveGeneration,
+    HistoryUsage,
+    ReclaimChat {
+        history: dekopon_core::history::HistoryKey,
+    },
 }
 
 impl BrokerRequest {
@@ -945,7 +958,26 @@ impl BrokerRequest {
             | Self::PrepareGeneration { .. }
             | Self::CommitGeneration { .. }
             | Self::AbortGeneration { .. }
-            | Self::ObserveGeneration => Ok(()),
+            | Self::ObserveGeneration
+            | Self::HistoryUsage
+            | Self::ReclaimChat { .. } => Ok(()),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_reconciliation_only(&self) -> bool {
+        match self {
+            Self::PrepareGeneration { .. }
+            | Self::CommitGeneration { .. }
+            | Self::AbortGeneration { .. }
+            | Self::ObserveGeneration
+            | Self::HistoryUsage
+            | Self::ReclaimChat { .. } => true,
+            Self::Capabilities { .. }
+            | Self::Run { .. }
+            | Self::Invoke { .. }
+            | Self::RecordDeliveredTurn { .. }
+            | Self::UpcallResult { .. } => false,
         }
     }
 }
@@ -1251,7 +1283,9 @@ impl ResponseEnvelope {
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. }
             | BrokerResponse::Error { .. }
-            | BrokerResponse::Generation { .. } => {}
+            | BrokerResponse::Generation { .. }
+            | BrokerResponse::History { .. }
+            | BrokerResponse::ChatReclaimed { .. } => {}
         }
         self
     }
@@ -1400,6 +1434,28 @@ pub enum BrokerResponse {
         digest: String,
         outcome: GenerationOutcome,
     },
+    History {
+        usage: HistoryUsage,
+    },
+    ChatReclaimed {
+        outcome: ChatReclaim,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HistoryUsage {
+    pub chat_used: u64,
+    pub chat_reserved: u64,
+    pub root_free_bytes: u64,
+    pub root_free_entries: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", deny_unknown_fields, rename_all = "camelCase")]
+pub enum ChatReclaim {
+    Reclaimed { namespaces: u64, bytes: u64 },
+    Busy,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1783,7 +1839,9 @@ impl BrokerClient {
             | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::Upcall { .. }
-            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Generation { .. }
+            | BrokerResponse::History { .. }
+            | BrokerResponse::ChatReclaimed { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1880,7 +1938,9 @@ impl BrokerClient {
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. }
-            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Generation { .. }
+            | BrokerResponse::History { .. }
+            | BrokerResponse::ChatReclaimed { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1972,7 +2032,9 @@ impl BrokerClient {
             | BrokerResponse::Ran { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. }
-            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Generation { .. }
+            | BrokerResponse::History { .. }
+            | BrokerResponse::ChatReclaimed { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1992,7 +2054,9 @@ impl BrokerClient {
             | BrokerResponse::Ran { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Upcall { .. }
-            | BrokerResponse::Generation { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Generation { .. }
+            | BrokerResponse::History { .. }
+            | BrokerResponse::ChatReclaimed { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -2015,7 +2079,9 @@ impl BrokerClient {
             | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::History { .. }
+            | BrokerResponse::ChatReclaimed { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -2046,7 +2112,9 @@ impl BrokerClient {
             | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::History { .. }
+            | BrokerResponse::ChatReclaimed { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -2060,7 +2128,9 @@ impl BrokerClient {
             | BrokerRequest::RecordDeliveredTurn { .. }
             | BrokerRequest::UpcallResult { .. }
             | BrokerRequest::PrepareGeneration { .. }
-            | BrokerRequest::ObserveGeneration => return Err(ClientError::UnexpectedResponse),
+            | BrokerRequest::ObserveGeneration
+            | BrokerRequest::HistoryUsage
+            | BrokerRequest::ReclaimChat { .. } => return Err(ClientError::UnexpectedResponse),
         };
         let expected = digest.clone();
         match self
@@ -2077,7 +2147,52 @@ impl BrokerClient {
             | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Upcall { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::History { .. }
+            | BrokerResponse::ChatReclaimed { .. } => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn history_usage(&self) -> Result<HistoryUsage, ClientError> {
+        match self
+            .exchange(RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                request: BrokerRequest::HistoryUsage,
+            })
+            .await?
+        {
+            BrokerResponse::History { usage } => Ok(usage),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Ran { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::Generation { .. }
+            | BrokerResponse::ChatReclaimed { .. } => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn reclaim_chat(
+        &self,
+        history: dekopon_core::history::HistoryKey,
+    ) -> Result<ChatReclaim, ClientError> {
+        match self
+            .exchange(RequestEnvelope {
+                api_version: ProtocolVersion::V1Alpha3,
+                request: BrokerRequest::ReclaimChat { history },
+            })
+            .await?
+        {
+            BrokerResponse::ChatReclaimed { outcome } => Ok(outcome),
+            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Capabilities { .. }
+            | BrokerResponse::Ran { .. }
+            | BrokerResponse::Invocation { .. }
+            | BrokerResponse::CommandRun { .. }
+            | BrokerResponse::Upcall { .. }
+            | BrokerResponse::Generation { .. }
+            | BrokerResponse::History { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 

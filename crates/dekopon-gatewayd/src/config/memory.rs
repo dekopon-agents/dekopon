@@ -28,6 +28,10 @@ pub struct Retention {
     pub max_age_ms: NonZeroU64,
     #[serde(default = "default_agent_bytes")]
     pub max_bytes_per_agent: NonZeroU64,
+    #[serde(default = "default_history_bytes")]
+    pub max_history_bytes: NonZeroU64,
+    #[serde(default = "default_chat_idle")]
+    pub max_chat_idle_ms: NonZeroU64,
 }
 
 impl Default for Retention {
@@ -35,8 +39,17 @@ impl Default for Retention {
         Self {
             max_age_ms: default_age(),
             max_bytes_per_agent: default_agent_bytes(),
+            max_history_bytes: default_history_bytes(),
+            max_chat_idle_ms: default_chat_idle(),
         }
     }
+}
+
+fn default_history_bytes() -> NonZeroU64 {
+    NonZeroU64::new(20_000_000_000).expect("positive history budget")
+}
+fn default_chat_idle() -> NonZeroU64 {
+    NonZeroU64::new(90 * 24 * 60 * 60 * 1000).expect("positive chat idle window")
 }
 
 fn default_age() -> NonZeroU64 {

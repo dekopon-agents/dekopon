@@ -4953,6 +4953,7 @@ fn runner_tracking(
         reply_on_busy: true,
         conversations: ConversationStore::new(max_conversations),
         journal: None,
+        history: None,
         summaries: None,
         follow: None,
         assets: Arc::new(AssetStore::new(
@@ -17477,6 +17478,8 @@ mod github_burst;
 mod github_http_invocation;
 #[path = "tests/github_invocation.rs"]
 mod github_invocation;
+#[path = "tests/history.rs"]
+mod history;
 #[path = "tests/jobs_burn_in.rs"]
 mod jobs_burn_in;
 #[path = "tests/jobs_e2e.rs"]
@@ -17522,6 +17525,7 @@ fn journaled_runner(
         gate: SessionGate::new(4),
         reply_on_busy: true,
         conversations: ConversationStore::new(1024),
+        history: None,
         journal: Some(Arc::new(
             crate::journal::Journal::open(
                 journal,

@@ -28,7 +28,7 @@ use dekopon_broker_protocol::{
     ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED,
     InvocationOutcome, InvocationResult, SessionRefusal,
 };
-use dekopon_core::{AttestedSubject, PrincipalId, Subject};
+use dekopon_core::{AttestedSubject, PrincipalId, Subject, history::HistoryKey};
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
     blocking::BlockingModel,
@@ -1283,6 +1283,9 @@ impl CancelOutcome {
 
 pub(crate) struct PendingNotice(StopCause);
 
+// Storage framing a delivered turn adds beyond its text: record envelope, index line, entry charge.
+const DELIVERED_TURN_OVERHEAD: u64 = 8 * 1024;
+
 pub(crate) struct SessionRunner {
     pub broker: ResolvedBroker,
     pub models: Arc<ModelCache>,
@@ -1292,6 +1295,7 @@ pub(crate) struct SessionRunner {
     pub pending_notices: Mutex<HashMap<ConversationKey, PendingNotice>>,
     pub sealed_conversations: Mutex<HashMap<ConversationKey, SealedConversation>>,
     pub journal: Option<Arc<Journal>>,
+    pub history: Option<Arc<crate::memory::retention::HistoryRetention>>,
     pub summaries: Option<crate::memory::engine::Sender>,
     pub follow: Option<Arc<crate::follow::FollowTable>>,
     pub assets: Arc<AssetStore>,
@@ -2616,6 +2620,10 @@ async fn session_turn(
         MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Job { .. } => None,
     };
     let mut deferred = Deferred::default();
+    // Held from before the first history read through deferred persistence.
+    if let Some(history) = runner.history.as_ref() {
+        deferred.history = Some(history.begin_use(&key.journal_stem()).await);
+    }
     let mut recalled_journal = None;
     let (mut seeded, cache_key, conversation_lease, asset_access, delta) = match window {
         Some(window) => {
@@ -3749,9 +3757,12 @@ async fn session_turn(
             record_delivered_turn(
                 runner,
                 message,
+                &key.journal_stem(),
                 claim,
-                steers.user_text(&message.text),
-                DeliveredAnswer::accepted_by_transport(answer),
+                DeliveredText {
+                    user: steers.user_text(&message.text),
+                    assistant: DeliveredAnswer::accepted_by_transport(answer),
+                },
                 &identifiers,
             )
             .await;
@@ -4087,12 +4098,17 @@ fn chat_claim_for(
     Ok(claim)
 }
 
+struct DeliveredText {
+    user: String,
+    assistant: DeliveredAnswer,
+}
+
 async fn record_delivered_turn(
     runner: &SessionRunner,
     message: &InboundMessage,
+    stem: &str,
     claim: Attestation,
-    user: String,
-    assistant: DeliveredAnswer,
+    DeliveredText { user, assistant }: DeliveredText,
     identifiers: &IdSequence,
 ) {
     let MessageId::Native(message_id) = &message.message_id else {
@@ -4112,26 +4128,44 @@ async fn record_delivered_turn(
         return;
     };
     let result: Result<(), MemoryRecordFailure> = async {
+        let mut turn = DeliveredTurnRequest::new(
+            identifiers.next_invocation(),
+            identifiers.trace_parent(),
+            delivery,
+            user,
+            assistant,
+        );
+        let admission = match runner.history.as_ref() {
+            Some(history) => {
+                let admission = history.admit().await;
+                let need = (turn.user().len() + turn.assistant().as_str().len()) as u64
+                    + DELIVERED_TURN_OVERHEAD;
+                admission
+                    .ensure(stem, need)
+                    .await
+                    .map_err(|error| MemoryRecordFailure::Outcome(error.category()))?;
+                let key = HistoryKey::new(stem.to_owned())
+                    .map_err(|_invalid| MemoryRecordFailure::Outcome("history-key"))?;
+                turn = turn.with_history(key);
+                Some((history, admission))
+            }
+            None => None,
+        };
         let client = runner
             .broker
             .leg_client()
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
         let result = client
-            .record_delivered_turn(
-                claim,
-                DeliveredTurnRequest::new(
-                    identifiers.next_invocation(),
-                    identifiers.trace_parent(),
-                    delivery,
-                    user,
-                    assistant,
-                ),
-            )
+            .record_delivered_turn(claim, turn)
             .await
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
         memory_record_outcome_category(&result).map_or(Ok(()), |category| {
             Err(MemoryRecordFailure::Outcome(category))
-        })
+        })?;
+        if let Some((history, _admission)) = admission {
+            history.note_activity(stem, SystemTime::now()).await;
+        }
+        Ok(())
     }
     .await;
     if let Err(error) = result {

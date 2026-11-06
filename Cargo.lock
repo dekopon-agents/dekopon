@@ -1152,6 +1152,7 @@ dependencies = [
  "dekopon-agent",
  "dekopon-broker-protocol",
  "dekopon-brokerd",
+ "dekopon-capability",
  "dekopon-config",
  "dekopon-core",
  "dekopon-model",

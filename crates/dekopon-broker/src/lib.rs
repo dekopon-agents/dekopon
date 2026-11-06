@@ -1940,6 +1940,11 @@ where
     }
 
     #[must_use]
+    pub fn history_store(&self) -> Option<dekopon_storage_host::StorageHost> {
+        self.registry.storage_host()
+    }
+
+    #[must_use]
     pub fn storage_retention_policies(&self) -> RetentionPolicies {
         self.constraints
             .retention_policies()
@@ -2779,11 +2784,14 @@ where
                 },
                 |(capability, _)| capability.clone(),
             );
-        let input = serde_json::json!({
+        let mut input = serde_json::json!({
             "delivery": turn.delivery,
             "user": turn.user(),
             "assistant": turn.assistant(),
         });
+        if let Some(history) = &turn.history {
+            input["history"] = serde_json::json!(history);
+        }
         let request = InvocationRequest {
             id: turn.id,
             capability,
@@ -3301,7 +3309,14 @@ where
             Some(memory) => grant_request.with_memory_continuity(memory),
             None => grant_request,
         };
-        host.prepare_grant(grant_request)
+        // Only `record_delivered_turn` builds a record proposal, and only it sets `history`.
+        let history = (set.route == CapabilityRoute::ChatMemoryRecord)
+            .then(|| request.input.get("history").cloned())
+            .flatten()
+            .map(serde_json::from_value::<dekopon_core::history::HistoryKey>)
+            .transpose()
+            .map_err(|_invalid| BrokerError::InvalidMemoryInput)?;
+        host.prepare_grant(grant_request.with_history(history))
             .map(Some)
             .map_err(|source| BrokerError::Storage { source })
     }
@@ -3725,7 +3740,7 @@ where
             let object = request
                 .input
                 .as_object()
-                .filter(|object| object.len() == 3)
+                .filter(|object| object.len() == 3 + usize::from(object.contains_key("history")))
                 .ok_or(BrokerError::InvalidMemoryInput)?;
             #[allow(
                 clippy::map_err_ignore,

@@ -2382,7 +2382,9 @@ mod tests {
                     | BrokerRequest::PrepareGeneration { .. }
                     | BrokerRequest::CommitGeneration { .. }
                     | BrokerRequest::AbortGeneration { .. }
-                    | BrokerRequest::ObserveGeneration) => {
+                    | BrokerRequest::ObserveGeneration
+                    | BrokerRequest::HistoryUsage
+                    | BrokerRequest::ReclaimChat { .. }) => {
                         panic!("unexpected request {other:?}")
                     }
                 };

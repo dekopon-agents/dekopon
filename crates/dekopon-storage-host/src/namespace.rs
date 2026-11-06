@@ -23,6 +23,7 @@ use crate::{
 const POINTER_V1: &str = "dekopon.dev/storage-authority-pointer/v1alpha1";
 const POINTER_V2: &str = "dekopon.dev/storage-authority-pointer/v1alpha2";
 const IDENTITY_VERSION: &str = "dekopon.dev/storage-resource/v1alpha1";
+pub(crate) const HISTORY_MARKER: &str = "chat";
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -148,6 +149,7 @@ pub(crate) struct NamespacePlan {
     existing_base_lease: Option<File>,
     resource_identity: Vec<u8>,
     new_metadata: bool,
+    history_marker: Option<Vec<u8>>,
     before_usage: Usage,
     reserved_bytes: u64,
     reserved_entries: u64,
@@ -285,6 +287,27 @@ impl NamespacePlan {
         } else if let Some(length) = selection.removed_pointer_length {
             simulation.remove(length)?;
         }
+        let history_marker = match request.history() {
+            Some(key) => {
+                let wanted = key.as_str().as_bytes();
+                let current = match base {
+                    Some(base) => file_length(base, HISTORY_MARKER)?
+                        .map(|_| base.read_bounded(HISTORY_MARKER, 4_096))
+                        .transpose()?,
+                    None => None,
+                };
+                if current.as_deref() == Some(wanted) {
+                    None
+                } else {
+                    simulation.replace(
+                        current.as_ref().map(|bytes| bytes.len() as u64),
+                        wanted.len() as u64,
+                    )?;
+                    Some(wanted.to_vec())
+                }
+            }
+            None => None,
+        };
         Ok(Self {
             continuity: selection.continuity,
             base_token,
@@ -298,6 +321,7 @@ impl NamespacePlan {
             existing_base_lease,
             resource_identity,
             new_metadata,
+            history_marker,
             before_usage,
             reserved_bytes: simulation.peak_bytes,
             reserved_entries: simulation.peak_entries,
@@ -363,6 +387,9 @@ impl NamespacePlan {
                 .and_then(|()| file.sync_all())
                 .map_err(|source| base.io_error(source))?;
             base.sync()?;
+        }
+        if let Some(marker) = &self.history_marker {
+            base.replace_private(HISTORY_MARKER, marker)?;
         }
         touch_marker(&base, self.new_metadata)?;
         Ok(Namespace {

@@ -770,7 +770,9 @@ async fn wake_reason_returns_the_batch_the_claim_carries() {
             | BrokerRequest::PrepareGeneration { .. }
             | BrokerRequest::CommitGeneration { .. }
             | BrokerRequest::AbortGeneration { .. }
-            | BrokerRequest::ObserveGeneration => None,
+            | BrokerRequest::ObserveGeneration
+            | BrokerRequest::HistoryUsage
+            | BrokerRequest::ReclaimChat { .. } => None,
         })
         .collect();
     assert_eq!(claims.len(), 2, "inspection opens no extra broker leg");

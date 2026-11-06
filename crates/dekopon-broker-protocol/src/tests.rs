@@ -884,6 +884,7 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
         },
         user: "private user sentinel".to_owned(),
         assistant: DeliveredAnswer("private assistant sentinel".to_owned()),
+        history: None,
     };
     assert!(scope.is_bounded() && turn.is_bounded());
     for rendered in [
@@ -1996,6 +1997,7 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
         },
         user: "hello".to_owned(),
         assistant: DeliveredAnswer("hi".to_owned()),
+        history: None,
     };
     let unattested = Attestation::for_subject(
         dekopon_core::AttestedSubject::one(subject()).expect("one-form subject"),

@@ -307,6 +307,17 @@ where
             config.memory.summaries.concurrency,
         )
     });
+    let history = match journal.as_ref() {
+        Some(journal) => Some(
+            open_history(
+                Arc::clone(journal),
+                config.broker.clone(),
+                &config.memory.retention,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let thread_owner = threads::Owner::new(shell_threads);
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
@@ -322,6 +333,7 @@ where
         ),
         follow,
         journal,
+        history,
         assets: Arc::clone(&assets),
         asset_fetchers,
         thread_ownership,
@@ -455,6 +467,35 @@ async fn enqueue_boot(sender: &memory::engine::Sender, boot: memory::journal::re
         memory.boot.crashed_files = boot.crashed_files,
         "gateway.memory.startup"
     );
+}
+
+// Pending intents finish before any session can claim their chat, so a replay never deletes a
+// turn recorded after the crash.
+async fn open_history(
+    journal: Arc<journal::Journal>,
+    broker: config::ResolvedBroker,
+    retention: &config::memory::Retention,
+) -> Result<Arc<memory::retention::HistoryRetention>, GatewaydError> {
+    let history = memory::retention::HistoryRetention::new(
+        journal,
+        broker,
+        retention.max_history_bytes.get(),
+        std::time::Duration::from_millis(retention.max_chat_idle_ms.get()),
+    );
+    history
+        .recover()
+        .await
+        .map_err(|error| GatewaydError::History {
+            category: error.category(),
+        })?;
+    if let Err(error) = history.expire(std::time::SystemTime::now()).await {
+        tracing::warn!(
+            event = "gateway_history_expiry_failed",
+            category = error.category(),
+            "gateway.history.expiry.failed"
+        );
+    }
+    Ok(history)
 }
 
 async fn open_journal(
@@ -1394,6 +1435,8 @@ pub enum GatewaydError {
     TransportsLost,
     #[error("conversation journal directory is unusable: {kind}")]
     Journal { kind: std::io::ErrorKind },
+    #[error("chat history could not finish its pending reclamation: {category}")]
+    History { category: &'static str },
     #[error(transparent)]
     CacheKeySecret(#[from] cache_key::CacheKeySecretError),
     #[error(transparent)]
