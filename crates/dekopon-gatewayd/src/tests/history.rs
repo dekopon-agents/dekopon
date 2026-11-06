@@ -416,3 +416,33 @@ async fn a_transcript_without_a_clock_takes_its_newest_record_time_at_boot() {
     stores.assert_gone(OLDER, "c-older");
     stores.stop_broker().await;
 }
+
+#[test]
+fn a_measured_turn_bounds_the_bytes_its_append_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let (journal, _boot) = Journal::boot(
+        directory.path(),
+        IDLE,
+        IDLE,
+        IDLE,
+        std::num::NonZeroUsize::new(64).unwrap(),
+        SystemTime::now(),
+    )
+    .unwrap();
+    let turn = captured("synthetic question", Some("synthetic answer"));
+    let grant = GrantDigest::of(&["probe.read".to_owned()]);
+    let entry = Entry {
+        at: SystemTime::now(),
+        grant: &grant,
+        captured: &turn,
+        keep: Keep::Everything,
+        plan: None,
+        attachments: Default::default(),
+        arrivals: &[],
+        inventory: &[],
+        next_asset_id: 1,
+    };
+    let measured = crate::memory::journal::measure(&entry).unwrap();
+    journal.append(OLDER, &entry).unwrap().unwrap();
+    assert!(measured >= journal.history_bytes().unwrap());
+}

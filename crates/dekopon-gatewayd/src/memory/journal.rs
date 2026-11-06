@@ -222,9 +222,11 @@ impl Entry<'_> {
     }
 }
 
-// The highest record id gives the longest header, so the measure bounds the appended bytes.
+// A twenty-digit record id gives the longest header, so the measure bounds the appended bytes; the
+// encoder needs room for the next id.
 pub(crate) fn measure(entry: &Entry<'_>) -> Result<u64, JournalError> {
-    let (record, arrived) = entry.record(RecordId(NonZeroU64::MAX))?;
+    let id = NonZeroU64::new(u64::MAX - 1).ok_or(JournalError::Corrupt)?;
+    let (record, arrived) = entry.record(RecordId(id))?;
     let mut size = records::Counted(0);
     records::encode_record(&mut size, &record, arrived)?;
     Ok(size.0.saturating_add(MAX_SIDECAR_BYTES))
