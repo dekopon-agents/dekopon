@@ -342,17 +342,35 @@ pub(crate) fn chat_namespaces(
         if !is_token(&token) {
             continue;
         }
-        let base = namespaces.open_directory(&token)?;
-        if !base.exists(HISTORY_MARKER)? {
-            continue;
+        // A corrupt base is left for its next grant to refuse, as the root usage scan leaves it.
+        match chat_namespace(namespaces, &token, maximum) {
+            Ok(Some((key, usage))) => found.push((token, key, usage)),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                event = "storage_history_namespace_ignored",
+                storage.namespace = %token,
+                storage.check = %error.class(),
+                "storage.history.namespace.ignored"
+            ),
         }
-        let bytes = base.read_bounded(HISTORY_MARKER, 4_096)?;
-        let key = String::from_utf8(bytes)
-            .ok()
-            .and_then(|value| HistoryKey::new(value).ok())
-            .ok_or_else(|| base.corrupt(HISTORY_MARKER, "history-marker"))?;
-        let usage = usage_with_directory_entry(scan_usage(&base, maximum)?)?;
-        found.push((token, key, usage));
     }
     Ok(found)
+}
+
+fn chat_namespace(
+    namespaces: &Directory,
+    token: &str,
+    maximum: u64,
+) -> Result<Option<(HistoryKey, Usage)>, StorageHostError> {
+    let base = namespaces.open_directory(token)?;
+    if !base.exists(HISTORY_MARKER)? {
+        return Ok(None);
+    }
+    let bytes = base.read_bounded(HISTORY_MARKER, 4_096)?;
+    let key = String::from_utf8(bytes)
+        .ok()
+        .and_then(|value| HistoryKey::new(value).ok())
+        .ok_or_else(|| base.corrupt(HISTORY_MARKER, "history-marker"))?;
+    let usage = usage_with_directory_entry(scan_usage(&base, maximum)?)?;
+    Ok(Some((key, usage)))
 }
