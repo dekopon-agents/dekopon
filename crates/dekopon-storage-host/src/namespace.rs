@@ -854,6 +854,18 @@ fn read_pointer(
     Ok(scheme.map(|scheme| (scheme, document)))
 }
 
+// The generation a grant would select: the pointer's epoch, or the relaxed stable generation.
+pub(crate) fn current_generation(
+    base_directory: &Directory,
+    base_token: &str,
+) -> Result<String, StorageHostError> {
+    let epoch = read_pointer(base_directory, base_token)?.map_or_else(
+        || b"stable".to_vec(),
+        |(_, document)| document.epoch.into_bytes(),
+    );
+    Ok(token(DOMAIN_GENERATION, &[base_token.as_bytes(), &epoch]))
+}
+
 pub(crate) fn deadline_after(timeout_ms: u64) -> Result<Instant, StorageHostError> {
     Instant::now()
         .checked_add(Duration::from_millis(timeout_ms))

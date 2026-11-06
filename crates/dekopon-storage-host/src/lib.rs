@@ -61,7 +61,7 @@ mod vfs;
 pub use config::{StorageConfigError, StorageLimits};
 pub use handle::StorageHandle;
 pub use jsonl::JsonlChunk;
-pub use sweep::{ChatReclaim, ChatReclaimOutcome, RetentionPolicies, SweepSummary};
+pub use sweep::{ChatReclaim, ChatReclaimOutcome, Recording, RetentionPolicies, SweepSummary};
 pub use vfs::{Durability, FileStat, OpenOptions};
 
 use key::{
@@ -159,6 +159,8 @@ pub struct HistoryUsage {
     pub root_free_entries: u64,
     pub record_bound: u64,
     pub oldest_unlinked: Option<UnlinkedHistory>,
+    pub unmeasured: u64,
+    pub recording: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -462,6 +464,7 @@ struct HostInner {
     limits: StorageLimits,
     namespace_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     namespace_observation_lock: Mutex<()>,
+    recording: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -496,14 +499,18 @@ impl StorageHost {
             "storage.namespace.capacity"
         );
         let ledger = QuotaLedger::new(limits.clone(), usage);
-        for (namespace, class, usage) in
+        for (namespace, measured) in
             sweep::chat_namespaces(layout.namespaces(), limits.startup_max_entries)?
         {
-            match class {
-                sweep::ChatClass::Linked(key) => ledger.classify_chat(&namespace, key, usage),
-                sweep::ChatClass::Unlinked(activity_ms) => {
+            match measured {
+                Some((sweep::ChatClass::Linked(key), usage)) => {
+                    ledger.classify_chat(&namespace, key, usage);
+                }
+                Some((sweep::ChatClass::Unlinked(activity_ms, adopted), usage)) => {
+                    ledger.charge_root(adopted);
                     ledger.classify_unlinked(&namespace, usage, activity_ms);
                 }
+                None => ledger.mark_unmeasured(&namespace, quota::Remeasure::Chat),
             }
         }
         #[allow(
@@ -522,6 +529,7 @@ impl StorageHost {
                 limits,
                 namespace_locks: Mutex::new(BTreeMap::new()),
                 namespace_observation_lock: Mutex::new(()),
+                recording: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }

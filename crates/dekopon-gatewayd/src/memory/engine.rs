@@ -92,6 +92,7 @@ pub(crate) struct Sender {
     queue: mpsc::Sender<Queued>,
     cancel: watch::Sender<bool>,
     journal: Arc<Journal>,
+    history: Option<Arc<super::retention::HistoryRetention>>,
     pub counts: Arc<Counts>,
     assets: Arc<AssetStore>,
     in_flight: AssetReservations,
@@ -130,11 +131,11 @@ pub(crate) struct Dispatcher {
     receiver: mpsc::Receiver<Queued>,
     sender: Sender,
     concurrency: NonZeroUsize,
-    history: Option<Arc<super::retention::HistoryRetention>>,
 }
 
 pub(crate) fn channel(
     journal: Arc<Journal>,
+    history: Option<Arc<super::retention::HistoryRetention>>,
     assets: Arc<AssetStore>,
     counts: Arc<Counts>,
     queue: NonZeroUsize,
@@ -145,6 +146,7 @@ pub(crate) fn channel(
         queue: tx,
         cancel: watch::channel(false).0,
         journal,
+        history,
         counts,
         assets,
         in_flight: Arc::default(),
@@ -154,20 +156,11 @@ pub(crate) fn channel(
         receiver,
         sender: sender.clone(),
         concurrency,
-        history: None,
     };
     (sender, dispatcher)
 }
 
 impl Dispatcher {
-    pub(crate) fn with_history(
-        mut self,
-        history: Option<Arc<super::retention::HistoryRetention>>,
-    ) -> Self {
-        self.history = history;
-        self
-    }
-
     pub(crate) fn start(
         self,
         current: CurrentGeneration,
@@ -178,7 +171,7 @@ impl Dispatcher {
     ) {
         let resources = Resources {
             journal: Arc::clone(&self.sender.journal),
-            history: self.history,
+            history: self.sender.history.clone(),
             assets: Arc::clone(&self.sender.assets),
             current,
             models,
@@ -204,12 +197,13 @@ pub(crate) fn spawn(
 ) -> Sender {
     let (sender, dispatcher) = channel(
         Arc::clone(&resources.journal),
+        resources.history.clone(),
         Arc::clone(&resources.assets),
         Arc::clone(&resources.counts),
         queue,
         concurrency,
     );
-    dispatcher.with_history(resources.history).start(
+    dispatcher.start(
         resources.current,
         resources.models,
         resources.thread_owner,
@@ -238,6 +232,7 @@ impl Sender {
             }
             Err(mpsc::error::TrySendError::Full(queued)) => {
                 let journal = Arc::clone(&self.journal);
+                let history = self.history.clone();
                 let counts = Arc::clone(&self.counts);
                 let span = summarize_span(&queued.task, &queued.since);
                 let subscriber = tracing::dispatcher::get_default(Clone::clone);
@@ -246,6 +241,7 @@ impl Sender {
                     span.in_scope(|| {
                         let count = mark_later(
                             &journal,
+                            history.as_ref(),
                             &queued.task,
                             None,
                             SummaryFailure::Overflow,
@@ -302,6 +298,7 @@ async fn dispatch(
                             match (error.is_panic(), &task.stage) {
                                 (true, Stage::Summary) => {
                                     let journal = Arc::clone(&resources.journal);
+                                    let history = resources.history.clone();
                                     let turn = *task.binding.lock();
                                     let write = task.task.clone();
                                     let subscriber = tracing::dispatcher::get_default(Clone::clone);
@@ -311,7 +308,7 @@ async fn dispatch(
                                         let _subscriber = tracing::dispatcher::set_default(&subscriber);
                                         span.in_scope(|| {
                                             if !*cancelled.borrow() {
-                                                let _written = mark_later(&journal, &write, turn, SummaryFailure::Panicked, "summary task panicked");
+                                                let _written = mark_later(&journal, history.as_ref(), &write, turn, SummaryFailure::Panicked, "summary task panicked");
                                             }
                                             Next::Stop
                                         })
@@ -460,24 +457,14 @@ fn summarize(
         Ok(input) => input,
         Err(_refusal) => return Next::Stop,
     };
-    match write_slot(journal, task, &Slot::Queued, Slot::Running, expected) {
-        Ok(true) => {}
-        Ok(false) => return evicted(resources, task),
-        Err(error) => {
-            return fail(
-                resources,
-                task,
-                expected,
-                &Slot::Queued,
-                error_slot(io_failure(error), "could not persist summary start"),
-                next,
-            );
-        }
+    if let Err(stopped) = start(resources, task, expected, next) {
+        return stopped;
     }
     let current = resources.current.load();
     let Some(model) = current.routes.models.get(&plan.model) else {
         let _written = mark_later(
             journal,
+            resources.history.as_ref(),
             task,
             expected,
             SummaryFailure::Unconfigured,
@@ -493,6 +480,7 @@ fn summarize(
     if image && !model.accepts_images() {
         let _written = mark_later(
             journal,
+            resources.history.as_ref(),
             task,
             expected,
             SummaryFailure::Unconfigured,
@@ -591,6 +579,33 @@ fn load(resources: &Resources, task: &SlotTask) -> Result<Snapshot, Next> {
     }
 }
 
+fn start(
+    resources: &Resources,
+    task: &SlotTask,
+    expected: Option<TurnId>,
+    next: Next,
+) -> Result<(), Next> {
+    match write_slot(
+        &resources.journal,
+        resources.history.as_ref(),
+        task,
+        &Slot::Queued,
+        Slot::Running,
+        expected,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(evicted(resources, task)),
+        Err(error) => Err(fail(
+            resources,
+            task,
+            expected,
+            &Slot::Queued,
+            error_slot(io_failure(error), "could not persist summary start"),
+            next,
+        )),
+    }
+}
+
 fn finish(
     resources: &Resources,
     task: &SlotTask,
@@ -605,6 +620,7 @@ fn finish(
         Completed::Refused => {
             let _written = mark_later(
                 journal,
+                resources.history.as_ref(),
                 task,
                 expected,
                 SummaryFailure::Refused,
@@ -613,36 +629,14 @@ fn finish(
             return Next::Stop;
         }
     };
-    // A summary line is history growth like any turn; it waits for room or is not written.
-    let _admission = match resources.history.as_ref() {
-        Some(history) => {
-            let bytes = serde_json::to_vec(&slot_line(task, slot.clone()))
-                .map_or(0, |line| line.len() as u64)
-                .saturating_add(SUMMARY_LINE_FRAMING);
-            let admitted = tokio::runtime::Handle::current().block_on(async {
-                let admission = history.admit().await;
-                admission
-                    .ensure(&task.stem, super::retention::Growth::journal(bytes))
-                    .await
-                    .map(|()| admission)
-            });
-            match admitted {
-                Ok(admission) => Some(admission),
-                Err(error) => {
-                    tracing::warn!(
-                        event = "gateway_memory_summary_write_failed",
-                        reason = error.category(),
-                        memory.record.id = task.record.0.get(),
-                        memory.summary.part = task.part.get(),
-                        "gateway.memory.summary.write.failed"
-                    );
-                    return Next::Stop;
-                }
-            }
-        }
-        None => None,
-    };
-    match write_slot(journal, task, &Slot::Running, slot, expected) {
+    match write_slot(
+        journal,
+        resources.history.as_ref(),
+        task,
+        &Slot::Running,
+        slot,
+        expected,
+    ) {
         Ok(true) => next,
         Ok(false) => evicted(resources, task),
         Err(error) => fail(
@@ -918,6 +912,41 @@ fn input(snapshot: &Snapshot, head: &Head, cap: usize) -> Result<Vec<Text>, Jour
 // Envelope and newline the journal adds around a summary line's JSON body.
 const SUMMARY_LINE_FRAMING: u64 = 64;
 
+// Every persisted summary transition is history growth: it waits for room or is not written.
+// Callers run on blocking threads, so admission is awaited in place.
+fn admit_line(
+    history: Option<&Arc<super::retention::HistoryRetention>>,
+    task: &SlotTask,
+    line: &SlotLine,
+) -> Result<Option<super::retention::HistoryAdmission>, JournalError> {
+    let Some(history) = history.filter(|_| false) else {
+        return Ok(None);
+    };
+    let bytes = serde_json::to_vec(line)
+        .map_or(0, |line| line.len() as u64)
+        .saturating_add(SUMMARY_LINE_FRAMING);
+    tokio::runtime::Handle::current()
+        .block_on(async {
+            let admission = history.admit().await;
+            admission
+                .ensure(&task.stem, super::retention::Growth::journal(bytes))
+                .await
+                .map(|()| Some(admission))
+        })
+        .map_err(|error| {
+            tracing::warn!(
+                event = "gateway_memory_summary_write_failed",
+                reason = error.category(),
+                memory.record.id = task.record.0.get(),
+                memory.summary.part = task.part.get(),
+                "gateway.memory.summary.write.failed"
+            );
+            JournalError::Io {
+                kind: std::io::ErrorKind::QuotaExceeded,
+            }
+        })
+}
+
 fn slot_line(task: &SlotTask, slot: Slot) -> SlotLine {
     SlotLine {
         at_ms: super::journal::millis(SystemTime::now()),
@@ -935,8 +964,9 @@ fn error_slot(kind: SummaryFailure, detail: &str) -> Slot {
     })
 }
 
-fn write_slot(
+pub(crate) fn write_slot(
     journal: &Journal,
+    history: Option<&Arc<super::retention::HistoryRetention>>,
     task: &SlotTask,
     from: &Slot,
     slot: Slot,
@@ -944,6 +974,7 @@ fn write_slot(
 ) -> Result<bool, JournalError> {
     let to = slot.clone();
     let line = slot_line(task, slot);
+    let _admission = admit_line(history, task, &line)?;
     let written = match (task.subject, turn) {
         (Subject::Asset(_), Some(turn)) => journal.write_pending_slot_for(&task.stem, line, turn),
         (Subject::Record, Some(turn)) => journal.write_slot_for(&task.stem, line, turn),
@@ -964,7 +995,14 @@ fn fail(
     failed: Slot,
     next: Next,
 ) -> Next {
-    match write_slot(&resources.journal, task, from, failed, turn) {
+    match write_slot(
+        &resources.journal,
+        resources.history.as_ref(),
+        task,
+        from,
+        failed,
+        turn,
+    ) {
         Ok(false) => evicted(resources, task),
         Ok(true) => next,
         Err(_error) => {
@@ -990,6 +1028,7 @@ fn io_failure(error: JournalError) -> SummaryFailure {
 
 fn mark_later(
     journal: &Journal,
+    history: Option<&Arc<super::retention::HistoryRetention>>,
     task: &SlotTask,
     turn: Option<TurnId>,
     kind: SummaryFailure,
@@ -1019,11 +1058,9 @@ fn mark_later(
             ..task.clone()
         };
         let to = error_slot(kind, detail);
-        if journal.write_pending_slot_for(
-            &task.stem,
-            slot_line(&later, to.clone()),
-            head.header.turn,
-        )? {
+        let line = slot_line(&later, to.clone());
+        let _admission = admit_line(history, &later, &line)?;
+        if journal.write_pending_slot_for(&task.stem, line, head.header.turn)? {
             transition(&later, &slots[usize::from(part.get() - 1)], &to);
             match kind {
                 SummaryFailure::Overflow => dropped(&later, Dropped::Overflow),

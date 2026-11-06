@@ -1638,7 +1638,7 @@ pub(super) fn attested(
             | BrokerRequest::CommitGeneration { .. }
             | BrokerRequest::AbortGeneration { .. }
             | BrokerRequest::ObserveGeneration
-            | BrokerRequest::HistoryUsage
+            | BrokerRequest::HistoryUsage { .. }
             | BrokerRequest::ReclaimChat { .. } => {}
         }
     }

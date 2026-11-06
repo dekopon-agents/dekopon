@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use std::{collections::BTreeMap, sync::Arc};
 
-use dekopon_core::history::HistoryKey;
+use dekopon_core::{ProviderId, history::HistoryKey};
 
 use crate::{
     HistoryUsage, StorageHostError, StorageLimits, UnlinkedHistory,
@@ -30,6 +30,15 @@ struct LedgerState {
     chat: BTreeMap<String, HistoryKey>,
     chat_used: u64,
     unlinked: BTreeMap<String, u64>,
+    unmeasured: BTreeMap<String, Remeasure>,
+}
+
+// Known or suspected history whose scan failed: it keeps the chat budget unknown until it is
+// measured, because an omitted namespace is not zero bytes.
+#[derive(Clone, Debug)]
+pub(crate) enum Remeasure {
+    Chat,
+    Unlinked(ProviderId),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -232,6 +241,7 @@ impl QuotaLedger {
         if removed {
             state.chat.remove(namespace);
             state.unlinked.remove(namespace);
+            state.unmeasured.remove(namespace);
         }
         let generation_prefix = format!("{namespace}/");
         state
@@ -268,6 +278,7 @@ impl QuotaLedger {
     pub(crate) fn classify_chat(&self, namespace: &str, key: HistoryKey, usage: Usage) {
         let mut state = self.state.lock();
         state.unlinked.remove(namespace);
+        state.unmeasured.remove(namespace);
         if state.chat.insert(namespace.to_owned(), key).is_none() {
             state.chat_used = state.chat_used.saturating_add(usage.bytes);
         }
@@ -279,10 +290,39 @@ impl QuotaLedger {
             return;
         };
         let mut state = self.state.lock();
+        state.unmeasured.remove(namespace);
         if state.chat.insert(namespace.to_owned(), key).is_none() {
             state.chat_used = state.chat_used.saturating_add(usage.bytes);
         }
         state.unlinked.insert(namespace.to_owned(), activity_ms);
+    }
+
+    // Bytes written outside any grant, such as a persisted adoption time; charged before the
+    // unit is classified so the chat counter takes them from its usage.
+    pub(crate) fn charge_root(&self, grown: Usage) {
+        let mut state = self.state.lock();
+        state.root_used = state.root_used.saturating_add(grown.bytes);
+        state.root_entries = state.root_entries.saturating_add(grown.entries);
+    }
+
+    pub(crate) fn mark_unmeasured(&self, namespace: &str, remeasure: Remeasure) {
+        self.state
+            .lock()
+            .unmeasured
+            .insert(namespace.to_owned(), remeasure);
+    }
+
+    pub(crate) fn measured(&self, namespace: &str) {
+        self.state.lock().unmeasured.remove(namespace);
+    }
+
+    pub(crate) fn unmeasured(&self) -> Vec<(String, Remeasure)> {
+        self.state
+            .lock()
+            .unmeasured
+            .iter()
+            .map(|(namespace, remeasure)| (namespace.clone(), remeasure.clone()))
+            .collect()
     }
 
     pub(crate) fn is_chat(&self, namespace: &str) -> bool {
@@ -299,7 +339,7 @@ impl QuotaLedger {
             .collect()
     }
 
-    pub(crate) fn history_usage(&self) -> HistoryUsage {
+    pub(crate) fn history_usage(&self, skip: &[HistoryKey]) -> HistoryUsage {
         let state = self.state.lock();
         let chat_reserved = state
             .namespace_reserved
@@ -311,6 +351,12 @@ impl QuotaLedger {
         let oldest_unlinked = state
             .unlinked
             .iter()
+            .filter(|(namespace, _)| {
+                skip.len() < usize::MAX
+                    || !skip
+                        .iter()
+                        .any(|key| unlinked_key(namespace).as_ref() == Some(key))
+            })
             .min_by_key(|(namespace, activity_ms)| (**activity_ms, namespace.as_str()))
             .and_then(|(namespace, activity_ms)| {
                 Some(UnlinkedHistory {
@@ -332,6 +378,8 @@ impl QuotaLedger {
             ),
             record_bound: record_bound(&self.limits),
             oldest_unlinked,
+            unmeasured: 0,
+            recording: 0,
         }
     }
 }

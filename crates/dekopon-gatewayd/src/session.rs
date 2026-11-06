@@ -2622,12 +2622,15 @@ async fn session_turn(
     if let Some(history) = runner.history.as_ref() {
         match history.begin_use(&key.journal_stem()).await {
             Ok(in_use) => deferred.history = Some(in_use),
-            // The journal refuses this chat's reads and writes until its reclaim completes.
-            Err(error) => tracing::warn!(
-                event = "gateway_history_use_refused",
-                category = error.category(),
-                "gateway.history.use.refused"
-            ),
+            // Without the claim a reclaim could delete this chat between the turn's broker reads.
+            Err(error) => {
+                tracing::error!(
+                    event = "gateway_session_failed",
+                    category = error.category(),
+                    error = %error,
+                    "gateway.session.failed"
+                );
+            }
         }
     }
     let mut recalled_journal = None;
@@ -4169,7 +4172,7 @@ async fn record_delivered_turn(
             .await
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
         if let Some(ticket) = ticket {
-            ticket.answered();
+            ticket.answered().await;
         }
         memory_record_outcome_category(&result).map_or(Ok(()), |category| {
             Err(MemoryRecordFailure::Outcome(category))

@@ -357,6 +357,7 @@ async fn the_sweep_probe_never_audits() {
     let before = std::fs::read(world.disk.path().join("index.json")).unwrap();
     let (sender, _dispatcher) = channel(
         Arc::clone(&world.journal),
+        None,
         Arc::clone(&world.store),
         Arc::default(),
         8.try_into().unwrap(),
@@ -438,6 +439,7 @@ async fn asset_parts_never_take_more_than_half_the_queue() {
     let other_header = other.arrive(&["image/png"; 12], Some(b"pixels"), 1);
     let (sender, dispatcher) = channel(
         Arc::clone(&world.journal),
+        None,
         Arc::clone(&world.store),
         Arc::default(),
         8.try_into().unwrap(),
@@ -825,6 +827,7 @@ async fn a_running_asset_part_at_boot_is_written_queued() {
     assert_eq!(world.slots(&header, 0), [Slot::Queued]);
     let (sender, mut dispatcher) = channel(
         Arc::clone(&world.journal),
+        None,
         Arc::clone(&world.store),
         Arc::default(),
         8.try_into().unwrap(),
@@ -845,6 +848,7 @@ async fn a_failed_asset_send_releases_its_reservation() {
     let header = world.arrive(&["image/png"], Some(b"pixels"), 1);
     let (sender, dispatcher) = channel(
         Arc::clone(&world.journal),
+        None,
         Arc::clone(&world.store),
         Arc::default(),
         2.try_into().unwrap(),

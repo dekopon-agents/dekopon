@@ -39,6 +39,8 @@ pub(crate) enum HistoryError {
     ReplayBlocked,
     #[error("chat history needs a conversation journal to keep its budget and clock")]
     Unavailable,
+    #[error("the broker holds chat history it cannot measure, so the budget is unknown")]
+    Unmeasured,
 }
 
 impl HistoryError {
@@ -53,6 +55,7 @@ impl HistoryError {
             Self::Pending => "history-pending",
             Self::ReplayBlocked => "history-replay-blocked",
             Self::Unavailable => "history-unavailable",
+            Self::Unmeasured => "history-unmeasured",
         }
     }
 }
@@ -187,7 +190,8 @@ pub(crate) struct HistoryRetention {
     idle: Duration,
     admission: Arc<tokio::sync::Mutex<()>>,
     claims: Arc<Claims>,
-    // Broker recordings whose outcome never arrived: their whole bound stays spent.
+    // Broker recordings whose outcome never arrived: their whole bound stays spent until the broker
+    // reports none in flight, across gateway restarts.
     indeterminate: Mutex<u64>,
     expired_at: Mutex<std::time::Instant>,
 }
@@ -208,8 +212,18 @@ pub(crate) struct RecordTicket {
 }
 
 impl RecordTicket {
-    pub(crate) fn answered(mut self) {
+    pub(crate) async fn answered(mut self) {
         self.settled = true;
+        let journal = Arc::clone(&self.retention.journal);
+        let remaining = *self.retention.indeterminate.lock();
+        // A debit that cannot be lowered stays persisted, which only overstates use.
+        if let Err(error) = blocking(move || journal.write_debit(remaining)).await {
+            tracing::warn!(
+                event = "gateway_history_debit_failed",
+                category = error.category(),
+                "gateway.history.debit.failed"
+            );
+        }
     }
 }
 
@@ -314,7 +328,7 @@ impl HistoryRetention {
         if self.journal.reclaiming(stem) {
             return Err(HistoryError::Pending);
         }
-        let bound = self.usage().await?.record_bound;
+        let bound = self.usage(Vec::new()).await?.record_bound;
         admission
             .ensure(
                 stem,
@@ -329,6 +343,9 @@ impl HistoryRetention {
         blocking(move || journal.note_activity(&stem, at))
             .await
             .map_err(|_unpublished| HistoryError::Clock)?;
+        let debit = self.indeterminate.lock().saturating_add(bound);
+        let journal = Arc::clone(&self.journal);
+        blocking(move || journal.write_debit(debit)).await?;
         Ok(RecordTicket {
             _admission: admission,
             retention: Arc::clone(self),
@@ -339,6 +356,9 @@ impl HistoryRetention {
 
     // Boot replays every intent before any session can claim its chat.
     pub(crate) async fn recover(&self) -> Result<usize, HistoryError> {
+        let journal = Arc::clone(&self.journal);
+        let debit = blocking(move || journal.debit()).await?;
+        let _restored = debit;
         let journal = Arc::clone(&self.journal);
         let adopted = blocking(move || journal.adopt_history()).await?;
         if adopted > 0 {
@@ -409,15 +429,18 @@ impl HistoryRetention {
         let chat = blocking(move || journal.oldest_chat(&excluded))
             .await?
             .map(Candidate::Chat);
-        let unlinked = self
-            .usage()
-            .await?
-            .oldest_unlinked
-            .filter(|unlinked| !skipped.contains(unlinked.history.as_str()))
-            .map(|unlinked| Candidate::Unlinked {
-                key: unlinked.history,
-                activity_ms: unlinked.activity_ms,
-            });
+        let skip = skipped
+            .iter()
+            .filter_map(|name| HistoryKey::new(name.clone()).ok())
+            .collect();
+        let unlinked =
+            self.usage(skip)
+                .await?
+                .oldest_unlinked
+                .map(|unlinked| Candidate::Unlinked {
+                    key: unlinked.history,
+                    activity_ms: unlinked.activity_ms,
+                });
         Ok(match (chat, unlinked) {
             (Some(chat), Some(unlinked)) if unlinked.activity_ms() < chat.activity_ms() => {
                 Some(unlinked)
@@ -427,13 +450,13 @@ impl HistoryRetention {
         })
     }
 
-    async fn usage(&self) -> Result<HistoryUsage, HistoryError> {
+    async fn usage(&self, skip: Vec<HistoryKey>) -> Result<HistoryUsage, HistoryError> {
         let client = self
             .broker
             .leg_client()
             .map_err(|_unreachable| HistoryError::Broker)?;
         client
-            .history_usage()
+            .history_usage(skip)
             .await
             .map_err(|_failed| HistoryError::Broker)
     }
@@ -450,6 +473,13 @@ impl HistoryRetention {
         let Some(claim) = self.try_reclaim(&chat.stem) else {
             return Ok(Reclaimed::Busy);
         };
+        // An earlier decision whose deletion stopped part way is finished, never re-decided.
+        if self.journal.reclaiming(&chat.stem) && chat.stem.is_empty() {
+            return match self.finish(claim, Mode::Replay).await {
+                Err(HistoryError::ReplayBlocked) => Ok(Reclaimed::Busy),
+                outcome => outcome,
+            };
+        }
         let journal = Arc::clone(&self.journal);
         let stem = chat.stem.clone();
         let activity_ms = blocking(move || journal.activity(&stem))
@@ -462,8 +492,10 @@ impl HistoryRetention {
         if active {
             return Ok(Reclaimed::Active);
         }
+        // The claim rides with the publication, so an aborted caller cannot free the chat for a
+        // new turn while an intent that would delete that turn is still being written.
         let journal = Arc::clone(&self.journal);
-        let stem = chat.stem.clone();
+        let stem = claim.stem.clone();
         blocking(move || journal.write_reclaim_intent(&stem)).await?;
         let outcome = self.finish(claim, Mode::Decide).await;
         if matches!(outcome, Ok(Reclaimed::Chat)) {
@@ -567,7 +599,17 @@ impl HistoryAdmission {
 
 impl HistoryRetention {
     async fn fits(&self, growth: Growth) -> Result<bool, HistoryError> {
-        let usage = self.usage().await?;
+        let usage = self.usage(Vec::new()).await?;
+        if usage.unmeasured > 0 {
+            return Err(HistoryError::Unmeasured);
+        }
+        // Admission is held, so no recording of ours is in flight: none in flight means every
+        // debited recording has landed in the broker's own count.
+        if usage.recording == 0 && *self.indeterminate.lock() > 0 {
+            let journal = Arc::clone(&self.journal);
+            blocking(move || journal.write_debit(0)).await?;
+            *self.indeterminate.lock() = 0;
+        }
         let journal = Arc::clone(&self.journal);
         let journal_bytes = blocking(move || journal.history_bytes()).await?;
         let total = journal_bytes

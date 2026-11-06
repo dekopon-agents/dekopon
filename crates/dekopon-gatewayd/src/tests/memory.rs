@@ -312,6 +312,7 @@ fn summarizing(
     let counts = Arc::<Counts>::default();
     let (sender, dispatcher) = crate::memory::engine::channel(
         Arc::clone(&journal),
+        None,
         Arc::clone(&runner.assets),
         Arc::clone(&counts),
         queue.try_into().unwrap(),
@@ -996,6 +997,7 @@ async fn an_unloadable_journal_resets_with_one_startup_record() {
     );
     let (sender, _dispatcher) = crate::memory::engine::channel(
         Arc::new(journal),
+        None,
         Arc::new(asset_store()),
         Arc::default(),
         4.try_into().unwrap(),
@@ -2460,6 +2462,7 @@ async fn asset_summaries_go_only_to_the_summaries_model() {
     let counts = Arc::<Counts>::default();
     let (sender, dispatcher) = crate::memory::engine::channel(
         Arc::clone(&journal),
+        None,
         Arc::clone(&runner.assets),
         Arc::clone(&counts),
         8.try_into().unwrap(),

@@ -904,7 +904,10 @@ pub enum BrokerRequest {
         digest: String,
     },
     ObserveGeneration,
-    HistoryUsage,
+    HistoryUsage {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skip: Vec<dekopon_core::history::HistoryKey>,
+    },
     ReclaimChat {
         history: dekopon_core::history::HistoryKey,
     },
@@ -959,7 +962,7 @@ impl BrokerRequest {
             | Self::CommitGeneration { .. }
             | Self::AbortGeneration { .. }
             | Self::ObserveGeneration
-            | Self::HistoryUsage
+            | Self::HistoryUsage { .. }
             | Self::ReclaimChat { .. } => Ok(()),
         }
     }
@@ -971,7 +974,7 @@ impl BrokerRequest {
             | Self::CommitGeneration { .. }
             | Self::AbortGeneration { .. }
             | Self::ObserveGeneration
-            | Self::HistoryUsage
+            | Self::HistoryUsage { .. }
             | Self::ReclaimChat { .. } => true,
             Self::Capabilities { .. }
             | Self::Run { .. }
@@ -1452,6 +1455,8 @@ pub struct HistoryUsage {
     pub record_bound: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_unlinked: Option<UnlinkedHistory>,
+    pub unmeasured: u64,
+    pub recording: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2139,7 +2144,7 @@ impl BrokerClient {
             | BrokerRequest::UpcallResult { .. }
             | BrokerRequest::PrepareGeneration { .. }
             | BrokerRequest::ObserveGeneration
-            | BrokerRequest::HistoryUsage
+            | BrokerRequest::HistoryUsage { .. }
             | BrokerRequest::ReclaimChat { .. } => return Err(ClientError::UnexpectedResponse),
         };
         let expected = digest.clone();
@@ -2163,11 +2168,14 @@ impl BrokerClient {
         }
     }
 
-    pub async fn history_usage(&self) -> Result<HistoryUsage, ClientError> {
+    pub async fn history_usage(
+        &self,
+        skip: Vec<dekopon_core::history::HistoryKey>,
+    ) -> Result<HistoryUsage, ClientError> {
         match self
             .exchange(RequestEnvelope {
                 api_version: ProtocolVersion::V1Alpha3,
-                request: BrokerRequest::HistoryUsage,
+                request: BrokerRequest::HistoryUsage { skip },
             })
             .await?
         {

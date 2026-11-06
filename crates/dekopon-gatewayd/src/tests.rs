@@ -4533,7 +4533,7 @@ async fn stub_broker_assets(
 // The chat-history budget's own requests are answered here, outside a test's scripted replies.
 fn history_answer(request: &BrokerRequest) -> Option<ResponseEnvelope> {
     let response = match request {
-        BrokerRequest::HistoryUsage => dekopon_broker_protocol::BrokerResponse::History {
+        BrokerRequest::HistoryUsage { .. } => dekopon_broker_protocol::BrokerResponse::History {
             usage: dekopon_broker_protocol::HistoryUsage {
                 root_free_bytes: u64::MAX,
                 root_free_entries: u64::MAX,
@@ -4565,7 +4565,6 @@ fn history_answer(request: &BrokerRequest) -> Option<ResponseEnvelope> {
     })
 }
 
-// A runner whose chat history is admitted against the default budget through `broker`.
 fn with_history(mut runner: Arc<SessionRunner>, journal: &Path) -> Arc<SessionRunner> {
     let history_journal = match runner.journal.as_ref() {
         Some(journal) => Arc::clone(journal),
@@ -5757,6 +5756,44 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
         observed.try_recv().is_err(),
         "the warning is not a delivered model answer and must not be durably recorded"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_whose_unfinished_reclaim_cannot_finish_is_not_served() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let model = ModelScript::new([answer("must not be produced")]);
+    let runner = with_history(
+        journaled_runner(broker, Arc::new(Arc::clone(&model)), journal_dir.path()),
+        journal_dir.path(),
+    );
+    let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+    let inbound = message("question");
+    let stem = ConversationKey::of(
+        &route.agent,
+        &route.transport,
+        &inbound.conversation,
+        Some(inbound.subject.name()),
+    )
+    .journal_stem();
+    let journal = Arc::clone(runner.journal.as_ref().unwrap());
+    journal.write_reclaim_intent(&stem).unwrap();
+    fs::create_dir_all(journal_dir.path().join(format!("{stem}.jsonl"))).unwrap();
+    let driver = Arc::new(RecordingDriver::default());
+
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(model.requests(), 0, "the turn stops before the model");
+    assert_ne!(driver.replies(), ["must not be produced"]);
+    assert!(journal.reclaiming(&stem));
 }
 
 #[tokio::test(flavor = "multi_thread")]

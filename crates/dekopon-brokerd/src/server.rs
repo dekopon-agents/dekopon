@@ -851,8 +851,17 @@ where
                 response: dekopon_broker_protocol::BrokerResponse::Generation { digest, outcome },
             }
         }
-        BrokerRequest::HistoryUsage => {
-            let usage = broker.history_store().map_or(
+        BrokerRequest::HistoryUsage { skip } => {
+            // A stale scan may remeasure history on disk, so it runs off the connection's thread.
+            let measured = match broker.history_store() {
+                None => None,
+                Some(host) => Some(
+                    tokio::task::spawn_blocking(move || host.history_usage(&skip))
+                        .await
+                        .map_err(|_stopped| ConnectionError::InvalidRequest)?,
+                ),
+            };
+            let usage = measured.map_or(
                 dekopon_broker_protocol::HistoryUsage {
                     chat_used: 0,
                     chat_reserved: 0,
@@ -860,22 +869,23 @@ where
                     root_free_entries: u64::MAX,
                     record_bound: 0,
                     oldest_unlinked: None,
+                    unmeasured: 0,
+                    recording: 0,
                 },
-                |host| {
-                    let usage = host.history_usage();
-                    dekopon_broker_protocol::HistoryUsage {
-                        chat_used: usage.chat_used,
-                        chat_reserved: usage.chat_reserved,
-                        root_free_bytes: usage.root_free_bytes,
-                        root_free_entries: usage.root_free_entries,
-                        record_bound: usage.record_bound,
-                        oldest_unlinked: usage.oldest_unlinked.map(|unlinked| {
-                            dekopon_broker_protocol::UnlinkedHistory {
-                                history: unlinked.key,
-                                activity_ms: unlinked.activity_ms,
-                            }
-                        }),
-                    }
+                |usage| dekopon_broker_protocol::HistoryUsage {
+                    chat_used: usage.chat_used,
+                    chat_reserved: usage.chat_reserved,
+                    root_free_bytes: usage.root_free_bytes,
+                    root_free_entries: usage.root_free_entries,
+                    record_bound: usage.record_bound,
+                    oldest_unlinked: usage.oldest_unlinked.map(|unlinked| {
+                        dekopon_broker_protocol::UnlinkedHistory {
+                            history: unlinked.key,
+                            activity_ms: unlinked.activity_ms,
+                        }
+                    }),
+                    unmeasured: usage.unmeasured,
+                    recording: usage.recording,
                 },
             );
             ResponseEnvelope {
@@ -944,6 +954,7 @@ where
             return Err(ConnectionError::InvalidRequest);
         }
         BrokerRequest::RecordDeliveredTurn { attestation, turn } => {
+            let _recording = broker.history_store().map(|host| host.begin_recording());
             if !claim_is_valid(Some(&attestation), Some(&turn.id)) || !turn.is_bounded() {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
@@ -1085,7 +1096,7 @@ impl Upcaller<'_> {
             | BrokerRequest::CommitGeneration { .. }
             | BrokerRequest::AbortGeneration { .. }
             | BrokerRequest::ObserveGeneration
-            | BrokerRequest::HistoryUsage
+            | BrokerRequest::HistoryUsage { .. }
             | BrokerRequest::ReclaimChat { .. } => Err(UpcallError::UnexpectedRequest),
         }
     }
@@ -1284,7 +1295,7 @@ impl ReceivedRequest {
             | BrokerRequest::CommitGeneration { .. }
             | BrokerRequest::AbortGeneration { .. }
             | BrokerRequest::ObserveGeneration
-            | BrokerRequest::HistoryUsage
+            | BrokerRequest::HistoryUsage { .. }
             | BrokerRequest::ReclaimChat { .. } => {
                 if !descriptors.is_empty() {
                     return Err(ProtocolError::UnexpectedDescriptors);
@@ -1617,7 +1628,7 @@ mod generation_tests {
                     &coordination,
                     stranger.clone(),
                     owner.clone(),
-                    BrokerRequest::HistoryUsage,
+                    BrokerRequest::HistoryUsage { skip: Vec::new() },
                 )
                 .await,
             );
@@ -1630,7 +1641,7 @@ mod generation_tests {
                 &coordination,
                 owner.clone(),
                 strangers[0].clone(),
-                BrokerRequest::HistoryUsage
+                BrokerRequest::HistoryUsage { skip: Vec::new() }
             )
             .await,
             BrokerResponse::History { .. }

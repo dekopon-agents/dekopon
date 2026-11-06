@@ -279,7 +279,12 @@ async fn two_chats(stores: &mut Stores) -> (Arc<Journal>, ResolvedBroker) {
 }
 
 async fn used(journal: &Arc<Journal>, broker: &ResolvedBroker) -> u64 {
-    let usage = broker.leg_client().unwrap().history_usage().await.unwrap();
+    let usage = broker
+        .leg_client()
+        .unwrap()
+        .history_usage(Vec::new())
+        .await
+        .unwrap();
     journal.history_bytes().unwrap() + usage.chat_used
 }
 
@@ -523,7 +528,12 @@ async fn a_journal_append_does_not_need_broker_root_space() {
     let journal = stores.journal();
     stores.transcript(&journal, OLDER, SystemTime::now());
     let probe = stores.start_broker().await;
-    let usage = probe.leg_client().unwrap().history_usage().await.unwrap();
+    let usage = probe
+        .leg_client()
+        .unwrap()
+        .history_usage(Vec::new())
+        .await
+        .unwrap();
     stores.stop_broker().await;
     let used_root = StorageLimits::default().max_root_bytes - usage.root_free_bytes;
     let tight = StorageLimits {
@@ -575,38 +585,6 @@ async fn a_recording_bound_larger_than_the_budget_is_refused() {
     assert!(matches!(
         history.begin_record(OLDER, SystemTime::now()).await,
         Err(HistoryError::TooLarge { .. })
-    ));
-    stores.stop_broker().await;
-}
-
-#[tokio::test]
-async fn an_unanswered_recording_keeps_its_bound_spent() {
-    let mut stores = Stores::new();
-    let journal = stores.journal();
-    let broker = stores.start_broker().await;
-    let bound = broker
-        .leg_client()
-        .unwrap()
-        .history_usage()
-        .await
-        .unwrap()
-        .record_bound;
-    let budget = 2 * bound - 1;
-    let history = HistoryRetention::new(Arc::clone(&journal), broker, budget, IDLE);
-
-    let answered = history
-        .begin_record(OLDER, SystemTime::now())
-        .await
-        .unwrap();
-    answered.answered();
-    let unanswered = history
-        .begin_record(OLDER, SystemTime::now())
-        .await
-        .unwrap();
-    drop(unanswered);
-    assert!(matches!(
-        history.begin_record(NEWER, SystemTime::now()).await,
-        Err(HistoryError::Exhausted)
     ));
     stores.stop_broker().await;
 }
@@ -794,5 +772,315 @@ async fn an_unreadable_chat_marker_is_its_own_unit_and_reclaimed_under_pressure(
     drop(admission);
     assert!(!stores.namespace_exists("c-older"));
     assert_eq!(used(&journal, &broker).await, 0);
+    stores.stop_broker().await;
+}
+
+// Answers the budget's own requests from `usage`, so a test can hold a recording in flight.
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "the socket is test-owned; a failed reply shows up as the test's own broker error"
+)]
+async fn usage_broker(
+    directory: &Path,
+    usage: Arc<parking_lot::Mutex<dekopon_broker_protocol::HistoryUsage>>,
+) -> ResolvedBroker {
+    let socket = directory.join("usage.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut stream = DescriptorStream::new(stream);
+            let Ok((request, _inputs)) = stream
+                .read_frame::<RequestEnvelope>(FrameLimits::default())
+                .await
+            else {
+                continue;
+            };
+            let response = match request.request {
+                BrokerRequest::HistoryUsage { .. } => {
+                    dekopon_broker_protocol::BrokerResponse::History {
+                        usage: usage.lock().clone(),
+                    }
+                }
+                BrokerRequest::ReclaimChat { .. }
+                | BrokerRequest::Capabilities { .. }
+                | BrokerRequest::Run { .. }
+                | BrokerRequest::Invoke { .. }
+                | BrokerRequest::RecordDeliveredTurn { .. }
+                | BrokerRequest::UpcallResult { .. }
+                | BrokerRequest::PrepareGeneration { .. }
+                | BrokerRequest::CommitGeneration { .. }
+                | BrokerRequest::AbortGeneration { .. }
+                | BrokerRequest::ObserveGeneration => {
+                    dekopon_broker_protocol::BrokerResponse::ChatReclaimed {
+                        outcome: dekopon_broker_protocol::ChatReclaim::Reclaimed {
+                            namespaces: 0,
+                            bytes: 0,
+                        },
+                    }
+                }
+            };
+            let _ = stream
+                .write_frame(
+                    &ResponseEnvelope {
+                        api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha3,
+                        response,
+                    },
+                    &[],
+                    FrameLimits::default(),
+                )
+                .await;
+        }
+    });
+    ResolvedBroker {
+        socket_path: socket,
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    }
+}
+
+#[tokio::test]
+async fn an_unanswered_recording_stays_debited_across_a_restart_until_none_is_in_flight() {
+    let stores = Stores::new();
+    let journal = stores.journal();
+    let usage = Arc::new(parking_lot::Mutex::new(
+        dekopon_broker_protocol::HistoryUsage {
+            root_free_bytes: u64::MAX,
+            root_free_entries: u64::MAX,
+            record_bound: 10_000,
+            recording: 1,
+            ..Default::default()
+        },
+    ));
+    let broker = usage_broker(stores.directory.path(), Arc::clone(&usage)).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker.clone(), 15_000, IDLE);
+    history
+        .begin_record(OLDER, SystemTime::now())
+        .await
+        .unwrap()
+        .answered()
+        .await;
+    drop(
+        history
+            .begin_record(OLDER, SystemTime::now())
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        history.begin_record(NEWER, SystemTime::now()).await,
+        Err(HistoryError::Exhausted)
+    ));
+    drop(history);
+
+    let restarted = HistoryRetention::new(Arc::clone(&journal), broker, 15_000, IDLE);
+    restarted.recover().await.unwrap();
+    assert!(matches!(
+        restarted.begin_record(NEWER, SystemTime::now()).await,
+        Err(HistoryError::Exhausted)
+    ));
+    usage.lock().recording = 0;
+    restarted
+        .begin_record(NEWER, SystemTime::now())
+        .await
+        .unwrap()
+        .answered()
+        .await;
+}
+
+#[tokio::test]
+async fn a_live_retry_keeps_an_earlier_reclaim_decision() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    stores.record(&journal, OLDER, "c-older", SystemTime::now());
+    stores.record(&journal, OLDER, "c-older-second", SystemTime::now());
+    journal.write_reclaim_intent(OLDER).unwrap();
+    let lease = File::open(stores.broker_namespace("c-older-second").join("base.lock")).unwrap();
+    lease.lock().unwrap();
+    let broker = stores.start_broker().await;
+    let total = used(&journal, &broker).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, total + 1, IDLE);
+
+    let admission = history.admit().await;
+    assert!(matches!(
+        admission.ensure("assistant/new", Growth::journal(2)).await,
+        Err(HistoryError::Exhausted)
+    ));
+    drop(admission);
+    assert!(stores.intent(OLDER).exists(), "the decision survives Busy");
+    drop(lease);
+    history.recover().await.unwrap();
+    stores.assert_gone(OLDER, "c-older");
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn an_aborted_reclaim_keeps_its_claim_until_the_intent_is_published() {
+    let mut stores = Stores::new();
+    let (journal, broker) = two_chats(&mut stores).await;
+    let total = used(&journal, &broker).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, total + 1, IDLE);
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+    let held_journal = Arc::clone(&journal);
+    let blocker = tokio::task::spawn_blocking(move || {
+        let _held = held_journal.hold_io_for_test();
+        locked.send(()).unwrap();
+        unblock
+            .recv_timeout(Duration::from_secs(10))
+            .expect("journal lock released");
+    });
+    ready.await.unwrap();
+    let admitting = {
+        let history = Arc::clone(&history);
+        tokio::spawn(async move {
+            let admission = history.admit().await;
+            admission.ensure("assistant/new", Growth::journal(2)).await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !history.claimed(OLDER) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reclaim claims the oldest chat");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    admitting.abort();
+    assert!(admitting.await.unwrap_err().is_cancelled());
+    assert!(
+        history.claimed(OLDER),
+        "the claim waits for the intent's publication"
+    );
+    release.send(()).unwrap();
+    blocker.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while history.claimed(OLDER) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the claim ends once the intent is published");
+    assert!(stores.intent(OLDER).exists());
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn a_busy_oldest_legacy_unit_does_not_hide_the_next_one() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    for (stem, conversation) in [(OLDER, "c-first"), (NEWER, "c-second")] {
+        stores.record(&journal, stem, conversation, SystemTime::now());
+        fs::remove_file(stores.transcript_path(stem)).unwrap();
+        fs::remove_file(stores.activity(stem)).unwrap();
+        fs::write(
+            stores.broker_namespace(conversation).join("chat"),
+            b"not a key",
+        )
+        .unwrap();
+    }
+    let broker = stores.start_broker().await;
+    let oldest = broker
+        .leg_client()
+        .unwrap()
+        .history_usage(Vec::new())
+        .await
+        .unwrap()
+        .oldest_unlinked
+        .unwrap()
+        .history;
+    let token = oldest.as_str().trim_start_matches("unlinked/").to_owned();
+    let leased = stores.storage().join("namespaces").join(&token);
+    let lease = File::open(leased.join("base.lock")).unwrap();
+    lease.lock().unwrap();
+    let total = used(&journal, &broker).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker.clone(), total + 1, IDLE);
+
+    let admission = history.admit().await;
+    admission
+        .ensure("assistant/new", Growth::journal(2))
+        .await
+        .unwrap();
+    drop(admission);
+    assert!(leased.exists(), "the leased unit is kept");
+    drop(lease);
+    stores.stop_broker().await;
+}
+
+#[tokio::test]
+async fn unmeasured_broker_history_refuses_admission() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    stores.record(&journal, OLDER, "c-older", SystemTime::now());
+    std::os::unix::fs::symlink(
+        "/nonexistent",
+        stores.broker_namespace("c-older").join("stray"),
+    )
+    .unwrap();
+    let broker = stores.start_broker().await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, BUDGET, IDLE);
+
+    let admission = history.admit().await;
+    assert!(matches!(
+        admission.ensure("assistant/new", Growth::journal(2)).await,
+        Err(HistoryError::Unmeasured)
+    ));
+    drop(admission);
+    stores.stop_broker().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_summary_transition_waits_for_room_or_is_not_written() {
+    let mut stores = Stores::new();
+    let journal = stores.journal();
+    let turn = captured("synthetic question", Some("synthetic answer"));
+    let header = journal
+        .append(
+            OLDER,
+            &Entry {
+                at: SystemTime::now(),
+                grant: &GrantDigest::of(&["probe.read".to_owned()]),
+                captured: &turn,
+                keep: Keep::Everything,
+                plan: Some(crate::memory::record::SummaryPlan {
+                    model: "summary".to_owned(),
+                    parts: vec![std::num::NonZeroU32::new(8).unwrap()],
+                    max_input_bytes: std::num::NonZeroU32::new(1024).unwrap(),
+                }),
+                attachments: Default::default(),
+                arrivals: &[],
+                inventory: &[],
+                next_asset_id: 1,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let broker = stores.start_broker().await;
+    let full = used(&journal, &broker).await;
+    let history = HistoryRetention::new(Arc::clone(&journal), broker, full, IDLE);
+    let task = crate::memory::engine::SlotTask {
+        stem: OLDER.to_owned(),
+        record: header.id,
+        part: std::num::NonZeroU8::MIN,
+        subject: crate::memory::record::Subject::Record,
+        access: None,
+    };
+
+    let written = {
+        let journal = Arc::clone(&journal);
+        tokio::task::spawn_blocking(move || {
+            crate::memory::engine::write_slot(
+                &journal,
+                Some(&history),
+                &task,
+                &crate::memory::record::Slot::Queued,
+                crate::memory::record::Slot::Running,
+                None,
+            )
+        })
+        .await
+        .unwrap()
+    };
+    assert!(written.is_err(), "a full budget refuses the start line");
+    assert_eq!(journal.history_bytes().unwrap(), full);
     stores.stop_broker().await;
 }

@@ -36,6 +36,7 @@ const SEAL_EXTENSION: &str = "sealed";
 const FOLLOW_EXTENSION: &str = "followed";
 const ACTIVITY_EXTENSION: &str = "activity";
 const RECLAIM_EXTENSION: &str = "reclaim";
+const DEBIT_FILE: &str = "history.debit";
 const MAX_SIDECAR_BYTES: u64 = 512;
 pub(crate) const SIDECAR_BYTES: u64 = MAX_SIDECAR_BYTES;
 // A chat with a published reclaim takes no new history until the reclaim completes.
@@ -775,12 +776,12 @@ impl Journal {
         excluded: &std::collections::HashSet<String>,
     ) -> Result<Option<HistoryChat>, JournalError> {
         let mut oldest: Option<HistoryChat> = None;
-        for (stem, path) in self.sidecars(ACTIVITY_EXTENSION)? {
+        self.each_sidecar(ACTIVITY_EXTENSION, |stem, path| {
             if excluded.contains(&stem) {
-                continue;
+                return;
             }
-            let Ok(Some(activity)) = read_sidecar::<Activity>(&path) else {
-                continue;
+            let Ok(Some(activity)) = read_sidecar::<Activity>(path) else {
+                return;
             };
             let candidate = HistoryChat {
                 stem,
@@ -791,7 +792,7 @@ impl Journal {
             }) {
                 oldest = Some(candidate);
             }
-        }
+        })?;
         Ok(oldest)
     }
 
@@ -869,11 +870,9 @@ impl Journal {
     }
 
     pub(crate) fn reclaim_intents(&self) -> Result<Vec<String>, JournalError> {
-        Ok(self
-            .sidecars(RECLAIM_EXTENSION)?
-            .into_iter()
-            .map(|(stem, _)| stem)
-            .collect())
+        let mut intents = Vec::new();
+        self.each_sidecar(RECLAIM_EXTENSION, |stem, _path| intents.push(stem))?;
+        Ok(intents)
     }
 
     // Seals and follow markers keep their own lifecycle; only the transcript and its clock go.
@@ -884,13 +883,32 @@ impl Journal {
         unlink_synced(&self.sidecar(stem, ACTIVITY_EXTENSION))
     }
 
+    // Recording allowance the broker may still spend; it outlives a gateway restart.
+    pub(crate) fn debit(&self) -> Result<u64, JournalError> {
+        Ok(read_sidecar::<Debit>(&self.dir.join(DEBIT_FILE))?.map_or(0, |debit| debit.bytes))
+    }
+
+    pub(crate) fn write_debit(&self, bytes: u64) -> Result<(), JournalError> {
+        let _lock = self.lock.lock();
+        let path = self.dir.join(DEBIT_FILE);
+        if bytes == 0 {
+            return unlink_synced(&path);
+        }
+        let encoded =
+            serde_json::to_vec(&Debit { bytes }).map_err(|_unencodable| JournalError::Corrupt)?;
+        write_sidecar(&path, &encoded)
+    }
+
     pub(crate) fn finish_reclaim_intent(&self, stem: &str) -> Result<(), JournalError> {
         let _lock = self.lock.lock();
         unlink_synced(&self.sidecar(stem, RECLAIM_EXTENSION))
     }
 
-    fn sidecars(&self, extension: &str) -> Result<Vec<(String, PathBuf)>, JournalError> {
-        let mut found = Vec::new();
+    fn each_sidecar(
+        &self,
+        extension: &str,
+        mut visit: impl FnMut(String, &Path),
+    ) -> Result<(), JournalError> {
         for entry in fs::read_dir(&self.dir)? {
             let directory = entry?.path();
             if !is_agent_directory(&directory) {
@@ -905,11 +923,11 @@ impl Journal {
                 if is_sidecar(&path, extension)
                     && let Some(name) = path.file_stem().and_then(|name| name.to_str())
                 {
-                    found.push((format!("{agent}/{name}"), path.clone()));
+                    visit(format!("{agent}/{name}"), &path);
                 }
             }
         }
-        Ok(found)
+        Ok(())
     }
 
     pub(crate) fn maintain(&self, stem: &str, now: SystemTime, next_asset_id: u64) {
@@ -1231,6 +1249,12 @@ pub(crate) struct HistoryChat {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Activity {
     committed_ms: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Debit {
+    bytes: u64,
 }
 
 fn is_sidecar(path: &Path, extension: &str) -> bool {

@@ -298,15 +298,6 @@ where
     let models = Arc::new(ModelCache::new(
         Arc::clone(&configured) as Arc<dyn session::ModelFactory>
     ));
-    let engine = journal.as_ref().map(|journal| {
-        memory::engine::channel(
-            Arc::clone(journal),
-            Arc::clone(&assets),
-            Arc::default(),
-            config.memory.summaries.queue,
-            config.memory.summaries.concurrency,
-        )
-    });
     let history = match journal.as_ref() {
         Some(journal) => Some(
             open_history(
@@ -318,7 +309,16 @@ where
         ),
         None => None,
     };
-    let engine_history = history.clone();
+    let engine = journal.as_ref().map(|journal| {
+        memory::engine::channel(
+            Arc::clone(journal),
+            history.clone(),
+            Arc::clone(&assets),
+            Arc::default(),
+            config.memory.summaries.queue,
+            config.memory.summaries.concurrency,
+        )
+    });
     let thread_owner = threads::Owner::new(shell_threads);
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
@@ -388,7 +388,7 @@ where
             .map_err(GatewaydError::Proxy)?;
     }
     if let Some((sender, dispatcher)) = engine {
-        dispatcher.with_history(engine_history).start(
+        dispatcher.start(
             generation.clone(),
             models,
             Arc::clone(&thread_owner),

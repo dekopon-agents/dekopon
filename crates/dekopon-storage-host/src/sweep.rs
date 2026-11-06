@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs::TryLockError, time::SystemTime};
+use std::{collections::BTreeMap, fs::TryLockError, sync::atomic::Ordering, time::SystemTime};
 
 use dekopon_capability::{StorageRetention, StorageScope};
 use dekopon_core::{ProviderId, history::HistoryKey};
@@ -7,6 +7,7 @@ use crate::{
     StorageHost, StorageHostError,
     layout::{Directory, EntryKind, Usage, scan_usage, usage_with_directory_entry},
     namespace::{HISTORY_MARKER, is_token, marker_time, read_identity},
+    quota::Remeasure,
 };
 
 const TOMBSTONE_SUFFIX: &str = ".reclaiming";
@@ -212,6 +213,10 @@ fn remove_entry(
     match metadata.kind {
         EntryKind::File if metadata.nlink == 1 => {
             let _file = parent.open_private(name, false)?;
+            #[cfg(test)]
+            if tests::removal_fails() {
+                return Err(StorageHostError::Io);
+            }
             parent.remove_file(name)
         }
         EntryKind::Directory => {
@@ -229,9 +234,65 @@ fn remove_entry(
 }
 
 impl StorageHost {
+    // Units in `skip` are left for the caller's next candidate, so a busy oldest unit cannot hide
+    // a reclaimable one behind it.
     #[must_use]
-    pub fn history_usage(&self) -> crate::HistoryUsage {
-        self.inner.ledger.history_usage()
+    pub fn history_usage(&self, skip: &[HistoryKey]) -> crate::HistoryUsage {
+        self.remeasure();
+        let mut usage = self.inner.ledger.history_usage(skip);
+        usage.recording = self.inner.recording.load(Ordering::Acquire);
+        usage
+    }
+
+    // Counts a delivered-turn recording from the moment the broker accepts it until it finishes,
+    // so a debit the gateway holds is released only once no recording can still land.
+    pub fn begin_recording(&self) -> Recording {
+        self.inner.recording.fetch_add(1, Ordering::AcqRel);
+        Recording { host: self.clone() }
+    }
+
+    // A namespace whose grant is in progress is measured on a later call instead.
+    fn remeasure(&self) {
+        let namespaces = self.inner.layout.namespaces();
+        let maximum = self.inner.limits.startup_max_entries;
+        for (token, remeasure) in self.inner.ledger.unmeasured() {
+            let mutex = crate::namespace_lock(&self.inner.namespace_locks, &token);
+            let Some(_guard) = mutex.try_lock() else {
+                continue;
+            };
+            if !matches!(namespaces.exists(&token), Ok(true)) {
+                if matches!(namespaces.exists(&token), Ok(false)) {
+                    self.inner.ledger.measured(&token);
+                }
+                continue;
+            }
+            let measured = match &remeasure {
+                Remeasure::Chat => chat_namespace(namespaces, &token, maximum),
+                Remeasure::Unlinked(provider) => {
+                    unlinked_unit(namespaces, &token, provider, maximum).map(|legacy| {
+                        legacy.map(|legacy| {
+                            (
+                                ChatClass::Unlinked(legacy.activity_ms, legacy.adopted),
+                                legacy.usage,
+                            )
+                        })
+                    })
+                }
+            };
+            match measured {
+                Ok(Some((ChatClass::Linked(key), usage))) => {
+                    self.inner.ledger.classify_chat(&token, key, usage);
+                }
+                Ok(Some((ChatClass::Unlinked(activity_ms, adopted), usage))) => {
+                    self.inner.ledger.charge_root(adopted);
+                    self.inner
+                        .ledger
+                        .classify_unlinked(&token, usage, activity_ms);
+                }
+                Ok(None) => self.inner.ledger.measured(&token),
+                Err(_unmeasured) => {}
+            }
+        }
     }
 
     // Every namespace linked to the key is leased before any is touched, so a busy member leaves
@@ -291,14 +352,7 @@ impl StorageHost {
                 namespaces.rename_to(token, namespaces, &tombstone)?;
                 namespaces.sync()?;
             }
-            remove_tree(
-                namespaces,
-                &tombstone,
-                self.inner.limits.startup_max_entries,
-            )?;
-            self.inner
-                .ledger
-                .account_sweep(token, before, Usage::default(), true)?;
+            self.remove_tombstone(token, before, true)?;
             reclaimed.namespaces += 1;
             reclaimed.bytes = reclaimed.bytes.saturating_add(before.bytes);
         }
@@ -332,15 +386,37 @@ impl StorageHost {
             &directory,
             self.inner.limits.startup_max_entries,
         )?)?;
-        remove_tree(
-            namespaces,
-            &tombstone,
-            self.inner.limits.startup_max_entries,
-        )?;
+        self.remove_tombstone(token, before, last)?;
+        Ok(Some(before.bytes))
+    }
+
+    // Whatever a removal managed to unlink is released before its error returns, so a retry that
+    // measures only the remainder still settles the whole tombstone.
+    fn remove_tombstone(
+        &self,
+        token: &str,
+        before: Usage,
+        last: bool,
+    ) -> Result<(), StorageHostError> {
+        let namespaces = self.inner.layout.namespaces();
+        let maximum = self.inner.limits.startup_max_entries;
+        let tombstone = format!("{token}{TOMBSTONE_SUFFIX}");
+        remove_tree(namespaces, &tombstone, maximum)?;
+        let removal = Ok(());
+        let removed = !namespaces.exists(&tombstone)?;
+        let after = if removed {
+            Usage::default()
+        } else {
+            namespaces
+                .open_directory(&tombstone)
+                .and_then(|directory| scan_usage(&directory, maximum))
+                .and_then(usage_with_directory_entry)
+                .unwrap_or(before)
+        };
         self.inner
             .ledger
-            .account_sweep(token, before, Usage::default(), last)?;
-        Ok(Some(before.bytes))
+            .account_sweep(token, before, after, removed && last)?;
+        removal
     }
 
     // History recorded before chat keys existed, or with an unreadable marker, is its own unit on
@@ -354,19 +430,25 @@ impl StorageHost {
                 continue;
             }
             match unlinked_unit(namespaces, &token, provider, maximum) {
-                Ok(Some((usage, activity_ms))) => {
+                Ok(Some(legacy)) => {
+                    self.inner.ledger.charge_root(legacy.adopted);
                     self.inner
                         .ledger
-                        .classify_unlinked(&token, usage, activity_ms);
+                        .classify_unlinked(&token, legacy.usage, legacy.activity_ms);
                     adopted += 1;
                 }
                 Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    event = "storage_history_namespace_ignored",
-                    storage.namespace = %token,
-                    storage.check = %error.class(),
-                    "storage.history.namespace.ignored"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "storage_history_namespace_unmeasured",
+                        storage.namespace = %token,
+                        storage.check = %error.class(),
+                        "storage.history.namespace.unmeasured"
+                    );
+                    self.inner
+                        .ledger
+                        .mark_unmeasured(&token, Remeasure::Unlinked(provider.clone()));
+                }
             }
         }
         if adopted > 0 {
@@ -389,7 +471,7 @@ fn unlinked_unit(
     token: &str,
     provider: &ProviderId,
     maximum: u64,
-) -> Result<Option<(Usage, u64)>, StorageHostError> {
+) -> Result<Option<Legacy>, StorageHostError> {
     let base = namespaces.open_directory(token)?;
     let Some((scope, values)) = read_identity(&base)? else {
         return Ok(None);
@@ -402,34 +484,61 @@ fn unlinked_unit(
     if owner != provider.as_str() {
         return Ok(None);
     }
-    let usage = usage_with_directory_entry(scan_usage(&base, maximum)?)?;
-    Ok(Some((usage, newest_data_ms(&base, maximum)?)))
+    legacy_unit(&base, token, maximum).map(Some)
 }
 
-// Appends and record-time compaction are the only writes under a generation; reads never touch
-// those files, so their newest mtime is the newest recorded turn.
-fn newest_data_ms(base: &Directory, maximum: u64) -> Result<u64, StorageHostError> {
-    let mut remaining = maximum;
-    let mut newest = None;
-    for name in base.entries_bounded(remaining)? {
-        if matches!(
-            name.as_str(),
-            "base.lock" | "identity" | "last-used" | "current"
-        ) || name == HISTORY_MARKER
-        {
-            continue;
-        }
-        newest_in(base, &name, &mut remaining, &mut newest)?;
+// Measured after the clock is settled, so a persisted adoption time is part of the unit's charge.
+fn legacy_unit(base: &Directory, token: &str, maximum: u64) -> Result<Legacy, StorageHostError> {
+    let before = usage_with_directory_entry(scan_usage(base, maximum)?)?;
+    let activity_ms = legacy_clock(base, token, maximum)?;
+    let usage = usage_with_directory_entry(scan_usage(base, maximum)?)?;
+    Ok(Legacy {
+        usage,
+        activity_ms,
+        adopted: Usage {
+            bytes: usage.bytes.saturating_sub(before.bytes),
+            entries: usage.entries.saturating_sub(before.entries),
+            files: usage.files.saturating_sub(before.files),
+        },
+    })
+}
+
+pub(crate) struct Legacy {
+    pub usage: Usage,
+    pub activity_ms: u64,
+    // What persisting the adoption time added, charged to the root beside the unit itself.
+    pub adopted: Usage,
+}
+
+// Appends and record-time compaction are the only writes under a generation and reads never touch
+// its files, so the current generation's newest data mtime is the newest recorded turn. Without
+// one, the adoption time is persisted once so a restart never moves the clock.
+fn legacy_clock(base: &Directory, token: &str, maximum: u64) -> Result<u64, StorageHostError> {
+    if base.exists(ADOPTED)? && token.is_empty() {
+        return std::str::from_utf8(&base.read_bounded(ADOPTED, 32)?)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| base.corrupt(ADOPTED, "adoption-time"));
     }
-    Ok(newest.unwrap_or_else(|| {
-        u64::try_from(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX)
-    }))
+    let mut newest = None;
+    let mut remaining = maximum;
+    for name in base.entries_bounded(maximum)? {
+        if is_token(&name) {
+            newest_in(base, &name, &mut remaining, &mut newest)?;
+        }
+    }
+    if let Some(newest) = newest {
+        return Ok(newest);
+    }
+    let adopted = u64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    base.replace_private(ADOPTED, adopted.to_string().as_bytes())?;
+    Ok(adopted)
 }
 
 fn newest_in(
@@ -466,6 +575,8 @@ fn newest_in(
     }
 }
 
+const ADOPTED: &str = "adopted";
+
 fn remove_tree(parent: &Directory, name: &str, maximum: u64) -> Result<(), StorageHostError> {
     let mut remaining = maximum;
     remove_entry(parent, name, &mut remaining)?;
@@ -490,33 +601,50 @@ pub(crate) fn finish_tombstones(
     Ok(())
 }
 
+pub(crate) type Measured = (ChatClass, Usage);
+
 pub(crate) enum ChatClass {
     Linked(HistoryKey),
-    Unlinked(u64),
+    Unlinked(u64, Usage),
 }
 
+// A base that cannot be measured is returned unmeasured: it may hold chat history, so the budget
+// stays unknown until it can be scanned.
 pub(crate) fn chat_namespaces(
     namespaces: &Directory,
     maximum: u64,
-) -> Result<Vec<(String, ChatClass, Usage)>, StorageHostError> {
+) -> Result<Vec<(String, Option<Measured>)>, StorageHostError> {
     let mut found = Vec::new();
     for token in namespaces.entries_bounded(maximum)? {
         if !is_token(&token) {
             continue;
         }
-        // A corrupt base is left for its next grant to refuse, as the root usage scan leaves it.
         match chat_namespace(namespaces, &token, maximum) {
-            Ok(Some((class, usage))) => found.push((token, class, usage)),
+            Ok(Some(measured)) => found.push((token, Some(measured))),
             Ok(None) => {}
-            Err(error) => tracing::warn!(
-                event = "storage_history_namespace_ignored",
-                storage.namespace = %token,
-                storage.check = %error.class(),
-                "storage.history.namespace.ignored"
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    event = "storage_history_namespace_unmeasured",
+                    storage.namespace = %token,
+                    storage.check = %error.class(),
+                    "storage.history.namespace.unmeasured"
+                );
+                found.push((token, None));
+            }
         }
     }
     Ok(found)
+}
+
+#[must_use = "a recording counts as in flight only while this is held"]
+pub struct Recording {
+    host: StorageHost,
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        self.host.inner.recording.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn chat_namespace(
@@ -528,15 +656,95 @@ fn chat_namespace(
     if !base.exists(HISTORY_MARKER)? {
         return Ok(None);
     }
-    let usage = usage_with_directory_entry(scan_usage(&base, maximum)?)?;
     let key = base
         .read_bounded(HISTORY_MARKER, 4_096)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|value| HistoryKey::new(value).ok());
-    let class = match key {
-        Some(key) => ChatClass::Linked(key),
-        None => ChatClass::Unlinked(newest_data_ms(&base, maximum)?),
+    Ok(Some(match key {
+        Some(key) => (
+            ChatClass::Linked(key),
+            usage_with_directory_entry(scan_usage(&base, maximum)?)?,
+        ),
+        None => {
+            let legacy = legacy_unit(&base, token, maximum)?;
+            (
+                ChatClass::Unlinked(legacy.activity_ms, legacy.adopted),
+                legacy.usage,
+            )
+        }
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
+    use dekopon_core::history::HistoryKey;
+
+    use crate::{
+        ChatReclaimOutcome, ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits,
     };
-    Ok(Some((class, usage)))
+
+    thread_local! {
+        static REMOVALS_BEFORE_FAILURE: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn removal_fails() -> bool {
+        REMOVALS_BEFORE_FAILURE.with(|left| match left.get() {
+            Some(0) => true,
+            Some(count) => {
+                left.set(Some(count - 1));
+                false
+            }
+            None => false,
+        })
+    }
+
+    #[test]
+    fn a_removal_that_stops_part_way_releases_what_it_unlinked() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap().join("storage");
+        let host = StorageHost::open(&root, StorageLimits::default()).unwrap();
+        let key = HistoryKey::new("assistant/partial".to_owned()).unwrap();
+        let preparation = host
+            .prepare_grant(
+                StorageGrantRequest::new(
+                    "history-invocation".parse().unwrap(),
+                    "memory-chat.record".parse().unwrap(),
+                    "memory-chat".parse().unwrap(),
+                    StorageInterface::Jsonl,
+                    StorageAccess::ReadWrite,
+                    StorageScope::PrivateConversation,
+                    "assistant".parse().unwrap(),
+                    "drn:slack:user:t0123abc:u0123abc".parse().unwrap(),
+                    "slack",
+                    "example-slack",
+                    "c0123abc",
+                    "c-partial",
+                    ContinuityPolicy::Relaxed,
+                    b"surface".to_vec(),
+                )
+                .with_history(Some(key.clone())),
+            )
+            .unwrap();
+        let mut handle = host.begin(preparation.materialize().unwrap()).unwrap();
+        for index in 0..8 {
+            handle
+                .jsonl_append(&format!("turns-{index}.jsonl"), 0, br#"{"turn":1}"#)
+                .unwrap();
+        }
+        handle.commit().unwrap();
+        assert!(host.history_usage(&[]).chat_used > 0);
+
+        REMOVALS_BEFORE_FAILURE.with(|left| left.set(Some(4)));
+        assert!(host.reclaim_chat(&key).is_err());
+        REMOVALS_BEFORE_FAILURE.with(|left| left.set(None));
+        assert!(matches!(
+            host.reclaim_chat(&key).unwrap(),
+            ChatReclaimOutcome::Reclaimed(_)
+        ));
+        assert_eq!(host.history_usage(&[]).chat_used, 0);
+    }
 }

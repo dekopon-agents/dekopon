@@ -424,6 +424,7 @@ async fn an_overflowed_part_marks_its_later_parts() {
         cancel: watch::channel(false).0,
         queue: tx,
         journal: Arc::clone(&journal),
+        history: None,
         counts: Arc::default(),
         assets: Arc::new(AssetStore::new(16, Duration::from_secs(3600))),
         in_flight: Arc::default(),
@@ -975,6 +976,7 @@ fn runtime_overflow_preserves_terminal_slots_and_counts_only_changed_slots() {
     assert_eq!(
         mark_later(
             &journal,
+            None,
             &task(),
             Some(record.turn),
             SummaryFailure::Overflow,
@@ -991,6 +993,7 @@ fn runtime_overflow_preserves_terminal_slots_and_counts_only_changed_slots() {
     assert_eq!(
         mark_later(
             &journal,
+            None,
             &task(),
             Some(record.turn),
             SummaryFailure::Overflow,
@@ -1539,6 +1542,7 @@ async fn an_overflowed_part_logs_one_drop_per_later_part() {
         cancel: watch::channel(false).0,
         queue: tx,
         journal: Arc::clone(&journal),
+        history: None,
         counts: Arc::default(),
         assets: Arc::new(AssetStore::new(16, Duration::from_secs(3600))),
         in_flight: Arc::default(),

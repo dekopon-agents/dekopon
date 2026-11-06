@@ -771,7 +771,7 @@ async fn wake_reason_returns_the_batch_the_claim_carries() {
             | BrokerRequest::CommitGeneration { .. }
             | BrokerRequest::AbortGeneration { .. }
             | BrokerRequest::ObserveGeneration
-            | BrokerRequest::HistoryUsage
+            | BrokerRequest::HistoryUsage { .. }
             | BrokerRequest::ReclaimChat { .. } => None,
         })
         .collect();
