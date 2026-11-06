@@ -128,20 +128,7 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
         record,
         history: in_use,
     } = deferred;
-    let side_bytes = pins
-        .iter()
-        .map(|pin| serde_json::to_vec(pin).map_or(0, |line| line.len() as u64))
-        .chain(
-            choice
-                .iter()
-                .map(|line| serde_json::to_vec(line).map_or(0, |line| line.len() as u64)),
-        )
-        .fold(0_u64, |total, bytes| {
-            total
-                .saturating_add(bytes)
-                .saturating_add(SIDE_LINE_FRAMING)
-        });
-    let (record, admission) = admit(runner, record, side_bytes).await;
+    let (record, admission) = admit(runner, record, side_line_bytes(&pins, choice.as_ref())).await;
     if record.is_none() {
         for pin in &pins {
             pin_dropped(pin.record, pin.subject, "turn-not-persisted");
@@ -287,6 +274,17 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
 // this one.
 // Envelope and newline a pin or choice line adds around its JSON body.
 const SIDE_LINE_FRAMING: u64 = 64;
+
+fn side_line_bytes(pins: &[PinLine], choice: Option<&ChoiceLine>) -> u64 {
+    pins.iter()
+        .map(|pin| serde_json::to_vec(pin).map_or(0, |line| line.len() as u64))
+        .chain(choice.map(|line| serde_json::to_vec(line).map_or(0, |line| line.len() as u64)))
+        .fold(0_u64, |total, bytes| {
+            total
+                .saturating_add(bytes)
+                .saturating_add(SIDE_LINE_FRAMING)
+        })
+}
 
 async fn admit(
     runner: &SessionRunner,

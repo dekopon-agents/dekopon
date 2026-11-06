@@ -130,6 +130,7 @@ pub(crate) struct Dispatcher {
     receiver: mpsc::Receiver<Queued>,
     sender: Sender,
     concurrency: NonZeroUsize,
+    history: Option<Arc<super::retention::HistoryRetention>>,
 }
 
 pub(crate) fn channel(
@@ -153,23 +154,31 @@ pub(crate) fn channel(
         receiver,
         sender: sender.clone(),
         concurrency,
+        history: None,
     };
     (sender, dispatcher)
 }
 
 impl Dispatcher {
+    pub(crate) fn with_history(
+        mut self,
+        history: Option<Arc<super::retention::HistoryRetention>>,
+    ) -> Self {
+        self.history = history;
+        self
+    }
+
     pub(crate) fn start(
         self,
         current: CurrentGeneration,
         models: Arc<ModelCache>,
         thread_owner: Arc<crate::threads::Owner>,
         shell_threads: dekopon_process::ShellThreads,
-        history: Option<Arc<super::retention::HistoryRetention>>,
         owned_tasks: &mut JoinSet<()>,
     ) {
         let resources = Resources {
             journal: Arc::clone(&self.sender.journal),
-            history,
+            history: self.history,
             assets: Arc::clone(&self.sender.assets),
             current,
             models,
@@ -200,12 +209,11 @@ pub(crate) fn spawn(
         queue,
         concurrency,
     );
-    dispatcher.start(
+    dispatcher.with_history(resources.history).start(
         resources.current,
         resources.models,
         resources.thread_owner,
         resources.shell_threads,
-        resources.history,
         owned_tasks,
     );
     sender

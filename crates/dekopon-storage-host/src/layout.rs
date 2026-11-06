@@ -365,7 +365,7 @@ impl Directory {
             modified_ms: u64::try_from(stat.st_mtime)
                 .unwrap_or(0)
                 .saturating_mul(1_000)
-                .saturating_add(u64::try_from(stat.st_mtime_nsec).unwrap_or(0) / 1_000_000),
+                .saturating_add(u64::try_from(stat.st_mtime_nsec as i64).unwrap_or(0) / 1_000_000),
         }))
     }
 

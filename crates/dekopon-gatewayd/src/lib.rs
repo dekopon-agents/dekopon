@@ -388,12 +388,11 @@ where
             .map_err(GatewaydError::Proxy)?;
     }
     if let Some((sender, dispatcher)) = engine {
-        dispatcher.start(
+        dispatcher.with_history(engine_history).start(
             generation.clone(),
             models,
             Arc::clone(&thread_owner),
             runner_threads,
-            engine_history,
             &mut owned_tasks,
         );
         if let Some(boot) = boot {

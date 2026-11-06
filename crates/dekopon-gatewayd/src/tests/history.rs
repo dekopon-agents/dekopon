@@ -738,7 +738,17 @@ async fn an_aborted_persistence_keeps_the_chat_claimed_until_its_native_job_ends
         history: Some(history.begin_use(OLDER).await.unwrap()),
         ..Default::default()
     };
-    let held = journal.hold_io_for_test();
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
+    let held_journal = Arc::clone(&journal);
+    let blocker = tokio::task::spawn_blocking(move || {
+        let _held = held_journal.hold_io_for_test();
+        locked.send(()).unwrap();
+        unblock
+            .recv_timeout(Duration::from_secs(10))
+            .expect("journal lock released");
+    });
+    ready.await.unwrap();
     let drained = {
         let runner = Arc::clone(&runner);
         tokio::spawn(async move { crate::memory::generation::drain(&runner, deferred).await })
@@ -747,7 +757,8 @@ async fn an_aborted_persistence_keeps_the_chat_claimed_until_its_native_job_ends
     drained.abort();
     assert!(drained.await.unwrap_err().is_cancelled());
     assert!(history.claimed(OLDER), "the native job still owns the chat");
-    drop(held);
+    release.send(()).unwrap();
+    blocker.await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while history.claimed(OLDER) {
             tokio::time::sleep(Duration::from_millis(10)).await;

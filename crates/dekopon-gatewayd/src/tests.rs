@@ -4549,7 +4549,15 @@ fn history_answer(request: &BrokerRequest) -> Option<ResponseEnvelope> {
                 },
             }
         }
-        _ => return None,
+        BrokerRequest::Capabilities { .. }
+        | BrokerRequest::Run { .. }
+        | BrokerRequest::Invoke { .. }
+        | BrokerRequest::RecordDeliveredTurn { .. }
+        | BrokerRequest::UpcallResult { .. }
+        | BrokerRequest::PrepareGeneration { .. }
+        | BrokerRequest::CommitGeneration { .. }
+        | BrokerRequest::AbortGeneration { .. }
+        | BrokerRequest::ObserveGeneration => return None,
     };
     Some(ResponseEnvelope {
         api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha3,

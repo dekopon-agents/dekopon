@@ -4141,16 +4141,24 @@ async fn record_delivered_turn(
             user,
             assistant,
         );
-        let history = runner.history.as_ref().ok_or(MemoryRecordFailure::Outcome(
-            HistoryError::Unavailable.category(),
-        ))?;
-        let key = HistoryKey::new(stem.to_owned())
-            .map_err(|_invalid| MemoryRecordFailure::Outcome("history-key"))?;
-        turn = turn.with_history(key);
-        let ticket = history
-            .begin_record(stem, SystemTime::now())
-            .await
-            .map_err(|error| MemoryRecordFailure::Outcome(error.category()))?;
+        let ticket = match runner.history.as_ref() {
+            Some(history) => {
+                let key = HistoryKey::new(stem.to_owned())
+                    .map_err(|_invalid| MemoryRecordFailure::Outcome("history-key"))?;
+                turn = turn.with_history(key);
+                Some(
+                    history
+                        .begin_record(stem, SystemTime::now())
+                        .await
+                        .map_err(|error| MemoryRecordFailure::Outcome(error.category()))?,
+                )
+            }
+            None => {
+                return Err(MemoryRecordFailure::Outcome(
+                    HistoryError::Unavailable.category(),
+                ));
+            }
+        };
         let client = runner
             .broker
             .leg_client()
@@ -4160,7 +4168,9 @@ async fn record_delivered_turn(
             .record_delivered_turn(claim, turn)
             .await
             .map_err(|error| MemoryRecordFailure::Broker(BrokerLegError::from(error)))?;
-        ticket.answered();
+        if let Some(ticket) = ticket {
+            ticket.answered();
+        }
         memory_record_outcome_category(&result).map_or(Ok(()), |category| {
             Err(MemoryRecordFailure::Outcome(category))
         })
