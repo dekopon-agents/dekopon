@@ -65,6 +65,7 @@ struct Queued {
 
 pub(crate) struct Resources {
     pub journal: Arc<Journal>,
+    pub history: Option<Arc<super::retention::HistoryRetention>>,
     pub assets: Arc<AssetStore>,
     pub current: CurrentGeneration,
     pub models: Arc<ModelCache>,
@@ -163,10 +164,12 @@ impl Dispatcher {
         models: Arc<ModelCache>,
         thread_owner: Arc<crate::threads::Owner>,
         shell_threads: dekopon_process::ShellThreads,
+        history: Option<Arc<super::retention::HistoryRetention>>,
         owned_tasks: &mut JoinSet<()>,
     ) {
         let resources = Resources {
             journal: Arc::clone(&self.sender.journal),
+            history,
             assets: Arc::clone(&self.sender.assets),
             current,
             models,
@@ -202,6 +205,7 @@ pub(crate) fn spawn(
         resources.models,
         resources.thread_owner,
         resources.shell_threads,
+        resources.history,
         owned_tasks,
     );
     sender
@@ -601,6 +605,35 @@ fn finish(
             return Next::Stop;
         }
     };
+    // A summary line is history growth like any turn; it waits for room or is not written.
+    let _admission = match resources.history.as_ref() {
+        Some(history) => {
+            let bytes = serde_json::to_vec(&slot_line(task, slot.clone()))
+                .map_or(0, |line| line.len() as u64)
+                .saturating_add(SUMMARY_LINE_FRAMING);
+            let admitted = tokio::runtime::Handle::current().block_on(async {
+                let admission = history.admit().await;
+                admission
+                    .ensure(&task.stem, super::retention::Growth::journal(bytes))
+                    .await
+                    .map(|()| admission)
+            });
+            match admitted {
+                Ok(admission) => Some(admission),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "gateway_memory_summary_write_failed",
+                        reason = error.category(),
+                        memory.record.id = task.record.0.get(),
+                        memory.summary.part = task.part.get(),
+                        "gateway.memory.summary.write.failed"
+                    );
+                    return Next::Stop;
+                }
+            }
+        }
+        None => None,
+    };
     match write_slot(journal, task, &Slot::Running, slot, expected) {
         Ok(true) => next,
         Ok(false) => evicted(resources, task),
@@ -873,6 +906,9 @@ fn input(snapshot: &Snapshot, head: &Head, cap: usize) -> Result<Vec<Text>, Jour
     chosen.sort_by_key(|(index, _text)| *index);
     Ok(chosen.into_iter().map(|(_index, text)| text).collect())
 }
+
+// Envelope and newline the journal adds around a summary line's JSON body.
+const SUMMARY_LINE_FRAMING: u64 = 64;
 
 fn slot_line(task: &SlotTask, slot: Slot) -> SlotLine {
     SlotLine {

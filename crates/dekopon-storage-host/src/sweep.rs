@@ -43,7 +43,8 @@ impl StorageHost {
         let mut summary = SweepSummary::default();
         let now = SystemTime::now();
         for token in namespaces.entries_bounded(self.inner.limits.startup_max_entries)? {
-            if is_tombstone(&token) {
+            // Chat history expires on the gateway's chat clock, never on a provider's idle TTL.
+            if is_tombstone(&token) || self.inner.ledger.is_chat(&token) {
                 continue;
             }
             summary.examined += 1;
@@ -270,6 +271,10 @@ impl StorageHost {
         }
         let mut reclaimed = ChatReclaim::default();
         for (token, _guard, leased) in held {
+            if let Some(bytes) = self.finish_tombstone(token, leased.is_none())? {
+                reclaimed.namespaces += 1;
+                reclaimed.bytes = reclaimed.bytes.saturating_add(bytes);
+            }
             let Some((base, _lease)) = leased else {
                 self.inner
                     .ledger
@@ -309,6 +314,158 @@ impl StorageHost {
     }
 }
 
+impl StorageHost {
+    // A rename that outlived its removal is finished here, under the token's namespace mutex, and
+    // only then are its bytes released; `last` also drops the token's classification.
+    pub(crate) fn finish_tombstone(
+        &self,
+        token: &str,
+        last: bool,
+    ) -> Result<Option<u64>, StorageHostError> {
+        let namespaces = self.inner.layout.namespaces();
+        let tombstone = format!("{token}{TOMBSTONE_SUFFIX}");
+        if !namespaces.exists(&tombstone)? {
+            return Ok(None);
+        }
+        let directory = namespaces.open_directory(&tombstone)?;
+        let before = usage_with_directory_entry(scan_usage(
+            &directory,
+            self.inner.limits.startup_max_entries,
+        )?)?;
+        remove_tree(
+            namespaces,
+            &tombstone,
+            self.inner.limits.startup_max_entries,
+        )?;
+        self.inner
+            .ledger
+            .account_sweep(token, before, Usage::default(), last)?;
+        Ok(Some(before.bytes))
+    }
+
+    // History recorded before chat keys existed, or with an unreadable marker, is its own unit on
+    // the clock of its newest data write, so its bytes never leave the budget.
+    pub fn adopt_unlinked_history(&self, provider: &ProviderId) -> Result<u64, StorageHostError> {
+        let namespaces = self.inner.layout.namespaces();
+        let maximum = self.inner.limits.startup_max_entries;
+        let mut adopted = 0;
+        for token in namespaces.entries_bounded(maximum)? {
+            if !is_token(&token) || self.inner.ledger.is_chat(&token) {
+                continue;
+            }
+            match unlinked_unit(namespaces, &token, provider, maximum) {
+                Ok(Some((usage, activity_ms))) => {
+                    self.inner
+                        .ledger
+                        .classify_unlinked(&token, usage, activity_ms);
+                    adopted += 1;
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    event = "storage_history_namespace_ignored",
+                    storage.namespace = %token,
+                    storage.check = %error.class(),
+                    "storage.history.namespace.ignored"
+                ),
+            }
+        }
+        if adopted > 0 {
+            tracing::info!(
+                event = "storage_history_unlinked_adopted",
+                storage.namespaces = adopted,
+                "storage.history.unlinked.adopted"
+            );
+        }
+        Ok(adopted)
+    }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "identity scopes other than conversations never hold chat history"
+)]
+fn unlinked_unit(
+    namespaces: &Directory,
+    token: &str,
+    provider: &ProviderId,
+    maximum: u64,
+) -> Result<Option<(Usage, u64)>, StorageHostError> {
+    let base = namespaces.open_directory(token)?;
+    let Some((scope, values)) = read_identity(&base)? else {
+        return Ok(None);
+    };
+    let owner = match scope {
+        StorageScope::PrivateConversation if values.len() == 7 => &values[0],
+        StorageScope::SharedConversation if values.len() == 7 => &values[1],
+        _ => return Ok(None),
+    };
+    if owner != provider.as_str() {
+        return Ok(None);
+    }
+    let usage = usage_with_directory_entry(scan_usage(&base, maximum)?)?;
+    Ok(Some((usage, newest_data_ms(&base, maximum)?)))
+}
+
+// Appends and record-time compaction are the only writes under a generation; reads never touch
+// those files, so their newest mtime is the newest recorded turn.
+fn newest_data_ms(base: &Directory, maximum: u64) -> Result<u64, StorageHostError> {
+    let mut remaining = maximum;
+    let mut newest = None;
+    for name in base.entries_bounded(remaining)? {
+        if matches!(
+            name.as_str(),
+            "base.lock" | "identity" | "last-used" | "current"
+        ) || name == HISTORY_MARKER
+        {
+            continue;
+        }
+        newest_in(base, &name, &mut remaining, &mut newest)?;
+    }
+    Ok(newest.unwrap_or_else(|| {
+        u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    }))
+}
+
+fn newest_in(
+    parent: &Directory,
+    name: &str,
+    remaining: &mut u64,
+    newest: &mut Option<u64>,
+) -> Result<(), StorageHostError> {
+    if *remaining == 0 {
+        return Err(StorageHostError::StartupEntryLimit {
+            count: 1,
+            maximum: 0,
+        });
+    }
+    *remaining -= 1;
+    let Some(metadata) = parent.metadata(name)? else {
+        return Ok(());
+    };
+    match metadata.kind {
+        EntryKind::File => {
+            if !name.ends_with(".lock") {
+                *newest = Some(newest.unwrap_or(0).max(metadata.modified_ms));
+            }
+            Ok(())
+        }
+        EntryKind::Directory => {
+            let child = parent.open_directory(name)?;
+            for entry in child.entries_bounded(*remaining)? {
+                newest_in(&child, &entry, remaining, newest)?;
+            }
+            Ok(())
+        }
+        EntryKind::Symlink | EntryKind::Other => Err(parent.corrupt(name, "history-entry")),
+    }
+}
+
 fn remove_tree(parent: &Directory, name: &str, maximum: u64) -> Result<(), StorageHostError> {
     let mut remaining = maximum;
     remove_entry(parent, name, &mut remaining)?;
@@ -333,10 +490,15 @@ pub(crate) fn finish_tombstones(
     Ok(())
 }
 
+pub(crate) enum ChatClass {
+    Linked(HistoryKey),
+    Unlinked(u64),
+}
+
 pub(crate) fn chat_namespaces(
     namespaces: &Directory,
     maximum: u64,
-) -> Result<Vec<(String, HistoryKey, Usage)>, StorageHostError> {
+) -> Result<Vec<(String, ChatClass, Usage)>, StorageHostError> {
     let mut found = Vec::new();
     for token in namespaces.entries_bounded(maximum)? {
         if !is_token(&token) {
@@ -344,7 +506,7 @@ pub(crate) fn chat_namespaces(
         }
         // A corrupt base is left for its next grant to refuse, as the root usage scan leaves it.
         match chat_namespace(namespaces, &token, maximum) {
-            Ok(Some((key, usage))) => found.push((token, key, usage)),
+            Ok(Some((class, usage))) => found.push((token, class, usage)),
             Ok(None) => {}
             Err(error) => tracing::warn!(
                 event = "storage_history_namespace_ignored",
@@ -361,16 +523,20 @@ fn chat_namespace(
     namespaces: &Directory,
     token: &str,
     maximum: u64,
-) -> Result<Option<(HistoryKey, Usage)>, StorageHostError> {
+) -> Result<Option<(ChatClass, Usage)>, StorageHostError> {
     let base = namespaces.open_directory(token)?;
     if !base.exists(HISTORY_MARKER)? {
         return Ok(None);
     }
-    let bytes = base.read_bounded(HISTORY_MARKER, 4_096)?;
-    let key = String::from_utf8(bytes)
-        .ok()
-        .and_then(|value| HistoryKey::new(value).ok())
-        .ok_or_else(|| base.corrupt(HISTORY_MARKER, "history-marker"))?;
     let usage = usage_with_directory_entry(scan_usage(&base, maximum)?)?;
-    Ok(Some((key, usage)))
+    let key = base
+        .read_bounded(HISTORY_MARKER, 4_096)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|value| HistoryKey::new(value).ok());
+    let class = match key {
+        Some(key) => ChatClass::Linked(key),
+        None => ChatClass::Unlinked(newest_data_ms(&base, maximum)?),
+    };
+    Ok(Some((class, usage)))
 }

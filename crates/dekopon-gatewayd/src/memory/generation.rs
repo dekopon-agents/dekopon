@@ -101,7 +101,7 @@ pub(crate) async fn drain(runner: &SessionRunner, deferred: Deferred) {
         .await;
     runner.assets.finish_publications().await;
     if let Some(history) = runner.history.as_ref()
-        && let Err(error) = history.expire(SystemTime::now()).await
+        && let Err(error) = history.expire_due(SystemTime::now()).await
     {
         tracing::warn!(
             event = "gateway_history_expiry_failed",
@@ -126,9 +126,22 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
         pins,
         choice,
         record,
-        history: _in_use,
+        history: in_use,
     } = deferred;
-    let (record, _admission) = admit(runner, record).await;
+    let side_bytes = pins
+        .iter()
+        .map(|pin| serde_json::to_vec(pin).map_or(0, |line| line.len() as u64))
+        .chain(
+            choice
+                .iter()
+                .map(|line| serde_json::to_vec(line).map_or(0, |line| line.len() as u64)),
+        )
+        .fold(0_u64, |total, bytes| {
+            total
+                .saturating_add(bytes)
+                .saturating_add(SIDE_LINE_FRAMING)
+        });
+    let (record, admission) = admit(runner, record, side_bytes).await;
     if record.is_none() {
         for pin in &pins {
             pin_dropped(pin.record, pin.subject, "turn-not-persisted");
@@ -138,7 +151,11 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let span = tracing::Span::current();
     let store = Arc::clone(&runner.assets);
+    // The chat's use claim and the admission travel with the native job, so an aborted caller
+    // cannot release them while the append still runs.
     let written = tokio::task::spawn_blocking(move || {
+        let _in_use = in_use;
+        let _admission = admission;
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = span.enter();
             let journal = journal?;
@@ -268,9 +285,13 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
 
 // The admission is held across the append so no other history write lands between the check and
 // this one.
+// Envelope and newline a pin or choice line adds around its JSON body.
+const SIDE_LINE_FRAMING: u64 = 64;
+
 async fn admit(
     runner: &SessionRunner,
     record: Option<PostReply>,
+    side_bytes: u64,
 ) -> (
     Option<PostReply>,
     Option<crate::memory::retention::HistoryAdmission>,
@@ -301,7 +322,8 @@ async fn admit(
     let failure = match measured {
         Ok((reply, Ok(need))) => {
             let stem = reply.key.journal_stem();
-            match admission.ensure(&stem, need).await {
+            let growth = crate::memory::retention::Growth::journal(need.saturating_add(side_bytes));
+            match admission.ensure(&stem, growth).await {
                 Ok(()) => return (Some(reply), Some(admission)),
                 Err(error) => error.category(),
             }

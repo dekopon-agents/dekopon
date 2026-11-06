@@ -320,6 +320,10 @@ async fn record_marker(broker: &Broker<InMemoryAuditLog>, marker: &str, sequence
                 local_delivery(sequence),
                 marker.to_owned(),
                 DeliveredAnswer::accepted_by_transport("assistant".to_owned()),
+            )
+            .with_history(
+                dekopon_core::history::HistoryKey::new("assistant/synthetic".to_owned())
+                    .expect("history key"),
             ),
         )
         .await
@@ -449,6 +453,10 @@ async fn smoke_record_rebuilds_local_delivery_and_ordinary_command_reads_only_de
             delivery,
             marker.to_owned(),
             DeliveredAnswer::accepted_by_transport("assistant".to_owned()),
+        )
+        .with_history(
+            dekopon_core::history::HistoryKey::new("assistant/synthetic".to_owned())
+                .expect("history key"),
         )
     };
     let recorded = broker

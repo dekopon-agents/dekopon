@@ -25,7 +25,10 @@ async fn both_steering_flavors_consume_the_second_message_before_one_final_reply
             Steering::Boundary => vec![answer("discarded draft"), answer("final")],
         };
         let models = InterruptibleModel::new(turns);
-        let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 1);
+        let runner = super::with_history(
+            runner_with(broker, Arc::new(Arc::clone(&models)), 1),
+            &directory.path().join("history"),
+        );
         let driver = Arc::new(RecordingDriver::default());
         let mut route = route(model_config());
         route.steering = flavor;

@@ -318,6 +318,7 @@ where
         ),
         None => None,
     };
+    let engine_history = history.clone();
     let thread_owner = threads::Owner::new(shell_threads);
     let runner = Arc::new(SessionRunner {
         pending_notices: Default::default(),
@@ -392,6 +393,7 @@ where
             models,
             Arc::clone(&thread_owner),
             runner_threads,
+            engine_history,
             &mut owned_tasks,
         );
         if let Some(boot) = boot {

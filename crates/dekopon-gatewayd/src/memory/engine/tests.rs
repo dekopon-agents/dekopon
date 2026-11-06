@@ -186,6 +186,7 @@ fn resources(
     }
     (
         Resources {
+            history: None,
             assets: Arc::new(AssetStore::new(16, Duration::from_secs(3600))),
             journal,
             current: CurrentGeneration::boot(Arc::new(routes), Arc::default()),
@@ -773,6 +774,7 @@ pub(crate) fn live_resources(journal: Arc<Journal>, endpoint: &str, timeout_ms: 
     let mut routes = RoutingTable::default();
     routes.models.insert("summary".to_owned(), Arc::new(serde_json::from_value(serde_json::json!({"kind":"openaiCompatible","name":"summary","endpoint":endpoint,"model":"fixture","modalities":["image"],"timeoutMs":timeout_ms})).unwrap()));
     Resources {
+        history: None,
         assets: Arc::new(AssetStore::new(16, Duration::from_secs(3600))),
         journal,
         current: CurrentGeneration::boot(Arc::new(routes), Arc::default()),

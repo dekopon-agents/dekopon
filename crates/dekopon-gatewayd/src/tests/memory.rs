@@ -333,6 +333,7 @@ fn summarizing(
         ))),
         Arc::clone(&runner.thread_owner),
         runner.shell_threads.clone(),
+        None,
         &mut owned,
     );
     runner.summaries = Some(sender);
@@ -2477,6 +2478,7 @@ async fn asset_summaries_go_only_to_the_summaries_model() {
         ))),
         Arc::clone(&runner.thread_owner),
         runner.shell_threads.clone(),
+        None,
         &mut owned,
     );
     runner.summaries = Some(sender);

@@ -482,6 +482,7 @@ async fn asset_parts_never_take_more_than_half_the_queue() {
         resources.models,
         resources.thread_owner,
         resources.shell_threads,
+        None,
         &mut owned,
     );
     idle(&sender).await;

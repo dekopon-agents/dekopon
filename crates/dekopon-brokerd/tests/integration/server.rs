@@ -1306,6 +1306,10 @@ async fn mismatched_smoke_delivery_reaches_broker_denial_not_duplicate_socket_ca
         },
         "synthetic".to_owned(),
         DeliveredAnswer::accepted_by_transport("answer".to_owned()),
+    )
+    .with_history(
+        dekopon_core::history::HistoryKey::new("assistant/synthetic".to_owned())
+            .expect("history key"),
     );
     let response = client
         .record_delivered_turn(attestation, turn)

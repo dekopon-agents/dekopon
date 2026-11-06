@@ -699,7 +699,10 @@ async fn a_notice_steers_without_aborting_and_keeps_its_words_out_of_recorded_us
         answer("recalled"),
     ]);
     let factory = || Arc::new(Arc::clone(&models)) as Arc<dyn ModelFactory>;
-    let runner = journaled_runner(broker.clone(), factory(), journal.path());
+    let runner = super::with_history(
+        journaled_runner(broker.clone(), factory(), journal.path()),
+        journal.path(),
+    );
     let driver = Arc::new(RecordingDriver::default());
     let mut route = crate::routes::BoundRoute {
         job_timeout: Some(Duration::from_secs(10)),

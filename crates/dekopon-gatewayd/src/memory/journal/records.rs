@@ -587,6 +587,9 @@ impl Journal {
         let mut bytes = serde_json::to_vec(line).map_err(corrupt)?;
         bytes.push(b'\n');
         let _lock = self.lock.lock();
+        if self.reclaiming(stem) {
+            return Ok(false);
+        }
         let Some(snapshot) = self.record_lookup(stem, record)? else {
             return Ok(false);
         };
@@ -603,6 +606,7 @@ impl Journal {
         }) {
             return Ok(false);
         }
+        self.write_activity(stem, super::millis(std::time::SystemTime::now()))?;
         OpenOptions::new()
             .append(true)
             .open(self.path(stem))?

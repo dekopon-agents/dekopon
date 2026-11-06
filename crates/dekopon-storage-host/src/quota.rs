@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_core::history::HistoryKey;
 
-use crate::{HistoryUsage, StorageHostError, StorageLimits, layout::Usage};
+use crate::{
+    HistoryUsage, StorageHostError, StorageLimits, UnlinkedHistory,
+    layout::{ENTRY_CHARGE, Usage},
+};
 
 #[derive(Debug)]
 pub(crate) struct QuotaLedger {
@@ -26,12 +29,32 @@ struct LedgerState {
     active_invocations: u64,
     chat: BTreeMap<String, HistoryKey>,
     chat_used: u64,
+    unlinked: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NamespaceClass {
     Provider,
     ChatHistory,
+}
+
+// Entries a recording grant can add around its data: base, lease, generation directory, its lease
+// and data directory, identity, last-used, authority pointer and history marker, plus a replacement
+// temporary for each rewritten pointer or marker.
+const HOUSEKEEPING_ENTRIES: u64 = 11;
+const HOUSEKEEPING_BYTES: u64 = 3 * 4_096;
+
+// The most one recording can grow a namespace, from the limits that bound its grant and mutations.
+fn record_bound(limits: &StorageLimits) -> u64 {
+    HOUSEKEEPING_ENTRIES
+        .saturating_add(limits.max_files_per_namespace)
+        .saturating_mul(ENTRY_CHARGE)
+        .saturating_add(HOUSEKEEPING_BYTES)
+        .saturating_add(limits.max_write_bytes_per_invocation)
+}
+
+fn unlinked_key(namespace: &str) -> Option<HistoryKey> {
+    HistoryKey::new(format!("unlinked/{namespace}")).ok()
 }
 
 fn base_of(namespace: &str) -> &str {
@@ -208,6 +231,7 @@ impl QuotaLedger {
         state.charge_chat(namespace, 0, bytes);
         if removed {
             state.chat.remove(namespace);
+            state.unlinked.remove(namespace);
         }
         let generation_prefix = format!("{namespace}/");
         state
@@ -243,9 +267,26 @@ impl QuotaLedger {
     // same hooks that charge the root.
     pub(crate) fn classify_chat(&self, namespace: &str, key: HistoryKey, usage: Usage) {
         let mut state = self.state.lock();
+        state.unlinked.remove(namespace);
         if state.chat.insert(namespace.to_owned(), key).is_none() {
             state.chat_used = state.chat_used.saturating_add(usage.bytes);
         }
+    }
+
+    // History no gateway key names yet: its own unit, on the clock of its newest data write.
+    pub(crate) fn classify_unlinked(&self, namespace: &str, usage: Usage, activity_ms: u64) {
+        let Some(key) = unlinked_key(namespace) else {
+            return;
+        };
+        let mut state = self.state.lock();
+        if state.chat.insert(namespace.to_owned(), key).is_none() {
+            state.chat_used = state.chat_used.saturating_add(usage.bytes);
+        }
+        state.unlinked.insert(namespace.to_owned(), activity_ms);
+    }
+
+    pub(crate) fn is_chat(&self, namespace: &str) -> bool {
+        self.state.lock().chat.contains_key(namespace)
     }
 
     pub(crate) fn chat_namespaces(&self, key: &HistoryKey) -> Vec<String> {
@@ -267,6 +308,16 @@ impl QuotaLedger {
             .fold(0_u64, |total, (_, reserved)| {
                 total.saturating_add(*reserved)
             });
+        let oldest_unlinked = state
+            .unlinked
+            .iter()
+            .min_by_key(|(namespace, activity_ms)| (**activity_ms, namespace.as_str()))
+            .and_then(|(namespace, activity_ms)| {
+                Some(UnlinkedHistory {
+                    key: unlinked_key(namespace)?,
+                    activity_ms: *activity_ms,
+                })
+            });
         HistoryUsage {
             chat_used: state.chat_used,
             chat_reserved,
@@ -279,6 +330,8 @@ impl QuotaLedger {
                     .root_entries
                     .saturating_add(state.root_entries_reserved),
             ),
+            record_bound: record_bound(&self.limits),
+            oldest_unlinked,
         }
     }
 }

@@ -3172,6 +3172,10 @@ async fn authenticated_console_cannot_attest_a_real_scope() {
         },
         "synthetic".to_owned(),
         dekopon_broker_protocol::DeliveredAnswer::accepted_by_transport("answer".to_owned()),
+    )
+    .with_history(
+        dekopon_core::history::HistoryKey::new("assistant/synthetic".to_owned())
+            .expect("history key"),
     );
     let unmapped_turn = turn.clone();
     let result = broker
