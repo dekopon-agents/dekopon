@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.88.0] - 2026-11-06
+
+### Changed
+
+- Discord, the local socket and fauxlack refuse an asset send that would carry one reply's attachments past 40 MiB.
+
+### Fixed
+
+- A Slack reply with several images is one message carrying the answer and every image, instead of one file share per image, and a reply may carry up to 10 images on Slack, Discord, the local socket and fauxlack (4 on Telegram and WhatsApp, where each image is its own message; none on GitHub, whose replies are discarded).
+- The agent is told an asset it sends is queued until its reply is delivered, a Slack image that fails to upload is named under "Not attached:" in the reply, and the `agent.asset.send` audit record says `dispatched=true` only for an asset the chat service confirmed.
+
+## [dekopon-chart-0.75.0] - 2026-11-06
+
+### Changed
+
+- Chart 0.75.0 targets core v0.88.0 and renders the `v0.88.0` image tag.
+
 ## [0.87.0] - 2026-11-05
 
 ### Added
