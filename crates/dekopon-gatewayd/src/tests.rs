@@ -4083,6 +4083,13 @@ fn injected(kind: FailureKind) -> TransportError {
 
 #[async_trait]
 impl ChatDriver for RecordingDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        dekopon_agent::attachment::AttachmentLimit::new(
+            10,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         _target: &ReplyTarget,
@@ -4346,6 +4353,13 @@ impl DelayedStatusDriver {
 
 #[async_trait]
 impl ChatDriver for DelayedStatusDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        dekopon_agent::attachment::AttachmentLimit::new(
+            10,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         _target: &ReplyTarget,
@@ -4383,6 +4397,13 @@ struct PartialDeliveryDriver;
 
 #[async_trait]
 impl ChatDriver for PartialDeliveryDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        dekopon_agent::attachment::AttachmentLimit::new(
+            10,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         _target: &ReplyTarget,
@@ -11705,6 +11726,7 @@ async fn slack_auto_posts_only_the_answer_and_uses_same_session_native_refusal_f
             policy
                 .terminal(Terminal::Answered(OutboundReply::text("complete answer")))
                 .await
+                .accepted()
         );
         let cleaned = if refused {
             "/api/reactions.remove"
@@ -12050,7 +12072,8 @@ async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn slack_uploads_each_attachment_without_sending_the_token_to_the_upload_url() {
+async fn slack_uploads_each_attachment_then_shares_them_once_without_sending_the_token_to_the_upload_url()
+ {
     let base = Arc::new(Mutex::new(String::new()));
     let response_base = Arc::clone(&base);
     let api = spawn_http_mock(move |path, _body| match path {
@@ -12080,28 +12103,30 @@ async fn slack_uploads_each_attachment_without_sending_the_token_to_the_upload_u
             ),
         )
         .await
-        .expect("both file shares are accepted");
+        .expect("the file share is accepted");
 
     let calls = api.calls();
-    assert_eq!(calls.len(), 6, "three calls per attachment");
+    assert_eq!(calls.len(), 5, "two uploads, then one share");
     assert!(calls[0].1.contains("filename=asset-1.png"));
     assert!(calls[0].1.contains("length=20"));
     assert!(calls[1].1.contains("kitty pixels"));
-    assert!(calls[3].1.contains("filename=asset-2.mp4"));
-    assert_eq!(calls[4].1.as_bytes(), b"mp4\0frames");
-    let first: Value = serde_json::from_str(&calls[2].1).expect("first completion JSON");
-    let second: Value = serde_json::from_str(&calls[5].1).expect("second completion JSON");
-    assert_eq!(first["channel_id"], "d0123abc");
-    assert_eq!(first["thread_ts"], "1712345678.000100");
-    assert_eq!(first["initial_comment"], "Here is your kitty.");
-    assert_eq!(second["channel_id"], "d0123abc");
-    assert!(
-        second.get("initial_comment").is_none(),
-        "the answer is posted once, not once per attachment: {second}"
+    assert!(calls[2].1.contains("filename=asset-2.mp4"));
+    assert_eq!(calls[3].1.as_bytes(), b"mp4\0frames");
+    assert_eq!(calls[4].0, "/api/files.completeUploadExternal");
+    let share: Value = serde_json::from_str(&calls[4].1).expect("completion JSON");
+    assert_eq!(share["channel_id"], "d0123abc");
+    assert_eq!(share["thread_ts"], "1712345678.000100");
+    assert_eq!(share["initial_comment"], "Here is your kitty.");
+    assert_eq!(
+        share["files"],
+        json!([
+            {"id": "f-generated", "title": "asset-1.png"},
+            {"id": "f-generated", "title": "asset-2.mp4"}
+        ])
     );
     let headers = api.headers();
-    assert_eq!(headers.len(), 6);
-    for upload in [&headers[1], &headers[4]] {
+    assert_eq!(headers.len(), 5);
+    for upload in [&headers[1], &headers[3]] {
         assert!(
             !upload.to_ascii_lowercase().contains("authorization:"),
             "the service-selected upload URL must never receive the bot token"
@@ -15168,6 +15193,13 @@ impl ParkedReplyDriver {
 
 #[async_trait]
 impl ChatDriver for ParkedReplyDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        dekopon_agent::attachment::AttachmentLimit::new(
+            10,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         _target: &ReplyTarget,
@@ -17491,6 +17523,8 @@ mod participants;
 mod pull_request_links;
 #[path = "tests/reload_evidence.rs"]
 mod reload_evidence;
+#[path = "tests/reply_attachments.rs"]
+mod reply_attachments;
 #[path = "tests/sealed_handoff.rs"]
 mod sealed_handoff;
 #[path = "tests/steering.rs"]
@@ -18106,6 +18140,13 @@ struct FarewellOrderDriver {
 
 #[async_trait]
 impl ChatDriver for FarewellOrderDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        dekopon_agent::attachment::AttachmentLimit::new(
+            10,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         _target: &ReplyTarget,
@@ -18385,6 +18426,13 @@ impl HistoryDriver {
 
 #[async_trait]
 impl ChatDriver for HistoryDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        dekopon_agent::attachment::AttachmentLimit::new(
+            10,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         target: &ReplyTarget,

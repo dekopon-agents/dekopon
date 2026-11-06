@@ -65,7 +65,7 @@ use crate::{
         record::GrantDigest,
     },
     metering::ChatProviderGovernor,
-    progress::{ProgressInputs, ProgressPolicy, StopCause, Terminal},
+    progress::{Delivery, ProgressInputs, ProgressPolicy, StopCause, Terminal},
     routes::BoundRoute,
     transport::{
         AssetFetcher, CancelRequest, ChatDriver, InboundMessage, MessageId, OutboundReply,
@@ -2877,7 +2877,7 @@ async fn session_turn(
         .unwrap_or_default();
     let leg = leg.with_cancel_signal(cancellation.signal());
     let attachments = Arc::new(ReplyAttachments::new(
-        asset::MAX_SENDS_PER_TURN,
+        driver.attachments_per_reply(),
         Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::GeneratedAssetStore>,
         message.transport.to_string(),
     ));
@@ -3428,7 +3428,7 @@ async fn session_turn(
             } else {
                 remember_stop(runner, &key, StopCause::SessionTask)
             };
-            let replied = progress.terminal(terminal).await;
+            let replied = progress.terminal(terminal).await.accepted();
             if replied {
                 reply_delivered(MessageOutcome::Failed);
             }
@@ -3655,13 +3655,17 @@ async fn session_turn(
             (terminal, MessageOutcome::Failed, None)
         }
     };
-    let delivered = progress.terminal(terminal).await;
+    let delivery = progress.terminal(terminal).await;
+    let delivered = delivery.accepted();
     if delivered {
         reply_delivered(completed_outcome);
     }
-    attachments.finish(match (&outcome, delivered) {
-        (Ok(_), true) => AssetDeliveryDisposition::Delivered,
-        (Ok(_), false) => AssetDeliveryDisposition::Failed,
+    attachments.finish(match (&outcome, delivery) {
+        (Ok(_), Delivery::Delivered) => AssetDeliveryDisposition::Delivered,
+        (Ok(_), Delivery::MissingAttachments(failed)) => {
+            AssetDeliveryDisposition::Partial { failed }
+        }
+        (Ok(_), Delivery::NotDelivered) => AssetDeliveryDisposition::Failed,
         (Err(_), _) => AssetDeliveryDisposition::Abandoned,
     });
     if delivered {
@@ -3932,7 +3936,7 @@ async fn stopped(
     } else {
         remember_stop(runner, key, StopCause::Cancelled(by))
     };
-    if progress.terminal(terminal).await {
+    if progress.terminal(terminal).await.accepted() {
         reply_delivered(MessageOutcome::Cancelled);
     }
     crate::memory::generation::drain(runner, deferred).await;

@@ -965,6 +965,15 @@ pub(crate) struct SlackReplier {
 
 #[async_trait]
 impl ChatDriver for SlackReplier {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        // files.completeUploadExternal documents no maximum for its files array, so one share stays
+        // within the 10 files Slack's composer allows in one message.
+        dekopon_agent::attachment::AttachmentLimit::new(
+            10,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         target: &ReplyTarget,
@@ -1451,45 +1460,58 @@ impl SlackReplier {
         mut images: super::hydration::ImageQueue,
         footer: Option<&crate::progress::Footer>,
     ) -> Result<(), TransportError> {
-        let mut accepted = false;
+        let names = images.filenames();
+        let mut uploaded = Vec::with_capacity(names.len());
+        let mut missing = Vec::new();
+        let mut cause = None;
         while let Some(read) = images.next().await {
-            let (index, image) = match read {
-                Ok(read) => read,
-                Err(_) if accepted => return Err(TransportError::PartialDelivery),
-                Err(error) => return Err(error),
+            let index = uploaded.len() + missing.len();
+            let upload = match read {
+                Ok((_, image)) => self.upload_file(image).await,
+                Err(error) => Err(error),
             };
-            let comment = (index == 0)
-                .then_some(text.as_str())
-                .filter(|text| !text.is_empty());
-            match self
-                .upload_attachment(
-                    &channel,
-                    thread_ts.as_deref(),
-                    comment,
-                    image,
-                    (index == 0).then_some(footer).flatten(),
-                )
-                .await
-            {
-                Ok(()) => accepted = true,
-                Err(_) if accepted => return Err(TransportError::PartialDelivery),
-                Err(error) => return Err(error),
+            match upload {
+                Ok(file) => uploaded.push(file),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "gateway_reply_attachment_failed",
+                        transport = "slack",
+                        attachment.index = index,
+                        category = error.category(),
+                        "gateway.reply.attachment.failed"
+                    );
+                    missing.push(index);
+                    cause.get_or_insert(error);
+                }
             }
         }
-        accepted.then_some(()).ok_or(TransportError::Response)
+        if uploaded.is_empty() {
+            return Err(cause.unwrap_or(TransportError::Response));
+        }
+        let mut comment = text;
+        if !missing.is_empty() {
+            let absent: Vec<&str> = missing
+                .iter()
+                .filter_map(|index| names.get(*index).map(String::as_str))
+                .collect();
+            if !comment.is_empty() {
+                comment.push_str("\n\n");
+            }
+            comment.push_str(&format!("Not attached: {}", absent.join(", ")));
+        }
+        self.share_files(&channel, thread_ts.as_deref(), &comment, &uploaded, footer)
+            .await?;
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(TransportError::AttachmentsMissing { failed: missing })
+        }
     }
 
-    async fn upload_attachment(
+    async fn upload_file(
         &self,
-        channel: &str,
-        thread_ts: Option<&str>,
-        initial_comment: Option<&str>,
         image: super::hydration::HydratedImage,
-        footer: Option<&crate::progress::Footer>,
-    ) -> Result<(), TransportError> {
-        let blocks = footer
-            .map(|_| answer_blocks(initial_comment.unwrap_or_default(), footer, footer_block_id))
-            .transpose()?;
+    ) -> Result<UploadedFile, TransportError> {
         let filename = image.filename;
         let length = image.bytes.len().to_string();
         let described = check_ok(
@@ -1508,7 +1530,7 @@ impl SlackReplier {
         let upload_url = described["upload_url"]
             .as_str()
             .ok_or(TransportError::Response)?;
-        let file_id = described["file_id"]
+        let id = described["file_id"]
             .as_str()
             .filter(|id| !id.trim().is_empty())
             .ok_or(TransportError::Response)?
@@ -1529,15 +1551,32 @@ impl SlackReplier {
                 code: format!("http-{}", uploaded.status().as_u16()),
             });
         }
+        Ok(UploadedFile {
+            id,
+            title: filename,
+        })
+    }
 
+    async fn share_files(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        comment: &str,
+        files: &[UploadedFile],
+        footer: Option<&crate::progress::Footer>,
+    ) -> Result<(), TransportError> {
         let mut body = json!({
-            "files": [{"id": file_id, "title": filename}],
+            "files": files
+                .iter()
+                .map(|file| json!({"id": file.id, "title": file.title}))
+                .collect::<Vec<_>>(),
             "channel_id": channel,
         });
-        if let Some(blocks) = blocks {
+        if footer.is_some() {
+            let blocks = answer_blocks(comment, footer, footer_block_id)?;
             body["blocks"] = Value::String(blocks.to_string());
-        } else if let Some(initial_comment) = initial_comment {
-            body["initial_comment"] = Value::String(initial_comment.to_owned());
+        } else if !comment.is_empty() {
+            body["initial_comment"] = Value::String(comment.to_owned());
         }
         if let Some(thread_ts) = thread_ts {
             body["thread_ts"] = Value::String(thread_ts.to_owned());
@@ -1564,14 +1603,20 @@ impl SlackReplier {
                 .map_err(|source| TransportError::Request(Box::new(source)))?,
         )
         .await?;
-        let accepted = completed["files"]
-            .as_array()
-            .is_some_and(|files| files.iter().any(|file| file["id"] == file_id));
-        if !accepted {
+        let shared = completed["files"].as_array();
+        let confirmed = files.iter().all(|file| {
+            shared.is_some_and(|shared| shared.iter().any(|entry| entry["id"] == file.id.as_str()))
+        });
+        if !confirmed {
             return Err(TransportError::Response);
         }
         Ok(())
     }
+}
+
+struct UploadedFile {
+    id: String,
+    title: String,
 }
 
 impl SlackReplier {
@@ -2008,6 +2053,7 @@ impl PermanentReactionError {
             | TransportError::Response
             | TransportError::MalformedResponse(_)
             | TransportError::PartialDelivery
+            | TransportError::AttachmentsMissing { .. }
             | TransportError::ConnectTimeout
             | TransportError::RecoveryExhausted { .. }
             | TransportError::IdentityChanged
@@ -3127,6 +3173,7 @@ mod driver_tests {
                 policy
                     .terminal(Terminal::Answered(OutboundReply::text("All good.")))
                     .await
+                    .accepted()
             );
         }
         assert_eq!(

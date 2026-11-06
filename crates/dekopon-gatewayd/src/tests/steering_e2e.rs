@@ -230,6 +230,13 @@ pub(super) struct HeldReplyDriver {
 
 #[async_trait]
 impl ChatDriver for HeldReplyDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        dekopon_agent::attachment::AttachmentLimit::new(
+            10,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         target: &ReplyTarget,

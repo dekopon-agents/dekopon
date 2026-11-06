@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use dekopon_agent::attachment::GeneratedImage;
+use dekopon_agent::attachment::{AttachmentLimit, GeneratedImage, Holding};
 use dekopon_agent::wake::WakeId;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, Trigger};
 use dekopon_core::{AttestedSubject, Subject};
@@ -558,6 +558,12 @@ pub(crate) trait TextStream: Send + Sync {
     ) -> Result<(), TransportError>;
 }
 
+// A driver that holds a whole reply's attachments in memory at once stays within the decoded bytes
+// one invocation may already carry.
+pub(crate) const HELD_REPLY: Holding = Holding::AllAtOnce {
+    bytes: dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES,
+};
+
 #[async_trait]
 pub(crate) trait InboundReaction: Send + Sync {
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError>;
@@ -577,6 +583,8 @@ pub(crate) trait CancelButton: Send + Sync {
 pub(crate) trait ChatDriver: Send + Sync {
     async fn reply(&self, target: &ReplyTarget, reply: OutboundReply)
     -> Result<(), TransportError>;
+
+    fn attachments_per_reply(&self) -> AttachmentLimit;
 
     fn typing(&self) -> Option<&dyn TypingLease> {
         None
@@ -720,6 +728,8 @@ pub enum TransportError {
     MalformedResponse(#[source] serde_json::Error),
     #[error("chat service accepted only part of a split answer")]
     PartialDelivery,
+    #[error("chat service posted the reply without {} of its attachments", failed.len())]
+    AttachmentsMissing { failed: Vec<usize> },
     #[error("chat transport connection attempt exceeded its deadline")]
     ConnectTimeout,
     #[error("chat transport recovery exhausted after {failures} failures")]
@@ -759,6 +769,7 @@ impl TransportError {
             Self::Response => "response",
             Self::MalformedResponse(_) => "malformed-response",
             Self::PartialDelivery => "partial-delivery",
+            Self::AttachmentsMissing { .. } => "attachments-missing",
             Self::Closed => "closed",
             Self::ConnectTimeout => "connect-timeout",
             Self::RecoveryExhausted { .. } => "recovery-exhausted",

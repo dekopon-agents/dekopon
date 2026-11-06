@@ -349,6 +349,13 @@ struct TestDriver {
 
 #[async_trait]
 impl ChatDriver for TestDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        dekopon_agent::attachment::AttachmentLimit::new(
+            10,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         target: &ReplyTarget,
@@ -917,7 +924,7 @@ async fn a_delivered_answers_idle_write_precedes_the_next_runs_working_status() 
     let delivered = run_a
         .terminal(Terminal::Answered(OutboundReply::text("done")))
         .await;
-    assert!(delivered, "the answer still reaches the person");
+    assert!(delivered.accepted(), "the answer still reaches the person");
 
     let (mut run_b, sink_b) = run();
     sink_b.emit(started());
@@ -960,7 +967,7 @@ async fn a_stop_after_handover_clears_status_text_before_the_stopped_reply() {
             Call::Status(Status::Idle)
         ]
     );
-    assert!(!harness.policy.terminal(Terminal::Silent).await);
+    assert!(!harness.policy.terminal(Terminal::Silent).await.accepted());
 }
 
 #[tokio::test]
@@ -1263,7 +1270,7 @@ async fn the_twenty_fifth_note_is_neither_recorded_nor_queued() {
     for _ in 0..25 {
         harness.sink.emit(note.clone());
     }
-    assert!(!harness.policy.terminal(Terminal::Silent).await);
+    assert!(!harness.policy.terminal(Terminal::Silent).await.accepted());
     let terminals = events_named(&capture, "gateway.progress")
         .into_iter()
         .filter(|record| record.contains(" kind=\"terminal_silent\""))
@@ -1329,7 +1336,7 @@ async fn a_one_turn_answer_posts_no_progress_message() {
         .policy
         .terminal(Terminal::Answered(OutboundReply::text("done")))
         .await;
-    assert!(delivered);
+    assert!(delivered.accepted());
     assert!(
         harness
             .recorder
@@ -1372,7 +1379,7 @@ async fn the_ladder_runs_at_started_and_a_tool_call_posts_the_surface() {
         .policy
         .terminal(Terminal::Answered(OutboundReply::text("a picture")))
         .await;
-    assert!(delivered);
+    assert!(delivered.accepted());
     assert_eq!(
         harness.recorder.writes().last(),
         Some(&Call::Finalize("a picture".to_owned())),
@@ -1598,6 +1605,7 @@ async fn auto_selects_existing_indicators_and_only_falls_back_to_supported_messa
                 .policy
                 .terminal(Terminal::Answered(OutboundReply::text("done")))
                 .await
+                .accepted()
         );
         settle().await;
         assert_eq!(
@@ -1655,7 +1663,8 @@ async fn answer_streaming_is_independent_of_progress_and_detail() {
             harness
                 .policy
                 .terminal(Terminal::Answered(OutboundReply::text("done")))
-                .await,
+                .await
+                .accepted(),
             "{case}"
         );
         assert_eq!(
@@ -1711,6 +1720,7 @@ async fn steering_clears_pending_text_and_restarts_the_same_numbered_turn() {
             .policy
             .terminal(Terminal::Answered(OutboundReply::text("done")))
             .await
+            .accepted()
     );
 }
 
@@ -1733,7 +1743,7 @@ async fn a_silent_terminal_after_steering_never_sends_an_empty_edit() {
     });
     settle().await;
     harness.sink.emit(ProgressEvent::Steered { turn: 1 });
-    assert!(!harness.policy.terminal(Terminal::Silent).await);
+    assert!(!harness.policy.terminal(Terminal::Silent).await.accepted());
     assert_eq!(
         harness.recorder.writes(),
         [Call::Stream(text.as_str().to_owned())]
@@ -1773,6 +1783,7 @@ async fn auto_preserves_explicit_buttons_and_disabled_liveness() {
                 .policy
                 .terminal(Terminal::Answered(OutboundReply::text("done")))
                 .await
+                .accepted()
         );
     }
 }
@@ -1857,7 +1868,8 @@ async fn the_answer_moves_below_the_progress_post_only_when_a_steer_lands_after_
             harness
                 .policy
                 .terminal(Terminal::Answered(OutboundReply::text("done")))
-                .await,
+                .await
+                .accepted(),
             "{steer:?}"
         );
         let writes = harness.recorder.writes();
@@ -1923,7 +1935,8 @@ async fn a_steer_after_the_stream_began_discards_it_before_delivering_the_answer
             harness
                 .policy
                 .terminal(Terminal::Answered(OutboundReply::text("done")))
-                .await,
+                .await
+                .accepted(),
             "stream post in flight: {in_flight}"
         );
         let calls: Vec<_> = harness
@@ -1954,7 +1967,7 @@ async fn a_refused_finalize_deletes_the_surface_but_one_that_missed_its_deadline
             .terminal(Terminal::Answered(OutboundReply::text("the answer")))
             .await;
         assert!(
-            delivered,
+            delivered.accepted(),
             "refused: {refused}: the fallback is what delivered it"
         );
         let writes = harness.recorder.writes();
@@ -2044,7 +2057,7 @@ async fn a_failed_streamed_session_closes_the_stream_under_the_partial_answer() 
         .terminal(Terminal::Failed(FAILURE_REPLY.to_owned()))
         .await;
 
-    assert!(delivered);
+    assert!(delivered.accepted());
     let writes = harness.recorder.writes();
     assert_eq!(
         writes.last(),
@@ -2128,7 +2141,7 @@ async fn a_cancel_renders_the_stopped_line_before_the_session_unwinds() {
             },
         )))
         .await;
-    assert!(!delivered, "the ending had already been written");
+    assert!(!delivered.accepted(), "the ending had already been written");
     assert_eq!(
         harness
             .recorder
@@ -2178,7 +2191,10 @@ async fn a_stop_after_the_loop_sealed_leaves_the_answer_as_the_only_terminal_wri
         .policy
         .terminal(Terminal::Answered(OutboundReply::text(ANSWER.to_owned())))
         .await;
-    assert!(delivered, "the session's answer still reaches the person");
+    assert!(
+        delivered.accepted(),
+        "the session's answer still reaches the person"
+    );
     assert_eq!(
         harness
             .recorder
@@ -2246,7 +2262,7 @@ async fn an_answer_one_millisecond_before_the_deadline_writes_no_stop() {
         .terminal(Terminal::Answered(OutboundReply::text(ANSWER.to_owned())))
         .await;
     assert!(
-        delivered,
+        delivered.accepted(),
         "the answer beat the deadline and reached the person"
     );
 
@@ -2454,7 +2470,7 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
             } else {
                 OutboundReply::text("done")
             };
-            assert!(policy.terminal(Terminal::Answered(reply)).await);
+            assert!(policy.terminal(Terminal::Answered(reply)).await.accepted());
             transport
                 .driver()
                 .reply(&inbound.reply, OutboundReply::text("end marker"))

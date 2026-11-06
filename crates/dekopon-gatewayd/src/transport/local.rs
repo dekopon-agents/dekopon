@@ -481,6 +481,10 @@ impl LocalDriver {
 
 #[async_trait]
 impl ChatDriver for LocalDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        dekopon_agent::attachment::AttachmentLimit::new(10, super::HELD_REPLY)
+    }
+
     async fn reply(
         &self,
         target: &ReplyTarget,

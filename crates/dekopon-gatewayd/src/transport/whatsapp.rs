@@ -706,6 +706,14 @@ impl SteerAck for WhatsappDriver {
 
 #[async_trait]
 impl ChatDriver for WhatsappDriver {
+    fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
+        // Each image is its own message, so the count bounds how many messages one reply posts.
+        dekopon_agent::attachment::AttachmentLimit::new(
+            4,
+            dekopon_agent::attachment::Holding::OneAtATime,
+        )
+    }
+
     async fn reply(
         &self,
         target: &ReplyTarget,
