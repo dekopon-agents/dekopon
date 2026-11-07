@@ -147,6 +147,10 @@ fn both_slack_manifests_receive_follow_events_while_only_agent_enables_agent_ui(
     for manifest in [&classic, &agent] {
         assert_eq!(manifest["settings"]["interactivity"]["is_enabled"], true);
         let scopes = scopes(manifest);
+        assert!(
+            scopes.iter().any(|scope| scope == "canvases:read"),
+            "provider-slack canvas read requires canvases:read"
+        );
         for required in [
             "channels:history",
             "groups:history",

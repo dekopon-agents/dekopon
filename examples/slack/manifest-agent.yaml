@@ -16,6 +16,8 @@
 #
 # The bot scope split is:
 # - `assistant:write`: declares the installed app as an Agent.
+# - `canvases:read`: lets provider-slack's `slack.canvas.read` read the one canvas a broker fences
+#   it to. Nothing reads a canvas without that grant.
 # - `chat:write`: posts replies and manages Agent session status.
 # - `reactions:write`: optional working/seen reactions; leave both off when removing it.
 # - `message.im`/`im:history`: direct-message prompts.
@@ -56,6 +58,7 @@ oauth_config:
     bot:
       - app_mentions:read
       - assistant:write
+      - canvases:read
       - channels:history
       # `*:read` resolve one conversation's kind: an `app_mention` carries no `channel_type`, so
       # without them a mention in a DM or a group DM is minted as a channel and matches no route.
