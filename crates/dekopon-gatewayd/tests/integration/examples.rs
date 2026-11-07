@@ -99,7 +99,7 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
 }
 
 #[test]
-fn both_slack_manifests_receive_follow_events_while_only_agent_enables_agent_ui() {
+fn both_slack_manifests_request_canvas_read_and_follow_events_while_only_agent_enables_agent_ui() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let load = |name: &str| {
         let path = root.join("examples/slack").join(name);

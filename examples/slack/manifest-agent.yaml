@@ -16,8 +16,8 @@
 #
 # The bot scope split is:
 # - `assistant:write`: declares the installed app as an Agent.
-# - `canvases:read`: lets provider-slack's `slack.canvas.read` read the one canvas a broker fences
-#   it to. Nothing reads a canvas without that grant.
+# - `canvases:read`: lets provider-slack's `slack.canvas.read` read the one canvas pinned in its
+#   provider settings.
 # - `chat:write`: posts replies and manages Agent session status.
 # - `reactions:write`: optional working/seen reactions; leave both off when removing it.
 # - `message.im`/`im:history`: direct-message prompts.
