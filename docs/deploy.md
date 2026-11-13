@@ -9,22 +9,22 @@ example](authorization.md#example) does, including its request `forbid`.
 
 | Shape | For | Trade |
 |---|---|---|
-| [One account](#one-account) | a personal Mac or Linux box | no `sudo`; [scoping, not separation](security-model.md#current-local-process-boundary) |
+| [One account](#one-account) | a personal Mac | no `sudo`; [scoping, not separation](security-model.md#current-local-process-boundary) |
 | [Two accounts](#two-accounts) | a shared host | separation; every edit needs `sudo` |
 | [Kubernetes](#kubernetes) | teams | separation |
 
 Nothing listens on a network port unless you configure a `githubWebhook` or `whatsappCloudApi`
-transport or the model proxy. Slack Socket Mode and Discord connect out over WebSockets, Telegram
-long-polls, and model and provider calls are outbound HTTPS.
+transport or the model proxy.
 
 ## Files
 
-Each daemon refuses a symlink, a second hard link, or a file another UID owns (the gateway also
-takes root's on a read-only mount). Configuration and policy must not be group- or world-writable;
+Each daemon [refuses](../crates/dekopon-core/src/trusted_file.rs) a symlink, a second hard link,
+or a file another UID owns (on a read-only mount the gateway also takes root's file or a
+projection). Configuration and policy must not be group- or world-writable;
 the secret map, credential files and `--env-file` must be `0600`. Directories above the socket,
 providers and storage must not be group- or world-writable unless sticky, and above `--env-file`
 and `--log-file` must belong to root or the daemon. `dekopon-brokerd check` skips credential files
-and an unreadable secret map, so their owner and mode fail only at start. macOS refuses a socket
+and an unreadable secret map: the map's owner and mode fail at start, a `secureFile`'s at first use. macOS refuses a socket
 path of 104 bytes or more.
 
 ## Kubernetes
@@ -92,21 +92,23 @@ within seconds, and refuses any other change until a restart.
 
 ### One account
 
-Both daemons run as your login, so you edit configuration in place in a git checkout, and an agent
-running as you can read it. Anything else running as you can read the credentials too.
+Both daemons run as your login, so you edit configuration in place and an agent running as you
+can read it. The gateway and anything else running as you can read the credentials
+and rewrite policy.
 
-1. Keep credentials, the socket, the journal and logs in a `0700` directory the checkout ignores.
+1. Keep the secret map, credentials, the socket, the journal and logs in a `0700` directory the
+   checkout ignores; git writes tracked files `0644`.
 2. Map only your UID in the broker's `identities`, as `dekopon-gatewayd` with its `attestor` grant;
    the gateway's `broker.serverUid` defaults to its own UID.
-3. Install two LaunchAgents with `KeepAlive`, `Umask` 63 and an `ExitTimeOut` above the shutdown
+3. Run both once in the foreground, since under `KeepAlive` a refused start only loops, then
+   install two LaunchAgents with `KeepAlive`, `Umask` 63 and an `ExitTimeOut` above the shutdown
    grace.
 4. To restart, run both `check`s, then `launchctl bootout gui/$UID/<label>` the gateway, then the
    broker, waiting until `launchctl print` fails, since `bootout` returns first. Then `launchctl
    bootstrap gui/$UID` the broker, wait for `dekopon-brokerd probe --socket <path>`, and bootstrap
    the gateway.
 
-LaunchAgents run only while you are logged in, and FileVault rules out automatic login after a
-reboot.
+LaunchAgents run only while you are logged in; FileVault blocks automatic login.
 
 ### Two accounts
 

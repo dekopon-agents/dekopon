@@ -16,7 +16,7 @@ are Unix-only.
 ## Four ideas
 
 **Credentials the agent never holds.** The model proposes through one script tool; a command word in
-it is a request, not a process. `dekopon-brokerd`, a separate process under its own UID, runs the
+it is a request, not a process. `dekopon-brokerd`, a separate process, runs the
 provider in a fresh Wasm sandbox, and after the provider builds an HTTP request the broker adds a
 credential bound to that destination. The model, the script, the gateway and the provider never see
 it, and the broker refuses a response that echoes it back. The endpoint does receive it, so trust
