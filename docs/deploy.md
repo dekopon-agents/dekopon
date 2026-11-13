@@ -2,8 +2,30 @@
 
 Kubernetes is the preferred deployment. The Mac path serves people moving from OpenClaw or Hermes.
 Both run `dekopon-brokerd`, holding policy and provider credentials, and `dekopon-gatewayd`, holding
-chat and model credentials, under separate UIDs joined by one Unix socket. Write policy as the [authorization
+chat and model credentials, joined by one Unix socket. Write policy as the [authorization
 example](authorization.md#example) does, including its request `forbid`.
+
+## Shapes
+
+| Shape | For | Trade |
+|---|---|---|
+| [One account](#one-account) | a personal Mac or Linux box | no `sudo`; [scoping, not separation](security-model.md#current-local-process-boundary) |
+| [Two accounts](#two-accounts) | a shared host | separation; every edit needs `sudo` |
+| [Kubernetes](#kubernetes) | teams | separation |
+
+Nothing listens on a network port unless you configure a `githubWebhook` or `whatsappCloudApi`
+transport or the model proxy. Slack Socket Mode and Discord connect out over WebSockets, Telegram
+long-polls, and model and provider calls are outbound HTTPS.
+
+## Files
+
+Each daemon refuses a symlink, a second hard link, or a file another UID owns (the gateway also
+takes root's on a read-only mount). Configuration and policy must not be group- or world-writable;
+the secret map, credential files and `--env-file` must be `0600`. Directories above the socket,
+providers and storage must not be group- or world-writable unless sticky, and above `--env-file`
+and `--log-file` must belong to root or the daemon. `dekopon-brokerd check` skips credential files
+and an unreadable secret map, so their owner and mode fail only at start. macOS refuses a socket
+path of 104 bytes or more.
 
 ## Kubernetes
 
@@ -12,10 +34,9 @@ helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
   -n dekopon --create-namespace -f my-values.yaml
 ```
 
-This installs the newest chart; `--version <chart-version>` pins one. [`values.yaml`](../charts/dekopon/values.yaml) is
-the reference. The defaults start a broker with nothing to run; a chat deployment sets
-`gateway.enabled` and supplies policy, configuration, a catalog and credentials, as
-[`examples/conditional-write`](../examples/conditional-write/) does.
+[`values.yaml`](../charts/dekopon/values.yaml) is the reference. The defaults start a broker with
+nothing to run; a chat deployment sets `gateway.enabled` and supplies policy, configuration, a
+catalog and credentials, as [`examples/conditional-write`](../examples/conditional-write/) does.
 
 What the values don't make obvious:
 
@@ -24,11 +45,10 @@ What the values don't make obvious:
   grant. Inline configuration writes it into the broker's `identities` itself and sets the gateway's
   `broker.socketPath: /run/dekopon/broker.sock` and `broker.serverUid: 65532`; otherwise the broker
   refuses the gateway.
-- **An init container copies the broker's files.** The broker refuses a configuration, policy or
-  credential file that is a symlink, has a second link, belongs to another UID or is group-readable.
-  A projected Secret key is a symlink and a `subPath` file is root-owned, so no volume passes. The
-  `prepare-files` init container, root with only `CHOWN` and `FOWNER`, copies each into a memory
-  volume as a fresh `0600` file. The namespace must admit it: Pod Security `baseline`, not
+- **An init container copies the broker's files.** No volume passes the [file checks](#files): a
+  projected Secret key is a symlink and a `subPath` file is root-owned. The `prepare-files` init
+  container, root with only `CHOWN` and `FOWNER`, copies each into a memory volume as a fresh `0600`
+  file. The namespace must admit it: Pod Security `baseline`, not
   `restricted`. A changed existing Secret reaches the broker only when you restart the pod.
 - **The image's providers belong to `65532`**, and the broker loads only components it owns.
 - **A hook Job syncs the provider set.** With `broker.providerSet` and `broker.providerSync`, a
@@ -64,27 +84,50 @@ brew pin dekopon
 ```
 
 The pin keeps `brew upgrade` away from running services. Anything running as your login can replace
-Homebrew's binaries; the release archives can be installed root-owned instead.
+Homebrew's binaries; the release archives can be installed root-owned instead. Dekopon creates no
+accounts or services. Start each daemon with `--log-file`, since launchd never rotates stdout, and
+keep the Mac awake. While the gateway is connected, the broker reloads an edited secret map, policy
+file or `broker.yaml` key listed in `SWAP` ([`config.rs`](../crates/dekopon-brokerd/src/config.rs))
+within seconds, and refuses any other change until a restart.
 
-Dekopon creates no accounts or services. As an administrator:
+### One account
+
+Both daemons run as your login, so you edit configuration in place in a git checkout, and an agent
+running as you can read it. Anything else running as you can read the credentials too.
+
+1. Keep credentials, the socket, the journal and logs in a `0700` directory the checkout ignores.
+2. Map only your UID in the broker's `identities`, as `dekopon-gatewayd` with its `attestor` grant;
+   the gateway's `broker.serverUid` defaults to its own UID.
+3. Install two LaunchAgents with `KeepAlive`, `Umask` 63 and an `ExitTimeOut` above the shutdown
+   grace.
+4. To restart, run both `check`s, then `launchctl bootout gui/$UID/<label>` the gateway, then the
+   broker, waiting until `launchctl print` fails, since `bootout` returns first. Then `launchctl
+   bootstrap gui/$UID` the broker, wait for `dekopon-brokerd probe --socket <path>`, and bootstrap
+   the gateway.
+
+LaunchAgents run only while you are logged in, and FileVault rules out automatic login after a
+reboot.
+
+### Two accounts
+
+Every edit goes through `sudo`, since a file must belong to the daemon that reads it. As an
+administrator:
 
 1. Create a group, such as `dekopon-ipc`, and two hidden non-login accounts in it, `_dekopon_broker`
-   and `_dekopon_gateway`. Under one UID the gateway could read the broker's credentials.
-2. Give each account a `0700` directory, and the broker a `0710` socket directory in the group.
-   Every ancestor must be owned by root and not group- or world-writable; an old Homebrew under
-   `/usr/local` often leaves `/usr/local/etc` or `/usr/local/var` writable by your login.
+   and `_dekopon_gateway`.
+2. Give each account a `0700` directory, and the broker a `0710` socket directory in the group. An
+   old Homebrew under `/usr/local` often leaves `/usr/local/etc` or `/usr/local/var` owned by your
+   login, failing the [ancestor check](#files).
 3. Create each credential file empty, `0600`, owned by its daemon, then edit it with
    `sudo -u <account> -e`: chat and model tokens in the gateway's `--env-file`, provider
    secrets in the files the broker's secret map names. The broker reads no credential from its
-   environment and, while the gateway is connected, reloads an edited secret map without a restart.
+   environment.
 4. Map both UIDs in the broker's `identities`, the gateway's and its own for `probe`, and set the
    gateway's `broker.serverUid`.
 5. Run each daemon's `check` as its account, then both once in the foreground.
 6. Install two LaunchDaemons with `UserName`, `KeepAlive`, and an `ExitTimeOut` above the shutdown
    grace. Load the broker, wait for `dekopon-brokerd probe --socket <path>`, then the gateway. At
    boot the order is arbitrary; `KeepAlive` relaunches a gateway that found no broker.
-
-Keep the Mac awake, and start each daemon with `--log-file`; launchd never rotates stdout.
 
 ## Slack
 
@@ -112,7 +155,8 @@ Upgrade both daemons together from one release; their protocol has no cross-rele
 
 `helm upgrade` does this in one pod, broker first and last; `configCheck.enabled` runs both checks
 before the release applies. With Homebrew, step 3 is `brew unpin dekopon && brew upgrade dekopon &&
-brew pin dekopon`, which deletes the previous keg: keep the previous release archive.
+brew pin dekopon`, which deletes the previous keg: keep the previous release archive. On one
+account, steps 2 and 4 are its [restart](#one-account) order.
 
 To roll back, run the same steps with the previous pair and the configuration and provider lock it
 ran. Nothing migrates backwards:

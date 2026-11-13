@@ -7,7 +7,7 @@ person asking, what each command may do, and only the broker holds credentials. 
 can still steer the model, but reaches only what the broker allows the person who asked.
 
 Install on [Kubernetes](docs/deploy.md#kubernetes), the preferred deployment, or [on a
-Mac](docs/deploy.md#mac) if you are moving from OpenClaw or Hermes.
+Mac](docs/deploy.md#mac) under [one account or two](docs/deploy.md#shapes).
 
 **Status:** pre-1.0, with breaking changes between releases. It runs the maintainer's Raspberry Pi,
 an integration and utility box for a few people, with no production-hardening claim. Both daemons
