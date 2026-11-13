@@ -20,6 +20,18 @@ The model proposes; a separate broker authorizes and executes provider effects.
   no owner memories, machine instructions or sibling repositories, and needs none: fetch what a
   gate needs (`ci/fetch-external-provider-components.sh`), and name every gate you could not run.
 
+## Where things are
+
+- gatewayd (`crates/dekopon-gatewayd/src`): `lib.rs` boot, `gateway.rs` generation swap and reload,
+  `wake.rs` and `wake/store.rs`, `session.rs`, `memory/`, `transport/`, `config.rs`. brokerd
+  (`crates/dekopon-brokerd/src`): `lib.rs` boot, `secrets.rs` and `secrets/`, `refresh_scheduler.rs`,
+  `reaper.rs`, `provider_manager.rs`. Compiled-component cache: `crates/dekopon-broker-host/src/cwasm.rs`.
+  Chart: `charts/dekopon/templates/deployment.yaml` and `values.yaml`.
+- Never read these whole; `git grep -n`, then `sed -n` the range: `crates/dekopon-gatewayd/src/tests.rs`
+  (840 KB), `CHANGELOG.md`, `crates/dekopon-agent/src/prompt.rs`, `crates/dekopon-broker/src/lib.rs`,
+  `crates/dekopon-gatewayd/src/{config,session,asset,transport/slack}.rs`, `crates/dekopon-shell/src/interp.rs`,
+  `Cargo.lock`. Each is over 150 KB, and splitting them is planned (campaign-trail IDEA-0156).
+
 ## Boundaries that must survive
 
 - Only the broker grants provider authority; capability declarations permit proposals.
