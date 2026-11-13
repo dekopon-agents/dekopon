@@ -1,0 +1,53 @@
+diff --git a/crates/dekopon-model/src/http.rs b/crates/dekopon-model/src/http.rs
+index a737200..c186e1c 100644
+--- a/crates/dekopon-model/src/http.rs
++++ b/crates/dekopon-model/src/http.rs
+@@ -31,7 +31,11 @@ impl InferenceHttp {
+         if timeout.is_zero() {
+             return Err(RequestError::ZeroTimeout.into());
+         }
+-        let client = reqwest::Client::builder()
++        let mut builder = reqwest::Client::builder();
++        for certificate in crate::lab_extra_ca::reqwest_roots() {
++            builder = builder.add_root_certificate(certificate);
++        }
++        let client = builder
+             .use_rustls_tls()
+             .no_proxy()
+             .redirect(reqwest::redirect::Policy::none())
+diff --git a/crates/dekopon-model/src/lib.rs b/crates/dekopon-model/src/lib.rs
+index 2fd0061..d6841df 100644
+--- a/crates/dekopon-model/src/lib.rs
++++ b/crates/dekopon-model/src/lib.rs
+@@ -49,10 +49,31 @@ fn agent_from(config: ConfigBuilder<AgentScope>, timeout: Duration) -> Agent {
+         .max_redirects(0)
+         .http_status_as_error(false)
+         .proxy(None)
++        .tls_config(lab_extra_ca::ureq_tls())
+         .build()
+         .into()
+ }
+ 
++pub(crate) mod lab_extra_ca {
++    const PEM: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/lab-extra-ca.pem"));
++
++    pub(crate) fn ureq_tls() -> ureq::tls::TlsConfig {
++        let certificates: Vec<_> = ureq::tls::parse_pem(PEM)
++            .filter_map(|item| match item {
++                Ok(ureq::tls::PemItem::Certificate(certificate)) => Some(certificate),
++                _ => None,
++            })
++            .collect();
++        ureq::tls::TlsConfig::builder()
++            .root_certs(ureq::tls::RootCerts::new_with_certs(&certificates))
++            .build()
++    }
++
++    pub(crate) fn reqwest_roots() -> Vec<reqwest::Certificate> {
++        reqwest::Certificate::from_pem_bundle(PEM).unwrap_or_default()
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use ureq::Proxy;
