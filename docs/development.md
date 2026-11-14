@@ -59,7 +59,7 @@ line, `Changelog: <Added|Changed|Deprecated|Removed|Fixed|Security>: <text>`.
 2. After it merges, dispatch **Cut release** with `v<version>` and, if the chart changed,
    `dekopon-chart-<version>`, dry run first. It pushes the tags as the release GitHub App.
 3. `release.yml` publishes the archives, images, tap formula and every crate in
-   `.github/release-crates.txt`. If crate publication stops, dispatch **Release** with the tag and
+   `.github/release-crates.txt`, then dispatches the website re-pin. If crate publication stops, dispatch **Release** with the tag and
    `publish_to_crates`; it skips published versions.
 
 Each public crate needs a crates.io trusted publisher: `dekopon-agents/dekopon`, `release.yml`,
@@ -69,16 +69,16 @@ versions never move.
 
 ### Homebrew tap GitHub App
 
-`GITHUB_TOKEN` cannot push to `dekopon-agents/homebrew-tap`, so the tap job mints a token from an
-organization App. A maintainer sets it up once:
+`GITHUB_TOKEN` cannot push to `dekopon-agents/homebrew-tap`, so the tap and website jobs mint a
+token from an organization App. Set it up once:
 
-1. Create the App with its webhook off and only **Contents: Read and write**.
-2. Generate a private key; GitHub offers the `.pem` once.
-3. Install the App on `homebrew-tap` only.
+1. Create the App, webhook off, with only **Contents: Read and write**.
+2. Generate a private key, shown once.
+3. Install the App on `homebrew-tap` and `dekopon-agents.github.io`.
 4. Add repository secrets `TAP_APP_ID` and `TAP_APP_PRIVATE_KEY`, the whole `.pem`.
 
-Until then the tap job warns and skips; the release still publishes. The App's token expires within
-the hour, reaches one repository, and belongs to the organization, not a maintainer.
+Until then both jobs warn and skip; the release publishes and the website pins it daily. Each
+token expires within the hour, reaches one repository, and is the organization's.
 
 ## Before opening a pull request
 
