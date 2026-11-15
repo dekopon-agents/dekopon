@@ -404,9 +404,7 @@ impl ScheduledCatalog {
     }
 
     pub(crate) fn entries(&self) -> Vec<(SecretDrn, PathBuf, bool)> {
-        let mut records = BTreeMap::new();
-        for (drn, path, has_seed) in self
-            .resolver
+        self.resolver
             .iter()
             .flat_map(|resolver| &resolver.entries)
             .filter_map(|(drn, entry)| match &entry.source {
@@ -434,12 +432,6 @@ impl ScheduledCatalog {
                 | SecretSource::ChatgptSubscription { .. }
                 | SecretSource::GithubApp { .. } => None,
             })
-        {
-            records.entry(path).or_insert((drn, has_seed));
-        }
-        records
-            .into_iter()
-            .map(|(path, (drn, has_seed))| (drn, path, has_seed))
             .collect()
     }
 
@@ -1719,7 +1711,8 @@ async fn validate_map(
         ));
     }
     let mut seen = BTreeSet::new();
-    let mut oauth2_records: BTreeMap<PathBuf, Vec<OAuth2RecordOwner>> = BTreeMap::new();
+    let mut self_rotated_paths = BTreeSet::new();
+    let mut file_owners: BTreeMap<PathBuf, BTreeSet<SecretDrn>> = BTreeMap::new();
     let mut bootstrap_paths = BTreeSet::new();
     let mut material_paths = BTreeSet::new();
     let mut binding_ids = BTreeSet::new();
@@ -1733,39 +1726,25 @@ async fn validate_map(
         if let Err(reason) = entry.source.validate() {
             problems.push(format!("{} source is invalid: {reason}", entry.drn));
         }
-        if let SecretSource::OAuth2Refresh {
-            record_path,
-            token_endpoint,
-            client_id,
-            seed_path,
-            ..
-        } = &entry.source
-        {
-            let owners = oauth2_records.entry(record_path.clone()).or_default();
-            for owner in owners.iter() {
-                if owner.token_endpoint != *token_endpoint
-                    || owner.client_id != *client_id
-                    || owner.seed_path != *seed_path
-                {
-                    problems.push(format!(
-                        "oauth2Refresh record has conflicting tokenEndpoint, clientId or seedPath for {} and {}",
-                        owner.drn,
-                        entry.drn,
-                    ));
-                }
-            }
-            owners.push(OAuth2RecordOwner {
-                drn: entry.drn.clone(),
-                token_endpoint: token_endpoint.clone(),
-                client_id: client_id.clone(),
-                seed_path: seed_path.clone(),
-            });
+        if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
+            self_rotated_paths.insert(record_path.clone());
+        }
+        if let SecretSource::ChatgptSubscription { auth_file } = &entry.source {
+            self_rotated_paths.insert(auth_file.clone());
         }
         if let Some(path) = entry.source.bootstrap_path() {
-            bootstrap_paths.insert(path);
+            bootstrap_paths.insert(path.clone());
+            file_owners
+                .entry(path)
+                .or_default()
+                .insert(entry.drn.clone());
         }
         if let Some(path) = entry.source.material_file() {
-            material_paths.insert(path);
+            material_paths.insert(path.clone());
+            file_owners
+                .entry(path)
+                .or_default()
+                .insert(entry.drn.clone());
         }
         if entry.bindings.is_empty() || entry.bindings.len() > MAX_BINDINGS_PER_SECRET {
             problems.push(format!("{} has an invalid binding count", entry.drn));
@@ -1858,6 +1837,19 @@ async fn validate_map(
             problems.push(format!(
                 "secret material path {} is also a backend bootstrap credential",
                 path.display()
+            ));
+        }
+    }
+    for (path, owners) in &file_owners {
+        if self_rotated_paths.contains(path) && owners.len() > 1 {
+            problems.push(format!(
+                "secret path {} is used by secret-map entries {}",
+                path.display(),
+                owners
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -2287,13 +2279,6 @@ async fn read_kubernetes_projection(root: &Path, key: &str) -> Result<Vec<u8>, S
         return Err(SourceError::TooLarge);
     }
     Ok(bytes)
-}
-
-struct OAuth2RecordOwner {
-    drn: SecretDrn,
-    token_endpoint: String,
-    client_id: String,
-    seed_path: Option<PathBuf>,
 }
 
 fn headers_within_limits(response: &reqwest::Response) -> bool {
@@ -2831,6 +2816,8 @@ pub enum SecretMapError {
 #[cfg(test)]
 mod oauth2_tests;
 #[cfg(test)]
+mod record_path_exclusivity;
+#[cfg(test)]
 mod token_request_tests;
 
 #[cfg(test)]
@@ -3335,6 +3322,48 @@ secrets:
             problems
                 .iter()
                 .any(|problem| problem.contains("is also a backend bootstrap credential")),
+            "{problems:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chatgpt_auth_file_cannot_serve_two_entries() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+        let auth = directory.path().join("auth.json");
+        write(&auth, chatgpt_auth_document().as_bytes()).await;
+        let map = directory.path().join("map.yaml");
+        let first = format!(
+            "  - drn: drn:secret:chatgpt/first\n    destinations: [chatgpt.com]\n    source: {{ kind: chatgptSubscription, authFile: {} }}\n",
+            auth.display()
+        );
+        let second = format!(
+            "  - drn: drn:secret:chatgpt/second\n    destinations: [chatgpt.com]\n    source: {{ kind: chatgptSubscription, authFile: {} }}\n",
+            auth.display()
+        );
+        let document = format!(
+            "{}{}",
+            minted_map(&first),
+            minted_map(&second)
+                .split_once("secrets:\n")
+                .expect("one entry")
+                .1
+                .replace("id: minted", "id: second")
+        );
+        write(&map, document.as_bytes()).await;
+
+        let Err(SecretMapError::Validation { problems }) = load(&map, uid()).await else {
+            panic!("one authFile must belong to one entry");
+        };
+        assert!(
+            problems.iter().any(|problem| {
+                problem
+                    == &format!(
+                        "secret path {} is used by secret-map entries drn:secret:chatgpt/first, drn:secret:chatgpt/second",
+                        auth.display()
+                    )
+            }),
             "{problems:?}"
         );
     }

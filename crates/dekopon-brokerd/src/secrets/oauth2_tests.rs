@@ -515,7 +515,7 @@ fn map(path: &Path, endpoint: &str, bootstrap: Option<&Path>) -> SecretMapFile {
     if let Some(bootstrap) = bootstrap {
         secrets.push(json!({"drn":drn("bootstrap"),"source":{"kind":"onePasswordConnect","endpoint":"https://example.org", "tokenFile":bootstrap,"vault":"a","item":"b","field":"c"},"bindings":[]}));
     } else {
-        secrets.push(json!({"drn":drn("two"), "destinations":["runner.example"], "source":source_value(path,endpoint),"bindings":[{
+        secrets.push(json!({"drn":drn("two"), "destinations":["runner.example"], "source":source_value(&path.with_file_name("record-two.json"),endpoint),"bindings":[{
             "id":"second","capabilities":["vm.session.create"],"sink":"httpBearer","allowedHosts":["runner.example"],"allowedMethods":["POST"],"allowedPaths":[{"match":"exact","path":"/v1/sessions"}]
         }]}));
     }
@@ -633,15 +633,8 @@ fn oauth_policy() -> PolicyEngine {
                action == Dekopon::Action::"secret.use",
                resource == Dekopon::Secret::"{}")
         when {{ context.capability == "http-probe.fetch"
-             && context.provider == "http-probe" && context.sink == "httpBearer" }};
-        @id("use-two")
-        permit(principal == Dekopon::Principal::"caller",
-               action == Dekopon::Action::"secret.use",
-               resource == Dekopon::Secret::"{}")
-        when {{ context.capability == "http-probe.fetch"
              && context.provider == "http-probe" && context.sink == "httpBearer" }};"#,
-        drn("one"),
-        drn("two")
+        drn("one")
     );
     let world = PolicyWorld::new(
         ["caller".parse::<PrincipalId>().unwrap()],
@@ -651,7 +644,7 @@ fn oauth_policy() -> PolicyEngine {
         )],
     )
     .unwrap()
-    .with_secrets([drn("one"), drn("two")]);
+    .with_secrets([drn("one")]);
     PolicyEngine::new(&policy, &world).unwrap()
 }
 
@@ -660,7 +653,7 @@ fn oauth_policy() -> PolicyEngine {
     clippy::too_many_lines,
     reason = "one concurrent credential rotation scenario"
 )]
-async fn two_drns_over_one_record_share_one_refresh() {
+async fn two_invocations_of_one_record_share_one_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
     expired(&path);
@@ -680,6 +673,7 @@ async fn two_drns_over_one_record_share_one_refresh() {
     );
     let authority = target.authority().to_owned();
     let mut file = map(&path, &api.endpoint, None);
+    file.secrets.pop();
     for entry in &mut file.secrets {
         entry.destinations = vec![authority.clone()];
         for binding in &mut entry.bindings {
@@ -699,7 +693,7 @@ async fn two_drns_over_one_record_share_one_refresh() {
     .await
     .unwrap();
     let catalog = catalog.catalog;
-    assert_eq!(catalog.drns().count(), 2);
+    assert_eq!(catalog.drns().count(), 1);
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -807,7 +801,7 @@ async fn two_drns_over_one_record_share_one_refresh() {
         })
     };
     let a = invoke("invoke-oauth-one", drn("one"));
-    let b = invoke("invoke-oauth-two", drn("two"));
+    let b = invoke("invoke-oauth-two", drn("one"));
     for task in [a, b] {
         let result = tokio::time::timeout(Duration::from_secs(30), task)
             .await
@@ -1009,7 +1003,7 @@ async fn no_token_or_oauth_error_body_reaches_the_trace() {
 }
 
 #[tokio::test]
-async fn a_shared_record_with_a_different_endpoint_or_client_is_refused() {
+async fn a_record_shared_by_three_entries_reports_all_three() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
     let mut file = map(&path, "https://one.example/token", None);
@@ -1032,43 +1026,16 @@ async fn a_shared_record_with_a_different_endpoint_or_client_is_refused() {
     )
     .await
     else {
-        panic!("mismatched refresh sources cannot share a record");
-    };
-    assert_eq!(problems.len(), 3, "{problems:?}");
-    for (first, second) in [("one", "two"), ("one", "three"), ("two", "three")] {
-        assert!(
-            problems.iter().any(|problem| {
-                problem.contains(drn(first).as_str()) && problem.contains(drn(second).as_str())
-            }),
-            "{problems:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn a_shared_record_cannot_have_two_seed_paths() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("record.json");
-    let mut file = map(&path, "https://example.org/token", None);
-    for (entry, name) in file.secrets.iter_mut().zip(["seed-one", "seed-two"]) {
-        let mut value = source_value(&path, "https://example.org/token");
-        value["seedPath"] = json!(dir.path().join(name));
-        entry.source = serde_json::from_value(value).unwrap();
-    }
-    let Err(SecretMapError::Validation { problems }) = validate_map(
-        file,
-        &dir.path().join("map.json"),
-        rustix::process::geteuid().as_raw(),
-    )
-    .await
-    else {
-        panic!("different seed path must refuse")
+        panic!("a record cannot serve multiple entries");
     };
     assert!(
-        problems
-            .iter()
-            .any(|problem| problem.contains(drn("one").as_str())
-                && problem.contains(drn("two").as_str()))
+        problems.iter().any(|problem| {
+            problem.contains(&path.display().to_string())
+                && ["one", "two", "three"]
+                    .iter()
+                    .all(|name| problem.contains(drn(name).as_str()))
+        }),
+        "{problems:?}"
     );
 }
 
@@ -1079,11 +1046,9 @@ async fn unsafe_present_seed_refuses_at_boot_but_missing_seed_allows_live_record
     let seed = dir.path().join("seed");
     write_record(&record, u64::MAX);
     let mut file = map(&record, "https://example.org/token", None);
-    for entry in &mut file.secrets {
-        let mut source = source_value(&record, "https://example.org/token");
-        source["seedPath"] = json!(seed);
-        entry.source = serde_json::from_value(source).unwrap();
-    }
+    let mut source = source_value(&record, "https://example.org/token");
+    source["seedPath"] = json!(seed);
+    file.secrets[0].source = serde_json::from_value(source).unwrap();
     let map_path = dir.path().join("map.json");
     assert!(
         validate_map(file.clone(), &map_path, rustix::process::geteuid().as_raw())
