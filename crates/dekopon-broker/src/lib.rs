@@ -4034,7 +4034,9 @@ where
                     span.in_scope(|| preparation.materialize())
                 })
                 .await
-                .map_err(|source| BrokerError::StorageTask { source })?;
+                .map_err(|source| BrokerError::StorageTask {
+                    source: dekopon_core::TaskOutcome::from_join_error(source),
+                })?;
                 Some(materialized.map_err(|source| {
                     if source.namespace_reset() {
                         tracing::Span::current().record("storage.reset", true);
@@ -5582,7 +5584,7 @@ pub enum BrokerError {
     #[error("broker storage materialization did not complete")]
     StorageTask {
         #[source]
-        source: tokio::task::JoinError,
+        source: dekopon_core::TaskOutcome,
     },
     #[error("broker could not create constrained authorization")]
     Authorization {

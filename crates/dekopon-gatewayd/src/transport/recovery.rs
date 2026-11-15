@@ -370,7 +370,10 @@ mod tests {
         let error = crate::supervise_transports(&mut readers, std::future::pending())
             .await
             .expect_err("task failure stops gateway");
-        assert!(matches!(error, crate::GatewaydError::TransportTask(source) if source.is_panic()));
+        assert!(matches!(
+            error,
+            crate::GatewaydError::TransportTask(dekopon_core::TaskOutcome::Panicked)
+        ));
     }
     #[tokio::test(start_paused = true)]
     async fn a_changed_identity_is_terminal_instead_of_using_stale_routing_metadata() {

@@ -38,6 +38,20 @@ pub(crate) struct Gateway {
     drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
 }
 
+fn observe_tick<T>(result: Result<Option<T>, tokio::task::JoinError>) -> Option<T> {
+    match result {
+        Ok(fired) => fired,
+        Err(error) => {
+            tracing::error!(
+                event = "gateway_wake_task_failed",
+                failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
+                "gateway.wake.task.failed"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) struct ServingGeneration {
     pub(crate) routes: Arc<RoutingTable>,
     stop_words: Arc<Vec<String>>,
@@ -418,9 +432,10 @@ impl Gateway {
                             tracing::error!(event = "gateway_wake_store_failed", error = %error, wakes = "stopped", "gateway.wake.store.failed");
                             wakes = None;
                         }
-                        Err(_) => {
+                        Err(error) => {
                             tracing::error!(
                                 event = "gateway_wake_store_failed",
+                                failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
                                 wakes = "stopped",
                                 "gateway.wake.store.failed"
                             );
@@ -429,13 +444,8 @@ impl Gateway {
                     }
                 },
                 Some(result) = ticks.join_next() => {
-                    match result {
-                        Ok(Some(fired)) => self.start_wake(&mut sessions, fired),
-                        Ok(None) => {}
-                        Err(_) => tracing::error!(
-                            event = "gateway_wake_task_failed",
-                            "gateway.wake.task.failed"
-                        ),
+                    if let Some(fired) = observe_tick(result) {
+                        self.start_wake(&mut sessions, fired);
                     }
                 },
                 () = async {
@@ -550,7 +560,7 @@ impl Gateway {
         // A tick that fires here has already retired its row, so its wake must still start.
         if timeout(grace, async {
             while let Some(result) = ticks.join_next().await {
-                if let Ok(Some(fired)) = result {
+                if let Some(fired) = observe_tick(result) {
                     self.start_wake(&mut sessions, fired);
                 }
             }
@@ -570,7 +580,7 @@ impl Gateway {
                 observe_session(result);
             }
             while let Some(result) = ticks.join_next().await {
-                if let Ok(Some(fired)) = result {
+                if let Some(fired) = observe_tick(result) {
                     self.start_wake(&mut sessions, fired);
                 }
             }
@@ -966,7 +976,7 @@ impl Gateway {
                         return;
                     }
                     Err(error) => {
-                        tracing::error!(event = "gateway_wake_store_failed", error = %error, "gateway.wake.store.failed");
+                        tracing::error!(event = "gateway_wake_store_failed", failure = dekopon_core::TaskOutcome::from_join_error(error).category(), "gateway.wake.store.failed");
                         ticket.answer(transport::github::Acked::Busy);
                         return;
                     }

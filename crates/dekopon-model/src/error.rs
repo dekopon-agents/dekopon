@@ -171,7 +171,7 @@ pub enum TransportFailure {
         source: reqwest::Error,
     },
     #[error("blocking model task failed: {0}")]
-    Blocking(#[source] tokio::task::JoinError),
+    Blocking(#[source] dekopon_core::TaskOutcome),
     #[error("request body: {0}")]
     Encoding(#[source] serde_json::Error),
     #[error("could not prepare model credential: {0}")]

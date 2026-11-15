@@ -16,6 +16,7 @@ include = ["src/**", "README.md", "Cargo.toml"]
 [features]
 native = ["dep:base64"]
 cli = ["dep:clap"]
+tokio-task = ["dep:tokio"]
 
 [dependencies]
 base64 = { workspace = true, optional = true }
@@ -23,6 +24,7 @@ clap = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
 
 # The `accept()` classification is a table of Unix `errno` values; no other platform has one, and a
 # wasm guest never listens, so the dependency stays off every non-Unix build of this crate.

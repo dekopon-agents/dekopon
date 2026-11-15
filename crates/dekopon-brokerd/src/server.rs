@@ -299,9 +299,10 @@ fn refuse_over_capacity(stream: UnixStream, frame: &[u8]) -> bool {
 }
 
 fn observe_task(result: Result<Result<(), ConnectionError>, tokio::task::JoinError>) {
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
+    let outcome = dekopon_core::TaskOutcome::from_join(result);
+    match outcome {
+        dekopon_core::TaskOutcome::Completed => {}
+        dekopon_core::TaskOutcome::Failed(error) => {
             let cause = dekopon_core::error_chain(&error);
             match error.unaudited_outcome() {
                 Some(invocation) => tracing::error!(
@@ -325,17 +326,13 @@ fn observe_task(result: Result<Result<(), ConnectionError>, tokio::task::JoinErr
                 ),
             }
         }
-        // A panic payload is arbitrary text that may quote credential material, so only its class
-        // is recorded; the default panic hook has already written it to stderr.
-        Err(error) => tracing::error!(
-            event = "broker_connection_failed",
-            category = if error.is_panic() {
-                "task-panicked"
-            } else {
-                "task-cancelled"
-            },
-            "broker.connection.failed"
-        ),
+        failure @ (dekopon_core::TaskOutcome::Panicked | dekopon_core::TaskOutcome::Cancelled) => {
+            tracing::error!(
+                event = "broker_connection_failed",
+                category = failure.category(),
+                "broker.connection.failed"
+            )
+        }
     }
 }
 

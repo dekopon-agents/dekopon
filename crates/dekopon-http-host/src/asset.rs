@@ -81,7 +81,10 @@ impl AssetJobs {
         self.spawn(work)
             .await
             .map_err(|failure| {
-                tracing::error!(error = %failure, "http.asset.worker.failed");
+                tracing::error!(
+                    failure = dekopon_core::TaskOutcome::from_join_error(failure).category(),
+                    "http.asset.worker.failed"
+                );
                 AssetIoError::Worker
             })?
             .value

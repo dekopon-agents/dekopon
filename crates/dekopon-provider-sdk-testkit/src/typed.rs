@@ -568,7 +568,9 @@ impl ScriptServer {
                 tokio::time::timeout(timeout, &mut self.task)
                     .await
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?
-                    .map_err(std::io::Error::other)?
+                    .map_err(|error| {
+                        std::io::Error::other(dekopon_core::TaskOutcome::from_join_error(error))
+                    })?
             })?;
         }
         Ok(request)

@@ -372,10 +372,10 @@ async fn run(
         .await
     {
         Ok(next) => next,
-        Err(crate::threads::Failure::Task(crate::session::TaskFailure::Panicked { cause })) => {
-            std::panic::resume_unwind(Box::new(cause))
+        Err(crate::threads::Failure::Task(dekopon_core::TaskOutcome::Panicked)) => {
+            std::panic::resume_unwind(Box::new("memory summary task panicked"))
         }
-        Err(crate::threads::Failure::Task(crate::session::TaskFailure::Cancelled)) => Next::Stop,
+        Err(crate::threads::Failure::Task(dekopon_core::TaskOutcome::Cancelled)) => Next::Stop,
         Err(failure) => {
             span.in_scope(|| {
                 tracing::warn!(

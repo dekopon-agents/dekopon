@@ -167,9 +167,10 @@ async fn a_panicking_job_returns_its_thread_permit_and_its_owner_observes_panick
             panic!("job thread panicked");
         })
         .unwrap();
-    assert!(
-        matches!(result.await.unwrap(), Err(crate::session::TaskFailure::Panicked { cause }) if cause == "job thread panicked")
-    );
+    assert!(matches!(
+        result.await.unwrap(),
+        Err(dekopon_core::TaskOutcome::Panicked)
+    ));
     let rows = runner.jobs.list(&owner);
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -232,7 +233,7 @@ async fn shutdown_joins_admitted_threads_even_after_their_callers_are_cancelled(
 async fn a_cancelled_session_task_keeps_its_cancelled_category() {
     let task = tokio::spawn(std::future::pending::<()>());
     task.abort();
-    let failure = crate::session::TaskFailure::from(task.await.unwrap_err());
-    assert!(matches!(failure, crate::session::TaskFailure::Cancelled));
+    let failure = dekopon_core::TaskOutcome::from_join_error(task.await.unwrap_err());
+    assert!(matches!(failure, dekopon_core::TaskOutcome::Cancelled));
     assert_eq!(failure.category(), "cancelled");
 }

@@ -390,7 +390,9 @@ impl ProviderManager {
         let out = out.to_path_buf();
         tokio::task::spawn_blocking(move || export_skills(&sources, &out))
             .await
-            .map_err(|source| ProviderManagerError::SkillExportTask { source })?
+            .map_err(|source| ProviderManagerError::SkillExportTask {
+                source: dekopon_core::TaskOutcome::from_join_error(source),
+            })?
     }
 
     pub async fn verify(&self) -> Result<ProviderVerifyReport, ProviderManagerError> {
@@ -1966,7 +1968,11 @@ async fn read_secure_file(
     })
     .await
     .map_err(|join| {
-        ProviderManagerError::io_at(READ_PROVIDER_STATE, path.clone(), io::Error::other(join))
+        ProviderManagerError::io_at(
+            READ_PROVIDER_STATE,
+            path.clone(),
+            io::Error::other(dekopon_core::TaskOutcome::from_join_error(join)),
+        )
     })?
     .map_err(|error| match error {
         FileHygieneError::Io { path, source } => {
@@ -2316,7 +2322,7 @@ pub enum ProviderManagerError {
     #[error("could not join skill export")]
     SkillExportTask {
         #[source]
-        source: tokio::task::JoinError,
+        source: dekopon_core::TaskOutcome,
     },
     #[error("provider skills refused")]
     SkillRead {

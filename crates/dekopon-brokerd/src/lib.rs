@@ -1560,7 +1560,7 @@ pub enum BrokerdError {
     #[error("broker provider storage could not start")]
     Storage(#[source] dekopon_storage_host::StorageHostError),
     #[error("broker storage reaper task failed")]
-    StorageReaper(#[source] tokio::task::JoinError),
+    StorageReaper(#[source] dekopon_core::TaskOutcome),
     #[error("broker assets could not start")]
     Assets(#[source] assets::AssetsStartupError),
     #[error("broker provider host could not start")]

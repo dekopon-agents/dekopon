@@ -19,7 +19,7 @@ dekopon-broker-protocol.workspace = true
 dekopon-process.workspace = true
 # Loaded skills: the session shows a model text `dekopon-config` already read and bounded.
 dekopon-config.workspace = true
-dekopon-core = { workspace = true, features = ["native"] }
+dekopon-core = { workspace = true, features = ["native", "tokio-task"] }
 dekopon-model.workspace = true
 dekopon-model-token-governor.workspace = true
 dekopon-shell.workspace = true

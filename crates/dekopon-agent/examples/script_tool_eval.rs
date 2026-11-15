@@ -147,7 +147,7 @@ enum EvalError {
     #[error("runtime could not start")]
     Runtime(#[source] std::io::Error),
     #[error("blocking session did not finish")]
-    Join(#[from] tokio::task::JoinError),
+    Join(#[from] dekopon_core::TaskOutcome),
 }
 
 impl Arguments {
@@ -874,11 +874,13 @@ fn session<I: CapabilityInvoker + Send + 'static>(
     let instruction = Arc::clone(&trial.task.instruction);
     let system = Arc::clone(trial.system);
     let history = Arc::clone(trial.task.history.as_ref().unwrap_or(trial.history));
-    let (result, model, shell) = runtime.block_on(runtime.spawn_blocking(move || {
-        let inputs = SessionInputs::new(&instruction, limits).with_system(Some(&system));
-        let (result, _captured) = run_prompt_session(&model, &shell, inputs, &history);
-        (result, model, shell)
-    }))?;
+    let (result, model, shell) = runtime
+        .block_on(runtime.spawn_blocking(move || {
+            let inputs = SessionInputs::new(&instruction, limits).with_system(Some(&system));
+            let (result, _captured) = run_prompt_session(&model, &shell, inputs, &history);
+            (result, model, shell)
+        }))
+        .map_err(|error| EvalError::Join(error.into()))?;
     Ok(Session {
         result,
         turns: model.turns.into_inner(),
@@ -1036,6 +1038,7 @@ fn install_trace(path: &Path) -> Result<(), EvalError> {
 }
 
 fn main() -> ProcessExit {
+    dekopon_core::install_panic_hook();
     if let Some(code) = dekopon_shell::run_jq_worker_if_requested() {
         return code;
     }

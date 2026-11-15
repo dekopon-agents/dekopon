@@ -375,8 +375,11 @@ impl Worker {
         }
         while let Some(result) = self.tasks.join_next().await {
             if let Err(error) = result {
-                tracing::error!(event = "gateway_participant_task_failed", error = %error,
-                    "gateway.participant.task.failed");
+                tracing::error!(
+                    event = "gateway_participant_task_failed",
+                    failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
+                    "gateway.participant.task.failed"
+                );
             }
         }
     }

@@ -921,21 +921,18 @@ fn exhausted_bounds_are_terminal_rather_than_retriable() {
 }
 
 #[tokio::test]
-async fn a_panicking_storage_materialization_keeps_its_panic_and_its_public_category() {
+async fn a_panicking_storage_materialization_keeps_only_its_class_and_public_category() {
     let source = tokio::task::spawn_blocking(|| panic!("namespace generation pointer is missing"))
         .await
         .expect_err("the blocking task panics");
-    let error = super::BrokerError::StorageTask { source };
+    let error = super::BrokerError::StorageTask {
+        source: dekopon_core::TaskOutcome::from_join_error(source),
+    };
 
     assert_eq!(error.storage_failure_code(), Some("storage-io"));
     assert!(error.unaudited_outcome().is_none());
-    let cause = std::error::Error::source(&error).expect("the join failure is the cause");
-    assert!(
-        cause
-            .to_string()
-            .contains("namespace generation pointer is missing"),
-        "the panic message was discarded: {cause}"
-    );
+    let cause = std::error::Error::source(&error).expect("the task failure is the cause");
+    assert_eq!(cause.to_string(), "task panicked");
 }
 
 #[test]

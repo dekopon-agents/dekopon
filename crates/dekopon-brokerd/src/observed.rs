@@ -56,7 +56,10 @@ pub(crate) async fn observed<E: std::error::Error>(
             Ok(flushed) => flushed,
             Err(error) => {
                 return diagnostic(
-                    &format!("dekopon-brokerd: telemetry flush failed: {error}\n"),
+                    &format!(
+                        "dekopon-brokerd: telemetry flush failed: {}\n",
+                        dekopon_core::TaskOutcome::from_join_error(error)
+                    ),
                     code,
                 );
             }
@@ -73,7 +76,10 @@ pub(crate) async fn observed<E: std::error::Error>(
                 Ok(Ok(flushed)) => flushed,
                 Ok(Err(error)) => {
                     return diagnostic(
-                        &format!("dekopon-brokerd: telemetry flush failed: {error}\n"),
+                        &format!(
+                            "dekopon-brokerd: telemetry flush failed: {}\n",
+                            dekopon_core::TaskOutcome::from_join_error(error)
+                        ),
                         code,
                     );
                 }

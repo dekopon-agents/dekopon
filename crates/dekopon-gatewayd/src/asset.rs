@@ -309,7 +309,7 @@ impl Downloads {
             {
                 tracing::error!(
                     event = "gateway_asset_download_failed",
-                    %error,
+                    failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
                     "gateway.asset.download.failed"
                 );
             }
@@ -383,7 +383,10 @@ impl AssetStore {
         match tokio::task::spawn_blocking(move || retention.lock().finish_publications()).await {
             Ok(Ok(())) => (),
             Ok(Err(error)) => tracing::warn!(%error, "gateway.asset.reclaim.failed"),
-            Err(error) => tracing::warn!(%error, "gateway.asset.reclaim.failed"),
+            Err(error) => tracing::warn!(
+                failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
+                "gateway.asset.reclaim.failed"
+            ),
         }
     }
 

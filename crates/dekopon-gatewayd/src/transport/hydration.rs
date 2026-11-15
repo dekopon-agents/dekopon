@@ -109,15 +109,9 @@ impl ImageQueue {
 
 fn join<T>(joined: Result<T, tokio::task::JoinError>) -> Result<T, TransportError> {
     joined.map_err(|error| {
-        // Panic payloads may contain arbitrary text, so only the fixed reason string is kept, never
-        // the payload itself.
-        let reason = if error.is_panic() {
-            "panic"
-        } else {
-            "cancelled"
-        };
-        tracing::error!(reason, "gateway.hydration.failed");
-        TransportError::AttachmentTask { reason }
+        let outcome = dekopon_core::TaskOutcome::from(error);
+        tracing::error!(reason = outcome.category(), "gateway.hydration.failed");
+        TransportError::AttachmentTask { outcome }
     })
 }
 
@@ -470,7 +464,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             error,
-            TransportError::AttachmentTask { reason: "panic" }
+            TransportError::AttachmentTask {
+                outcome: dekopon_core::TaskOutcome::Panicked
+            }
         ));
         assert_eq!(error.category(), "attachment-task");
         assert!(error.to_string().contains("provider already executed"));
