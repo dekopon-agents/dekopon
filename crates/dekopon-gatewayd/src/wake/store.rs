@@ -1,8 +1,8 @@
 use parking_lot::Mutex;
 use std::{
-    fs::{self, DirBuilder, File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    fs::{DirBuilder, File},
+    io::{self, BufRead, BufReader},
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -10,6 +10,7 @@ use std::{
 use dekopon_agent::wake::{WakeId, WakeRefusal, WakeSummary, WatchSummary};
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, TraceParent};
 use dekopon_core::github::{GithubEvent, GithubEventName, GithubThread};
+use dekopon_core::private_file::{TemporarySweep, replace_private_file, sweep_stale_temporaries};
 use dekopon_core::{AgentId, AttestedSubject, Subject};
 use dekopon_shell::{CapabilityInvoker, Interpreter};
 use serde::{Deserialize, Serialize};
@@ -518,6 +519,12 @@ impl WakeStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error.into()),
         };
+        for outcome in sweep_stale_temporaries(&config.path, None) {
+            match outcome {
+                TemporarySweep::Removed { .. } => {}
+                TemporarySweep::Failed { source, .. } => return Err(source.into()),
+            }
+        }
         let next_id = wakes
             .iter()
             .map(|wake| wake.id.0)
@@ -1003,19 +1010,48 @@ fn read(file: File) -> Result<Vec<Wake>, WakeStoreError> {
 }
 
 fn write(path: &Path, wakes: &[Wake]) -> Result<(), WakeStoreError> {
-    let temporary = path.with_extension("next");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
+    let mut bytes = Vec::new();
     for wake in wakes {
-        let mut encoded = serde_json::to_vec(&Line::from(wake)).map_err(io::Error::from)?;
-        encoded.push(b'\n');
-        file.write_all(&encoded)?;
+        serde_json::to_writer(&mut bytes, &Line::from(wake)).map_err(io::Error::from)?;
+        bytes.push(b'\n');
     }
-    drop(file);
-    fs::rename(&temporary, path)?;
-    Ok(())
+    replace_private_file(path, &bytes).map_err(|error| error.source.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, time::Duration};
+
+    use tempfile::TempDir;
+
+    use dekopon_core::private_file::temporary_path;
+
+    use super::{WakeOperation, WakeStore};
+    use crate::config::{ResolvedWakes, WakeBounds};
+
+    #[test]
+    fn a_stale_wake_temporary_does_not_block_the_first_write_after_open() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("wakes.jsonl");
+        let stale = temporary_path(&path);
+        fs::write(&stale, b"partial").unwrap();
+        let store = WakeStore::open(&ResolvedWakes {
+            path: path.clone(),
+            bounds: WakeBounds {
+                max_per_subject: 20,
+                min_interval: Duration::ZERO,
+                max_horizon: Duration::ZERO,
+                max_subscriptions_per_agent: 1,
+                subscription_expiry: Duration::ZERO,
+            },
+        })
+        .unwrap();
+
+        store
+            .mutate(|_| WakeOperation::Created, |_| Ok(()))
+            .unwrap();
+
+        assert!(!stale.exists());
+        assert!(path.exists());
+    }
 }
