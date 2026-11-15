@@ -113,6 +113,8 @@ pub struct ManagedProviderSetConfig {
 pub struct AssetsConfig {
     pub root_path: PathBuf,
     pub max_in_flight_bytes: u64,
+    #[serde(default = "dekopon_http_host::asset::AssetDirectory::default_max_live_spools")]
+    pub max_live_spools_per_invocation: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -939,6 +941,9 @@ async fn resolve(
     let assets = config
         .assets
         .map(|mut assets| {
+            if assets.max_live_spools_per_invocation == 0 {
+                return Err(ConfigError::InvalidAssetSpoolLimit);
+            }
             assets.root_path = mode.runtime_path(resolve_path(assets.root_path), |path| {
                 dekopon_storage_host::resolve_storage_root_path(&path)
                     .map_err(|source| ConfigError::AssetsPath { source })
@@ -1472,6 +1477,8 @@ pub enum ConfigError {
     },
     #[error("assets.rootPath must not overlap broker files, provider storage or provider paths")]
     AssetsStateCollision,
+    #[error("assets.maxLiveSpoolsPerInvocation must be positive")]
+    InvalidAssetSpoolLimit,
     #[error("could not safely resolve a configured provider storage path")]
     StoragePath {
         #[source]

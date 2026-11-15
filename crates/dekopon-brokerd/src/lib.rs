@@ -70,6 +70,83 @@ pub use socket::{SocketError, SocketGuard, current_uid};
 
 pub const HARD_MAX_PROVIDERS: usize = 64;
 
+#[derive(Debug, PartialEq, Eq)]
+struct FdBudget {
+    spools_per_invocation: usize,
+    wasm_providers: usize,
+    nominal_in_flight: usize,
+    max_concurrent_invocations: usize,
+    worst_case_in_flight: usize,
+    in_flight_saturated: bool,
+    fd_soft_limit: u64,
+    fd_hard_limit: u64,
+    fd_soft_unlimited: bool,
+    fd_hard_unlimited: bool,
+}
+
+impl FdBudget {
+    fn new(
+        spools_per_invocation: usize,
+        wasm_providers: usize,
+        max_concurrent_invocations: usize,
+        limits: rustix::process::Rlimit,
+    ) -> Self {
+        let nominal = wasm_providers.checked_mul(spools_per_invocation);
+        let worst_case = max_concurrent_invocations.checked_mul(spools_per_invocation);
+        Self {
+            spools_per_invocation,
+            wasm_providers,
+            nominal_in_flight: nominal.unwrap_or(usize::MAX),
+            max_concurrent_invocations,
+            worst_case_in_flight: worst_case.unwrap_or(usize::MAX),
+            in_flight_saturated: nominal.is_none() || worst_case.is_none(),
+            fd_soft_limit: limits.current.unwrap_or(u64::MAX),
+            fd_hard_limit: limits.maximum.unwrap_or(u64::MAX),
+            fd_soft_unlimited: limits.current.is_none(),
+            fd_hard_unlimited: limits.maximum.is_none(),
+        }
+    }
+
+    fn log(&self) {
+        tracing::info!(
+            event = "broker_fd_budget",
+            spools_per_invocation = self.spools_per_invocation,
+            wasm_providers = self.wasm_providers,
+            nominal_in_flight = self.nominal_in_flight,
+            max_concurrent_invocations = self.max_concurrent_invocations,
+            worst_case_in_flight = self.worst_case_in_flight,
+            in_flight_saturated = self.in_flight_saturated,
+            fd_soft_limit = self.fd_soft_limit,
+            fd_hard_limit = self.fd_hard_limit,
+            fd_soft_unlimited = self.fd_soft_unlimited,
+            fd_hard_unlimited = self.fd_hard_unlimited,
+            "broker.fd_budget"
+        );
+    }
+}
+
+fn raise_nofile_limit() -> rustix::process::Rlimit {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let limits = getrlimit(Resource::Nofile);
+    if limits.current != limits.maximum
+        && let Err(error) = setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: limits.maximum,
+                maximum: limits.maximum,
+            },
+        )
+    {
+        tracing::warn!(
+            event = "broker_fd_limit_raise_failed",
+            error = %error,
+            "broker.fd_limit.raise.failed"
+        );
+    }
+    getrlimit(Resource::Nofile)
+}
+
 pub async fn telemetry_settings(
     config_path: impl AsRef<Path>,
     uid: u32,
@@ -97,6 +174,7 @@ async fn serve<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    let fd_limits = raise_nofile_limit();
     let (candidate, report) = load_candidate(config_path.as_ref(), Mode::Boot).await;
     for warning in &report.warnings {
         warning.log();
@@ -107,6 +185,16 @@ where
             return Err(BrokerdError::from_problems(report.problems));
         }
     };
+    FdBudget::new(
+        candidate.assets.as_ref().map_or(
+            dekopon_http_host::asset::AssetDirectory::default_max_live_spools(),
+            dekopon_http_host::asset::AssetDirectory::max_live_spools_per_invocation,
+        ),
+        candidate.ready.registry.manifests().len(),
+        candidate.limits.max_connections,
+        fd_limits,
+    )
+    .log();
     let uid = current_uid();
     let limits = candidate.limits;
     let socket_path = candidate.socket_path.clone();

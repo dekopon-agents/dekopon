@@ -8,6 +8,40 @@ use sha2::{Digest as _, Sha256};
 
 use super::{config, current_uid, socket};
 
+#[test]
+fn fd_budget_reports_provider_count_and_connection_bound_separately() {
+    let budget = super::FdBudget::new(
+        32,
+        8,
+        64,
+        rustix::process::Rlimit {
+            current: Some(8192),
+            maximum: Some(8192),
+        },
+    );
+    assert_eq!(budget.spools_per_invocation, 32);
+    assert_eq!(budget.wasm_providers, 8);
+    assert_eq!(budget.nominal_in_flight, 256);
+    assert_eq!(budget.max_concurrent_invocations, 64);
+    assert_eq!(budget.worst_case_in_flight, 2048);
+    assert_eq!(budget.fd_soft_limit, 8192);
+    assert_eq!(budget.fd_hard_limit, 8192);
+    assert!(!budget.in_flight_saturated);
+    let unbounded_config = super::FdBudget::new(
+        usize::MAX,
+        8,
+        64,
+        rustix::process::Rlimit {
+            current: None,
+            maximum: None,
+        },
+    );
+    assert!(unbounded_config.in_flight_saturated);
+    assert_eq!(unbounded_config.worst_case_in_flight, usize::MAX);
+    assert!(unbounded_config.fd_soft_unlimited);
+    assert!(unbounded_config.fd_hard_unlimited);
+}
+
 pub(super) const POLICIES: &str = r#"
 @id("chat-agent-session")
 permit(principal == Dekopon::Principal::"cpetersen",
@@ -1606,7 +1640,23 @@ fn assets_config_is_optional_but_present_sections_require_both_keys_and_reject_u
     let parsed: config::AssetsConfig =
         serde_json::from_value(json!({"rootPath": "assets", "maxInFlightBytes": 0})).unwrap();
     assert_eq!(parsed.max_in_flight_bytes, 0);
+    assert_eq!(parsed.max_live_spools_per_invocation, 32);
     assert_eq!(parsed.root_path, Path::new("assets"));
+    let configured: config::AssetsConfig = serde_json::from_value(json!({
+        "rootPath": "assets",
+        "maxInFlightBytes": 0,
+        "maxLiveSpoolsPerInvocation": 8
+    }))
+    .unwrap();
+    assert_eq!(configured.max_live_spools_per_invocation, 8);
+    assert!(
+        serde_json::from_value::<config::AssetsConfig>(json!({
+            "rootPath": "assets",
+            "maxInFlightBytes": 0,
+            "maxLiveSpoolsPerComponent": 8
+        }))
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1655,6 +1705,37 @@ async fn assets_paths_are_resolved_and_refuse_overlap_in_both_directions() {
         config::load(&path, uid).await,
         Err(config::ConfigError::AssetsStateCollision)
     ));
+}
+
+#[tokio::test]
+async fn zero_live_asset_spool_limit_is_refused_at_load() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    write_owner_only(
+        &directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    );
+    let mut document = attested_document(uid);
+    document["assets"] = json!({
+        "rootPath": "assets",
+        "maxInFlightBytes": 100,
+        "maxLiveSpoolsPerInvocation": 0
+    });
+    write_config(&path, &document);
+    let refused = config::load(&path, uid).await.unwrap_err();
+    assert!(matches!(
+        refused,
+        config::ConfigError::InvalidAssetSpoolLimit
+    ));
+    assert_eq!(
+        refused.to_string(),
+        "assets.maxLiveSpoolsPerInvocation must be positive"
+    );
 }
 
 #[tokio::test]

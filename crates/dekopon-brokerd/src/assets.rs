@@ -61,7 +61,8 @@ pub async fn initialize(config: &AssetsConfig) -> Result<AssetDirectory, AssetsS
                 fs::remove_file(entry.path()).map_err(io_error)?;
             }
         }
-        Ok(AssetDirectory::new(root, config.max_in_flight_bytes))
+        Ok(AssetDirectory::new(root, config.max_in_flight_bytes)
+            .with_max_live_spools(config.max_live_spools_per_invocation))
     })
     .await
     .map_err(|source| AssetsStartupError::Worker {
@@ -89,6 +90,7 @@ mod tests {
         initialize(&AssetsConfig {
             root_path: root.clone(),
             max_in_flight_bytes: 1,
+            max_live_spools_per_invocation: AssetDirectory::default_max_live_spools(),
         })
         .await
         .unwrap();
@@ -106,7 +108,8 @@ mod tests {
         assert!(matches!(
             initialize(&AssetsConfig {
                 root_path: root.clone(),
-                max_in_flight_bytes: 1
+                max_in_flight_bytes: 1,
+                max_live_spools_per_invocation: AssetDirectory::default_max_live_spools(),
             })
             .await,
             Err(AssetsStartupError::UnsafeRoot)
