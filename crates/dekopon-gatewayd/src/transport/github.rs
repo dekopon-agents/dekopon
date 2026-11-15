@@ -240,11 +240,10 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
         .filter(|value| dekopon_core::github::GithubDeliveryId::new(value).is_ok());
     let event = header(headers, "x-github-event")
         .filter(|value| !value.is_empty() && value.len() <= 64 && value.is_ascii());
-    let (Some(delivery), Some(event)) = (delivery, event) else {
+    let (Some(delivery), Some(_event)) = (delivery, event) else {
         return refuse(state, Refusal::Headers, StatusCode::BAD_REQUEST);
     };
     let delivery = delivery.to_owned();
-    let event = event.to_owned();
     let body = match webhook::verified_body(request, state.secret.expose()).await {
         Ok(body) => body,
         Err(VerifyFailure::Headers) => {
@@ -263,41 +262,14 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
     let Ok(root) = serde_json::from_slice::<Value>(&body) else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
     };
-    let event_kind = match serde_json::from_value::<GithubEvent>(Value::String(event.clone())) {
-        Ok(event) => event,
-        Err(_) => {
-            let reason = if matches!(
-                event.as_str(),
-                "ping"
-                    | "installation"
-                    | "installation_repositories"
-                    | "installation_target"
-                    | "github_app_authorization"
-                    | "marketplace_purchase"
-                    | "organization"
-                    | "org_block"
-                    | "membership"
-                    | "team"
-                    | "sponsorship"
-                    | "personal_access_token_request"
-                    | "security_advisory"
-                    | "custom_property"
-                    | "projects_v2"
-                    | "projects_v2_item"
-                    | "projects_v2_status_update"
-            ) {
-                "no-repository"
-            } else {
-                "unknown-event"
-            };
-            ignored(state, &delivery, reason);
-            return webhook::content_free(StatusCode::OK);
-        }
-    };
     if let Some(reason) = repository_ignore_reason(&root) {
         ignored(state, &delivery, reason);
         return webhook::content_free(StatusCode::OK);
     }
+    let Some(event_kind) = signed_event_family(&root) else {
+        ignored(state, &delivery, "unclassified");
+        return webhook::content_free(StatusCode::OK);
+    };
     let Some(entry) = parse(&root, event_kind, &delivery) else {
         return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST);
     };
@@ -385,6 +357,61 @@ async fn process(state: &StateData, request: Request, received: &tracing::Span) 
 
 fn repository_ignore_reason(root: &Value) -> Option<&'static str> {
     (!root.get("repository").is_some_and(Value::is_object)).then_some("no-repository")
+}
+
+fn signed_event_family(root: &Value) -> Option<GithubEvent> {
+    let markers = [
+        "issue",
+        "parent_issue",
+        "blocked_issue",
+        "discussion",
+        "pull_request",
+        "deployment",
+        "workflow_run",
+        "workflow_job",
+        "check_run",
+        "check_suite",
+        "release",
+    ];
+    let mut present = markers
+        .iter()
+        .filter(|key| root.get(**key).is_some_and(Value::is_object));
+    let marker = *present.next()?;
+    if present.next().is_some() {
+        return None;
+    }
+    match marker {
+        "issue" if root.get("comment").is_some_and(Value::is_object) => {
+            Some(GithubEvent::IssueComment)
+        }
+        "issue" => Some(GithubEvent::Issues),
+        "parent_issue" => Some(GithubEvent::SubIssues),
+        "blocked_issue" => Some(GithubEvent::IssueDependencies),
+        "discussion" if root.get("comment").is_some_and(Value::is_object) => {
+            Some(GithubEvent::DiscussionComment)
+        }
+        "discussion" => Some(GithubEvent::Discussion),
+        "pull_request" if root.get("thread").is_some_and(Value::is_object) => {
+            Some(GithubEvent::PullRequestReviewThread)
+        }
+        "pull_request" if root.get("review").is_some_and(Value::is_object) => {
+            Some(GithubEvent::PullRequestReview)
+        }
+        "pull_request" if root.get("comment").is_some_and(Value::is_object) => {
+            Some(GithubEvent::PullRequestReviewComment)
+        }
+        "pull_request" => Some(GithubEvent::PullRequest),
+        "deployment" if root.get("deployment_status").is_some_and(Value::is_object) => {
+            Some(GithubEvent::DeploymentStatus)
+        }
+        "deployment" => None,
+        "workflow_run" => Some(GithubEvent::WorkflowRun),
+        "workflow_job" => Some(GithubEvent::WorkflowJob),
+        "check_run" => Some(GithubEvent::CheckRun),
+        "check_suite" => Some(GithubEvent::CheckSuite),
+        "release" => Some(GithubEvent::Release),
+        _ => None,
+    }
 }
 
 fn ignored(state: &StateData, delivery: &str, reason: &str) {
@@ -709,6 +736,7 @@ pub(crate) mod tests {
         body["blocked_issue_repo"] = json!({"id":10});
         body["comment"] = json!({"id":2,"author_association":"OWNER"});
         body["review"] = json!({"id":2,"author_association":"OWNER","state":"approved","commit_id":"a".repeat(40)});
+        body["thread"] = json!({});
         body["discussion"] = json!({"number":7,"author_association":"OWNER","state":"open","category":{"slug":"q-a"}});
         body["ref"] = json!(if event == "push" {
             "refs/heads/main"
@@ -741,6 +769,51 @@ pub(crate) mod tests {
         body["package"] = json!({"id":3,"package_type":"CONTAINER"});
         body["registry_package"] = body["package"].clone();
         body["member"] = json!({"id":3});
+        let keep: &[&str] = match event {
+            "issues" => &["issue"],
+            "issue_comment" => &["issue", "comment"],
+            "sub_issues" => &["parent_issue", "parent_issue_repo"],
+            "issue_dependencies" => &["blocked_issue", "blocked_issue_repo"],
+            "discussion" => &["discussion"],
+            "discussion_comment" => &["discussion", "comment"],
+            "commit_comment" => &["comment"],
+            "pull_request" => &["pull_request"],
+            "pull_request_review" => &["pull_request", "review"],
+            "pull_request_review_comment" => &["pull_request", "comment"],
+            "pull_request_review_thread" => &["pull_request", "thread"],
+            "deployment" | "deployment_review" | "deployment_protection_rule" => &["deployment"],
+            "deployment_status" => &["deployment", "deployment_status"],
+            "workflow_run" => &["workflow_run"],
+            "workflow_job" => &["workflow_job"],
+            "check_run" => &["check_run"],
+            "check_suite" => &["check_suite"],
+            "release" => &["release"],
+            "code_scanning_alert"
+            | "dependabot_alert"
+            | "secret_scanning_alert"
+            | "secret_scanning_alert_location"
+            | "repository_vulnerability_alert" => &["alert"],
+            "repository_advisory" => &["repository_advisory"],
+            "label" => &["label"],
+            "milestone" => &["milestone"],
+            "merge_group" => &["merge_group"],
+            "package" => &["package"],
+            "registry_package" => &["registry_package"],
+            "member" => &["member"],
+            "push" => &[
+                "ref", "before", "after", "created", "deleted", "forced", "commits",
+            ],
+            "create" | "delete" => &["ref", "ref_type"],
+            "workflow_dispatch" => &["ref"],
+            "status" => &["id", "sha", "state"],
+            _ => &[],
+        };
+        body.as_object_mut()
+            .expect("fixture body object")
+            .retain(|key, _| {
+                matches!(key.as_str(), "repository" | "sender" | "action")
+                    || keep.contains(&key.as_str())
+            });
         body
     }
 
@@ -1143,18 +1216,6 @@ pub(crate) mod tests {
         body["action"] = json!("requested");
         let mut run = body["workflow_run"].clone();
         run["conclusion"] = Value::Null;
-        body.as_object_mut().unwrap().remove("workflow_run");
-        let missing = serde_json::to_vec(&body).expect("signed JSON");
-        assert_eq!(
-            process(
-                &state,
-                signed(&missing, b"secret", "no-run", "workflow_run"),
-                &receive_span(ChatTransportKind::Github)
-            )
-            .await
-            .status(),
-            StatusCode::BAD_REQUEST
-        );
         body["workflow_run"] = run.clone();
         body["workflow_run"].as_object_mut().unwrap().remove("id");
         let missing_id = serde_json::to_vec(&body).expect("signed JSON");

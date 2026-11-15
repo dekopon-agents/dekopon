@@ -86,7 +86,7 @@ async fn fixture_with_subscriptions(
         "issue_comment",
         "pull_request_review",
         "check_run",
-        "push"
+        "release"
     ]);
     if !anchors.is_empty() {
         doc["sessions"]["wakes"] = json!({"path":directory.path().join("wakes/wakes.jsonl")});
@@ -170,10 +170,16 @@ fn body(event: &str, number: u64, actor: u64) -> Value {
     let mut body = crate::transport::github::tests::sample(event);
     body["sender"]["id"] = json!(actor);
     body["number"] = json!(number);
-    body["pull_request"]["number"] = json!(number);
-    body["issue"]["number"] = json!(number);
-    body["issue"]["pull_request"] = json!({});
-    body["check_run"]["pull_requests"] = json!([{"number":number,"base":{"repo":{"id":10}}}]);
+    if let Some(pull_request) = body.get_mut("pull_request") {
+        pull_request["number"] = json!(number);
+    }
+    if let Some(issue) = body.get_mut("issue") {
+        issue["number"] = json!(number);
+        issue["pull_request"] = json!({});
+    }
+    if let Some(check_run) = body.get_mut("check_run") {
+        check_run["pull_requests"] = json!([{"number":number,"base":{"repo":{"id":10}}}]);
+    }
     body["action"] = json!(if event == "pull_request" {
         "opened"
     } else {
@@ -473,13 +479,23 @@ async fn a_repositoryless_event_is_acknowledged_and_ignored() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn three_pushes_share_the_repository_and_coalesce() {
+async fn three_releases_share_the_repository_and_coalesce() {
     let models = InterruptibleModel::new([answer("first"), answer("follow-up")]);
     let mut fixture = fixture(Arc::new(Arc::clone(&models)), 8).await;
     let mut sessions = tokio::task::JoinSet::new();
-    for (index, id) in ["push-1", "push-2", "push-3"].into_iter().enumerate() {
+    for (index, id) in ["release-1", "release-2", "release-3"]
+        .into_iter()
+        .enumerate()
+    {
         assert_eq!(
-            post(&mut fixture, &mut sessions, id, "push", &body("push", 7, 1)).await,
+            post(
+                &mut fixture,
+                &mut sessions,
+                id,
+                "release",
+                &body("release", 7, 1)
+            )
+            .await,
             axum::http::StatusCode::OK
         );
         if index == 0 {
@@ -497,8 +513,8 @@ async fn three_pushes_share_the_repository_and_coalesce() {
         .map(|(_, text)| text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(note.contains("repository; delivery push-2."));
-    assert!(note.find("delivery push-2.").unwrap() < note.find("delivery push-3.").unwrap());
+    assert!(note.contains("repository; delivery release-2."));
+    assert!(note.find("delivery release-2.").unwrap() < note.find("delivery release-3.").unwrap());
 }
 
 #[tokio::test(start_paused = true)]
