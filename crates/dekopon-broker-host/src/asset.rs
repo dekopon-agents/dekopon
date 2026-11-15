@@ -299,6 +299,9 @@ fn io_error(error_value: AssetIoError) -> wit::Error {
             wit::ErrorCode::OverBudget,
             "broker asset byte budget is exhausted",
         ),
+        failure @ AssetIoError::TooManySpools { .. } => {
+            error(wit::ErrorCode::TooManyAssets, &failure.to_string())
+        }
         AssetIoError::Io {
             kind: std::io::ErrorKind::InvalidData,
         } => error(wit::ErrorCode::InvalidEncoding, "invalid base64 asset"),
@@ -1230,6 +1233,45 @@ mod tests {
         state.assets = AssetState::disabled();
         assert!(state.list().await.is_err());
         assert!(state.assets.attempted());
+    }
+
+    #[tokio::test]
+    async fn allocation_refuses_with_actionable_error_at_the_invocation_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = AssetDirectory::new(root.path().to_owned(), 0).with_max_live_spools(2);
+        let mut state = state(
+            Some(directory),
+            AssetConstraints::default(),
+            AssetInputs::default(),
+            vec![],
+        )
+        .await;
+        let first = state
+            .allocate("text/plain".to_owned(), wit::Encoding::Identity)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .allocate("text/plain".to_owned(), wit::Encoding::Identity)
+            .await
+            .unwrap()
+            .unwrap();
+        let refused = state
+            .allocate("text/plain".to_owned(), wit::Encoding::Identity)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refused.code, wit::ErrorCode::TooManyAssets);
+        assert_eq!(
+            refused.message,
+            "asset limit reached: 2 live files are open in this call (maxLiveSpoolsPerInvocation); produce fewer outputs at once"
+        );
+        wit::HostWriter::drop(&mut state, first).await.unwrap();
+        state
+            .allocate("text/plain".to_owned(), wit::Encoding::Identity)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

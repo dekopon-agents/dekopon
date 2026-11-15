@@ -680,6 +680,9 @@ impl BufferedHttpClient {
                 ErrorCode::Internal,
                 "over-budget: broker asset disk capacity exhausted",
             ),
+            failure @ AssetIoError::TooManySpools { .. } => {
+                http_error(ErrorCode::Internal, failure.to_string())
+            }
             AssetIoError::Io { kind } => {
                 tracing::error!(?kind, "http.spool.failed");
                 http_error(ErrorCode::Internal, "broker asset spool I/O failed")

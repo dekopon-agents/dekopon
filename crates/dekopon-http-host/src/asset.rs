@@ -14,6 +14,10 @@ use thiserror::Error;
 pub enum AssetIoError {
     #[error("broker asset byte budget is exhausted")]
     OverBudget,
+    #[error(
+        "asset limit reached: {maximum} live files are open in this call (maxLiveSpoolsPerInvocation); produce fewer outputs at once"
+    )]
+    TooManySpools { maximum: usize },
     #[error("broker asset I/O failed ({kind:?})")]
     Io { kind: io::ErrorKind },
     #[error("broker asset worker failed")]
@@ -34,6 +38,23 @@ impl From<io::Error> for AssetIoError {
 struct Budget {
     maximum: u64,
     used: AtomicU64,
+}
+
+const DEFAULT_MAX_LIVE_SPOOLS: usize = 32;
+
+#[derive(Debug)]
+struct SpoolSlots {
+    maximum: usize,
+    used: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct SpoolSlot(Arc<SpoolSlots>);
+
+impl Drop for SpoolSlot {
+    fn drop(&mut self) {
+        self.0.used.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -107,9 +128,18 @@ pub struct AssetDirectory {
     root: PathBuf,
     budget: Arc<Budget>,
     jobs: AssetJobs,
+    slots: Arc<SpoolSlots>,
 }
 
 impl AssetDirectory {
+    pub const fn default_max_live_spools() -> usize {
+        DEFAULT_MAX_LIVE_SPOOLS
+    }
+
+    pub fn max_live_spools_per_invocation(&self) -> usize {
+        self.slots.maximum
+    }
+
     pub fn new(root: PathBuf, maximum: u64) -> Self {
         Self {
             root,
@@ -118,7 +148,19 @@ impl AssetDirectory {
                 maximum,
                 used: AtomicU64::new(0),
             }),
+            slots: Arc::new(SpoolSlots {
+                maximum: DEFAULT_MAX_LIVE_SPOOLS,
+                used: AtomicUsize::new(0),
+            }),
         }
+    }
+
+    pub fn with_max_live_spools(mut self, maximum: usize) -> Self {
+        self.slots = Arc::new(SpoolSlots {
+            maximum,
+            used: AtomicUsize::new(0),
+        });
+        self
     }
 
     pub fn invocation(&self, jobs: AssetJobs) -> Self {
@@ -126,6 +168,10 @@ impl AssetDirectory {
             root: self.root.clone(),
             budget: Arc::clone(&self.budget),
             jobs,
+            slots: Arc::new(SpoolSlots {
+                maximum: self.slots.maximum,
+                used: AtomicUsize::new(0),
+            }),
         }
     }
 
@@ -134,6 +180,16 @@ impl AssetDirectory {
     }
 
     pub async fn allocate(&self) -> Result<Spool, AssetIoError> {
+        self.slots
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(1)
+                    .filter(|next| *next <= self.slots.maximum)
+            })
+            .map_err(|_used| AssetIoError::TooManySpools {
+                maximum: self.slots.maximum,
+            })?;
+        let slot = SpoolSlot(Arc::clone(&self.slots));
         let root = self.root.clone();
         let budget = Arc::clone(&self.budget);
         let jobs = self.jobs.clone();
@@ -149,6 +205,7 @@ impl AssetDirectory {
                         release_probe: None,
                     },
                     jobs,
+                    slot,
                 })
             })
             .await
@@ -194,6 +251,7 @@ pub struct Spool {
     sink: Sink,
     reservation: Reservation,
     jobs: AssetJobs,
+    slot: SpoolSlot,
 }
 
 #[derive(Debug)]
@@ -233,6 +291,7 @@ impl Spool {
                 sink: Sink::File { fd: writer, path },
                 reservation,
                 jobs,
+                slot,
             } = self;
             drop(writer);
             // This preserves the same close-before-release ordering on the fallible unlink path as
@@ -243,6 +302,7 @@ impl Spool {
                 jobs,
             };
             path.close()?;
+            drop(slot);
             Ok(output)
         })
         .await
