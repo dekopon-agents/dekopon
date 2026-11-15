@@ -1136,6 +1136,10 @@ impl SeenIds {
         }
         true
     }
+
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.seen.contains(key)
+    }
 }
 
 pub(crate) fn floor_boundary(text: &str, index: usize) -> usize {
