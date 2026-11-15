@@ -1,10 +1,12 @@
 mod media;
 #[cfg(test)]
 pub(crate) mod tests_media;
+#[cfg(test)]
+mod tests_redelivery;
 
 use parking_lot::Mutex;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     io,
     sync::Arc,
     time::{Duration, Instant},
@@ -32,9 +34,9 @@ use crate::{
     config::{LivenessMode, LivenessSettings},
     transport::{
         AssetFetcher, ChatDriver, ChatTransport, InboundMessage, InputRefusal, LivenessTarget,
-        MediaRefusal, MessageId, OutboundReply, ReplyTarget, SteerAck, TextUnit, TransportError,
-        TransportEvent, TransportIdentity, TypingLease, bound_inbound, credential_client,
-        receive_span, record_conversation,
+        MediaRefusal, MessageId, OutboundReply, ReplyTarget, SeenIds, SteerAck, TextUnit,
+        TransportError, TransportEvent, TransportIdentity, TypingLease, bound_inbound,
+        credential_client, receive_span, record_conversation,
         webhook::{
             self, MAX_WEBHOOK_CONCURRENCY, VerifyFailure, WEBHOOK_REQUEST_TIMEOUT, content_free,
             text_response,
@@ -47,6 +49,7 @@ const MAX_QUERY_VALUE_BYTES: usize = 512;
 const MAX_MESSAGES_PER_DELIVERY: usize = 128;
 const MAX_QUEUED_MESSAGES: usize = 512;
 const WEBHOOK_QUEUE: usize = 64;
+const RECENT_MESSAGES: usize = 1024;
 const GRAPH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const LIVENESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const TYPING_RENEW_INTERVAL: Duration = Duration::from_secs(20);
@@ -74,6 +77,7 @@ struct WebhookState {
     phone_number_id: String,
     native: bool,
     sender: mpsc::Sender<QueuedDelivery>,
+    seen: Arc<Mutex<SeenIds>>,
     refusals: Arc<Mutex<RefusalLog>>,
     queue_capacity: Arc<Semaphore>,
     concurrency: Arc<Semaphore>,
@@ -207,6 +211,7 @@ impl WhatsappTransport {
                 phone_number_id,
                 native: liveness.mode == LivenessMode::Native,
                 sender,
+                seen: Arc::new(Mutex::new(SeenIds::new(RECENT_MESSAGES))),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 queue_capacity: Arc::new(Semaphore::new(MAX_QUEUED_MESSAGES)),
                 concurrency: Arc::new(Semaphore::new(MAX_WEBHOOK_CONCURRENCY)),
@@ -362,10 +367,20 @@ async fn process_webhook(
         Ok(value) => value,
         Err(_) => return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST),
     };
-    let messages = match parse_delivery(state, &value, received) {
+    let mut messages = match parse_delivery(state, &value, received) {
         Ok(messages) => messages,
         Err(()) => return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST),
     };
+    let mut seen = state.seen.lock();
+    let mut batch_ids = HashSet::new();
+    messages.retain(|message| {
+        let id = message.message_id.to_string();
+        let fresh = !seen.contains(&id) && batch_ids.insert(id);
+        if !fresh {
+            message.receive_span.record("drop.reason", "duplicate");
+        }
+        fresh
+    });
     if messages.is_empty() {
         return content_free(StatusCode::OK);
     }
@@ -374,13 +389,16 @@ async fn process_webhook(
     else {
         return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
     };
-    let delivery = QueuedDelivery {
+    let Ok(sender_permit) = state.sender.try_reserve() else {
+        return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
+    };
+    for message in &messages {
+        seen.insert(message.message_id.to_string());
+    }
+    sender_permit.send(QueuedDelivery {
         messages: messages.into(),
         _capacity: capacity,
-    };
-    if state.sender.try_send(delivery).is_err() {
-        return refuse(state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
-    }
+    });
     content_free(StatusCode::OK)
 }
 
@@ -830,6 +848,7 @@ mod tests {
                 phone_number_id: "456".to_owned(),
                 native: true,
                 sender,
+                seen: Arc::new(Mutex::new(SeenIds::new(RECENT_MESSAGES))),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
                 queue_capacity: Arc::new(Semaphore::new(MAX_QUEUED_MESSAGES)),
                 concurrency: Arc::new(Semaphore::new(1)),
@@ -1008,6 +1027,42 @@ mod tests {
             receiver.recv().await.expect("retried batch").messages.len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_message_ids_in_one_delivery_are_queued_once() {
+        let body = serde_json::to_vec(&json!({
+            "object":"whatsapp_business_account",
+            "entry":[{"id":"123","changes":[{"field":"messages","value":{
+                "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
+                "messages":[
+                    {"id":"same","from":"1603","type":"text","text":{"body":"first"}},
+                    {"id":"same","from":"1603","type":"text","text":{"body":"duplicate"}},
+                    {"id":"other","from":"1603","type":"text","text":{"body":"second"}}
+                ]
+            }}]}]
+        }))
+        .expect("json");
+        let (state, mut receiver) = state_and_receiver();
+        let response = process_webhook(
+            &state,
+            signed_request(&body),
+            Arc::clone(&state.concurrency)
+                .acquire_owned()
+                .await
+                .expect("permit"),
+            &received(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let delivery = receiver.recv().await.expect("batch");
+        let ids: Vec<_> = delivery
+            .messages
+            .iter()
+            .map(|message| message.message_id.to_string())
+            .collect();
+        assert_eq!(ids, ["same", "other"]);
     }
 
     #[test]
