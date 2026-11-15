@@ -240,6 +240,9 @@ pub(super) fn text_response(status: StatusCode, body: String) -> Response {
 }
 
 #[cfg(test)]
+mod github_event_family;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
