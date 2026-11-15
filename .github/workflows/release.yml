@@ -385,6 +385,65 @@ jobs:
     with:
       tag: ${{ needs.github-release.outputs.tag }}
 
+  site-pin:
+    name: re-pin the website
+    needs: [github-release, release-digests, homebrew-tap]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.github-release.outputs.tag }}
+    steps:
+      - name: Decide whether to dispatch
+        id: credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_APP_ID: ${{ secrets.TAP_APP_ID }}
+          TAP_APP_KEY_SET: ${{ secrets.TAP_APP_PRIVATE_KEY != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          prerelease=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)
+          if [ "$prerelease" = "true" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is a prerelease; the website pins stable releases only."
+          elif [ -z "$TAP_APP_ID" ] || [ "$TAP_APP_KEY_SET" != "true" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TAP_APP_ID or TAP_APP_PRIVATE_KEY is unset; the website's daily run will pin $TAG."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint a short-lived website installation token
+        id: site-token
+        if: steps.credential.outputs.present == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: dekopon-agents
+          repositories: dekopon-agents.github.io
+          permission-contents: write
+
+      - name: Dispatch the website re-pin
+        if: steps.credential.outputs.present == 'true'
+        env:
+          MINT: ${{ steps.site-token.outcome }}
+          GH_TOKEN: ${{ steps.site-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$MINT" != "success" ]; then
+            echo "::warning::The tap App is not installed on dekopon-agents.github.io; the website's daily run will pin $TAG." \
+              "See docs/development.md#homebrew-tap-github-app, step 3."
+            exit 0
+          fi
+          gh api repos/dekopon-agents/dekopon-agents.github.io/dispatches \
+            -f event_type=core-release -f "client_payload[tag]=$TAG"
+          echo "Dispatched the website re-pin to \`$TAG\`." >> "$GITHUB_STEP_SUMMARY"
+
   # An authorized release tag is the publication gate. Routine tag pushes publish every configured
   # artifact, including crates.io packages; workflow_dispatch remains idempotent recovery for an
   # existing tag because the loop skips versions crates.io already holds.
