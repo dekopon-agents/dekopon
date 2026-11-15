@@ -21,7 +21,7 @@ wasmparser = { version = "=0.262.0", default-features = false, features = ["comp
 parking_lot.workspace = true
 getrandom.workspace = true
 dekopon-capability.workspace = true
-dekopon-core = { workspace = true, features = ["native"] }
+dekopon-core = { workspace = true, features = ["native", "tokio-task"] }
 dekopon-broker-protocol.workspace = true
 rustix.workspace = true
 dekopon-http-host.workspace = true

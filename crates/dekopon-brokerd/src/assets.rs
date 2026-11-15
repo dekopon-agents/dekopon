@@ -25,7 +25,7 @@ pub enum AssetsStartupError {
     #[error("asset initialization worker failed")]
     Worker {
         #[source]
-        source: tokio::task::JoinError,
+        source: dekopon_core::TaskOutcome,
     },
 }
 
@@ -64,7 +64,9 @@ pub async fn initialize(config: &AssetsConfig) -> Result<AssetDirectory, AssetsS
         Ok(AssetDirectory::new(root, config.max_in_flight_bytes))
     })
     .await
-    .map_err(|source| AssetsStartupError::Worker { source })?
+    .map_err(|source| AssetsStartupError::Worker {
+        source: dekopon_core::TaskOutcome::from_join_error(source),
+    })?
 }
 
 #[cfg(test)]

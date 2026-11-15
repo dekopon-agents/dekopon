@@ -253,7 +253,11 @@ impl CredentialFile {
                 PrivateFileLock::try_acquire(&path)
             })
             .await
-            .map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))?
+            .map_err(|source| {
+                ChatGptError::RefreshTask(io::Error::other(
+                    dekopon_core::TaskOutcome::from_join_error(source),
+                ))
+            })?
             .map_err(|error| ChatGptError::LockAuth {
                 path: error.path,
                 source: error.source,
@@ -285,7 +289,7 @@ impl CredentialFile {
             let owner = Arc::clone(self);
             let (mut credentials, adopted) = tokio::task::spawn_blocking(move || {
                 owner.adopt(rejected.as_ref())
-            }).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))??;
+            }).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(dekopon_core::TaskOutcome::from_join_error(source))))??;
             if adopted {
                 return Ok(resolved(credentials, Some(RefreshOutcome::Adopted)));
             }
@@ -303,7 +307,7 @@ impl CredentialFile {
                 };
                 owner.install(&credentials);
                 (credentials, outcome)
-            }))).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))?;
+            }))).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(dekopon_core::TaskOutcome::from_join_error(source))))?;
             Ok(resolved(credentials, Some(outcome)))
         }.instrument(span.clone()).await;
         match &result {
@@ -362,7 +366,8 @@ fn resolved(
 
 fn observe_refresh_task(result: Result<(), tokio::task::JoinError>) {
     if let Err(source) = result {
-        tracing::error!(error = %source, "ChatGPT refresh task failed");
+        let failure = dekopon_core::TaskOutcome::from_join_error(source);
+        tracing::error!(failure = failure.category(), error = %failure, "ChatGPT refresh task failed");
     }
 }
 
@@ -400,7 +405,11 @@ async fn login_with_endpoints(
     let saved_path = path.clone();
     tokio::task::spawn_blocking(move || save_credentials(&saved_path, &credentials))
         .await
-        .map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))??;
+        .map_err(|source| {
+            ChatGptError::RefreshTask(io::Error::other(
+                dekopon_core::TaskOutcome::from_join_error(source),
+            ))
+        })??;
     Ok(path)
 }
 

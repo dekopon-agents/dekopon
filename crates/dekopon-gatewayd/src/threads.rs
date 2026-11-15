@@ -8,7 +8,7 @@ use tokio::{
 };
 use tracing::Instrument as _;
 
-use crate::session::TaskFailure;
+use dekopon_core::TaskOutcome;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Work {
@@ -36,7 +36,7 @@ pub(crate) enum Failure {
     #[error("could not start a shell thread: {kind}")]
     Spawn { kind: io::ErrorKind },
     #[error(transparent)]
-    Task(#[from] TaskFailure),
+    Task(#[from] TaskOutcome),
 }
 
 impl Failure {
@@ -96,7 +96,7 @@ impl Owner {
             .map_err(|error| Failure::Spawn { kind: error.kind() })?;
         result
             .await
-            .map_err(|_closed| TaskFailure::Cancelled)?
+            .map_err(|_closed| TaskOutcome::Cancelled)?
             .map_err(Failure::Task)
     }
 
@@ -113,7 +113,7 @@ impl Owner {
 }
 
 fn observe(result: Result<OwnedSemaphorePermit, tokio::task::JoinError>) {
-    let result = result.map_err(TaskFailure::from);
+    let result = result.map_err(TaskOutcome::from_join_error);
     if let Err(failure) = result {
         tracing::error!(
             event = "gateway_thread_failed",
@@ -135,7 +135,7 @@ impl Ticket {
         self,
         work: Work,
         run: impl FnOnce() -> T + Send + 'static,
-    ) -> io::Result<oneshot::Receiver<Result<T, TaskFailure>>> {
+    ) -> io::Result<oneshot::Receiver<Result<T, TaskOutcome>>> {
         let Self {
             owner,
             permit,
@@ -152,8 +152,8 @@ impl Ticket {
                 let join = crate::tests::native_join(join);
                 let result = join
                     .await
-                    .map_err(TaskFailure::from)
-                    .and_then(|result| result.map_err(TaskFailure::from));
+                    .map_err(TaskOutcome::from_join_error)
+                    .and_then(|result| result.map_err(TaskOutcome::from));
                 match reply.send(result) {
                     Ok(()) | Err(Ok(_)) => {}
                     Err(Err(failure)) => tracing::error!(

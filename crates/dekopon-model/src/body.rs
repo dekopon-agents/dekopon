@@ -153,7 +153,11 @@ impl Body for SliceBody {
                 let mut read = match result {
                     Ok(Ok(read)) => read,
                     Ok(Err(error)) => return this.fail(error),
-                    Err(error) => return this.fail(io::Error::other(error)),
+                    Err(error) => {
+                        return this.fail(io::Error::other(
+                            dekopon_core::TaskOutcome::from_join_error(error),
+                        ));
+                    }
                 };
                 let bytes = std::mem::take(&mut read.bytes);
                 this.remaining -= bytes.len() as u64;

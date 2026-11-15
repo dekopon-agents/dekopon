@@ -257,6 +257,7 @@ fn cpu_pool_builder(cli: &Cli) -> Result<rayon::ThreadPoolBuilder, clap::Error> 
 
 #[cfg(unix)]
 fn main() -> ExitCode {
+    dekopon_core::install_panic_hook();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => return dekopon_core::render_cli_error(error, Cli::command()),

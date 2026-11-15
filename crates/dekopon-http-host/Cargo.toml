@@ -22,7 +22,7 @@ parking_lot = { workspace = true, optional = true }
 aho-corasick.workspace = true
 base64.workspace = true
 dekopon-capability.workspace = true
-dekopon-core = { workspace = true, features = ["native"] }
+dekopon-core = { workspace = true, features = ["native", "tokio-task"] }
 dekopon-telemetry.workspace = true
 bytes.workspace = true
 http-body.workspace = true

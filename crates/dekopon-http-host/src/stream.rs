@@ -156,7 +156,11 @@ impl Body for StreamBody {
                 let chunk = match result {
                     Ok(Ok(chunk)) => chunk,
                     Ok(Err(error)) => return Poll::Ready(Some(Err(error))),
-                    Err(error) => return Poll::Ready(Some(Err(io::Error::other(error)))),
+                    Err(error) => {
+                        return Poll::Ready(Some(Err(io::Error::other(
+                            dekopon_core::TaskOutcome::from_join_error(error),
+                        ))));
+                    }
                 };
                 this.remaining -= chunk.bytes.len() as u64;
                 if chunk.active.cursor == chunk.active.part.decoded_bytes {

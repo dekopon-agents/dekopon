@@ -247,7 +247,9 @@ where
         None => cache_key::CacheKeySecret::generate(),
     })
     .await
-    .map_err(GatewaydError::TransportTask)??;
+    .map_err(|source| {
+        GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
+    })??;
     if journal.is_some() {
         for route in generation.load().routes.routes() {
             memory::generation::report_policy(route);
@@ -257,7 +259,9 @@ where
         Some(wakes) => Some(Arc::new(
             tokio::task::spawn_blocking(move || wake::WakeStore::open(&wakes))
                 .await
-                .map_err(GatewaydError::TransportTask)??,
+                .map_err(|source| {
+                    GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
+                })??,
         )),
         None => None,
     };
@@ -294,7 +298,9 @@ where
         Ok::<_, GatewaydError>(Arc::new(store))
     })
     .await
-    .map_err(GatewaydError::TransportTask)??;
+    .map_err(|source| {
+        GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
+    })??;
     let models = Arc::new(ModelCache::new(
         Arc::clone(&configured) as Arc<dyn session::ModelFactory>
     ));
@@ -403,7 +409,8 @@ where
                 "gateway.transport.stopped"
             ),
             Err(error) if !error.is_cancelled() => tracing::error!(
-                event = "gateway_transport_task_failed", error = %error,
+                event = "gateway_transport_task_failed",
+                failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
                 "gateway.transport.task.failed"
             ),
             Ok(Ok(())) | Err(_) => {}
@@ -493,7 +500,9 @@ async fn open_journal(
         Ok::<_, journal::JournalError>((journal, boot))
     })
     .await
-    .map_err(GatewaydError::TransportTask)?
+    .map_err(|source| {
+        GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
+    })?
     .map_err(|error| GatewaydError::Journal {
         kind: match error {
             journal::JournalError::Io { kind } => kind,
@@ -515,7 +524,9 @@ async fn load_follow_table(
     })?);
     let table = tokio::task::spawn_blocking(move || follow::FollowTable::load(journal))
         .await
-        .map_err(GatewaydError::TransportTask)?
+        .map_err(|source| {
+            GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
+        })?
         .map_err(|error| GatewaydError::Journal {
             kind: match error {
                 journal::JournalError::Io { kind } => kind,
@@ -900,8 +911,10 @@ fn observe_session(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result
         && !error.is_cancelled()
     {
+        let failure = dekopon_core::TaskOutcome::from_join_error(error);
         tracing::error!(
             event = "gateway_session_task_failed",
+            failure = failure.category(),
             "gateway.session.task.failed"
         );
     }
@@ -1086,7 +1099,7 @@ where
         () = shutdown => Ok(()),
         result = readers.join_next() => match result {
             Some(Ok(Err(problem))) => Err(GatewaydError::TransportConnect { problems: vec![problem] }),
-            Some(Err(source)) => Err(GatewaydError::TransportTask(source)),
+            Some(Err(source)) => Err(GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))),
             Some(Ok(Ok(()))) | None => Err(GatewaydError::TransportsLost),
         }
     }
@@ -1389,7 +1402,7 @@ pub enum GatewaydError {
         problems: Vec<TransportConnectProblem>,
     },
     #[error("chat transport task failed")]
-    TransportTask(#[source] tokio::task::JoinError),
+    TransportTask(#[source] dekopon_core::TaskOutcome),
     #[error("every chat transport ended; the gateway can no longer be reached")]
     TransportsLost,
     #[error("conversation journal directory is unusable: {kind}")]

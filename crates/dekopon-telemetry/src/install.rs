@@ -306,11 +306,8 @@ impl ConsoleWorker {
                 )));
             }
         }
-        let (output, reported) = self.handle.join().map_err(|payload| {
-            ShutdownError(format!(
-                "console writer shutdown: writer panicked: {}",
-                crate::exporter::panic_message(&*payload)
-            ))
+        let (output, reported) = self.handle.join().map_err(|_payload| {
+            ShutdownError("console writer shutdown: writer panicked".to_owned())
         })?;
         *self.state.lock() = ConsoleState::Direct(output);
         let total = self.dropped.load(Ordering::Relaxed);

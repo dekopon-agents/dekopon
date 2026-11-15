@@ -19,7 +19,7 @@ async-trait.workspace = true
 dekopon-broker-host.workspace = true
 dekopon-broker-protocol.workspace = true
 dekopon-capability.workspace = true
-dekopon-core.workspace = true
+dekopon-core = { workspace = true, features = ["tokio-task"] }
 dekopon-policy.workspace = true
 dekopon-telemetry.workspace = true
 dekopon-storage-host.workspace = true

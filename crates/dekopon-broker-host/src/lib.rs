@@ -1428,7 +1428,9 @@ pub async fn precompile(
         parent.in_scope(|| precompile_sources(&sources, &cwasm_dir))
     })
     .await
-    .map_err(|source| BrokerHostError::PrecompileWorker { source })?
+    .map_err(|source| BrokerHostError::PrecompileWorker {
+        source: dekopon_core::TaskOutcome::from_join_error(source),
+    })?
 }
 
 fn precompile_sources(
@@ -1572,7 +1574,7 @@ impl BrokerProviderRegistry {
                 });
                 let compiled = compiling.await.map_err(|join| BrokerHostError::Compile {
                     path: source.path,
-                    source: wasmtime::Error::new(join),
+                    source: wasmtime::Error::new(dekopon_core::TaskOutcome::from_join_error(join)),
                 })??;
                 let provider = BrokerWasmProvider::load(Arc::clone(&runtime), compiled).await?;
                 scan.record(&provider.manifest, providers.len());
@@ -2311,7 +2313,7 @@ pub enum BrokerHostError {
     #[error("precompile worker failed")]
     PrecompileWorker {
         #[source]
-        source: tokio::task::JoinError,
+        source: dekopon_core::TaskOutcome,
     },
     #[error(
         "guest memory growth exceeds the {maximum}-byte aggregate guest memory ceiling; \

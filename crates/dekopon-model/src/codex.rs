@@ -1074,8 +1074,11 @@ async fn responses_content(
                 let span = tracing::Span::current();
                 match tokio::task::spawn_blocking(move || span.in_scope(|| reference.read()))
                     .await
-                    .map_err(TransportFailure::Blocking)?
-                {
+                    .map_err(|source| {
+                        TransportFailure::Blocking(dekopon_core::TaskOutcome::from_join_error(
+                            source,
+                        ))
+                    })? {
                     Ok(bytes) => {
                         data.record_preparation(crate::asset::Preparation::Original);
                         Some(bytes)

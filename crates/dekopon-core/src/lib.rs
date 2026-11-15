@@ -30,6 +30,7 @@ mod redaction;
 mod skill;
 mod space;
 mod subject;
+mod task;
 mod trace;
 #[cfg(unix)]
 mod trusted_file;
@@ -57,6 +58,7 @@ pub use subject::{
     AttestedSubject, Namespace, PrincipalKind, Subject, SubjectError, SubjectField, SubjectKind,
     SubjectScope,
 };
+pub use task::{TaskOutcome, install_panic_hook};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
 pub use trusted_file::{

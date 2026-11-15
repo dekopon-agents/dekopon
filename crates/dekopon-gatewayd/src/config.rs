@@ -1972,7 +1972,7 @@ pub(crate) async fn read_config_file(
             .await
             .map_err(|join| ConfigError::Read {
                 path,
-                source: io::Error::other(join),
+                source: io::Error::other(dekopon_core::TaskOutcome::from_join_error(join)),
             })?;
     }
     tokio::task::spawn_blocking(move || {
@@ -2003,7 +2003,7 @@ pub(crate) async fn read_config_file(
     .await
     .map_err(|join| ConfigError::Read {
         path: path.clone(),
-        source: io::Error::other(join),
+        source: io::Error::other(dekopon_core::TaskOutcome::from_join_error(join)),
     })?
     .map_err(|error| match error {
         FileHygieneError::NotRegular { path, .. } => ConfigError::NotRegular { path },

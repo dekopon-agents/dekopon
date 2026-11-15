@@ -78,12 +78,14 @@ fn finish(
             Ok(())
         }
         Err(error) => {
+            let failure = dekopon_core::TaskOutcome::from_join_error(error);
             tracing::error!(
                 event = "storage_sweep_task_failed",
-                error = %error,
+                failure = failure.category(),
+                error = %failure,
                 "storage.sweep.task.failed"
             );
-            Err(BrokerdError::StorageReaper(error))
+            Err(BrokerdError::StorageReaper(failure))
         }
     }
 }

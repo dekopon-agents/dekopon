@@ -768,7 +768,7 @@ pub(crate) async fn read_not_world_writable(
     .await
     .map_err(|join| FileHygieneError::Io {
         path: path.to_path_buf(),
-        source: io::Error::other(join),
+        source: io::Error::other(dekopon_core::TaskOutcome::from_join_error(join)),
     })?
 }
 

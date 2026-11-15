@@ -1,6 +1,7 @@
 use super::*;
-use crate::{session::TaskFailure, transport::TransportError};
+use crate::transport::TransportError;
 use dekopon_agent::attachment::GeneratedAssetStore;
+use dekopon_core::TaskOutcome;
 use futures_util::future::BoxFuture;
 use std::sync::atomic::AtomicUsize;
 
@@ -495,13 +496,13 @@ fn a_second_completion_keeps_the_resident_length_and_charges_once() {
 }
 
 #[tokio::test]
-async fn a_panicking_session_task_surfaces_as_panicked_with_its_cause() {
+async fn a_panicking_session_task_surfaces_only_its_class() {
     let error = tokio::task::spawn(async { panic!("asset store exploded") })
         .await
         .unwrap_err();
     assert!(matches!(
-        TaskFailure::from(error),
-        TaskFailure::Panicked { cause } if cause == "asset store exploded"
+        TaskOutcome::from_join_error(error),
+        TaskOutcome::Panicked
     ));
 }
 

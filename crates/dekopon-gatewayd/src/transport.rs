@@ -701,8 +701,8 @@ pub enum TransportError {
     AssetType { accepted: &'static str },
     #[error("{0}")]
     Attachment(#[from] dekopon_model::asset::BlobError),
-    #[error("attachment hydration task failed ({reason}); provider already executed")]
-    AttachmentTask { reason: &'static str },
+    #[error("attachment hydration task failed ({outcome}); provider already executed")]
+    AttachmentTask { outcome: dekopon_core::TaskOutcome },
     #[error("credential environment variable {name} is not set")]
     MissingCredential { name: String },
     #[error("credential environment variable {name} is set to an empty value")]

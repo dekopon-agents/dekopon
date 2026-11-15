@@ -1138,6 +1138,7 @@ dependencies = [
  "serde_yaml_ng",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

@@ -42,6 +42,7 @@ const BLOCKING_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 fn main() -> ExitCode {
+    dekopon_core::install_panic_hook();
     if let Some(code) = dekopon_shell::run_jq_worker_if_requested() {
         return code;
     }
@@ -319,7 +320,10 @@ async fn serve(
             error = %error,
             "gateway.telemetry.shutdown.failed"
         ),
-        Err(error) => eprintln!("dekopon-gatewayd: telemetry flush failed: {error}"),
+        Err(error) => eprintln!(
+            "dekopon-gatewayd: telemetry flush failed: {}",
+            dekopon_core::TaskOutcome::from_join_error(error)
+        ),
     }
     code
 }

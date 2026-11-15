@@ -2696,7 +2696,12 @@ async fn session_turn(
                 })
                 .await
                 {
-                    tracing::error!(event = "gateway_session_failed", category = "asset-task", %error, "gateway.session.failed");
+                    tracing::error!(
+                        event = "gateway_session_failed",
+                        category = "asset-task",
+                        failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
+                        "gateway.session.failed"
+                    );
                     return MessageOutcome::Failed.into();
                 }
             }
@@ -2773,7 +2778,12 @@ async fn session_turn(
     {
         Ok(registered) => registered,
         Err(error) => {
-            tracing::error!(event = "gateway_session_failed", category = "asset-task", %error, "gateway.session.failed");
+            tracing::error!(
+                event = "gateway_session_failed",
+                category = "asset-task",
+                failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
+                "gateway.session.failed"
+            );
             return MessageOutcome::Failed.into();
         }
     };
@@ -4555,44 +4565,6 @@ mod model_factory_tests {
             2,
             "one credential per auth file, not per model"
         );
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum TaskFailure {
-    #[error("the session task panicked: {cause}")]
-    Panicked { cause: String },
-    #[error("the session task was cancelled")]
-    Cancelled,
-}
-
-impl TaskFailure {
-    pub(crate) const fn category(&self) -> &'static str {
-        match self {
-            Self::Panicked { .. } => "panicked",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
-
-impl From<tokio::task::JoinError> for TaskFailure {
-    fn from(error: tokio::task::JoinError) -> Self {
-        match error.try_into_panic() {
-            Ok(payload) => Self::from(payload),
-            Err(_cancelled) => Self::Cancelled,
-        }
-    }
-}
-
-impl From<Box<dyn std::any::Any + Send>> for TaskFailure {
-    fn from(payload: Box<dyn std::any::Any + Send>) -> Self {
-        Self::Panicked {
-            cause: payload
-                .downcast_ref::<&str>()
-                .map(|cause| (*cause).to_owned())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_default(),
-        }
     }
 }
 

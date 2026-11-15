@@ -44,7 +44,7 @@ enum ExampleError {
     #[error("runtime could not start")]
     Runtime(#[from] std::io::Error),
     #[error("blocking session did not finish")]
-    Join(#[from] tokio::task::JoinError),
+    Join(#[from] dekopon_core::TaskOutcome),
 }
 
 impl Arguments {
@@ -115,6 +115,7 @@ impl ScriptRuntime for SyntheticRuntime {
 }
 
 fn main() -> Result<(), ExampleError> {
+    dekopon_core::install_panic_hook();
     let arguments = Arguments::parse()?;
     let timeout = Duration::from_secs(120);
     let endpoint = arguments
@@ -191,7 +192,7 @@ fn finish_comparison<T>(
     drain: impl std::future::Future<Output = ()>,
 ) -> Result<T, ExampleError> {
     runtime.block_on(drain);
-    Ok(result??)
+    Ok(result.map_err(|error| ExampleError::Join(error.into()))??)
 }
 
 #[cfg(test)]

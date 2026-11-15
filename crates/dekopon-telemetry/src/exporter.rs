@@ -252,16 +252,6 @@ impl OtlpHttpClient {
     }
 }
 
-pub(super) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_owned();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "no panic message".to_owned()
-}
-
 #[async_trait]
 impl HttpClient for OtlpHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
@@ -316,7 +306,7 @@ pub enum TelemetryError {
 mod tests {
     use super::{
         ExporterSettings, OtlpHttpClient, TelemetryError, Transport, otlp_client_from,
-        panic_message, read_ca_certificate, signal_endpoint,
+        read_ca_certificate, signal_endpoint,
     };
     use opentelemetry::{
         logs::{Logger as _, LoggerProvider as _},
@@ -478,17 +468,6 @@ mod tests {
             OtlpHttpClient::new(Duration::from_secs(5), None),
             Err(TelemetryError::NoRuntime)
         ));
-    }
-
-    #[test]
-    fn a_panic_payload_keeps_its_message() {
-        let literal = std::panic::catch_unwind(|| panic!("failed to create tokio runtime"))
-            .expect_err("the closure panics");
-        assert_eq!(panic_message(&*literal), "failed to create tokio runtime");
-
-        let formatted = std::panic::catch_unwind(|| panic!("{} roots missing", 3))
-            .expect_err("the closure panics");
-        assert_eq!(panic_message(&*formatted), "3 roots missing");
     }
 
     #[test]

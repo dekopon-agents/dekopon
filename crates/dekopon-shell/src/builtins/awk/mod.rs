@@ -147,13 +147,8 @@ fn compile(source: &str, budget: &Budget) -> Result<Compiled, AwkError> {
                 parse::program(source)
             })
             .map_err(|error| Refusal::ParserStart(error.to_string()))?;
-        parser.join().map_err(|panic| {
-            let reason = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic payload");
-            AwkError::Refused(Refusal::ParserPanic(reason.to_owned()))
+        parser.join().map_err(|_panic| {
+            AwkError::Refused(Refusal::ParserPanic("parser task panicked".to_owned()))
         })?
     });
     drop(stack);
