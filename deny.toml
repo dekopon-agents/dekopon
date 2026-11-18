@@ -6,6 +6,8 @@ version = 2
 yanked = "deny"
 ignore = [
   { id = "RUSTSEC-2024-0449", reason = "unmaintained, not a vulnerability: unsafe-libyaml 0.2.11 reaches the workspace only through serde_yaml_ng 0.10; removable once config parsing moves to a maintained YAML crate such as serde-saphyr" },
+  { id = "RUSTSEC-2026-0542", reason = "unmaintained, not a vulnerability: humantime 2.4.0 is a direct dependency of dekopon-brokerd, dekopon-console and dekopon-gatewayd; removable when they move to a maintained duration parser" },
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained, not a vulnerability: chrono 0.4.45 reaches the graph only through cedar-policy-core 4.14.0 (cedar-policy, via dekopon-policy); removable when cedar-policy-core drops it" },
 ]
 
 [licenses]
