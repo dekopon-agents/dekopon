@@ -11,6 +11,7 @@ use dekopon_agent::{
     ShellRuntime,
     prompt::{PromptLimits, ScriptRuntime, SessionInputs, run_prompt_session},
 };
+use dekopon_core::offload;
 use dekopon_model::{
     TurnEvent,
     blocking::BlockingModel,
@@ -874,12 +875,16 @@ fn session<I: CapabilityInvoker + Send + 'static>(
     let instruction = Arc::clone(&trial.task.instruction);
     let system = Arc::clone(trial.system);
     let history = Arc::clone(trial.task.history.as_ref().unwrap_or(trial.history));
-    let (result, model, shell) = runtime
-        .block_on(runtime.spawn_blocking(move || {
+    let job = {
+        let _entered = runtime.enter();
+        offload(move || {
             let inputs = SessionInputs::new(&instruction, limits).with_system(Some(&system));
             let (result, _captured) = run_prompt_session(&model, &shell, inputs, &history);
             (result, model, shell)
-        }))
+        })
+    };
+    let (result, model, shell) = runtime
+        .block_on(job)
         .map_err(|error| EvalError::Join(error.into()))?;
     Ok(Session {
         result,
