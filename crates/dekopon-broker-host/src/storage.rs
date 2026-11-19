@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use dekopon_core::offload;
 use dekopon_storage_host::{
     Durability, FileStat, OpenOptions, StorageEvidence, StorageHandle, StorageHostError,
 };
@@ -79,7 +80,7 @@ impl StorageState {
             Self::Active { active, .. } => active,
         };
         let transaction = Arc::clone(&active.transaction);
-        let result = match tokio::task::spawn_blocking(move || {
+        let result = match offload(move || {
             let mut slot = transaction.lock();
             let transaction = slot
                 .as_mut()
@@ -121,11 +122,11 @@ impl StorageState {
             .ok_or(StorageHostError::Arithmetic)?;
         #[allow(
             clippy::map_err_ignore,
-            reason = "a `JoinError` from `spawn_blocking` distinguishes only a panic from runtime \
+            reason = "an offload join failure distinguishes only a panic from runtime \
                       cancellation, and the panic hook has already printed the panic with its \
                       location; `call` above classes the same failure as `Io` for the same reason"
         )]
-        let finished = tokio::task::spawn_blocking(move || {
+        let finished = offload(move || {
             let transaction = transaction
                 .lock()
                 .take()
