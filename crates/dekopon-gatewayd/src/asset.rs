@@ -22,6 +22,8 @@ use dekopon_agent::{
     prompt::{AssetSource, FetchedAsset},
 };
 use dekopon_broker_protocol::{AssetEncoding, AssetRow, NewAsset};
+use dekopon_core::OffloadTrace;
+use dekopon_core::offload;
 use dekopon_model::asset::{BlobError, BlobReference, BlobSource, DiskBlob};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -380,11 +382,11 @@ impl AssetStore {
             return;
         }
         let retention = Arc::clone(&self.retention);
-        match tokio::task::spawn_blocking(move || retention.lock().finish_publications()).await {
+        match offload(move || retention.lock().finish_publications()).await {
             Ok(Ok(())) => (),
             Ok(Err(error)) => tracing::warn!(%error, "gateway.asset.reclaim.failed"),
             Err(error) => tracing::warn!(
-                failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
+                failure = dekopon_core::TaskOutcome::from(error).category(),
                 "gateway.asset.reclaim.failed"
             ),
         }
@@ -1345,19 +1347,16 @@ impl Attempt {
                 }
             })?;
         let ticket = self.ticket.clone();
-        let subscriber = tracing::dispatcher::get_default(Clone::clone);
-        let span = tracing::Span::current();
-        tokio::task::spawn_blocking(move || {
+        let trace = OffloadTrace::capture(Some(tracing::Span::current()));
+        offload(move || {
             // The permit bounds the buffer, so it is released only after the store consumes it.
             let _permit = permit;
-            tracing::dispatcher::with_default(&subscriber, || {
-                span.in_scope(|| {
-                    ticket
-                        .store
-                        .upgrade()
-                        .ok_or(AssetFailure::Unknown)?
-                        .complete(&ticket, &data)
-                })
+            trace.in_scope(|| {
+                ticket
+                    .store
+                    .upgrade()
+                    .ok_or(AssetFailure::Unknown)?
+                    .complete(&ticket, &data)
             })
         })
         .await
