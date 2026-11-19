@@ -641,18 +641,29 @@ async fn post(
     .map_err(|source| classified(SourceError::Timeout, &source))?
 }
 
-pub(super) fn inspect_boot(path: &Path, uid: u32, credential: &SecretDrn) {
+pub(super) enum RecordInspection {
+    Missing,
+    Invalid,
+    Valid,
+}
+
+pub(super) fn inspect_boot(path: &Path, uid: u32, credential: &SecretDrn) -> RecordInspection {
     match read_record(path, uid) {
         Ok(OAuth2Record::Sealed { since, cause, .. }) => {
             tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential, since, cause = cause.label(), instruction = "provide a new seed" }, "broker.credential.sealed");
+            RecordInspection::Valid
         }
         Err(SourceError::Io)
             if std::fs::symlink_metadata(path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
-        Err(error) => {
-            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category(), instruction = "delete the record and provide a new seed", "broker.credential.record.invalid")
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            RecordInspection::Missing
         }
-        Ok(OAuth2Record::Live { .. }) => {}
+        Err(error) => {
+            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category(), instruction = "delete the record and provide a new seed", "broker.credential.record.invalid");
+            RecordInspection::Invalid
+        }
+        Ok(OAuth2Record::Live { .. }) => RecordInspection::Valid,
     }
 }
 

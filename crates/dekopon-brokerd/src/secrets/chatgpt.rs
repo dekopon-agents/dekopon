@@ -2,7 +2,10 @@ use std::{path::Path, sync::Arc};
 
 use dekopon_broker::SecretMaterial;
 use dekopon_core::{FileTier, SecretDrn, error_chain, read_trusted_file};
-use dekopon_model::chatgpt::{ChatGptError, CredentialFile, RefreshClient, RefreshOutcome};
+use dekopon_model::chatgpt::{
+    ChatGptAuthStatus, ChatGptError, CredentialFile, RefreshClient, RefreshOutcome,
+};
+use sha2::{Digest as _, Sha256};
 use tracing::Instrument as _;
 
 use super::{REAUTHORIZATION_CODES, REFRESH_TIMEOUT, RefreshError};
@@ -13,6 +16,8 @@ const HARD_MAX_CHATGPT_AUTH_BYTES: usize = 64 * 1024;
 pub(crate) struct ChatGptSubscription {
     drn: SecretDrn,
     credential: Arc<CredentialFile>,
+    auth_digest: [u8; 32],
+    status: ChatGptAuthStatus,
     refresh: RefreshClient,
 }
 
@@ -31,22 +36,21 @@ impl ChatGptSubscription {
         auth_file: &Path,
         expected_uid: u32,
     ) -> Result<Self, String> {
-        drop(
-            read_trusted_file(
-                auth_file,
-                expected_uid,
-                FileTier::Private,
-                HARD_MAX_CHATGPT_AUTH_BYTES,
+        let bytes = read_trusted_file(
+            auth_file,
+            expected_uid,
+            FileTier::Private,
+            HARD_MAX_CHATGPT_AUTH_BYTES,
+        )
+        .map_err(|source| {
+            format!(
+                "{drn} authFile {} is not trusted input ({}): {}",
+                auth_file.display(),
+                source.category(),
+                error_chain(&source)
             )
-            .map_err(|source| {
-                format!(
-                    "{drn} authFile {} is not trusted input ({}): {}",
-                    auth_file.display(),
-                    source.category(),
-                    error_chain(&source)
-                )
-            })?,
-        );
+        })?;
+        let auth_digest = Sha256::digest(bytes).into();
         // The auth-file parent must be writable, since a read-only parent would leave a
         // rotated-but-unsaved retired token on disk for reuse.
         socket::validate_private_parent(auth_file, expected_uid).map_err(|source| {
@@ -83,22 +87,35 @@ impl ChatGptSubscription {
                 error_chain(&source)
             )
         })?;
-        tracing::info!(
-            event = "broker_chatgpt_credential_loaded",
-            credential = %drn,
-            path = %auth_file.display(),
-            expires_at = status.expires_at,
-            expired = status.expired,
-            "broker.chatgpt.credential.loaded"
-        );
         let refresh = RefreshClient::new(REFRESH_TIMEOUT, &[]).map_err(|source| {
             format!("{drn} could not build the ChatGPT refresh client: {source}")
         })?;
         Ok(Self {
             drn: drn.clone(),
             credential: Arc::new(credential),
+            auth_digest,
+            status,
             refresh,
         })
+    }
+
+    pub(super) fn auth_digest(&self) -> &[u8; 32] {
+        &self.auth_digest
+    }
+
+    pub(super) fn same_generation(&self, previous: &Self) -> bool {
+        self.auth_digest == previous.auth_digest && self.status.path == previous.status.path
+    }
+
+    pub(super) fn log_loaded(&self) {
+        tracing::info!(
+            event = "broker_chatgpt_credential_loaded",
+            credential = %self.drn,
+            path = %self.status.path.display(),
+            expires_at = self.status.expires_at,
+            expired = self.status.expired,
+            "broker.chatgpt.credential.loaded"
+        );
     }
 
     pub(crate) fn file(&self) -> Arc<CredentialFile> {

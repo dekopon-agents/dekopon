@@ -386,12 +386,24 @@ struct GenerationState {
     active: Arc<Candidate>,
     prepared: Option<(u32, Arc<Candidate>, Arc<Candidate>)>,
     reported: Option<RawCandidate>,
+    rejected: Option<RawCandidate>,
     retired_credentials: Vec<std::sync::Weak<dekopon_model::chatgpt::CredentialFile>>,
 }
 
 impl GenerationState {
     fn unreported(&mut self, raw: RawCandidate) -> bool {
         self.reported.replace(raw) != Some(raw)
+    }
+
+    fn record_recovery(&mut self) {
+        if let Some(rejected) = self.rejected.take() {
+            tracing::info!(
+                event = "broker_reload_recovered",
+                generation.digest = %self.active.digest,
+                rejected_generation.digest = %rejected.digest(),
+                "broker.reload.recovered"
+            );
+        }
     }
 
     fn owned_by(&self, uid: u32) -> bool {
@@ -405,6 +417,7 @@ impl GenerationState {
 
 impl Coordination {
     fn new(config_path: PathBuf, active: Candidate) -> Self {
+        active.ready.scheduled.log_chatgpt_loads(None);
         Self {
             config_path,
             loading: tokio::sync::Semaphore::new(1),
@@ -412,6 +425,7 @@ impl Coordination {
                 active: Arc::new(active),
                 prepared: None,
                 reported: None,
+                rejected: None,
                 retired_credentials: Vec::new(),
             }),
         }
@@ -473,31 +487,41 @@ impl Coordination {
                 .collect::<Vec<_>>();
             let count = entries.len();
             let error = bounded_problems(entries.into_iter());
-            let raw = RawCandidate::of(
+            let (raw, refusal) = RawCandidate::of(
                 self.config_path.clone(),
                 report.private_sources,
                 error.clone(),
             )
             .await;
-            let unreported = self.state.lock().unreported(raw);
             let unreadable = report.problems.iter().any(|problem| {
                 matches!(
                     problem,
                     BrokerdError::Config(config::ConfigError::Read { .. })
                 )
             });
-            match (unreported, unreadable) {
-                (false, _) => {}
-                (true, true) => {
-                    tracing::warn!(event = "broker_reload_monitor_failed", applied = false, error = %error, "broker.reload.monitor.failed");
+            let mut state = self.state.lock();
+            if state.unreported(refusal) {
+                if unreadable {
+                    tracing::warn!(
+                        event = "broker_reload_monitor_failed",
+                        applied = false,
+                        active_generation.digest = %state.active.digest,
+                        rejected_generation.digest = %raw.digest(),
+                        error = %error,
+                        "broker.reload.monitor.failed"
+                    );
+                } else {
+                    state.rejected = Some(raw);
+                    tracing::warn!(
+                        event = "broker_reload_refused",
+                        applied = false,
+                        active_generation.digest = %state.active.digest,
+                        rejected_generation.digest = %raw.digest(),
+                        problems = count,
+                        error = %error,
+                        "broker.reload.refused"
+                    );
                 }
-                (true, false) => tracing::warn!(
-                    event = "broker_reload_refused",
-                    applied = false,
-                    problems = count,
-                    error = %error,
-                    "broker.reload.refused"
-                ),
             }
             return (active.digest.clone(), GenerationOutcome::Refused);
         };
@@ -516,16 +540,27 @@ impl Coordination {
             match loaded {
                 Loaded::Unchanged => {
                     state.prepared = None;
+                    state.record_recovery();
                     return (active.digest.clone(), GenerationOutcome::Active);
                 }
                 Loaded::Candidate(next) => {
                     let next = Arc::<Candidate>::from(next);
+                    next.ready.scheduled.inherit_record_markers(
+                        &active.ready.scheduled,
+                        state
+                            .prepared
+                            .as_ref()
+                            .map(|(_, _, prior)| &prior.ready.scheduled),
+                    );
                     state.prepared = Some((uid, active, Arc::clone(&next)));
                     next
                 }
             }
         };
-        next.ready.scheduled.inspect_records().await;
+        next.ready
+            .scheduled
+            .inspect_records(Some(&next.digest))
+            .await;
         (next.digest.clone(), GenerationOutcome::Prepared)
     }
 
@@ -555,6 +590,11 @@ impl Coordination {
             .collect();
         state.retired_credentials.extend(retired);
         state.active = next;
+        state
+            .active
+            .ready
+            .scheduled
+            .log_chatgpt_loads(Some(&base.ready.scheduled));
         state.active.ready.policy_loaded();
         tracing::info!(
             event = "broker_reload_applied",
@@ -563,6 +603,7 @@ impl Coordination {
             categories = %categories.join(","),
             "broker.reload.applied"
         );
+        state.record_recovery();
         GenerationOutcome::Applied
     }
 
@@ -859,7 +900,7 @@ async fn boot_runtime(
 ) -> Option<Runtime> {
     let private = private_inputs(config, uid, problems).await;
     if let Some(private) = &private {
-        private.scheduled.inspect_records().await;
+        private.scheduled.inspect_records(None).await;
     }
     let storage = keep(
         problems,
@@ -999,7 +1040,7 @@ async fn private_inputs(
     let fingerprint = PrivateFingerprint::of(
         secrets
             .as_ref()
-            .map(|loaded| (loaded.bytes.as_slice(), &loaded.key_digest)),
+            .map(|loaded| (loaded.bytes.as_slice(), &loaded.minted_digest)),
     );
     Some(match secrets {
         Some(loaded) => PrivateInputs {
@@ -1049,11 +1090,15 @@ const MAX_RAW_SOURCE_BYTES: u64 = 16 << 20;
 struct RawCandidate([u8; 32]);
 
 impl RawCandidate {
-    async fn of(config: PathBuf, private: Vec<PathBuf>, refusal: String) -> Self {
+    fn digest(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    async fn of(config: PathBuf, private: Vec<PathBuf>, refusal: String) -> (Self, Self) {
         use std::io::Read as _;
 
         use sha2::{Digest as _, Sha256};
-        let digest = tokio::task::spawn_blocking(move || {
+        let digests = tokio::task::spawn_blocking(move || {
             let mut paths = std::fs::read_dir(&config).map_or_else(
                 |_| vec![config.clone()],
                 |entries| {
@@ -1083,11 +1128,13 @@ impl RawCandidate {
                     hasher.update(part);
                 }
             }
+            let source = hasher.clone().finalize().into();
             hasher.update(refusal.as_bytes());
-            hasher.finalize().into()
+            (source, hasher.finalize().into())
         })
         .await;
-        Self(digest.unwrap_or_default())
+        let (source, refusal) = digests.unwrap_or_default();
+        (Self(source), Self(refusal))
     }
 }
 
