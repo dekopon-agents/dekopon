@@ -1140,6 +1140,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1322,6 +1324,7 @@ dependencies = [
 name = "dekopon-process"
 version = "0.88.0"
 dependencies = [
+ "dekopon-core",
  "tokio",
 ]
 

@@ -4,6 +4,7 @@ use std::{
     thread::{self, Scope, ScopedJoinHandle},
 };
 
+use dekopon_core::offload;
 use tokio::{
     runtime::Handle,
     sync::{OwnedSemaphorePermit, Semaphore, oneshot},
@@ -122,11 +123,12 @@ impl ThreadPermit {
         Ok(async move {
             drop(completed.await);
             // Closure completion precedes TLS destruction, so even the final join stays off workers.
-            tokio::task::spawn_blocking(move || match thread.join() {
+            offload(move || match thread.join() {
                 Ok((_permit, result)) => result,
                 Err(payload) => Err(payload),
             })
             .await
+            .map_err(Into::into)
         })
     }
 

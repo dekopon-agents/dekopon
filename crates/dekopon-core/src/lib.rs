@@ -25,6 +25,8 @@ pub mod env_file;
 mod failure;
 #[cfg(unix)]
 pub mod fragments;
+#[cfg(feature = "tokio-task")]
+mod offload;
 #[cfg(unix)]
 pub mod private_file;
 mod redaction;
@@ -49,6 +51,10 @@ pub use backoff::Backoff;
 pub use cli_error::render_cli_error;
 pub use diagnostics::{MAX_PROBLEM_BYTES, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
 pub use failure::{MAX_FAILURE_CODE_BYTES, MAX_FAILURE_MESSAGE_BYTES, ProviderFailureDetail};
+#[cfg(feature = "offload-tracing")]
+pub use offload::OffloadTrace;
+#[cfg(feature = "tokio-task")]
+pub use offload::{Offload, OffloadError, offload};
 pub use redaction::{REDACTION_MARKER, Redacted, redaction_marker, serialize_exposed};
 pub use skill::{
     MAX_SKILL_FILE_BYTES, MAX_SKILL_NAME_LENGTH, MAX_SKILL_RESOURCE_BYTES,
