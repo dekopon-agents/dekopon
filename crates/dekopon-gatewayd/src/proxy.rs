@@ -586,7 +586,7 @@ pub(crate) mod tests {
         );
     }
 
-    async fn ask(address: SocketAddr, pki: &Pki, subject: &str, body: &str) -> String {
+    async fn ask(address: SocketAddr, pki: &Pki, subject: &str, path: &str, body: &str) -> String {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(pki.server_ca.der().clone()).unwrap();
         let (cert, key) = &pki.jail;
@@ -610,7 +610,7 @@ pub(crate) mod tests {
             .unwrap();
         tls.write_all(
             format!(
-                "POST /v1/messages HTTP/1.1\r\nhost: dekopon-gatewayd.test\r\nx-dekopon-vm-subject: {subject}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "POST {path} HTTP/1.1\r\nhost: dekopon-gatewayd.test\r\nx-dekopon-vm-subject: {subject}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
@@ -646,6 +646,7 @@ pub(crate) mod tests {
             address,
             &pki,
             "dekopon:stranger-vm",
+            "/v1/messages",
             r#"{"model":"claude-opus"}"#,
         )
         .await;
@@ -655,6 +656,7 @@ pub(crate) mod tests {
             address,
             &pki,
             "dekopon:gylmar-vm",
+            "/v1/messages",
             r#"{"model":"glm-flash"}"#,
         )
         .await;
@@ -733,13 +735,14 @@ pub(crate) mod tests {
             address,
             &pki,
             "dekopon:gylmar-vm",
+            "/v1/messages/count_tokens",
             r#"{"model":"claude-opus"}"#,
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert!(
             response.contains(
-                "dekopon sandbox: this VM runs on its agent's model `glm-flash`, which is served on `/v1/chat/completions`, not `/v1/messages`."
+                "dekopon sandbox: this VM runs on its agent's model `glm-flash`, which is served on `/v1/chat/completions` or `/v1/messages`, not `/v1/messages/count_tokens`."
             ),
             "{response}"
         );

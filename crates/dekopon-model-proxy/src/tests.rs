@@ -808,13 +808,13 @@ async fn an_unknown_subject_and_an_ungranted_model_are_sandbox_permission_errors
             "/v1/messages",
             long.as_str(),
             "permission_error",
-            "configured models: `claude-opus`. Set the model to one of them.",
+            "configured models: `claude-opus`, `glm-flash`. Set the model to one of them.",
         ),
         (
             "/v1/messages",
-            "glm-flash",
+            "glm-ungranted",
             "permission_error",
-            "configured models: `claude-opus`.",
+            "configured models: `claude-opus`, `glm-flash`.",
         ),
         (
             "/v1/chat/completions",
@@ -826,7 +826,7 @@ async fn an_unknown_subject_and_an_ungranted_model_are_sandbox_permission_errors
             "/v1/responses",
             "astra",
             "permission_denied",
-            "none is served on this path: `claude-opus` on `/v1/messages`, `glm-flash` on `/v1/chat/completions`.",
+            "none is served on this path: `claude-opus` on `/v1/messages` or `/v1/messages/count_tokens`, `glm-flash` on `/v1/chat/completions` or `/v1/messages`.",
         ),
     ] {
         let response = running
@@ -1214,18 +1214,102 @@ async fn a_guest_named_model_is_overwritten_never_forwarded() {
 }
 
 #[tokio::test]
-async fn a_dialect_the_inherited_model_cannot_serve_is_refused_before_any_upstream_call() {
+async fn openrouter_messages_preserve_guest_bytes_except_model_and_charge_anthropic_usage() {
+    for granted in [
+        Granted::Inherited("glm-flash".to_owned()),
+        Granted::Listed(BTreeSet::from(["glm-flash".to_owned()])),
+    ] {
+        let answer = r#"{"id":"x","type":"message","content":[],"usage":{"input_tokens":5,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":2}}"#;
+        let upstream = FakeUpstream::start(vec![json("200 OK", answer)]).await;
+        let mut models = models(&format!("{}/api/", upstream.url), None);
+        for model in &mut models {
+            if let Upstream::OpenRouter { settings, .. } = &mut model.upstream {
+                *settings = [
+                    (Field::MaxTokens, "512"),
+                    (Field::Temperature, "0.3"),
+                    (Field::TopP, "0.5"),
+                    (Field::Reasoning, r#"{"effort":"high"}"#),
+                    (Field::Provider, r#"{"only":["Anthropic"]}"#),
+                ]
+                .into_iter()
+                .map(|(field, raw)| (field, raw.to_owned()))
+                .collect();
+            }
+        }
+        let running = serve(models, granted, 100_000, Duration::from_secs(20)).await;
+        let body = r#"{ "model" : "glm-flash", "max_tokens":1024, "temperature":1.5, "top_p":0.9,
+ "system":[{"type":"text","text":"cached system","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+ "messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}] }"#;
+        let response = running
+            .post("/v1/messages", body)
+            .header("authorization", "Bearer guest-bearer-sentinel")
+            .header("x-api-key", "guest-key-sentinel")
+            .header("proxy-authorization", "Bearer guest-proxy-sentinel")
+            .header("cookie", "guest-cookie-sentinel")
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), answer);
+        assert_eq!(upstream.requests.lock().len(), 1);
+        let request = upstream.request();
+        let headers = request.split_once("\r\n\r\n").unwrap().0;
+        assert!(headers.starts_with("POST /api/v1/messages HTTP/1.1\r\n"));
+        assert!(headers.contains("authorization: Bearer sk-or-proxy\r\n"));
+        assert!(headers.contains("anthropic-version: 2023-06-01"));
+        assert!(!headers.contains("guest-"));
+        assert!(!headers.contains("x-api-key:"));
+        assert_eq!(
+            upstream.body(),
+            body.replace("glm-flash", "z-ai/glm-4.5-air")
+        );
+        assert_eq!(used(&running.metering), 17);
+    }
+}
+
+#[tokio::test]
+async fn openrouter_messages_refuse_fallback_routing_without_sending_or_charging() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    for field in [r#""models":["x/y"]"#, r#""route":"fallback""#] {
+        let response = running
+            .post("/v1/messages", format!(r#"{{"model":"anything",{field}}}"#))
+            .send()
+            .await
+            .unwrap();
+        let message = sandbox_refusal(response, "/v1/messages", 400, "invalid_request_error").await;
+        assert_eq!(
+            message,
+            "dekopon sandbox: OpenRouter fallback routing (`models` / `route`) is not allowed; the sandbox pins each call to one configured model. Remove the field."
+        );
+    }
+    assert!(upstream.requests.lock().is_empty());
+    assert_eq!(used(&running.metering), 0);
+}
+
+#[tokio::test]
+async fn openrouter_count_tokens_is_refused_before_any_upstream_call_and_never_charged() {
     let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
     let running = inheriting(&upstream.url).await;
     let response = running
-        .post("/v1/messages", r#"{"model":"claude-opus","messages":[]}"#)
+        .post(
+            "/v1/messages/count_tokens",
+            r#"{"model":"claude-opus","messages":[]}"#,
+        )
         .send()
         .await
         .unwrap();
-    let message = sandbox_refusal(response, "/v1/messages", 403, "permission_error").await;
+    let message = sandbox_refusal(
+        response,
+        "/v1/messages/count_tokens",
+        403,
+        "permission_error",
+    )
+    .await;
     assert_eq!(
         message,
-        "dekopon sandbox: this VM runs on its agent's model `glm-flash`, which is served on `/v1/chat/completions`, not `/v1/messages`. Call it on its own path."
+        "dekopon sandbox: this VM runs on its agent's model `glm-flash`, which is served on `/v1/chat/completions` or `/v1/messages`, not `/v1/messages/count_tokens`. Call it on its own path."
     );
     assert!(upstream.requests.lock().is_empty());
     assert_eq!(used(&running.metering), 0);

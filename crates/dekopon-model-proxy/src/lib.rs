@@ -86,21 +86,18 @@ impl Upstream {
         match (self, dialect) {
             (Self::Anthropic { .. }, Dialect::Messages | Dialect::CountTokens)
             | (Self::Codex { .. }, Dialect::Responses)
-            | (Self::OpenRouter { .. }, Dialect::Chat) => true,
+            | (Self::OpenRouter { .. }, Dialect::Chat | Dialect::Messages) => true,
             (Self::Anthropic { .. }, Dialect::Responses | Dialect::Chat)
             | (Self::Codex { .. }, Dialect::Messages | Dialect::CountTokens | Dialect::Chat)
-            | (
-                Self::OpenRouter { .. },
-                Dialect::Messages | Dialect::CountTokens | Dialect::Responses,
-            ) => false,
+            | (Self::OpenRouter { .. }, Dialect::CountTokens | Dialect::Responses) => false,
         }
     }
 
     const fn path(&self) -> &'static str {
         match self {
-            Self::Anthropic { .. } => "/v1/messages",
-            Self::Codex { .. } => "/v1/responses",
-            Self::OpenRouter { .. } => "/v1/chat/completions",
+            Self::Anthropic { .. } => "`/v1/messages` or `/v1/messages/count_tokens`",
+            Self::Codex { .. } => "`/v1/responses`",
+            Self::OpenRouter { .. } => "`/v1/chat/completions` or `/v1/messages`",
         }
     }
 
@@ -111,6 +108,7 @@ impl Upstream {
             }
             (Self::Anthropic { endpoint, .. }, _) => (endpoint, "/v1/messages"),
             (Self::Codex { endpoint, .. }, _) => (endpoint, "/responses"),
+            (Self::OpenRouter { endpoint, .. }, Dialect::Messages) => (endpoint, "/v1/messages"),
             (Self::OpenRouter { endpoint, .. }, _) => (endpoint, "/v1/chat/completions"),
         };
         format!("{}{path}", endpoint.trim_end_matches('/'))
@@ -204,7 +202,7 @@ impl ModelProxy {
             .collect::<Vec<_>>();
         if served.is_empty() {
             let elsewhere = granted()
-                .map(|model| format!("`{}` on `{}`", model.name, model.upstream.path()))
+                .map(|model| format!("`{}` on {}", model.name, model.upstream.path()))
                 .collect::<Vec<_>>();
             format!(
                 "this agent may only call its configured models, and none is served on this path: {}. Call one on its own path.",
@@ -411,7 +409,7 @@ async fn call(
                 return span.refused(dialect.sandbox(
                     Problem::Forbidden,
                     &format!(
-                        "this VM runs on its agent's model `{}`, which is served on `{}`, not `{}`. Call it on its own path.",
+                        "this VM runs on its agent's model `{}`, which is served on {}, not `{}`. Call it on its own path.",
                         model.name,
                         model.upstream.path(),
                         dialect.path()
@@ -443,6 +441,9 @@ async fn call(
                 Problem::Invalid,
                 "OpenRouter fallback routing (`models` / `route`) is not allowed; the sandbox pins each call to one configured model. Remove the field.",
             ));
+        }
+        (Upstream::OpenRouter { .. }, _) if dialect == Dialect::Messages => {
+            peek.rewrite(&body, &[(Field::Model, &wire_model)])
         }
         (Upstream::OpenRouter { settings, .. }, Granted::Inherited(_)) => {
             let mut replacements = vec![(Field::Model, wire_model.as_str())];
