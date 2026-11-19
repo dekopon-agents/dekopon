@@ -12,6 +12,7 @@
 mod assets;
 pub mod capabilities;
 
+const EGRESS_USER_AGENT: &str = concat!("dekopon-brokerd/", env!("CARGO_PKG_VERSION"));
 const BROKER_PRINCIPAL: &str = "dekopon-broker";
 const RECONCILIATION_OWNER: &str = "dekopon-gatewayd";
 mod config;
