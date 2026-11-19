@@ -51,6 +51,8 @@ use tokio::{
 };
 
 #[cfg(unix)]
+use dekopon_core::Backoff;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 pub const PROTOCOL_VERSION: &str = "dekopon.dev/broker/v1alpha2";
@@ -1724,6 +1726,61 @@ pub struct BrokerClient {
 const CONNECT_BACKOFF: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const MAX_CONNECT_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const CONNECT_JITTER_MS: u64 = 50;
+
+#[cfg(unix)]
+fn connect_backoff() -> Backoff {
+    Backoff::new(
+        CONNECT_BACKOFF,
+        MAX_CONNECT_BACKOFF,
+        Duration::from_millis(CONNECT_JITTER_MS),
+    )
+}
+
+#[cfg(unix)]
+fn connect_retry_delay(backoff: &mut Backoff, jitter: Duration, remaining: Duration) -> Duration {
+    backoff
+        .next_delay(jitter)
+        .min(MAX_CONNECT_BACKOFF)
+        .min(remaining)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn draw_connect_jitter(bytes: &mut [u8; 8]) -> io::Result<usize> {
+    rustix::rand::getrandom(bytes, rustix::rand::GetRandomFlags::NONBLOCK).map_err(Into::into)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn draw_connect_jitter(bytes: &mut [u8; 8]) -> io::Result<usize> {
+    let random = rustix::fs::open(
+        "/dev/urandom",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    rustix::io::read(random, bytes).map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn connect_jitter_with(draw: impl FnOnce(&mut [u8; 8]) -> io::Result<usize>) -> Duration {
+    let mut bytes = [0; 8];
+    let result = draw(&mut bytes).and_then(|read| {
+        if read == bytes.len() {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+        }
+    });
+    if let Err(error) = result {
+        tracing::warn!(
+            event = "broker_connect_jitter_unavailable",
+            error = %error,
+            "broker.connect.jitter.unavailable"
+        );
+        return Duration::ZERO;
+    }
+    Duration::from_millis(u64::from_le_bytes(bytes) % CONNECT_JITTER_MS)
+}
 
 #[cfg(unix)]
 impl BrokerClient {
@@ -2130,7 +2187,7 @@ impl BrokerClient {
 impl BrokerClient {
     async fn connect(&self) -> Result<UnixStream, ClientError> {
         let started = tokio::time::Instant::now();
-        let mut backoff = CONNECT_BACKOFF;
+        let mut backoff = connect_backoff();
         let mut budget = if self.connect_window.is_zero() {
             self.limits.io_timeout
         } else {
@@ -2145,7 +2202,8 @@ impl BrokerClient {
             if remaining.is_zero() {
                 return Err(absent);
             }
-            tokio::time::sleep(backoff.min(remaining)).await;
+            let jitter = connect_jitter_with(draw_connect_jitter);
+            tokio::time::sleep(connect_retry_delay(&mut backoff, jitter, remaining)).await;
             budget = self
                 .connect_window
                 .saturating_sub(started.elapsed())
@@ -2153,7 +2211,6 @@ impl BrokerClient {
             if budget.is_zero() {
                 return Err(absent);
             }
-            backoff = backoff.saturating_mul(2).min(MAX_CONNECT_BACKOFF);
         }
     }
 

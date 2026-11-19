@@ -2744,6 +2744,43 @@ const RETRY_LIMITS: FrameLimits = FrameLimits {
 };
 
 #[cfg(unix)]
+#[test]
+fn connect_retries_keep_their_schedule_cap_and_remaining_window_with_jitter() {
+    for jitter in [Duration::ZERO, Duration::from_millis(49)] {
+        let mut backoff = super::connect_backoff();
+        for millis in [50, 100, 200, 400, 800, 1000, 1000] {
+            assert_eq!(
+                super::connect_retry_delay(&mut backoff, jitter, Duration::from_secs(10)),
+                (Duration::from_millis(millis) + jitter).min(Duration::from_secs(1))
+            );
+        }
+        assert_eq!(
+            super::connect_retry_delay(&mut backoff, jitter, Duration::from_millis(23)),
+            Duration::from_millis(23)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn connect_jitter_uses_complete_draws_and_falls_back_when_unavailable() {
+    for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::Other] {
+        assert_eq!(
+            super::connect_jitter_with(|_| Err(std::io::Error::from(kind))),
+            Duration::ZERO
+        );
+    }
+    assert_eq!(super::connect_jitter_with(|_| Ok(3)), Duration::ZERO);
+    assert_eq!(
+        super::connect_jitter_with(|bytes| {
+            *bytes = 49_u64.to_le_bytes();
+            Ok(bytes.len())
+        }),
+        Duration::from_millis(49)
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn open_waits_through_an_absent_then_refusing_broker_until_one_accepts() {
     use tokio::net::UnixListener;

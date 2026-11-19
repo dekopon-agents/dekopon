@@ -1,11 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
+use dekopon_core::Backoff;
 use futures_util::future::BoxFuture;
 use tokio::time::{Instant, sleep, timeout};
 
 use super::{
-    AssetFetcher, ChatDriver, ChatTransport, ThreadOwnership, TransportError, TransportEvent,
-    TransportIdentity, reconnect_delay,
+    AssetFetcher, ChatDriver, ChatTransport, RECONNECT_JITTER_MS, ThreadOwnership, TransportError,
+    TransportEvent, TransportIdentity, jitter_below, reconnect_backoff,
 };
 
 const MAX_FAILURES: u32 = 10;
@@ -15,6 +16,7 @@ const HEALTHY_RESET: Duration = Duration::from_secs(5 * 60);
 pub(crate) struct RecoveringTransport {
     inner: Box<dyn ChatTransport>,
     failures: u32,
+    backoff: Backoff,
     connected_since: Option<Instant>,
     identity: Option<TransportIdentity>,
 }
@@ -24,21 +26,45 @@ impl RecoveringTransport {
         Self {
             inner,
             failures: 0,
+            backoff: reconnect_backoff(),
             connected_since: None,
             identity: None,
         }
     }
 
     async fn failed(&mut self, error: TransportError) -> Result<(), TransportError> {
+        let category = error.category();
+        let delay = self.retry_delay(error, || {
+            Duration::from_millis(jitter_below(RECONNECT_JITTER_MS))
+        })?;
+        tracing::warn!(
+            event = "gateway_transport_recovering",
+            transport = self.name(),
+            category,
+            failure = self.failures,
+            delay_ms = delay.as_millis() as u64,
+            "gateway.transport.recovering"
+        );
+        sleep(delay).await;
+        Ok(())
+    }
+
+    fn retry_delay(
+        &mut self,
+        error: TransportError,
+        jitter: impl FnOnce() -> Duration,
+    ) -> Result<Duration, TransportError> {
         if self
             .connected_since
             .take()
             .is_some_and(|since| since.elapsed() >= HEALTHY_RESET)
         {
             self.failures = 0;
+            self.backoff.reset();
         }
         self.failures = self.failures.saturating_add(1);
         if !self.inner.retryable(&error) {
+            let _delay = self.backoff.next_delay(Duration::ZERO);
             return Err(error);
         }
         if self.failures >= MAX_FAILURES {
@@ -47,17 +73,7 @@ impl RecoveringTransport {
                 source: Box::new(error),
             });
         }
-        let delay = reconnect_delay(self.failures - 1);
-        tracing::warn!(
-            event = "gateway_transport_recovering",
-            transport = self.name(),
-            category = error.category(),
-            failure = self.failures,
-            delay_ms = delay.as_millis() as u64,
-            "gateway.transport.recovering"
-        );
-        sleep(delay).await;
-        Ok(())
+        Ok(self.backoff.next_delay(jitter()))
     }
 
     async fn open(&mut self) -> Result<TransportIdentity, TransportError> {
@@ -290,10 +306,10 @@ mod tests {
         let mut transport = scripted([(Duration::ZERO, false), (Duration::ZERO, true)], vec![]);
         transport.connect().await.expect("recovered");
         tokio::time::advance(HEALTHY_RESET).await;
-        transport
-            .failed(TransportError::Closed)
-            .await
+        let delay = transport
+            .retry_delay(TransportError::Closed, || Duration::ZERO)
             .expect("new episode");
+        assert_eq!(delay, Duration::from_millis(500));
         assert_eq!(
             transport.failures, 1,
             "idle health does not require user traffic"
