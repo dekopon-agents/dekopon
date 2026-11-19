@@ -38,20 +38,19 @@ impl FakeUpstream {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&requests);
         tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let request = read_request(&mut stream).await;
-            recorded.lock().push(request);
-            for step in steps {
-                match step {
-                    Step::Write(bytes) => {
-                        if stream.write_all(&bytes).await.is_err() {
-                            return;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let request = read_request(&mut stream).await;
+                recorded.lock().push(request);
+                for step in &steps {
+                    match step {
+                        Step::Write(bytes) => {
+                            if stream.write_all(bytes).await.is_err() {
+                                return;
+                            }
+                            let _flushed = stream.flush().await;
                         }
-                        let _flushed = stream.flush().await;
+                        Step::Wait(duration) => tokio::time::sleep(*duration).await,
                     }
-                    Step::Wait(duration) => tokio::time::sleep(duration).await,
                 }
             }
         });
@@ -1237,7 +1236,8 @@ async fn openrouter_messages_preserve_guest_bytes_except_model_and_charge_anthro
             }
         }
         let running = serve(models, granted, 100_000, Duration::from_secs(20)).await;
-        let body = r#"{ "model" : "glm-flash", "max_tokens":1024, "temperature":1.5, "top_p":0.9,
+        let body = r#"{ "model" : "glm-flash", "max_tokens":1024, "max_tokens":2048,
+ "temperature":1.5, "temperature":0.7, "top_p":0.9, "top_p":0.8,
  "system":[{"type":"text","text":"cached system","cache_control":{"type":"ephemeral","ttl":"1h"}}],
  "messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}] }"#;
         let response = running
@@ -1255,8 +1255,20 @@ async fn openrouter_messages_preserve_guest_bytes_except_model_and_charge_anthro
         assert_eq!(upstream.requests.lock().len(), 1);
         let request = upstream.request();
         let headers = request.split_once("\r\n\r\n").unwrap().0;
-        assert!(headers.starts_with("POST /api/v1/messages HTTP/1.1\r\n"));
-        assert!(headers.contains("authorization: Bearer sk-or-proxy\r\n"));
+        assert_eq!(
+            headers.lines().next(),
+            Some("POST /api/v1/messages HTTP/1.1")
+        );
+        let credentials = headers
+            .lines()
+            .filter(|line| {
+                line.split_once(':').is_some_and(|(name, _)| {
+                    name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("proxy-authorization")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(credentials, ["authorization: Bearer sk-or-proxy"]);
         assert!(headers.contains("anthropic-version: 2023-06-01"));
         assert!(!headers.contains("guest-"));
         assert!(!headers.contains("x-api-key:"));
@@ -1310,6 +1322,27 @@ async fn openrouter_count_tokens_is_refused_before_any_upstream_call_and_never_c
     assert_eq!(
         message,
         "dekopon sandbox: this VM runs on its agent's model `glm-flash`, which is served on `/v1/chat/completions` or `/v1/messages`, not `/v1/messages/count_tokens`. Call it on its own path."
+    );
+    assert!(upstream.requests.lock().is_empty());
+    assert_eq!(used(&running.metering), 0);
+}
+
+#[tokio::test]
+async fn an_inheriting_chat_guest_refuses_repeated_generation_fields_before_forwarding() {
+    let upstream = FakeUpstream::start(vec![json("200 OK", USAGE_ANSWER)]).await;
+    let running = inheriting(&upstream.url).await;
+    let response = running
+        .post(
+            "/v1/chat/completions",
+            r#"{"model":"glm-flash","messages":[],"temperature":0.1,"temperature":0.2}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    let message = sandbox_refusal(response, "/v1/chat/completions", 400, "invalid_request").await;
+    assert_eq!(
+        message,
+        "dekopon sandbox: the request repeats the top-level key `temperature`; send it once."
     );
     assert!(upstream.requests.lock().is_empty());
     assert_eq!(used(&running.metering), 0);

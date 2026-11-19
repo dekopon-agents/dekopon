@@ -389,9 +389,13 @@ async fn call(
             ));
         }
     };
-    let peeked = match &grant.models {
-        Granted::Listed(_) => RequestPeek::of(&body),
-        Granted::Inherited(_) => RequestPeek::with_settings(&body),
+    let peeked = match (&grant.models, dialect) {
+        (Granted::Listed(_), _) | (Granted::Inherited(_), Dialect::Messages) => {
+            RequestPeek::of(&body)
+        }
+        (Granted::Inherited(_), Dialect::CountTokens | Dialect::Responses | Dialect::Chat) => {
+            RequestPeek::with_settings(&body)
+        }
     };
     let peek = match peeked {
         Ok(peek) => peek,
