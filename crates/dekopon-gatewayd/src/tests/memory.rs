@@ -1570,6 +1570,173 @@ fn reasoning_details(body: &Value) -> Vec<Value> {
         .collect()
 }
 
+#[derive(Clone, Debug, Default)]
+struct MeterLogSink(Arc<Mutex<Vec<opentelemetry_sdk::logs::SdkLogRecord>>>);
+
+impl opentelemetry_sdk::logs::LogExporter for MeterLogSink {
+    async fn export(
+        &self,
+        batch: opentelemetry_sdk::logs::LogBatch<'_>,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0.lock().extend(
+            batch
+                .iter()
+                .filter(|(record, _)| record.target().is_some_and(|target| target == "meter"))
+                .map(|(record, _)| record.clone()),
+        );
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn openrouter_calls_export_known_cache_counts_and_session_coordinates() {
+    if std::env::var_os("DEKOPON_TEST_COMPLETION_SUBSCRIBER").is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::memory::openrouter_calls_export_known_cache_counts_and_session_coordinates",
+            ])
+            .env("DEKOPON_TEST_COMPLETION_SUBSCRIBER", "1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "subscriber test: stdout={} stderr={}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+        return;
+    }
+
+    use opentelemetry::{Value as SpanValue, logs::AnyValue};
+    use opentelemetry_sdk::logs::SdkLoggerProvider;
+
+    let (provider, exported) = exporting_provider();
+    let logs = MeterLogSink::default();
+    let telemetry = dekopon_telemetry::Install::new(dekopon_telemetry::Console {
+        format: dekopon_telemetry::ConsoleFormat::Json,
+        writer: dekopon_telemetry::ConsoleWriter::Stderr,
+        filter: dekopon_telemetry::ConsoleFilter::Directive("off".into()),
+    })
+    .with_traces(provider, "completion-test", crate::OTEL_TRACE_FILTER)
+    .with_logs(
+        SdkLoggerProvider::builder()
+            .with_simple_exporter(logs.clone())
+            .build(),
+        "job=debug,meter=info",
+    )
+    .install()
+    .unwrap();
+    let cases = [("zero-cache", 0), ("positive-cache", 75)];
+    let mut responses = cases
+        .map(|(_, cached)| {
+            router_sse(json!({"model":"vendor/model",
+                "choices":[{"delta":{"content":"answered"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":100,"completion_tokens":12,
+                    "prompt_tokens_details":{"cached_tokens":cached,"cache_write_tokens":0},
+                    "completion_tokens_details":{"reasoning_tokens":0}}
+            }))
+        })
+        .to_vec();
+    responses.push(format!(
+        "data: {}\n\n",
+        json!({"model":"vendor/model","choices":[{"delta":{"content":"partial"}}]})
+    ));
+    let vendor = vendor(responses).await;
+    let directory = temporary();
+    let journal_dir = temporary();
+    let (broker, _) = stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let router = Arc::new(Router::new(&vendor));
+    let runner = journaled_runner(broker, Arc::<Router>::clone(&router), journal_dir.path());
+    let route = router_route(recall_window(RecallSource::Journal));
+    let driver = Arc::new(RecordingDriver::default());
+    for (id, _) in cases {
+        let mut message = message("answer this");
+        message.conversation.id = id.to_owned();
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+    assert_eq!(driver.replies(), ["answered", "answered"]);
+
+    let (_cancel, cancellation) = tokio::sync::watch::channel(false);
+    let model = router
+        .build_bound(
+            &route.model,
+            tokio::runtime::Handle::current(),
+            cancellation,
+        )
+        .unwrap();
+    let model = crate::metering::ChatProviderGovernor::wrap(
+        model,
+        &runner.metering,
+        &route.agent,
+        &route.model,
+    );
+    let cancelled = tokio::task::spawn_blocking(move || {
+        model.complete(
+            &[ModelMessage::user("stop after the first delta")],
+            &[],
+            &CompletionOptions::default(),
+            &mut |_| ControlFlow::Break(()),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(cancelled, Err(InferenceError::Cancelled)));
+    assert_eq!(vendor.bodies.lock().len(), 3);
+    telemetry.shutdown().unwrap();
+
+    let spans = exported.0.lock();
+    let completions = spans
+        .iter()
+        .filter(|span| span.name == "model.complete")
+        .collect::<Vec<_>>();
+    let logs = logs.0.lock();
+    assert_eq!(completions.len(), 3);
+    assert_eq!(logs.len(), 3);
+    for (index, (span, log)) in completions.iter().zip(logs.iter()).enumerate() {
+        let span_field = |name| {
+            span.attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == name)
+                .map(|attribute| &attribute.value)
+        };
+        let log_field = |name| {
+            log.attributes_iter()
+                .find(|(key, _)| key.as_str() == name)
+                .map(|(_, value)| value)
+        };
+        let expected_cache = cases.get(index).map(|&(_, cached)| cached);
+        for (name, expected) in [
+            ("usage.cached_input_tokens", expected_cache),
+            ("usage.cache_write_tokens", expected_cache.map(|_| 0)),
+            ("usage.reasoning_output_tokens", expected_cache.map(|_| 0)),
+        ] {
+            assert_eq!(
+                span_field(name),
+                expected
+                    .map(|count| SpanValue::String(count.to_string().into()))
+                    .as_ref(),
+            );
+            assert_eq!(log_field(name), expected.map(AnyValue::Int).as_ref());
+        }
+        if let Some(&(id, _)) = cases.get(index) {
+            for (key, value) in [
+                ("gen_ai.agent.name", "reviewer"),
+                ("conversation.id", id),
+                ("conversation.kind", "directMessage"),
+            ] {
+                assert_eq!(span_field(key), Some(&SpanValue::String(value.into())));
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn opaque_replays_as_an_object_and_never_reaches_the_trace() {
     const SENTINEL: &str = "opaque-sentinel-7f3a";

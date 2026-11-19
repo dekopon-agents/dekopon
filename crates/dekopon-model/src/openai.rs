@@ -215,6 +215,7 @@ impl InferenceModel for OpenAiClient {
                 &self.model,
                 "openai-compatible",
                 "chat-completions",
+                request.options,
                 async {
                     let mut progress = Progress::new();
                     (

@@ -14419,7 +14419,7 @@ pub(crate) fn capture_spans() -> (
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct SpanSink(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+pub(crate) struct SpanSink(pub(crate) Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
 
 impl opentelemetry_sdk::trace::SpanExporter for SpanSink {
     async fn export(

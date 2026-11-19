@@ -317,6 +317,7 @@ impl InferenceModel for CodexClient {
                 &self.model,
                 "chatgpt-subscription",
                 "codex-responses",
+                request.options,
                 async {
                     let mut progress = Progress::new();
                     (

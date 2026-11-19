@@ -365,6 +365,7 @@ impl InferenceModel for OpenRouterClient {
                 &self.model,
                 "openrouter",
                 "chat-completions",
+                request.options,
                 async {
                     let mut progress = Progress::new();
                     (

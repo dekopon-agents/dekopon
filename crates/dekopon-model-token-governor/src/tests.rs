@@ -500,6 +500,7 @@ fn a_settled_call_charges_once_and_emits_one_record() {
         input_tokens: Some(120),
         output_tokens: Some(30),
         cached_input_tokens: Some(100),
+        cache_write_tokens: Some(0),
         ..ModelUsage::default()
     });
     admission.settle(Outcome::Succeeded);

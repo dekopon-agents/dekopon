@@ -9,6 +9,7 @@ use crate::{
 };
 use dekopon_agent::memory_tools::Rung;
 use dekopon_model::model::{AssistantTurn, ChatModel, ModelTool};
+use dekopon_model_token_governor::ModelUsage;
 use parking_lot::Mutex;
 use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
 
@@ -21,6 +22,7 @@ const STEM: &str = "reviewer/0123456789abcdef0123456789abcdef0123456789abcdef012
 
 enum Action {
     Text(&'static str),
+    TextWithUsage(&'static str, ModelUsage),
     Timeout,
     Cancelled,
     Refused,
@@ -127,6 +129,13 @@ impl ChatModel for Script {
             .expect("one action per expected call");
         let text = match action {
             Action::Text(text) => text,
+            Action::TextWithUsage(text, usage) => {
+                return Ok(AssistantTurn::new(
+                    Some(text.to_owned()),
+                    Vec::new(),
+                    Some(usage),
+                ));
+            }
             Action::Timeout => return Err(InferenceError::DeadlineExceeded),
             Action::Cancelled => return Err(InferenceError::Cancelled),
             Action::Refused => {
@@ -230,6 +239,60 @@ async fn wait_for(journal: &Journal, predicate: impl Fn(&[Slot]) -> bool) {
 }
 fn failed(slot: &Slot, kind: SummaryFailure) -> bool {
     matches!(slot, Slot::Error(error) if error.kind == kind)
+}
+
+#[tokio::test]
+async fn a_summary_span_exports_the_reported_input_and_cached_counts() {
+    use opentelemetry::{Value, trace::TracerProvider as _};
+    use tracing_subscriber::prelude::*;
+
+    let (provider, exported) = crate::tests::exporting_provider();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("summary-test")))
+        .set_default();
+    let (_dir, journal) = journal();
+    journal.append_record(STEM, &fixture(), Vec::new()).unwrap();
+    let (resources, _) = resources(
+        journal,
+        [Action::TextWithUsage(
+            "summary",
+            ModelUsage {
+                input_tokens: Some(120),
+                cached_input_tokens: Some(90),
+                ..ModelUsage::default()
+            },
+        )],
+        true,
+    );
+    run(
+        Arc::new(resources),
+        Queued {
+            task: task(),
+            since: Instant::now(),
+        },
+        watch::channel(false).1,
+    )
+    .await;
+    provider.shutdown().unwrap();
+
+    let spans = exported.0.lock();
+    let summary = spans
+        .iter()
+        .find(|span| span.name == "memory.summarize")
+        .expect("summary span exported");
+    for (key, tokens) in [
+        ("usage.input_tokens", 120),
+        ("usage.cached_input_tokens", 90),
+    ] {
+        assert_eq!(
+            summary
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == key)
+                .map(|attribute| &attribute.value),
+            Some(&Value::I64(tokens)),
+        );
+    }
 }
 
 #[tokio::test]

@@ -2878,7 +2878,13 @@ async fn session_turn(
     };
     // Built here per request rather than passed to the shared factory, so a cached client's cache
     // key never gets baked in from the first conversation and silently mislabels every later one.
-    let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
+    let options = CompletionOptions::default()
+        .with_prompt_cache_key(cache_key.clone())
+        .with_session(
+            route.agent.clone(),
+            message.conversation.id.as_str(),
+            message.conversation.kind.as_str(),
+        );
 
     let liveness = route
         .indicators
