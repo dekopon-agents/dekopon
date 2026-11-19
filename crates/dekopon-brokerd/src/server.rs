@@ -16,7 +16,7 @@ use dekopon_broker_protocol::{
     RequestEnvelope, ResponseEnvelope, Streams, TraceParent, write_frame,
 };
 use dekopon_core::{
-    ACCEPT_BACKOFF_MS, InvocationId, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error,
+    ACCEPT_BACKOFF_MS, Backoff, InvocationId, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error,
 };
 use dekopon_telemetry::TraceContextParts;
 use thiserror::Error;
@@ -51,6 +51,14 @@ pub struct ServerLimits {
 }
 
 const UNBOUNDED_GRACE: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+
+fn accept_backoff() -> Backoff {
+    Backoff::new(
+        Duration::from_millis(ACCEPT_BACKOFF_MS),
+        Duration::from_millis(MAX_ACCEPT_BACKOFF_MS),
+        Duration::ZERO,
+    )
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ShutdownDeadline(Arc<OnceLock<Instant>>);
@@ -128,7 +136,7 @@ where
     {
         let semaphore = Arc::new(Semaphore::new(self.limits.max_connections));
         let mut tasks = JoinSet::new();
-        let mut accept_backoff_ms = ACCEPT_BACKOFF_MS;
+        let mut backoff = accept_backoff();
         let refusal = capacity_refusal(self.limits.frame)
             .await
             .map_err(|source| ServerError::InvalidFrameLimits { source })?;
@@ -143,23 +151,22 @@ where
                 accepted = listener.accept() => {
                     let stream = match accepted {
                         Ok((stream, _)) => {
-                            accept_backoff_ms = ACCEPT_BACKOFF_MS;
+                            backoff.reset();
                             stream
                         }
                         Err(source) => {
                             let Some(kind) = retryable_accept_error(&source) else {
                                 return Err(ServerError::Accept { source });
                             };
+                            let delay = backoff.next_delay(Duration::ZERO);
                             tracing::warn!(
                                 event = "broker_accept_retried",
                                 error.kind = kind,
-                                backoff_ms = accept_backoff_ms,
+                                backoff_ms = delay.as_millis() as u64,
                                 error = %dekopon_core::error_chain(&source),
                                 "broker.accept.retried"
                             );
-                            tokio::time::sleep(Duration::from_millis(accept_backoff_ms)).await;
-                            accept_backoff_ms =
-                                accept_backoff_ms.saturating_mul(2).min(MAX_ACCEPT_BACKOFF_MS);
+                            tokio::time::sleep(delay).await;
                             continue;
                         }
                     };
@@ -1220,6 +1227,27 @@ impl ReceivedRequest {
             descriptors,
             streams,
         })
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::*;
+
+    #[test]
+    fn accept_retries_cap_without_exhausting_and_reset_after_success() {
+        let mut backoff = accept_backoff();
+        for millis in [100, 200, 400, 800, 1000, 1000, 1000] {
+            assert_eq!(
+                backoff.next_delay(Duration::ZERO),
+                Duration::from_millis(millis)
+            );
+        }
+        backoff.reset();
+        assert_eq!(
+            backoff.next_delay(Duration::ZERO),
+            Duration::from_millis(100)
+        );
     }
 }
 

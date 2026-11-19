@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use dekopon_agent::attachment::{AttachmentLimit, GeneratedImage, Holding};
 use dekopon_agent::wake::WakeId;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, Trigger};
-use dekopon_core::{AttestedSubject, Subject};
+use dekopon_core::{AttestedSubject, Backoff, Subject};
 use dekopon_model::ModelText;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,7 +40,6 @@ pub(crate) const MAX_OUTBOUND_TEXT_BYTES: usize = 8 * 1024;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const BASE_RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const RECONNECT_JITTER_MS: u64 = 250;
-const MAX_RECONNECT_DOUBLINGS: u32 = 7;
 
 #[derive(Clone, Debug)]
 pub(crate) struct InboundMessage {
@@ -1051,10 +1050,12 @@ fn chunk_end<'f>(
     (end, open)
 }
 
-pub(crate) fn reconnect_delay(failures: u32) -> Duration {
-    let step = BASE_RECONNECT_DELAY.saturating_mul(1_u32 << failures.min(MAX_RECONNECT_DOUBLINGS));
-    step.min(MAX_RECONNECT_DELAY)
-        .saturating_add(Duration::from_millis(jitter_below(RECONNECT_JITTER_MS)))
+fn reconnect_backoff() -> Backoff {
+    Backoff::new(
+        BASE_RECONNECT_DELAY,
+        MAX_RECONNECT_DELAY,
+        Duration::from_millis(RECONNECT_JITTER_MS),
+    )
 }
 
 pub(crate) fn jitter_below(upper: u64) -> u64 {
@@ -1165,9 +1166,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BASE_RECONNECT_DELAY, MAX_RECONNECT_DELAY, MAX_RECONNECT_DOUBLINGS, RECONNECT_JITTER_MS,
-        SeenIds, TextUnit, TransportIdentity, asset_buffer, credential_client_from, is_stop_word,
-        jitter_below, reconnect_delay, reserve_for_chunk, retry_after_from_body, split_message,
+        RECONNECT_JITTER_MS, SeenIds, TextUnit, TransportIdentity, asset_buffer,
+        credential_client_from, is_stop_word, jitter_below, reconnect_backoff, reserve_for_chunk,
+        retry_after_from_body, split_message,
     };
 
     #[test]
@@ -1242,22 +1243,16 @@ mod tests {
     }
 
     #[test]
-    fn a_reconnect_delay_doubles_within_its_ceiling_and_jitter() {
-        let ceiling = MAX_RECONNECT_DELAY + Duration::from_millis(RECONNECT_JITTER_MS);
-        for failures in [0_u32, 1, 2, 7, 8, 20, u32::MAX] {
-            let floor = BASE_RECONNECT_DELAY
-                .saturating_mul(1 << failures.min(MAX_RECONNECT_DOUBLINGS))
-                .min(MAX_RECONNECT_DELAY);
-            let delay = reconnect_delay(failures);
-            assert!(
-                delay >= floor && delay <= ceiling,
-                "{failures} failures produced {delay:?}, outside {floor:?}..={ceiling:?}"
-            );
+    fn reconnect_delays_keep_their_schedule_and_add_jitter_after_the_cap() {
+        for jitter in [Duration::ZERO, Duration::from_millis(249)] {
+            let mut backoff = reconnect_backoff();
+            for millis in [500, 1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000] {
+                assert_eq!(
+                    backoff.next_delay(jitter),
+                    Duration::from_millis(millis) + jitter
+                );
+            }
         }
-        assert_eq!(
-            reconnect_delay(7).min(MAX_RECONNECT_DELAY),
-            reconnect_delay(u32::MAX).min(MAX_RECONNECT_DELAY)
-        );
     }
 
     #[test]

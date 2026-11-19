@@ -16,6 +16,7 @@ pub mod base64;
 
 mod accept;
 mod attribute;
+mod backoff;
 #[cfg(feature = "cli")]
 mod cli_error;
 mod diagnostics;
@@ -43,6 +44,7 @@ use thiserror::Error;
 
 pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error};
 pub use attribute::{BoundedDisplay, MAX_ATTRIBUTE_BYTES, bounded_attribute, bounded_display};
+pub use backoff::Backoff;
 #[cfg(feature = "cli")]
 pub use cli_error::render_cli_error;
 pub use diagnostics::{MAX_PROBLEM_BYTES, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
