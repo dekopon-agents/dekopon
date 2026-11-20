@@ -1,26 +1,51 @@
-use std::num::NonZeroU32;
+use std::{fmt, num::NonZeroU32};
 
 use dekopon_agent::wake::WakeId;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, TraceParent};
-use dekopon_core::{AgentId, Subject};
-use serde::{Deserialize, Serialize};
+use dekopon_core::{AgentId, Subject, TransportId};
+use dekopon_process::JobId;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::delivery::{DeliveryId, PendingDelivery};
 use crate::{
-    pull_request_links::PullRequestLinkTarget, transport::ReplyTarget, wake::CronSchedule,
+    memory::journal::FollowMarker,
+    pull_request_links::PullRequestLinkTarget,
+    transport::{ReplyTarget, ThreadClaim},
+    wake::CronSchedule,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct ConversationKey(String);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(transparent)]
-pub(crate) struct RecordVersion(NonZeroU32);
+impl ConversationKey {
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/durable-store"
+    )]
+    pub(crate) fn of(transport: &TransportId, conversation: &Conversation) -> Self {
+        todo!()
+    }
 
-pub(crate) struct Record {
-    pub(crate) v: RecordVersion,
-    pub(crate) snapshot: Snapshot,
+    #[expect(clippy::todo, reason = "skeleton: state/durable-store")]
+    pub(crate) fn transport(&self) -> TransportId {
+        todo!()
+    }
+}
+
+impl fmt::Display for ConversationKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+#[serde(transparent)]
+pub(super) struct RecordVersion(NonZeroU32);
+
+pub(super) struct Record {
+    pub(super) version: RecordVersion,
+    pub(super) snapshot: Snapshot,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -28,15 +53,14 @@ pub(crate) struct Record {
 pub(crate) struct Snapshot {
     pub(crate) wakes: Vec<WakeRow>,
     pub(crate) follows: Vec<FollowRow>,
-    pub(crate) ownership: Vec<OwnershipRow>,
+    pub(crate) ownership: Vec<ThreadClaim>,
     pub(crate) jobs: Vec<JobRow>,
-    pub(crate) deliveries: Vec<PendingDelivery>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct AnchorRow {
-    pub(crate) transport: String,
+    pub(crate) transport: TransportId,
     pub(crate) kind: ChatTransportKind,
     pub(crate) subject: Subject,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,64 +75,55 @@ pub(crate) struct AnchorRow {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct WakeRow {
-    pub(crate) id: u32,
+    #[serde(with = "wake_id")]
+    pub(crate) id: WakeId,
     pub(crate) anchor: AnchorRow,
     pub(crate) note: String,
     pub(crate) next_at_ms: u64,
     pub(crate) kind: WakeRowKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending: Option<PendingDelivery>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(
-    tag = "type",
-    deny_unknown_fields,
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(tag = "type", deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) enum WakeRowKind {
     Once,
-    Watch {
-        script: String,
-        prev: String,
-        every_ms: u64,
-        until_ms: u64,
-    },
-    Digest {
-        script: String,
-        prev: String,
-        every_ms: u64,
-        until_ms: u64,
-    },
-    Subscription {
-        target: PullRequestLinkTarget,
-    },
-    Cron {
-        schedule: CronSchedule,
-        message: String,
-    },
+    Watch(WatchRow),
+    Digest(WatchRow),
+    Subscription { target: PullRequestLinkTarget },
+    Cron { schedule: CronSchedule },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct WatchRow {
+    pub(crate) script: String,
+    pub(crate) prev: String,
+    pub(crate) every_ms: u64,
+    pub(crate) until_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct PendingDelivery {
+    pub(crate) text: String,
+    pub(crate) notice: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct FollowRow {
     pub(crate) key: String,
-    pub(crate) at_ms: u64,
-    pub(crate) until_ms: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub(crate) struct OwnershipRow {
-    pub(crate) team_id: String,
-    pub(crate) channel_id: String,
-    pub(crate) thread_ts: String,
-    pub(crate) user_id: String,
+    pub(crate) marker: FollowMarker,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct JobRow {
-    pub(crate) id: u64,
+    #[serde(with = "job_id")]
+    pub(crate) id: JobId,
+    pub(crate) anchor: AnchorRow,
     pub(crate) script_head: String,
     pub(crate) deadline_ms: u64,
 }
@@ -117,11 +132,37 @@ pub(crate) enum Change {
     PutWake(WakeRow),
     RemoveWake(WakeId),
     Follow(FollowRow),
-    Leave { key: String },
-    Claim(OwnershipRow),
-    Revoke(OwnershipRow),
+    Leave { follow: String },
+    Claim(ThreadClaim),
+    Revoke(ThreadClaim),
     JobStarted(JobRow),
-    JobEnded { id: u64 },
-    Deliver(PendingDelivery),
-    Acknowledged(DeliveryId),
+    JobEnded(JobId),
+}
+
+mod wake_id {
+    use super::{Deserialize, Deserializer, Serializer, WakeId};
+
+    pub(super) fn serialize<S: Serializer>(id: &WakeId, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(id.0)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<WakeId, D::Error> {
+        u32::deserialize(deserializer).map(WakeId)
+    }
+}
+
+mod job_id {
+    use super::{Deserialize, Deserializer, JobId, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(id: &JobId, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(id.get())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<JobId, D::Error> {
+        u64::deserialize(deserializer).map(JobId::new)
+    }
 }

@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use super::{StoreError, record::ConversationKey};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct LegacyInputs {
-    pub(crate) wakes: PathBuf,
+    pub(crate) wakes: Option<PathBuf>,
     pub(crate) journal: Option<PathBuf>,
 }
 
@@ -15,7 +15,7 @@ pub(crate) struct Conversion {
     pub(crate) follows: usize,
     pub(crate) ownership_derived: usize,
     pub(crate) ownership_lost: usize,
-    pub(crate) retained: PathBuf,
+    pub(crate) retained: Option<PathBuf>,
 }
 
 impl LegacyInputs {

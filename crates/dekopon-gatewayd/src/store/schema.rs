@@ -1,9 +1,13 @@
+use std::fmt;
+
 use super::StoreError;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct SchemaVersion(u32);
+pub struct SchemaVersion(u32);
 
 impl SchemaVersion {
+    pub(crate) const CURRENT: Self = Self(1);
+
     #[expect(
         clippy::todo,
         unused_variables,
@@ -23,5 +27,11 @@ impl SchemaVersion {
         transaction: &rusqlite::Transaction<'_>,
     ) -> Result<Self, StoreError> {
         todo!()
+    }
+}
+
+impl fmt::Display for SchemaVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
     }
 }

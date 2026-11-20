@@ -74,6 +74,12 @@ fn thread_ownership_without_persisted_evidence_is_marked_lost_at_cutover() {
 
 #[test]
 #[ignore = "skeleton: state/durable-store"]
+fn a_corrupt_legacy_wake_line_fails_boot_naming_the_line() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
 fn a_failed_migration_keeps_the_backup_and_names_the_one_line_restore() {
     todo!()
 }

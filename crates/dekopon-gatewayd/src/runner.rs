@@ -7,7 +7,9 @@ mod receipt;
 
 use serde::Deserialize;
 
-use crate::{config::ResolvedBroker, transport::ChatDriver, wake::CronSchedule};
+use crate::{
+    config::ResolvedBroker, notice::Destination, transport::ChatDriver, wake::CronSchedule,
+};
 
 #[expect(unused_imports, reason = "skeleton: rpi/tick-runner")]
 pub(crate) use receipt::{Receipt, ReceiptBatches, ReceiptOutcome, ReceiptOutput};
@@ -17,6 +19,13 @@ pub(crate) struct GitSha(String);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EpochSlug(String);
+
+impl EpochSlug {
+    #[expect(clippy::todo, unused_variables, reason = "skeleton: rpi/tick-runner")]
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        todo!()
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, serde::Serialize)]
 #[serde(transparent)]
@@ -28,8 +37,7 @@ pub(crate) struct RunnerEntry {
     pub(crate) schedule: CronSchedule,
     pub(crate) epoch: EpochSlug,
     pub(crate) approved: GitSha,
-    pub(crate) packets: crate::transport::ReplyTarget,
-    pub(crate) packet_transport: String,
+    pub(crate) packets: Destination,
 }
 
 #[derive(Debug, Deserialize)]

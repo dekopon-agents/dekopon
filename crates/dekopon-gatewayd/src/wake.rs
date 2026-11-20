@@ -22,10 +22,13 @@ use crate::{
 };
 
 mod cron;
+mod delivery;
 pub(crate) mod store;
 
 #[expect(unused_imports, reason = "skeleton: state/cron-wakes")]
 pub(crate) use cron::{CronRegistration, CronSchedule, MissedTicks};
+#[expect(unused_imports, reason = "skeleton: state/durable-store")]
+pub(crate) use delivery::{Delivery, DeliveryTicket};
 pub use store::WakeStoreError;
 pub(crate) use store::{Fired, Resolved, Tick, WakeStore};
 

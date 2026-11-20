@@ -9,24 +9,24 @@ use dekopon_agent::wake::WakeId;
 use dekopon_core::{Backoff, TaskOutcome};
 use serde::{Deserialize, Serialize};
 
-use crate::{TransportConnectProblem, store::StoreError};
+use crate::{TransportConnectProblem, store::StoreError, wake::Delivery};
 
 #[derive(Debug)]
 pub(crate) enum FatalCause {
-    WakeStore(StoreError),
+    Store(StoreError),
     Reload(TaskOutcome),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum FatalLabel {
-    WakeStore,
+    Store,
     Reload,
 }
 
 impl FatalCause {
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
-    pub(crate) fn label(&self) -> FatalLabel {
+    pub(crate) const fn label(&self) -> FatalLabel {
         todo!()
     }
 }
@@ -39,7 +39,6 @@ pub(crate) enum ReaderVerdict {
 
 pub(crate) struct ReaderRestarts {
     backoff: Backoff,
-    consecutive: u32,
 }
 
 impl ReaderRestarts {
@@ -59,13 +58,12 @@ impl ReaderRestarts {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum TickEnd<T> {
-    Finished(Option<T>),
-    Panicked { wake: WakeId, outcome: TaskOutcome },
+pub(crate) enum TickEnd {
+    Resolved(Option<Box<Delivery>>),
+    Panicked { wake: WakeId },
 }
 
 #[expect(clippy::todo, unused_variables, reason = "skeleton: daemon/supervisor")]
-pub(crate) fn record_tick_panic(wake: WakeId, outcome: &TaskOutcome) {
+pub(crate) fn record_tick_panic(wake: WakeId) {
     todo!()
 }

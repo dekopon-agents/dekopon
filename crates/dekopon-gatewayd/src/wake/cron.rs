@@ -55,7 +55,7 @@ impl<'de> Deserialize<'de> for CronSchedule {
 pub(crate) struct CronRegistration {
     pub(crate) anchor: super::Anchor,
     pub(crate) schedule: CronSchedule,
-    pub(crate) message: String,
+    pub(crate) note: String,
 }
 
 impl super::WakeStore {
