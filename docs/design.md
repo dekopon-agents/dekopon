@@ -1,13 +1,12 @@
 # Dekopon design
 
-Dekopon runs self-hosted AI agents whose tools are WebAssembly providers. This file holds the goals
-and the reasons for the shape; [authorization](authorization.md) covers how a decision is made, and
-the [security model](security-model.md) what Dekopon doesn't protect.
+For authority decisions see [authorization](authorization.md); for protection limits see the
+[security model](security-model.md).
 
 ## Constitution
 
-Three goals, in priority order. A change is judged by which one it serves; a subsystem that serves
-none is a deletion candidate, however well built.
+Judge changes by these goals, in priority order. Subsystems serving none are deletion candidates,
+however well built.
 
 1. **Credentials the agent never holds.** A model can name a secret; it can't read one. Secret bytes
    stay in the broker, out of the model, shell, gateway, wire protocol, provider memory and
@@ -28,6 +27,10 @@ An argument to keep or add code on any of these grounds is rejected.
 
 - **Idempotency, exactly-once, duplicate-effect defense, automatic retries.** A failed call goes
   back to the model, which decides whether to try again.
+- **Limits borrowed from another layer.** Each operation works or returns a typed error the model,
+  or the trace when none waits, can act on. It bounds what it spends before spending it, so it never
+  crashes; only the broker decides authority. It never inherits another layer's limit or refuses
+  input that a later tool or model can't use.
 - **Crash durability, reconciliation, quarantine, tamper detection.** A failure fails fast, leaves
   one trace record and has a reset path. Detection that can't fix anything isn't built.
 - **An authorized endpoint that transforms what it received.** The broker refuses a response that
@@ -88,12 +91,6 @@ waits on them. A full console queue drops lines and later logs how many it dropp
 (`crates/dekopon-telemetry/src/exporter.rs`). Lose the exporter, or overflow it, and those audit
 lines are gone; nothing reconstructs them. The telemetry store holds every prompt and output; it
 sits inside the operator's trust boundary.
-
-A `telemetry` block in each daemon's configuration turns the export on
-([broker](../crates/dekopon-brokerd/src/config.rs), [gateway](../crates/dekopon-gatewayd/src/config.rs);
-[example](../examples/conditional-write/broker.yaml)).
-The model's prompt lands in `agent.model.prompt` records and its reply in
-`agent.model.answer` ([`prompt.rs`](../crates/dekopon-agent/src/prompt.rs)).
 
 ## Keyless model access for outside VMs
 

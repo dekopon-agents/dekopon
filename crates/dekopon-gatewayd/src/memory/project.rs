@@ -551,7 +551,7 @@ fn fit_natives(
         .flat_map(|(_, rows)| rows)
         .map(assets::Row::bytes)
         .sum::<u64>()
-        > dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES as u64
+        > dekopon_agent::prompt::MAX_REQUEST_ASSET_BYTES as u64
     {
         let Some(i) = (0..input.records.len())
             .filter(|i| asset_visible(rungs[*i]))
