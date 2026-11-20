@@ -19,7 +19,7 @@ use dekopon_config::{Projection, ProjectionError};
 use dekopon_core::{
     AgentId, FileHygieneError, FileTier, Subject,
     fragments::{self, FragmentError, MergeRules},
-    read_trusted_file,
+    offload, read_trusted_file,
 };
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use rustls::pki_types::{CertificateDer, pem::PemObject as _};
@@ -1968,14 +1968,14 @@ pub(crate) async fn read_config_file(
     let projection =
         std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink());
     if projection {
-        return tokio::task::spawn_blocking(move || read_gateway_projection(&owned, expected_uid))
+        return offload(move || read_gateway_projection(&owned, expected_uid))
             .await
             .map_err(|join| ConfigError::Read {
                 path,
-                source: io::Error::other(dekopon_core::TaskOutcome::from_join_error(join)),
+                source: io::Error::other(dekopon_core::TaskOutcome::from(join)),
             })?;
     }
-    tokio::task::spawn_blocking(move || {
+    offload(move || {
         use std::os::unix::fs::MetadataExt as _;
         let observed = std::fs::symlink_metadata(&owned)
             .map_err(|source| FileHygieneError::Io {
@@ -2003,7 +2003,7 @@ pub(crate) async fn read_config_file(
     .await
     .map_err(|join| ConfigError::Read {
         path: path.clone(),
-        source: io::Error::other(dekopon_core::TaskOutcome::from_join_error(join)),
+        source: io::Error::other(dekopon_core::TaskOutcome::from(join)),
     })?
     .map_err(|error| match error {
         FileHygieneError::NotRegular { path, .. } => ConfigError::NotRegular { path },

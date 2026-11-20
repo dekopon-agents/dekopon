@@ -15,6 +15,7 @@ use crate::{
     sse::{SseEvent, decode_transcript},
     stream::{ModelText, TurnEvent},
 };
+use dekopon_core::offload;
 use dekopon_model_token_governor::ModelUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1072,12 +1073,10 @@ async fn responses_content(
             ContentPart::Image { data, .. } | ContentPart::File { data, .. } => {
                 let reference = data.clone();
                 let span = tracing::Span::current();
-                match tokio::task::spawn_blocking(move || span.in_scope(|| reference.read()))
+                match offload(move || span.in_scope(|| reference.read()))
                     .await
                     .map_err(|source| {
-                        TransportFailure::Blocking(dekopon_core::TaskOutcome::from_join_error(
-                            source,
-                        ))
+                        TransportFailure::Blocking(dekopon_core::TaskOutcome::from(source))
                     })? {
                     Ok(bytes) => {
                         data.record_preparation(crate::asset::Preparation::Original);

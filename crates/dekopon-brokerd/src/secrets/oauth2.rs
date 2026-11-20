@@ -5,8 +5,9 @@ use std::{
     time::Duration,
 };
 
+use dekopon_core::OffloadTrace;
 use dekopon_core::{
-    FileHygieneError, FileTier, Redacted, SecretDrn, private_file::PrivateFileLock,
+    FileHygieneError, FileTier, Redacted, SecretDrn, offload, private_file::PrivateFileLock,
     read_trusted_file,
 };
 use futures_util::StreamExt as _;
@@ -323,15 +324,8 @@ async fn run(inputs: RefreshInputs, span: tracing::Span) -> Result<Vec<u8>, Sour
     let started = std::time::Instant::now();
     let locked_path = inputs.path.clone();
     let uid = inputs.uid;
-    let read_span = span.clone();
-    let read_dispatch = tracing::dispatcher::get_default(Clone::clone);
-    let outcome = match tokio::task::spawn_blocking(move || {
-        tracing::dispatcher::with_default(&read_dispatch, || {
-            read_span.in_scope(|| read_locked(locked_path, uid))
-        })
-    })
-    .await
-    {
+    let trace = OffloadTrace::capture(Some(span.clone()));
+    let outcome = match offload(move || trace.in_scope(|| read_locked(locked_path, uid))).await {
         Ok(Ok(opened)) => refresh(opened, inputs)
             .await
             .and_then(RefreshResult::checked),
@@ -558,7 +552,7 @@ async fn save_bytes(path: &Path, lock: PrivateFileLock, bytes: Vec<u8>) -> Resul
         return Err(SourceError::Malformed);
     }
     let path = path.to_path_buf();
-    let saved = tokio::task::spawn_blocking(move || {
+    let saved = offload(move || {
         let _lock = lock;
         drop(dekopon_core::private_file::sweep_stale_temporaries(
             &path, None,

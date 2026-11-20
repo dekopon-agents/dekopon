@@ -17,7 +17,7 @@ include = ["src/**", "README.md", "Cargo.toml"]
 crossterm.workspace = true
 dekopon-agent.workspace = true
 dekopon-broker-protocol.workspace = true
-dekopon-core.workspace = true
+dekopon-core = { workspace = true, features = ["tokio-task"] }
 dekopon-model.workspace = true
 dekopon-model-token-governor.workspace = true
 dekopon-protocol.workspace = true

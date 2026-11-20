@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
 use dekopon_agent::attachment::GeneratedImage;
+use dekopon_core::OffloadTrace;
+use dekopon_core::offload;
 use dekopon_model::asset::BlobError;
 
 use super::TransportError;
@@ -33,17 +35,14 @@ impl ImageQueue {
 
     pub(super) async fn decoded_lengths(&mut self) -> Result<Vec<usize>, TransportError> {
         let taken = std::mem::take(&mut self.images);
-        let span = tracing::Span::current();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let task = tokio::task::spawn_blocking(move || {
-            tracing::dispatcher::with_default(&dispatch, || {
-                span.in_scope(move || {
-                    let lengths = taken
-                        .iter()
-                        .map(GeneratedImage::decoded_len)
-                        .collect::<Result<Vec<_>, BlobError>>();
-                    (taken, lengths)
-                })
+        let trace = OffloadTrace::capture(Some(tracing::Span::current()));
+        let task = offload(move || {
+            trace.in_scope(move || {
+                let lengths = taken
+                    .iter()
+                    .map(GeneratedImage::decoded_len)
+                    .collect::<Result<Vec<_>, BlobError>>();
+                (taken, lengths)
             })
         });
         let (taken, lengths) = join(task.await)?;
@@ -81,24 +80,21 @@ impl ImageQueue {
     pub(super) async fn read_all(&mut self) -> Result<Vec<HydratedImage>, TransportError> {
         let taken = std::mem::take(&mut self.images);
         let first = self.next;
-        let span = tracing::Span::current();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let task = tokio::task::spawn_blocking(move || {
-            tracing::dispatcher::with_default(&dispatch, || {
-                span.in_scope(move || {
-                    let read = taken
-                        .iter()
-                        .enumerate()
-                        .map(|(index, image)| {
-                            Ok(HydratedImage {
-                                filename: image.filename(first + index),
-                                media_type: image.media_type().to_owned(),
-                                bytes: image.bytes()?,
-                            })
+        let trace = OffloadTrace::capture(Some(tracing::Span::current()));
+        let task = offload(move || {
+            trace.in_scope(move || {
+                let read = taken
+                    .iter()
+                    .enumerate()
+                    .map(|(index, image)| {
+                        Ok(HydratedImage {
+                            filename: image.filename(first + index),
+                            media_type: image.media_type().to_owned(),
+                            bytes: image.bytes()?,
                         })
-                        .collect::<Result<Vec<_>, BlobError>>();
-                    (taken, read)
-                })
+                    })
+                    .collect::<Result<Vec<_>, BlobError>>();
+                (taken, read)
             })
         });
         let (taken, read) = join(task.await)?;
@@ -107,7 +103,7 @@ impl ImageQueue {
     }
 }
 
-fn join<T>(joined: Result<T, tokio::task::JoinError>) -> Result<T, TransportError> {
+fn join<T>(joined: Result<T, dekopon_core::OffloadError>) -> Result<T, TransportError> {
     joined.map_err(|error| {
         let outcome = dekopon_core::TaskOutcome::from(error);
         tracing::error!(reason = outcome.category(), "gateway.hydration.failed");
@@ -120,27 +116,24 @@ fn hydrate_images_with(
     images: Vec<GeneratedImage>,
     mut read: impl FnMut(GeneratedImage) -> Result<Vec<u8>, BlobError> + Send + 'static,
 ) -> impl Future<Output = Result<Vec<HydratedImage>, TransportError>> + Send {
-    let span = tracing::Span::current();
-    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let trace = OffloadTrace::capture(Some(tracing::Span::current()));
     let task = (!images.is_empty()).then(|| {
-        tokio::task::spawn_blocking(move || {
-            tracing::dispatcher::with_default(&dispatch, || {
-                span.in_scope(move || {
-                    images
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, image)| {
-                            let filename = image.filename(first_index + index);
-                            let media_type = image.media_type().to_owned();
-                            let bytes = read(image)?;
-                            Ok(HydratedImage {
-                                filename,
-                                media_type,
-                                bytes,
-                            })
+        offload(move || {
+            trace.in_scope(move || {
+                images
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, image)| {
+                        let filename = image.filename(first_index + index);
+                        let media_type = image.media_type().to_owned();
+                        let bytes = read(image)?;
+                        Ok(HydratedImage {
+                            filename,
+                            media_type,
+                            bytes,
                         })
-                        .collect::<Result<Vec<_>, BlobError>>()
-                })
+                    })
+                    .collect::<Result<Vec<_>, BlobError>>()
             })
         })
     });

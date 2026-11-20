@@ -17,7 +17,7 @@ use dekopon_capability::{
     AssetConstraints, ChatSlot, ChatSlotValues, ExecutionConstraints, HttpConstraints,
     ProposedInvocation, RequestTemplate, broker::AuthorizationGate,
 };
-use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, TraceId};
+use dekopon_core::{Actor, AgentId, InvocationId, PrincipalId, TraceId, offload};
 use dekopon_http_host::LoopbackHttpsPin;
 use dekopon_provider_sdk::provider::{
     self, Exit, Header, HttpError, HttpErrorCode, NativeChild, NativeChildStdin, NativeExit,
@@ -401,7 +401,7 @@ impl<P: Provider> Run<P> {
                 .map_err(|_closed| HarnessError::Fixture("stdout reader startup"))?;
             let invoke =
                 registry.invoke_with_test_imports(authorized, self.slots, assets, Some(&imports));
-            let feed = feeder.map(|f| tokio::task::spawn_blocking(f));
+            let feed = feeder.map(offload);
             let (result, captured, children) =
                 tokio::join!(invoke, capture, answer_children(answers, children));
             let fed = match feed {
@@ -457,11 +457,11 @@ fn capture_stdout(
     stdout: std::os::unix::net::UnixStream,
     close_after: Option<usize>,
 ) -> (
-    tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    dekopon_core::Offload<std::io::Result<Vec<u8>>>,
     tokio::sync::oneshot::Receiver<()>,
 ) {
     let (closed, ready) = tokio::sync::oneshot::channel();
-    let capture = tokio::task::spawn_blocking(move || {
+    let capture = offload(move || {
         use std::io::Read;
         if close_after == Some(0) {
             drop(stdout);

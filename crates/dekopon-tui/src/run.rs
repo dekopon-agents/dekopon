@@ -14,6 +14,7 @@ use dekopon_agent::{
     prompt::{History, HistoryLimits, ScriptRuntime},
 };
 use dekopon_broker_protocol::BrokerClient;
+use dekopon_core::offload;
 use dekopon_model::model::ChatModel;
 use dekopon_process::CallBudget;
 use dekopon_process::CancelSignal;
@@ -762,7 +763,7 @@ async fn dispatch_in_context(
             let span = tracing::Span::current();
             #[expect(clippy::disallowed_methods, reason = "owner: RunningTurn retained by the event loop and joined on completion or shutdown; bound: one active turn admitted by app.busy and running")]
             let handle = tokio::spawn(async move {
-                tokio::task::spawn_blocking(move || {
+                offload(move || {
                     let _entered = span.enter();
                     let script = tracing::info_span!("console.script");
                     let _script = script.enter();
@@ -788,7 +789,7 @@ async fn dispatch_in_context(
                     previous
                 })
                 .await
-                .map_err(SessionError::Task)
+                .map_err(|error| SessionError::Task(error.into()))
             }.in_current_span());
             *running = Some(RunningTurn {
                 events: receiver,

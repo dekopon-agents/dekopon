@@ -1,4 +1,5 @@
 use crate::config::AssetsConfig;
+use dekopon_core::offload;
 use dekopon_http_host::asset::AssetDirectory;
 use std::{
     fs, io,
@@ -31,7 +32,7 @@ pub enum AssetsStartupError {
 
 pub async fn initialize(config: &AssetsConfig) -> Result<AssetDirectory, AssetsStartupError> {
     let config = config.clone();
-    tokio::task::spawn_blocking(move || {
+    offload(move || {
         let root = dekopon_storage_host::resolve_storage_root_path(&config.root_path)
             .map_err(|source| AssetsStartupError::Path { source })?;
         let io_error = |source| AssetsStartupError::Io {
@@ -66,7 +67,7 @@ pub async fn initialize(config: &AssetsConfig) -> Result<AssetDirectory, AssetsS
     })
     .await
     .map_err(|source| AssetsStartupError::Worker {
-        source: dekopon_core::TaskOutcome::from_join_error(source),
+        source: dekopon_core::TaskOutcome::from(source),
     })?
 }
 

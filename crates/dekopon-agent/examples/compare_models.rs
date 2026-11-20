@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use dekopon_agent::prompt::{PromptLimits, ScriptRuntime, SessionInputs, run_prompt_session};
+use dekopon_core::offload;
 use dekopon_model::{
     blocking::BlockingModel,
     codex::CodexClient,
@@ -163,24 +164,30 @@ fn main() -> Result<(), ExampleError> {
         receiver,
         timeout,
     );
-    let result = runtime.block_on(runtime.spawn_blocking(move || {
-        run_prompt_session(
-            &model,
-            &SyntheticRuntime,
-            SessionInputs::new(
-                &arguments.prompt,
-                PromptLimits {
-                    max_steps: 4,
-                    max_capability_calls: 4,
-                },
+    let job = {
+        let _entered = runtime.enter();
+        offload(move || {
+            run_prompt_session(
+                &model,
+                &SyntheticRuntime,
+                SessionInputs::new(
+                    &arguments.prompt,
+                    PromptLimits {
+                        max_steps: 4,
+                        max_capability_calls: 4,
+                    },
+                )
+                .with_system(Some(
+                    "Tools return fixed synthetic data; no script or external effect is executed.",
+                )),
+                &[],
             )
-            .with_system(Some(
-                "Tools return fixed synthetic data; no script or external effect is executed.",
-            )),
-            &[],
-        )
-        .0
-    }));
+            .0
+        })
+    };
+    let result = runtime
+        .block_on(job)
+        .map_err(dekopon_core::TaskOutcome::from);
     let outcome = finish_comparison(&runtime, result, client.drain_credentials())?;
     println!("{}", outcome.answer);
     Ok(())
@@ -188,11 +195,11 @@ fn main() -> Result<(), ExampleError> {
 
 fn finish_comparison<T>(
     runtime: &tokio::runtime::Runtime,
-    result: Result<Result<T, dekopon_agent::prompt::PromptError>, tokio::task::JoinError>,
+    result: Result<Result<T, dekopon_agent::prompt::PromptError>, dekopon_core::TaskOutcome>,
     drain: impl std::future::Future<Output = ()>,
 ) -> Result<T, ExampleError> {
     runtime.block_on(drain);
-    Ok(result.map_err(|error| ExampleError::Join(error.into()))??)
+    Ok(result.map_err(ExampleError::Join)??)
 }
 
 #[cfg(test)]
@@ -219,7 +226,7 @@ mod tests {
         let results = [
             Ok(Ok(())),
             Ok(Err(dekopon_agent::prompt::PromptError::Cancelled)),
-            Err(join_error),
+            Err(join_error.into()),
         ];
         for (index, result) in results.into_iter().enumerate() {
             let temp = tempfile::TempDir::new().unwrap();
