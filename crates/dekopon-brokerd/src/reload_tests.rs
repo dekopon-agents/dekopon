@@ -56,7 +56,27 @@ fn the_brokers_own_credential_writes_trigger_no_reload() {}
 
 #[test]
 #[ignore = "skeleton: daemon/broker-self-reload"]
-fn a_generation_frame_from_an_older_gateway_is_refused_as_invalid() {}
+fn a_prepare_frame_from_an_older_gateway_is_refused() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn each_commit_publishes_the_broker_digest() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_restart_only_broker_change_that_cannot_boot_is_refused_not_exited() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_rotated_github_app_key_reloads_the_broker() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn an_aborted_lock_check_leaves_the_broker_serving() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_restarted_broker_verifies_the_lock_on_disk() {}
 
 #[test]
 #[ignore = "skeleton: daemon/signer-reload"]

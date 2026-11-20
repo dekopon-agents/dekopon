@@ -51,12 +51,44 @@ fn the_gateway_never_watches_a_broker_private_path() {}
 fn a_reload_block_change_is_a_restart_category() {}
 
 #[test]
-#[ignore = "skeleton: daemon/broker-self-reload"]
-fn a_gateway_reload_sends_the_broker_no_generation_frame() {}
+#[ignore = "skeleton: daemon/watcher-core"]
+fn a_restart_only_change_that_cannot_boot_is_refused_not_exited() {}
+
+#[test]
+#[ignore = "skeleton: daemon/watcher-core"]
+fn the_gateway_watch_set_classifies_each_source_path() {}
+
+#[test]
+#[ignore = "skeleton: daemon/watcher-core"]
+fn a_config_change_during_boot_is_served_after_startup() {}
 
 #[test]
 #[ignore = "skeleton: daemon/broker-self-reload"]
-fn a_gateway_boots_against_a_broker_without_observing_its_generation() {}
+fn a_gateway_reload_sends_no_prepare_or_commit() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn the_gateway_folds_a_published_broker_digest_without_calling_prepare() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_gateway_reload_racing_a_broker_commit_serves_the_newest_broker_digest() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn the_broker_generation_feed_holds_only_the_latest_digest() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_reconnected_gateway_learns_the_broker_digest_at_connect() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_lost_broker_feed_stops_the_gateway_with_its_cause() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_route_naming_an_agent_the_broker_refused_is_refused_until_the_broker_applies() {}
 
 #[test]
 #[ignore = "skeleton: daemon/reload-consumers"]

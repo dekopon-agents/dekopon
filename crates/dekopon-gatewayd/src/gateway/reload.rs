@@ -2,9 +2,10 @@
 
 use dekopon_core::reload::{Cause, Input, Reconcile, Reconciled, WatchSet};
 use dekopon_model_proxy::tls::TlsReload;
+use tokio::task::JoinSet;
 
 use super::ReloadState;
-use crate::GatewaydError;
+use crate::{GatewaydError, ServeOutcome};
 
 pub(crate) enum GatewayGroup {
     Config(Box<ReloadState>),
@@ -55,6 +56,11 @@ impl ReloadState {
     unused_variables,
     reason = "skeleton: daemon/reload-consumers"
 )]
-async fn reconcile_tls(tls: &TlsReload, cause: Cause) -> Reconciled {
+async fn reconcile_tls(tls: &mut TlsReload, cause: Cause) -> Reconciled {
+    todo!()
+}
+
+#[expect(clippy::todo, unused_variables, reason = "skeleton: daemon/supervisor")]
+async fn reload_ended(task: &mut JoinSet<GatewaydError>) -> ServeOutcome {
     todo!()
 }

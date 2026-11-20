@@ -65,3 +65,39 @@ fn a_single_mounted_file_is_refused_as_unwatchable() {}
 #[test]
 #[ignore = "skeleton: daemon/watcher-core"]
 fn mixed_case_reload_modes_parse_and_unknown_keys_are_refused() {}
+
+#[test]
+#[ignore = "skeleton: daemon/watcher-core"]
+fn a_backend_failure_behind_a_full_queue_still_ends_the_task() {}
+
+#[test]
+#[ignore = "skeleton: daemon/watcher-core"]
+fn an_overflow_wakes_an_idle_loop() {}
+
+#[test]
+#[ignore = "skeleton: daemon/watcher-core"]
+fn a_hangup_before_any_event_reconciles_every_operator_group() {}
+
+#[test]
+#[ignore = "skeleton: daemon/watcher-core"]
+fn a_rescan_rereads_every_group_without_a_safety_poll() {}
+
+#[test]
+#[ignore = "skeleton: daemon/watcher-core"]
+fn a_recreated_watched_directory_is_registered_again() {}
+
+#[test]
+#[ignore = "skeleton: daemon/watcher-core"]
+fn a_symlinked_file_entry_is_watched_at_its_target_directory() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_commit_subscriber_sees_only_the_latest_generation() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_dropped_commit_signal_ends_every_subscriber() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_new_commit_subscriber_starts_from_the_active_generation() {}

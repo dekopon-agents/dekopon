@@ -2,12 +2,10 @@
 
 use std::sync::Arc;
 
-use dekopon_core::reload::{Cause, Input, Reconcile, Reconciled, WatchSet};
-use tokio::sync::watch;
+use dekopon_core::reload::{Cause, CommitReceiver, Input, Reconcile, Reconciled, WatchSet};
+use tokio::task::JoinSet;
 
-use crate::{
-    BrokerdError, Candidate, Coordination, lock_watch::LockGroup, signer_reload::SignerGroup,
-};
+use crate::{BrokerdError, Coordination, lock_watch::LockGroup, signer_reload::SignerGroup};
 
 pub(crate) enum BrokerGroup {
     Config(ConfigGroup),
@@ -58,7 +56,12 @@ impl Coordination {
     }
 
     #[expect(clippy::todo, reason = "skeleton: daemon/broker-self-reload")]
-    pub(crate) fn commits(&self) -> watch::Receiver<Arc<Candidate>> {
+    pub(crate) fn commits(&self) -> CommitReceiver {
         todo!()
     }
+}
+
+#[expect(clippy::todo, unused_variables, reason = "skeleton: daemon/supervisor")]
+pub(crate) async fn reload_ended(task: &mut JoinSet<BrokerdError>) -> BrokerdError {
+    todo!()
 }

@@ -4,22 +4,27 @@ use std::{
     collections::BTreeSet,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, OnceLock, atomic::AtomicBool},
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use super::{Cause, Reconcile, ReloadError, ReloadSettings, WatchSet, path::Registration};
 
-// A full queue sets `overflowed` instead of blocking notify's thread; the run loop turns it into
-// one rescan of every group, so a burst coalesces and no change is lost.
 const EVENT_QUEUE: usize = 64;
 
 enum Event {
     Changed(PathBuf),
     Rescan,
-    Failed(io::ErrorKind),
     Hangup,
+}
+
+// notify's thread never blocks on the queue: a full queue sets `overflowed` and a backend error sets
+// `failed`, and both wake the loop through `wake`, so neither can be lost behind a full queue.
+struct Shared {
+    overflowed: AtomicBool,
+    failed: OnceLock<io::ErrorKind>,
+    wake: Notify,
 }
 
 enum Backend {
@@ -44,11 +49,14 @@ pub struct Watcher<G: Reconcile> {
     registered: BTreeSet<Registration>,
     backend: Backend,
     events: mpsc::Receiver<Event>,
-    overflowed: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     hangup: Hangup,
 }
 
-pub struct Injector(mpsc::Sender<Event>);
+pub struct Injector {
+    events: mpsc::Sender<Event>,
+    shared: Arc<Shared>,
+}
 
 impl<G: Reconcile> Watcher<G> {
     #[expect(

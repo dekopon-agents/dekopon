@@ -440,6 +440,7 @@ fn config_problems(
             | dekopon_gatewayd::GatewaydError::WakeStore(_)
             | dekopon_gatewayd::GatewaydError::Proxy(_)
             | dekopon_gatewayd::GatewaydError::Reload(_)
+            | dekopon_gatewayd::GatewaydError::ReloadTask(_)
             | dekopon_gatewayd::GatewaydError::Probe(_) => Vec::new(),
         })
         .collect()

@@ -29,6 +29,8 @@ pub mod fragments;
 mod offload;
 #[cfg(unix)]
 pub mod private_file;
+#[cfg(unix)]
+pub mod projection;
 mod redaction;
 #[cfg(all(unix, feature = "reload"))]
 pub mod reload;

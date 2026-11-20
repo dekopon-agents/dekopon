@@ -9509,7 +9509,7 @@ async fn losing_every_transport_ends_the_daemon_as_a_failure() {
     )
     .await;
 
-    assert_eq!(outcome, crate::ServeOutcome::TransportsLost);
+    assert!(matches!(outcome, crate::ServeOutcome::TransportsLost));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -9531,7 +9531,7 @@ async fn a_requested_shutdown_ends_the_daemon_successfully() {
     )
     .await;
 
-    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
+    assert!(matches!(outcome, crate::ServeOutcome::Shutdown));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -17137,7 +17137,10 @@ async fn photo_burst_serve_flushes_after_quiet_interval_with_one_lead_reply() {
         tokio::task::yield_now().await;
     }
     shutdown.send(()).unwrap();
-    assert_eq!(service.await.unwrap(), crate::ServeOutcome::Shutdown);
+    assert!(matches!(
+        service.await.unwrap(),
+        crate::ServeOutcome::Shutdown
+    ));
     assert_eq!(models.requests(), 1);
     assert_eq!(driver.replies(), ["One answer."]);
     let prompt = models
@@ -17580,7 +17583,7 @@ async fn fatal_transport_supervision_bounds_the_drain_of_a_parked_session() {
     )
     .await
     .expect("fatal exit cannot await a parked reply forever");
-    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
+    assert!(matches!(outcome, crate::ServeOutcome::Shutdown));
     assert!(matches!(
         terminal,
         Err(crate::GatewaydError::TransportConnect { .. })

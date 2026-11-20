@@ -1710,6 +1710,8 @@ pub enum BrokerdError {
     ProviderLockUnsettled,
     #[error("configuration reload stopped")]
     Reload(#[from] dekopon_core::reload::ReloadError),
+    #[error("configuration reload task failed")]
+    ReloadTask(#[source] dekopon_core::TaskOutcome),
     #[error("check could not prepare its private directory {path}")]
     CheckDirectory {
         path: PathBuf,
