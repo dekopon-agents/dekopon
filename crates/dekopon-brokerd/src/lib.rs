@@ -25,6 +25,7 @@ mod refresh_scheduler;
 mod secrets;
 mod server;
 mod socket;
+mod token_issuer;
 mod workflows;
 
 use std::{
@@ -726,6 +727,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                     Err(
                         error @ (secrets::SecretMapError::Decode { .. }
                         | secrets::SecretMapError::Validation { .. }
+                        | secrets::SecretMapError::SignedJwtValidation { .. }
                         | secrets::SecretMapError::Client { .. }
                         | secrets::SecretMapError::Source { .. }
                         | secrets::SecretMapError::Catalog { .. }),

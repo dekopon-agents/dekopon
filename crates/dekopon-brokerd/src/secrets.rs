@@ -44,6 +44,8 @@ use crate::github_app::{
     Downscope, GithubAppCredential, GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES, Installation,
 };
 
+use crate::token_issuer::{SelfSignedIssuer, SignedJwtConfig, SignedJwtConfigError};
+
 pub(crate) mod chatgpt;
 pub(crate) mod oauth2;
 
@@ -261,6 +263,8 @@ enum SecretSource {
         #[serde(default)]
         permissions: Option<BTreeMap<String, String>>,
     },
+    #[serde(rename = "signedJwt")]
+    SignedJwt(Box<SignedJwtConfig>),
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -343,6 +347,7 @@ struct ResolvedEntry {
 enum Minted {
     Chatgpt(chatgpt::ChatGptSubscription),
     GithubApp(Box<GithubAppCredential>),
+    SignedJwt(Box<SelfSignedIssuer>),
 }
 
 impl Minted {
@@ -353,6 +358,12 @@ impl Minted {
                 .resolve()
                 .await
                 .map(|token| SecretMaterial::new(token.into_inner().into_bytes())),
+            Self::SignedJwt(source) => source
+                .issue()
+                .map(|issued| SecretMaterial::issued_jwt(issued.token, issued.jti, issued.exp))
+                .map_err(|error| RefreshError::Unavailable {
+                    category: error.category(),
+                }),
         }
     }
 }
@@ -430,7 +441,8 @@ impl ScheduledCatalog {
                 | SecretSource::KubernetesTokenRequest { .. }
                 | SecretSource::KubernetesApi { .. }
                 | SecretSource::ChatgptSubscription { .. }
-                | SecretSource::GithubApp { .. } => None,
+                | SecretSource::GithubApp { .. }
+                | SecretSource::SignedJwt(_) => None,
             })
             .collect()
     }
@@ -529,7 +541,8 @@ impl SecretResolver for MapResolver {
             | SecretSource::KubernetesTokenRequest { .. }
             | SecretSource::KubernetesApi { .. }
             | SecretSource::ChatgptSubscription { .. }
-            | SecretSource::GithubApp { .. } => tracing::Span::none(),
+            | SecretSource::GithubApp { .. }
+            | SecretSource::SignedJwt(_) => tracing::Span::none(),
         };
         if let Some(minted) = &entry.minted {
             return minted.resolve().await.map_err(|error| {
@@ -596,9 +609,9 @@ impl MapResolver {
         client: &reqwest::Client,
     ) -> Result<Vec<u8>, SourceError> {
         match source {
-            SecretSource::ChatgptSubscription { .. } | SecretSource::GithubApp { .. } => {
-                Err(SourceError::Config)
-            }
+            SecretSource::ChatgptSubscription { .. }
+            | SecretSource::GithubApp { .. }
+            | SecretSource::SignedJwt(_) => Err(SourceError::Config),
             SecretSource::SecureFile { path } => {
                 read_private_file(path, self.expected_uid, HARD_MAX_SOURCE_RESPONSE_BYTES).await
             }
@@ -1216,6 +1229,7 @@ impl SecretSource {
             } => Some(credentials_file.clone()),
             Self::OAuth2Refresh { seed_path, .. } => seed_path.clone(),
             Self::GithubApp { private_key, .. } => Some(private_key.clone()),
+            Self::SignedJwt(config) => Some(config.private_key.clone()),
             Self::ChatgptSubscription { auth_file } => Some(auth_file.clone()),
             Self::SecureFile { .. } | Self::KubernetesProjection { .. } => None,
         }
@@ -1250,6 +1264,7 @@ impl SecretSource {
             Self::OAuth2Refresh { .. } => "oauth2-refresh",
             Self::ChatgptSubscription { .. } => "chatgpt-subscription",
             Self::GithubApp { .. } => "github-app",
+            Self::SignedJwt(_) => "signed-jwt",
         }
     }
 
@@ -1262,6 +1277,7 @@ impl SecretSource {
             Self::SecureFile { path } | Self::ChatgptSubscription { auth_file: path } => {
                 validate_absolute(path)
             }
+            Self::SignedJwt(_) => Ok(()),
             Self::GithubApp {
                 private_key,
                 repositories,
@@ -1522,12 +1538,14 @@ fn sanitized_yaml_diagnostic(error: &serde_yaml::Error, bytes: &[u8]) -> String 
         "kind",
         "bindings",
         "projection",
+        "iss",
     ];
-    let unknown = message
+    let named_field = message
         .split_once("unknown field `")
+        .or_else(|| message.split_once("missing field `"))
         .and_then(|(_, rest)| rest.split_once('`'))
         .map(|(name, _)| name);
-    let field = if let Some(name) = unknown {
+    let field = if let Some(name) = named_field {
         FIELDS.iter().copied().find(|field| *field == name)
     } else if class == "unknown variant" && message.contains("`lazy` or `scheduled`") {
         Some("refresh")
@@ -1604,6 +1622,8 @@ pub(crate) async fn load_shapes(
 ) -> Result<SecretCatalog, SecretMapError> {
     let (file, _) = read_map::<SecretMapFile>(path, expected_uid).await?;
     let mut problems = Vec::new();
+    let runners =
+        signed_jwt_runners(file.secrets.iter().map(|entry| (&entry.drn, &entry.source))).collect();
     let bindings = file
         .secrets
         .into_iter()
@@ -1612,7 +1632,21 @@ pub(crate) async fn load_shapes(
     if !problems.is_empty() {
         return Err(SecretMapError::Validation { problems });
     }
-    SecretCatalog::unresolved(bindings).map_err(|source| SecretMapError::Catalog { source })
+    SecretCatalog::unresolved(bindings)
+        .map(|catalog| catalog.with_signed_jwt_runners(runners))
+        .map_err(|source| SecretMapError::Catalog { source })
+}
+
+fn signed_jwt_runners<'a>(
+    sources: impl IntoIterator<Item = (&'a SecretDrn, &'a SecretSource)>,
+) -> impl Iterator<Item = (SecretDrn, SecretDrn)> {
+    sources.into_iter().filter_map(|(drn, source)| {
+        if let SecretSource::SignedJwt(config) = source {
+            Some((drn.clone(), config.runner_secret.clone()))
+        } else {
+            None
+        }
+    })
 }
 
 fn entry_bindings(
@@ -1717,7 +1751,7 @@ async fn validate_map(
     let mut material_paths = BTreeSet::new();
     let mut binding_ids = BTreeSet::new();
     let mut binding_keys = BTreeSet::new();
-    let mut entries = BTreeMap::new();
+    let mut entries = Vec::new();
     let mut bindings = Vec::new();
     for entry in file.secrets {
         if !seen.insert(entry.drn.clone()) {
@@ -1769,7 +1803,9 @@ async fn validate_map(
         }
         if matches!(
             entry.source,
-            SecretSource::ChatgptSubscription { .. } | SecretSource::GithubApp { .. }
+            SecretSource::ChatgptSubscription { .. }
+                | SecretSource::GithubApp { .. }
+                | SecretSource::SignedJwt(_)
         ) && (!matches!(entry.projection.format, DocumentFormat::Raw)
             || entry.projection.pointer.is_some()
             || entry.projection.decode_base64)
@@ -1823,7 +1859,7 @@ async fn validate_map(
             }
             bindings.push(resolved);
         }
-        entries.insert(drn, (source, projection));
+        entries.push((drn, (source, projection)));
     }
     if bootstrap_paths.contains(map_path) {
         problems
@@ -1859,6 +1895,7 @@ async fn validate_map(
             bindings.len()
         ));
     }
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
     for (drn, (source, _)) in &entries {
         if let SecretSource::OAuth2Refresh {
             seed_path: Some(path),
@@ -1876,22 +1913,30 @@ async fn validate_map(
             }
         }
     }
-    if !problems.is_empty() {
+    let runners = signed_jwt_runners(entries.iter().map(|(drn, (source, _))| (drn, source)))
+        .collect::<Vec<_>>();
+    let jwt_problems = signed_jwt_binding_problems(&runners, &bindings);
+    if runners.is_empty() && jwt_problems.is_empty() && !problems.is_empty() {
         return Err(SecretMapError::Validation { problems });
     }
     let minting = entries
         .iter()
         .filter(|(_, (source, _))| {
-            matches!(
-                source,
-                SecretSource::ChatgptSubscription { .. } | SecretSource::GithubApp { .. }
-            )
+            matches!(source, SecretSource::SignedJwt(_))
+                || (problems.is_empty()
+                    && jwt_problems.is_empty()
+                    && matches!(
+                        source,
+                        SecretSource::ChatgptSubscription { .. } | SecretSource::GithubApp { .. }
+                    ))
         })
         .map(|(drn, (source, _))| (drn.clone(), source.clone()))
         .collect::<Vec<_>>();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let mut minted = tokio::task::spawn_blocking(move || {
-        tracing::dispatcher::with_default(&dispatch, || mint_sources(minting, expected_uid))
+        tracing::dispatcher::with_default(&dispatch, || {
+            mint_sources(minting, expected_uid, problems, jwt_problems)
+        })
     })
     .await
     .map_err(|_join| SecretMapError::Validation {
@@ -1931,6 +1976,7 @@ async fn validate_map(
     });
     let dyn_resolver: Arc<dyn SecretResolver> = Arc::<MapResolver>::clone(&resolver);
     let catalog = SecretCatalog::new(bindings, dyn_resolver)
+        .map(|catalog| catalog.with_signed_jwt_runners(runners.into_iter().collect()))
         .and_then(|catalog| catalog.with_authority_revision(file.map_revision))
         .map_err(|source| SecretMapError::Catalog { source })?;
     Ok(ValidatedMap {
@@ -1956,11 +2002,60 @@ struct MintedSources {
     key_digest: [u8; 32],
 }
 
+fn signed_jwt_binding_problems(
+    runners: &[(SecretDrn, SecretDrn)],
+    bindings: &[SecretUseBinding],
+) -> Vec<SignedJwtProblem> {
+    let personas = runners
+        .iter()
+        .map(|(persona, _)| persona)
+        .collect::<BTreeSet<_>>();
+    let mut problems = Vec::new();
+    let mut capabilities = BTreeMap::<_, BTreeSet<_>>::new();
+    for binding in bindings {
+        capabilities
+            .entry((binding.sink, &binding.secret))
+            .or_default()
+            .extend(&binding.capabilities);
+        let jwt = personas.contains(&binding.secret);
+        if jwt != (binding.sink == SecretSinkKind::VmExecStdin)
+            || jwt
+                && (binding.allow_query
+                    || binding.max_injections != 1
+                    || binding.allowed_methods.as_slice() != ["POST"])
+        {
+            problems.push(SignedJwtProblem {
+                secret: binding.secret.clone(),
+                source: SignedJwtConfigError::SinkBinding,
+            });
+        }
+    }
+    for (secret, runner) in runners {
+        let persona_capabilities = capabilities.get(&(SecretSinkKind::VmExecStdin, secret));
+        if personas.contains(runner)
+            || capabilities
+                .get(&(SecretSinkKind::HttpBearer, runner))
+                .is_none_or(|runner_capabilities| {
+                    runner_capabilities.is_empty()
+                        || persona_capabilities
+                            .is_some_and(|required| !required.is_subset(runner_capabilities))
+                })
+        {
+            problems.push(SignedJwtProblem {
+                secret: secret.clone(),
+                source: SignedJwtConfigError::RunnerBinding,
+            });
+        }
+    }
+    problems
+}
+
 fn mint_sources(
     minting: Vec<(SecretDrn, SecretSource)>,
     expected_uid: u32,
+    mut problems: Vec<String>,
+    mut jwt_problems: Vec<SignedJwtProblem>,
 ) -> Result<MintedSources, SecretMapError> {
-    let mut problems = Vec::new();
     let mut sources = BTreeMap::new();
     let mut chatgpt = Vec::new();
     let mut keys = Sha256::new();
@@ -1995,6 +2090,18 @@ fn mint_sources(
                 },
             )
             .map(|credential| Minted::GithubApp(Box::new(credential))),
+            SecretSource::SignedJwt(config) => {
+                match SelfSignedIssuer::open(*config, expected_uid, &mut keys) {
+                    Ok(issuer) => Ok(Minted::SignedJwt(Box::new(issuer))),
+                    Err(errors) => {
+                        jwt_problems.extend(errors.into_iter().map(|source| SignedJwtProblem {
+                            secret: drn.clone(),
+                            source,
+                        }));
+                        continue;
+                    }
+                }
+            }
             SecretSource::SecureFile { .. }
             | SecretSource::KubernetesProjection { .. }
             | SecretSource::OnePasswordConnect { .. }
@@ -2014,6 +2121,12 @@ fn mint_sources(
             }
             Err(problem) => problems.push(problem),
         }
+    }
+    if !jwt_problems.is_empty() {
+        return Err(SecretMapError::SignedJwtValidation {
+            problems,
+            jwt_problems,
+        });
     }
     if !problems.is_empty() {
         return Err(SecretMapError::Validation { problems });
@@ -2796,6 +2909,14 @@ pub enum SecretMapError {
     Decode { diagnostic: String },
     #[error("private secret map has conflicts: {}", problems.join("; "))]
     Validation { problems: Vec<String> },
+    #[error(
+        "private secret map has conflicts: {}",
+        secret_map_conflict_text(problems, jwt_problems)
+    )]
+    SignedJwtValidation {
+        problems: Vec<String>,
+        jwt_problems: Vec<SignedJwtProblem>,
+    },
     #[error("private secret map HTTP client could not be built")]
     Client {
         #[source]
@@ -2813,10 +2934,29 @@ pub enum SecretMapError {
     },
 }
 
+#[derive(Debug, Error)]
+#[error("{secret}: {}", dekopon_core::error_chain(source))]
+pub struct SignedJwtProblem {
+    secret: SecretDrn,
+    #[source]
+    source: SignedJwtConfigError,
+}
+
+fn secret_map_conflict_text(problems: &[String], jwt_problems: &[SignedJwtProblem]) -> String {
+    problems
+        .iter()
+        .cloned()
+        .chain(jwt_problems.iter().map(ToString::to_string))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[cfg(test)]
 mod oauth2_tests;
 #[cfg(test)]
 mod record_path_exclusivity;
+#[cfg(test)]
+mod signed_jwt_tests;
 #[cfg(test)]
 mod token_request_tests;
 
@@ -2875,7 +3015,7 @@ mod tests {
         assert!(!events.contains(&path.display().to_string()), "{events}");
     }
 
-    async fn write(path: &std::path::Path, bytes: &[u8]) {
+    pub(super) async fn write(path: &std::path::Path, bytes: &[u8]) {
         tokio::fs::write(path, bytes).await.expect("write fixture");
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .await
