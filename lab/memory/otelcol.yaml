@@ -1,0 +1,26 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:${env:LAB_OTLP_PORT}
+processors:
+  batch:
+    timeout: 1s
+exporters:
+  file/traces:
+    path: /out/traces.jsonl
+  file/logs:
+    path: /out/logs.jsonl
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/traces]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/logs]
