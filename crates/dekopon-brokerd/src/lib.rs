@@ -669,7 +669,9 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                 (true, Some(providers)) => {
                     provider_lock_file = Some(providers.store.join(PROVIDER_LOCK_FILE));
                     match resolve_provider_set(providers, uid).await {
-                        Ok(sources) => {
+                        Ok((sources, cwasm_dir)) => {
+                            config.host_options.cwasm_dir =
+                                (!config.compile_on_load).then_some(cwasm_dir);
                             config.providers = sources
                                 .iter()
                                 .map(|source| source.path().to_path_buf())
@@ -1096,7 +1098,7 @@ const PROVIDER_LOCK_FILE: &str = "providers.lock.yaml";
 async fn resolve_provider_set(
     providers: CheckProviders,
     uid: u32,
-) -> Result<Vec<dekopon_broker_host::LockedProviderSource>, BrokerdError> {
+) -> Result<(Vec<dekopon_broker_host::LockedProviderSource>, PathBuf), BrokerdError> {
     let mut directory = tokio::fs::DirBuilder::new();
     directory.mode(0o700);
     match directory.create(&providers.store).await {
@@ -1126,9 +1128,10 @@ async fn resolve_provider_set(
         .precompile()
         .await
         .map_err(BrokerdError::ProviderSet)?;
-    provider_manager::load_locked_sources(&lock_file, &store, uid)
+    let sources = provider_manager::load_locked_sources(&lock_file, &store, uid)
         .await
-        .map_err(BrokerdError::ProviderSet)
+        .map_err(BrokerdError::ProviderSet)?;
+    Ok((sources, store.join("cwasm")))
 }
 
 fn scratch_host(
