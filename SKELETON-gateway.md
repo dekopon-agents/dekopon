@@ -70,12 +70,12 @@ I checked both runs with a local copy of the rule the coordinator stated. The re
 `footprint-edges.py` was not run here.
 
 ```footprint
-{"unit": "state/grant-settle", "step": "10-state/grant-settle/build", "files": ["crates/dekopon-agent/src/grant.rs", "crates/dekopon-agent/src/lib.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/tests/grant_holds.rs"], "rank": 1, "items": ["S-gateway-111", "S-gateway-129"]}
-{"unit": "state/durable-store", "step": "10-state/durable-store/build", "files": ["crates/dekopon-gatewayd/src/store.rs", "crates/dekopon-gatewayd/src/store/lock.rs", "crates/dekopon-gatewayd/src/store/schema.rs", "crates/dekopon-gatewayd/src/store/record.rs", "crates/dekopon-gatewayd/src/store/convert.rs", "crates/dekopon-gatewayd/src/wake.rs", "crates/dekopon-gatewayd/src/wake/store.rs", "crates/dekopon-gatewayd/src/wake/delivery.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/collection.rs", "crates/dekopon-gatewayd/src/follow.rs", "crates/dekopon-gatewayd/src/memory/journal.rs", "crates/dekopon-gatewayd/src/jobs.rs", "crates/dekopon-gatewayd/src/transport/slack.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests.rs", "crates/dekopon-gatewayd/src/tests/wakes.rs", "crates/dekopon-gatewayd/src/tests/attribution.rs", "crates/dekopon-gatewayd/src/tests/digests.rs", "crates/dekopon-gatewayd/src/tests/memory.rs", "crates/dekopon-gatewayd/src/tests/wake_reason.rs", "crates/dekopon-gatewayd/src/tests/jobs_e2e.rs", "crates/dekopon-gatewayd/src/tests/thread_budget.rs", "crates/dekopon-gatewayd/src/tests/subscriptions.rs", "crates/dekopon-gatewayd/src/tests/github_burst.rs", "crates/dekopon-gatewayd/src/tests/durable_store.rs", "crates/dekopon-gatewayd/tests/gateway.rs", "crates/dekopon-gatewayd/tests/gateway/fauxlack.rs", "crates/dekopon-gatewayd/tests/gateway/subscriptions.rs"], "rank": 2, "items": ["S-gateway-01", "S-gateway-02", "S-gateway-03", "S-gateway-04", "S-gateway-05", "S-gateway-10", "S-gateway-11", "S-gateway-12", "S-gateway-13", "S-gateway-14", "S-gateway-15", "S-gateway-16", "S-gateway-17", "S-gateway-18", "S-gateway-19", "S-gateway-20", "S-gateway-23", "S-gateway-25", "S-gateway-41", "S-gateway-104", "S-gateway-105", "S-gateway-106", "S-gateway-107", "S-gateway-108", "S-gateway-109", "S-gateway-42", "S-gateway-43", "S-gateway-44", "S-gateway-45", "S-gateway-46", "S-gateway-47", "S-gateway-48", "S-gateway-49", "S-gateway-50", "S-gateway-51", "S-gateway-52", "S-gateway-53", "S-gateway-113", "S-gateway-54", "S-gateway-55", "S-gateway-56", "S-gateway-57", "S-gateway-58", "S-gateway-59", "S-gateway-114", "S-gateway-115", "S-gateway-116", "S-gateway-117", "S-gateway-118", "S-gateway-119", "S-gateway-120", "S-gateway-121", "S-gateway-122", "S-gateway-123", "S-gateway-124", "S-gateway-125", "S-gateway-126"]}
-{"unit": "state/cron-wakes", "step": "10-state/cron-wakes/build", "files": ["crates/dekopon-gatewayd/src/wake.rs", "crates/dekopon-gatewayd/src/wake/cron.rs", "crates/dekopon-gatewayd/src/wake/store.rs", "crates/dekopon-agent/src/wake.rs", "crates/dekopon-gatewayd/src/tests/cron_wakes.rs"], "rank": 3, "items": ["S-gateway-31", "S-gateway-32", "S-gateway-110"]}
-{"unit": "rpi/tick-runner", "step": "11-rpi/tick-runner/build", "files": ["crates/dekopon-gatewayd/src/runner.rs", "crates/dekopon-gatewayd/src/runner/receipt.rs", "crates/dekopon-gatewayd/src/restart.rs", "crates/dekopon-gatewayd/src/transport.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/wake/store.rs", "crates/dekopon-gatewayd/src/tests/tick_runner.rs"], "rank": 4, "items": ["S-gateway-22", "S-gateway-24", "S-gateway-34", "S-gateway-35", "S-gateway-36", "S-gateway-37", "S-gateway-38", "S-gateway-39", "S-gateway-40", "S-gateway-112", "S-gateway-131", "S-gateway-132", "S-gateway-133", "S-gateway-134", "S-gateway-135", "S-gateway-136"]}
-{"unit": "daemon/notice-channel", "step": "09-daemon/notice-channel/build", "files": ["crates/dekopon-gatewayd/src/notice.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests/notice_channel.rs"], "rank": 5, "items": ["S-gateway-21", "S-gateway-26", "S-gateway-27", "S-gateway-28", "S-gateway-29", "S-gateway-30", "S-gateway-127", "S-gateway-128"]}
-{"unit": "state/spend-slice1", "step": "10-state/spend-slice1/build", "files": ["crates/dekopon-gatewayd/src/store.rs", "crates/dekopon-gatewayd/src/store/ledger.rs", "crates/dekopon-gatewayd/src/store/schema.rs", "crates/dekopon-gatewayd/src/metering.rs", "crates/dekopon-gatewayd/src/meter_restore.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests/spend_ledger.rs"], "rank": 6, "items": ["S-gateway-33", "S-gateway-130"]}
+{"unit": "state/grant-settle", "step": "10-state/grant-settle/build", "files": ["crates/dekopon-agent/src/grant.rs", "crates/dekopon-agent/src/lib.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/tests/grant_holds.rs"], "rank": 1, "items": ["S-gateway-91", "S-gateway-92", "S-gateway-93", "S-gateway-111", "S-gateway-129"]}
+{"unit": "state/durable-store", "step": "10-state/durable-store/build", "files": ["crates/dekopon-gatewayd/src/store.rs", "crates/dekopon-gatewayd/src/store/lock.rs", "crates/dekopon-gatewayd/src/store/schema.rs", "crates/dekopon-gatewayd/src/store/record.rs", "crates/dekopon-gatewayd/src/store/convert.rs", "crates/dekopon-gatewayd/src/wake.rs", "crates/dekopon-gatewayd/src/wake/store.rs", "crates/dekopon-gatewayd/src/wake/delivery.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/collection.rs", "crates/dekopon-gatewayd/src/follow.rs", "crates/dekopon-gatewayd/src/memory/journal.rs", "crates/dekopon-gatewayd/src/jobs.rs", "crates/dekopon-gatewayd/src/transport/slack.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests.rs", "crates/dekopon-gatewayd/src/tests/wakes.rs", "crates/dekopon-gatewayd/src/tests/attribution.rs", "crates/dekopon-gatewayd/src/tests/digests.rs", "crates/dekopon-gatewayd/src/tests/memory.rs", "crates/dekopon-gatewayd/src/tests/wake_reason.rs", "crates/dekopon-gatewayd/src/tests/jobs_e2e.rs", "crates/dekopon-gatewayd/src/tests/thread_budget.rs", "crates/dekopon-gatewayd/src/tests/subscriptions.rs", "crates/dekopon-gatewayd/src/tests/github_burst.rs", "crates/dekopon-gatewayd/src/tests/durable_store.rs", "crates/dekopon-gatewayd/tests/gateway.rs", "crates/dekopon-gatewayd/tests/gateway/fauxlack.rs", "crates/dekopon-gatewayd/tests/gateway/subscriptions.rs"], "rank": 2, "items": ["S-gateway-01", "S-gateway-02", "S-gateway-03", "S-gateway-04", "S-gateway-05", "S-gateway-10", "S-gateway-11", "S-gateway-12", "S-gateway-13", "S-gateway-14", "S-gateway-15", "S-gateway-16", "S-gateway-17", "S-gateway-18", "S-gateway-19", "S-gateway-20", "S-gateway-23", "S-gateway-25", "S-gateway-41", "S-gateway-42", "S-gateway-43", "S-gateway-44", "S-gateway-45", "S-gateway-46", "S-gateway-47", "S-gateway-48", "S-gateway-49", "S-gateway-50", "S-gateway-51", "S-gateway-52", "S-gateway-53", "S-gateway-54", "S-gateway-55", "S-gateway-56", "S-gateway-57", "S-gateway-58", "S-gateway-59", "S-gateway-60", "S-gateway-61", "S-gateway-62", "S-gateway-63", "S-gateway-72", "S-gateway-73", "S-gateway-74", "S-gateway-75", "S-gateway-104", "S-gateway-105", "S-gateway-106", "S-gateway-107", "S-gateway-108", "S-gateway-109", "S-gateway-113", "S-gateway-114", "S-gateway-115", "S-gateway-116", "S-gateway-117", "S-gateway-118", "S-gateway-119", "S-gateway-120", "S-gateway-121", "S-gateway-122", "S-gateway-123", "S-gateway-124", "S-gateway-125", "S-gateway-126"]}
+{"unit": "state/cron-wakes", "step": "10-state/cron-wakes/build", "files": ["crates/dekopon-gatewayd/src/wake.rs", "crates/dekopon-gatewayd/src/wake/cron.rs", "crates/dekopon-gatewayd/src/wake/store.rs", "crates/dekopon-agent/src/wake.rs", "crates/dekopon-gatewayd/src/tests/cron_wakes.rs"], "rank": 3, "items": ["S-gateway-31", "S-gateway-32", "S-gateway-85", "S-gateway-86", "S-gateway-87", "S-gateway-88", "S-gateway-89", "S-gateway-90", "S-gateway-110"]}
+{"unit": "rpi/tick-runner", "step": "11-rpi/tick-runner/build", "files": ["crates/dekopon-gatewayd/src/runner.rs", "crates/dekopon-gatewayd/src/runner/receipt.rs", "crates/dekopon-gatewayd/src/restart.rs", "crates/dekopon-gatewayd/src/transport.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/wake/store.rs", "crates/dekopon-gatewayd/src/tests/tick_runner.rs"], "rank": 4, "items": ["S-gateway-22", "S-gateway-24", "S-gateway-34", "S-gateway-35", "S-gateway-36", "S-gateway-37", "S-gateway-38", "S-gateway-39", "S-gateway-40", "S-gateway-64", "S-gateway-65", "S-gateway-66", "S-gateway-67", "S-gateway-68", "S-gateway-69", "S-gateway-70", "S-gateway-71", "S-gateway-98", "S-gateway-99", "S-gateway-100", "S-gateway-101", "S-gateway-102", "S-gateway-103", "S-gateway-112", "S-gateway-131", "S-gateway-132", "S-gateway-133", "S-gateway-134", "S-gateway-135", "S-gateway-136"]}
+{"unit": "daemon/notice-channel", "step": "09-daemon/notice-channel/build", "files": ["crates/dekopon-gatewayd/src/notice.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests/notice_channel.rs"], "rank": 5, "items": ["S-gateway-21", "S-gateway-26", "S-gateway-27", "S-gateway-28", "S-gateway-29", "S-gateway-30", "S-gateway-76", "S-gateway-77", "S-gateway-78", "S-gateway-79", "S-gateway-80", "S-gateway-81", "S-gateway-82", "S-gateway-83", "S-gateway-84", "S-gateway-127", "S-gateway-128"]}
+{"unit": "state/spend-slice1", "step": "10-state/spend-slice1/build", "files": ["crates/dekopon-gatewayd/src/store.rs", "crates/dekopon-gatewayd/src/store/ledger.rs", "crates/dekopon-gatewayd/src/store/schema.rs", "crates/dekopon-gatewayd/src/metering.rs", "crates/dekopon-gatewayd/src/meter_restore.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests/spend_ledger.rs"], "rank": 6, "items": ["S-gateway-33", "S-gateway-94", "S-gateway-95", "S-gateway-96", "S-gateway-97", "S-gateway-130"]}
 ```
 
 ## Items
@@ -159,14 +159,14 @@ The Unit column is the owning unit. "kept" means the id names the same item, pos
 | S-gateway-57 | state/durable-store | `durable_store.rs` | `every_record_is_migrated_forward_at_boot` |  |
 | S-gateway-58 | state/durable-store | `durable_store.rs` | `an_unacknowledged_delivery_replays_and_a_duplicate_is_accepted` |  |
 | S-gateway-59 | state/durable-store | `durable_store.rs` | `an_acknowledgement_commits_in_the_same_transaction_as_its_wake_change` |  |
-| draft id pending (60–103) | state/durable-store | `durable_store.rs` | `a_recurring_wake_holds_at_most_one_pending_delivery` |  |
-| draft id pending (60–103) | state/durable-store | `durable_store.rs` | `an_interrupted_job_is_reported_with_its_deadline_within_one_boot` |  |
-| draft id pending (60–103) | state/durable-store | `durable_store.rs` | `a_leave_drops_the_follow_and_the_thread_ownership_in_one_transaction` |  |
-| draft id pending (60–103) | state/durable-store | `durable_store.rs` | `follows_and_thread_ownership_survive_a_restart` |  |
-| draft id pending (60–103) | state/durable-store | `durable_store.rs` | `a_denied_wake_store_write_yields_one_cause_bearing_exit_and_a_nonzero_status` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | state/durable-store | `durable_store.rs` | `a_store_that_is_writable_again_after_the_restart_recovers` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | state/durable-store | `durable_store.rs` | `a_fatal_exit_joins_every_owned_task_within_the_shutdown_grace` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | state/durable-store | `durable_store.rs` | `a_restart_after_a_fatal_exit_resumes_from_the_store` | moved from `supervisor.rs` (ruling) |
+| S-gateway-60 | state/durable-store | `durable_store.rs` | `a_recurring_wake_holds_at_most_one_pending_delivery` |  |
+| S-gateway-61 | state/durable-store | `durable_store.rs` | `an_interrupted_job_is_reported_with_its_deadline_within_one_boot` |  |
+| S-gateway-62 | state/durable-store | `durable_store.rs` | `a_leave_drops_the_follow_and_the_thread_ownership_in_one_transaction` |  |
+| S-gateway-63 | state/durable-store | `durable_store.rs` | `follows_and_thread_ownership_survive_a_restart` |  |
+| S-gateway-72 | state/durable-store | `durable_store.rs` | `a_denied_wake_store_write_yields_one_cause_bearing_exit_and_a_nonzero_status` | moved from `supervisor.rs` (ruling) |
+| S-gateway-73 | state/durable-store | `durable_store.rs` | `a_store_that_is_writable_again_after_the_restart_recovers` | moved from `supervisor.rs` (ruling) |
+| S-gateway-74 | state/durable-store | `durable_store.rs` | `a_fatal_exit_joins_every_owned_task_within_the_shutdown_grace` | moved from `supervisor.rs` (ruling) |
+| S-gateway-75 | state/durable-store | `durable_store.rs` | `a_restart_after_a_fatal_exit_resumes_from_the_store` | moved from `supervisor.rs` (ruling) |
 | S-gateway-114 | state/durable-store | `durable_store.rs` | `the_store_is_acquired_once_at_initial_boot_and_never_by_check_or_reload` | new |
 | S-gateway-115 | state/durable-store | `durable_store.rs` | `a_second_gateway_process_on_the_same_store_fails_at_once` | new |
 | S-gateway-116 | state/durable-store | `durable_store.rs` | `conversion_reads_legacy_inputs_through_a_projected_symlink` | new |
@@ -180,46 +180,46 @@ The Unit column is the owning unit. "kept" means the id names the same item, pos
 | S-gateway-124 | state/durable-store | `durable_store.rs` | `a_subscription_synchronize_while_pending_keeps_the_pending_delivery` | new |
 | S-gateway-125 | state/durable-store | `durable_store.rs` | `an_interrupted_job_notice_replays_after_a_crash_before_its_acknowledgement` | new |
 | S-gateway-126 | state/durable-store | `durable_store.rs` | `a_tick_result_keeps_its_wake_id_on_every_outcome` | new |
-| draft id pending (60–103) | daemon/notice-channel | `notice_channel.rs` | `a_crash_mid_post_cannot_loop_because_notified_commits_before_the_post` |  |
-| draft id pending (60–103) | daemon/notice-channel | `notice_channel.rs` | `the_marker_is_deleted_after_the_stability_window_with_one_recovery_line` |  |
-| draft id pending (60–103) | daemon/notice-channel | `notice_channel.rs` | `further_fatal_exits_in_a_streak_only_update_the_marker` |  |
-| draft id pending (60–103) | daemon/notice-channel | `notice_channel.rs` | `several_fatal_exits_across_restarts_post_once_and_recover_once` |  |
-| draft id pending (60–103) | daemon/notice-channel | `notice_channel.rs` | `a_wake_panicking_on_every_tick_posts_once` |  |
-| draft id pending (60–103) | daemon/notice-channel | `notice_channel.rs` | `a_wake_s_next_success_after_a_panic_posts_one_recovery_line` |  |
-| draft id pending (60–103) | daemon/notice-channel | `notice_channel.rs` | `wake_panic_state_holds_only_open_streaks` |  |
-| draft id pending (60–103) | daemon/notice-channel | `notice_channel.rs` | `wake_panic_state_is_in_memory_so_a_restart_can_repeat_one_post` |  |
-| draft id pending (60–103) | daemon/notice-channel | `notice_channel.rs` | `a_gateway_without_a_notice_channel_posts_nothing` |  |
+| S-gateway-76 | daemon/notice-channel | `notice_channel.rs` | `a_crash_mid_post_cannot_loop_because_notified_commits_before_the_post` |  |
+| S-gateway-77 | daemon/notice-channel | `notice_channel.rs` | `the_marker_is_deleted_after_the_stability_window_with_one_recovery_line` |  |
+| S-gateway-78 | daemon/notice-channel | `notice_channel.rs` | `further_fatal_exits_in_a_streak_only_update_the_marker` |  |
+| S-gateway-79 | daemon/notice-channel | `notice_channel.rs` | `several_fatal_exits_across_restarts_post_once_and_recover_once` |  |
+| S-gateway-80 | daemon/notice-channel | `notice_channel.rs` | `a_wake_panicking_on_every_tick_posts_once` |  |
+| S-gateway-81 | daemon/notice-channel | `notice_channel.rs` | `a_wake_s_next_success_after_a_panic_posts_one_recovery_line` |  |
+| S-gateway-82 | daemon/notice-channel | `notice_channel.rs` | `wake_panic_state_holds_only_open_streaks` |  |
+| S-gateway-83 | daemon/notice-channel | `notice_channel.rs` | `wake_panic_state_is_in_memory_so_a_restart_can_repeat_one_post` |  |
+| S-gateway-84 | daemon/notice-channel | `notice_channel.rs` | `a_gateway_without_a_notice_channel_posts_nothing` |  |
 | S-gateway-127 | daemon/notice-channel | `notice_channel.rs` | `a_retired_wake_leaves_no_panic_streak` | new |
 | S-gateway-128 | daemon/notice-channel | `notice_channel.rs` | `a_lost_transport_exit_writes_the_marker` | new |
-| draft id pending (60–103) | state/cron-wakes | `cron_wakes.rs` | `a_cron_tick_interrupted_before_acknowledgement_fires_once_after_restart` |  |
-| draft id pending (60–103) | state/cron-wakes | `cron_wakes.rs` | `cancelling_a_cron_registration_ends_the_recurring_wake` |  |
-| draft id pending (60–103) | state/cron-wakes | `cron_wakes.rs` | `cron_ticks_missed_while_down_merge_into_one_late_delivery` |  |
-| draft id pending (60–103) | state/cron-wakes | `cron_wakes.rs` | `a_registered_cron_wake_survives_a_restart_and_fires_with_its_message` |  |
-| draft id pending (60–103) | state/cron-wakes | `cron_wakes.rs` | `an_empty_or_rule_resolved_cron_tick_invokes_no_model` |  |
-| draft id pending (60–103) | state/cron-wakes | `cron_wakes.rs` | `a_cron_wake_is_exempt_from_the_thirty_day_expiry` |  |
-| draft id pending (60–103) | state/grant-settle | `grant_holds.rs` | `a_grant_whose_tally_never_returns_is_charged_in_full` |  |
-| draft id pending (60–103) | state/grant-settle | `grant_holds.rs` | `a_returned_tally_settles_the_hold_and_refunds_the_rest` |  |
-| draft id pending (60–103) | state/grant-settle | `grant_holds.rs` | `a_grant_is_kept_across_calls_and_released_with_its_turn` | renamed from `open_holds_are_bounded_by_concurrent_vm_exec_calls` |
+| S-gateway-85 | state/cron-wakes | `cron_wakes.rs` | `a_cron_tick_interrupted_before_acknowledgement_fires_once_after_restart` |  |
+| S-gateway-86 | state/cron-wakes | `cron_wakes.rs` | `cancelling_a_cron_registration_ends_the_recurring_wake` |  |
+| S-gateway-87 | state/cron-wakes | `cron_wakes.rs` | `cron_ticks_missed_while_down_merge_into_one_late_delivery` |  |
+| S-gateway-88 | state/cron-wakes | `cron_wakes.rs` | `a_registered_cron_wake_survives_a_restart_and_fires_with_its_message` |  |
+| S-gateway-89 | state/cron-wakes | `cron_wakes.rs` | `an_empty_or_rule_resolved_cron_tick_invokes_no_model` |  |
+| S-gateway-90 | state/cron-wakes | `cron_wakes.rs` | `a_cron_wake_is_exempt_from_the_thirty_day_expiry` |  |
+| S-gateway-91 | state/grant-settle | `grant_holds.rs` | `a_grant_whose_tally_never_returns_is_charged_in_full` |  |
+| S-gateway-92 | state/grant-settle | `grant_holds.rs` | `a_returned_tally_settles_the_hold_and_refunds_the_rest` |  |
+| S-gateway-93 | state/grant-settle | `grant_holds.rs` | `a_grant_is_kept_across_calls_and_released_with_its_turn` | renamed from `open_holds_are_bounded_by_concurrent_vm_exec_calls` |
 | S-gateway-129 | state/grant-settle | `grant_holds.rs` | `a_carve_the_budget_cannot_cover_is_refused_before_the_vm_runs` | new |
-| draft id pending (60–103) | state/spend-slice1 | `spend_ledger.rs` | `a_sigkill_mid_stream_charges_the_open_hold_as_crashed_at_boot` |  |
-| draft id pending (60–103) | state/spend-slice1 | `spend_ledger.rs` | `a_failed_settlement_write_fails_fast_like_a_wake_store_failure` |  |
-| draft id pending (60–103) | state/spend-slice1 | `spend_ledger.rs` | `spend_outside_the_budget_window_is_not_rescanned_per_call` |  |
-| draft id pending (60–103) | state/spend-slice1 | `spend_ledger.rs` | `a_budget_survives_a_restart_and_refuses_an_over_budget_call_with_its_reset` |  |
+| S-gateway-94 | state/spend-slice1 | `spend_ledger.rs` | `a_sigkill_mid_stream_charges_the_open_hold_as_crashed_at_boot` |  |
+| S-gateway-95 | state/spend-slice1 | `spend_ledger.rs` | `a_failed_settlement_write_fails_fast_like_a_wake_store_failure` |  |
+| S-gateway-96 | state/spend-slice1 | `spend_ledger.rs` | `spend_outside_the_budget_window_is_not_rescanned_per_call` |  |
+| S-gateway-97 | state/spend-slice1 | `spend_ledger.rs` | `a_budget_survives_a_restart_and_refuses_an_over_budget_call_with_its_reset` |  |
 | S-gateway-130 | state/spend-slice1 | `spend_ledger.rs` | `the_ledger_restores_timed_model_charges_including_crashed_holds` | new |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_refused_effect_stops_the_cycle_and_records_the_receipts_so_far` |  |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_truncated_tick_plan_applies_nothing_and_parks` |  |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `serialized_receipt_batches_stay_within_twenty_kib_and_outputs_over_eight_kib_are_oversize` | renamed from `receipt_batches_stay_within_twenty_kib_and_outputs_of_eight_kib_are_oversize` |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_runner_cycle_resumes_on_schedule_across_a_gateway_restart` |  |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_failed_receipt_batch_parks_with_its_intent_ids` |  |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `an_agent_cannot_register_a_wake_for_the_rpi_coordinator_principal` |  |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_reader_that_fails_mid_frame_restarts_after_its_backoff` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_reconnected_reader_resets_its_backoff` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_reader_restart_delay_never_exceeds_the_backoff_cap` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `readers_restart_through_the_backoff_while_the_gateway_serves` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_wake_tick_panic_emits_one_cause_bearing_event_and_the_gateway_serves_on` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_reload_during_a_tick_keeps_the_tick_and_its_wake` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `ticks_in_flight_are_bounded_by_the_session_gate` | moved from `supervisor.rs` (ruling) |
-| draft id pending (60–103) | rpi/tick-runner | `tick_runner.rs` | `a_tick_that_panicked_before_a_restart_runs_again_from_its_row` | moved from `supervisor.rs` (ruling) |
+| S-gateway-98 | rpi/tick-runner | `tick_runner.rs` | `a_refused_effect_stops_the_cycle_and_records_the_receipts_so_far` |  |
+| S-gateway-99 | rpi/tick-runner | `tick_runner.rs` | `a_truncated_tick_plan_applies_nothing_and_parks` |  |
+| S-gateway-100 | rpi/tick-runner | `tick_runner.rs` | `serialized_receipt_batches_stay_within_twenty_kib_and_outputs_over_eight_kib_are_oversize` | renamed from `receipt_batches_stay_within_twenty_kib_and_outputs_of_eight_kib_are_oversize` |
+| S-gateway-101 | rpi/tick-runner | `tick_runner.rs` | `a_runner_cycle_resumes_on_schedule_across_a_gateway_restart` |  |
+| S-gateway-102 | rpi/tick-runner | `tick_runner.rs` | `a_failed_receipt_batch_parks_with_its_intent_ids` |  |
+| S-gateway-103 | rpi/tick-runner | `tick_runner.rs` | `an_agent_cannot_register_a_wake_for_the_rpi_coordinator_principal` |  |
+| S-gateway-64 | rpi/tick-runner | `tick_runner.rs` | `a_reader_that_fails_mid_frame_restarts_after_its_backoff` | moved from `supervisor.rs` (ruling) |
+| S-gateway-65 | rpi/tick-runner | `tick_runner.rs` | `a_reconnected_reader_resets_its_backoff` | moved from `supervisor.rs` (ruling) |
+| S-gateway-66 | rpi/tick-runner | `tick_runner.rs` | `a_reader_restart_delay_never_exceeds_the_backoff_cap` | moved from `supervisor.rs` (ruling) |
+| S-gateway-67 | rpi/tick-runner | `tick_runner.rs` | `readers_restart_through_the_backoff_while_the_gateway_serves` | moved from `supervisor.rs` (ruling) |
+| S-gateway-68 | rpi/tick-runner | `tick_runner.rs` | `a_wake_tick_panic_emits_one_cause_bearing_event_and_the_gateway_serves_on` | moved from `supervisor.rs` (ruling) |
+| S-gateway-69 | rpi/tick-runner | `tick_runner.rs` | `a_reload_during_a_tick_keeps_the_tick_and_its_wake` | moved from `supervisor.rs` (ruling) |
+| S-gateway-70 | rpi/tick-runner | `tick_runner.rs` | `ticks_in_flight_are_bounded_by_the_session_gate` | moved from `supervisor.rs` (ruling) |
+| S-gateway-71 | rpi/tick-runner | `tick_runner.rs` | `a_tick_that_panicked_before_a_restart_runs_again_from_its_row` | moved from `supervisor.rs` (ruling) |
 | S-gateway-131 | rpi/tick-runner | `tick_runner.rs` | `a_non_utf8_output_is_recorded_by_digest_unaltered` | new |
 | S-gateway-132 | rpi/tick-runner | `tick_runner.rs` | `a_receipt_that_cannot_fit_a_batch_parks_the_cycle` | new |
 | S-gateway-133 | rpi/tick-runner | `tick_runner.rs` | `a_cycle_interrupted_mid_batch_parks_with_its_receipts_so_far` | new |
@@ -227,7 +227,7 @@ The Unit column is the owning unit. "kept" means the id names the same item, pos
 | S-gateway-135 | rpi/tick-runner | `tick_runner.rs` | `a_cycle_past_its_deadline_parks` | new |
 | S-gateway-136 | rpi/tick-runner | `tick_runner.rs` | `the_runner_attests_as_its_configured_principal_and_agent` | new |
 
-There are 86 stubs: the 62 draft stubs (two renamed, twelve moved by ruling) and 24 new ones. Draft ids 60–103 are pending from the coordinator; each such row is a draft stub whose id is kept.
+There are 86 stubs: the 62 draft stubs (two renamed, twelve moved by ruling) and 24 new ones.
 
 ## Owners, bounds and shutdown
 
