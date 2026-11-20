@@ -2246,6 +2246,13 @@ async fn unreadable_reload_source_reports_monitor_failure_not_activation() {
     );
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].field("applied"), Some("false"));
+    assert_eq!(
+        failed[0].field("active_generation.digest"),
+        Some(old_digest.as_str())
+    );
+    let rejected = failed[0].field("rejected_generation.digest").unwrap();
+    assert_eq!(rejected.len(), 64);
+    assert!(rejected.bytes().all(|byte| byte.is_ascii_hexdigit()));
     let reason = failed[0]
         .field("error")
         .expect("sanitized monitor diagnostic");
@@ -2440,7 +2447,7 @@ async fn rotating_only_a_github_app_key_prepares_commits_once_and_reads_it_once_
 }
 
 #[tokio::test]
-async fn a_refused_reload_records_why_and_keeps_the_old_key_signing() {
+async fn a_refused_reload_is_reported_once_until_a_repair_commits() {
     use std::os::unix::fs::PermissionsExt as _;
 
     use dekopon_broker_protocol::GenerationOutcome;
@@ -2451,17 +2458,50 @@ async fn a_refused_reload_records_why_and_keeps_the_old_key_signing() {
     fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
     let digest = owner.active().digest.clone();
     let capture = dekopon_test_support::CaptureLayer::new();
+    let recovered =
+        || capture.events_where("dekopon_brokerd", &[("event", "broker_reload_recovered")]);
     async {
+        let uid = current_uid();
+        for _ in 0..3 {
+            assert_eq!(
+                owner.prepare(&digest, uid).await,
+                (digest.clone(), GenerationOutcome::Refused)
+            );
+        }
+        assert_eq!(owner.active().digest, digest);
+        write_owner_only(&key, &[b"\n".as_slice(), GITHUB_APP_KEY].concat());
         assert_eq!(
-            owner.prepare(&digest, current_uid()).await,
-            (digest.clone(), GenerationOutcome::Refused)
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Prepared)
+        );
+        assert!(recovered().is_empty());
+        assert_eq!(owner.commit(&digest, uid), GenerationOutcome::Applied);
+        assert_eq!(
+            owner.prepare(&digest, uid).await,
+            (digest.clone(), GenerationOutcome::Active)
         );
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
     .await;
-    assert_eq!(owner.active().digest, digest);
     let refused = capture.events_where("dekopon_brokerd", &[("event", "broker_reload_refused")]);
     assert_eq!(refused.len(), 1);
+    assert_eq!(
+        refused[0].field("active_generation.digest"),
+        Some(digest.as_str())
+    );
+    let rejected = refused[0].field("rejected_generation.digest").unwrap();
+    assert_eq!(rejected.len(), 64);
+    assert!(rejected.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let recovered = recovered();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].field("generation.digest"),
+        Some(digest.as_str())
+    );
+    assert_eq!(
+        recovered[0].field("rejected_generation.digest"),
+        Some(rejected)
+    );
     let error = refused[0].field("error").expect("refusal reason");
     assert!(
         error.contains(&format!(
@@ -2473,6 +2513,29 @@ async fn a_refused_reload_records_why_and_keeps_the_old_key_signing() {
     assert!(error.contains("has mode 0644"), "{error}");
     assert!(!error.contains("PRIVATE KEY"), "{error}");
 }
+
+fn enable_managed_oauth(broker: &ManagedBroker) -> std::path::PathBuf {
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["secretMapPath"] = json!("bindings.yaml");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["a.example.test"],
+        "allowedMethods": ["GET"], "maxRequests": 1,
+        "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    write_config(&broker.config(), &document);
+    broker.directory.path().join("bindings.yaml")
+}
+
+fn managed_oauth_map(record: &Path, revision: &str, name: &str) -> String {
+    format!(
+        "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: {revision}\nsecrets:\n  - drn: drn:secret:oauth/{name}\n    source: {{ kind: oauth2Refresh, recordPath: {}, tokenEndpoint: https://auth.example.test/token, clientId: public-client-id }}\n    destinations: [a.example.test]\n    bindings:\n      - id: api-token\n        capabilities: [cli-probe.upper]\n        sink: httpBearer\n        allowedHosts: [a.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+        record.display()
+    )
+}
+
+const SEALED_OAUTH_RECORD: &[u8] =
+    br#"{"version":2,"state":"sealed","since":10,"cause":"reauthorization-required"}"#;
 
 #[tokio::test]
 async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_per_poll() {
@@ -2489,22 +2552,8 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
         .unwrap()
         .join("record.json");
     write_owner_only(&record, b"{\"state\":");
-    let bindings = broker.directory.path().join("bindings.yaml");
-    let map = |revision: &str| {
-        format!(
-            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: {revision}\nsecrets:\n  - drn: drn:secret:oauth/one\n    source: {{ kind: oauth2Refresh, recordPath: {}, tokenEndpoint: https://auth.example.test/token, clientId: public-client-id }}\n    destinations: [a.example.test]\n    bindings:\n      - id: api-token\n        capabilities: [cli-probe.upper]\n        sink: httpBearer\n        allowedHosts: [a.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
-            record.display()
-        )
-    };
-    let mut document: serde_json::Value =
-        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
-    document["secretMapPath"] = json!("bindings.yaml");
-    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
-        "allowedHosts": ["a.example.test"],
-        "allowedMethods": ["GET"], "maxRequests": 1,
-        "maxRequestBytes": 1024, "maxResponseBytes": 1024
-    });
-    write_config(&broker.config(), &document);
+    let bindings = enable_managed_oauth(&broker);
+    let map = |revision: &str| managed_oauth_map(&record, revision, "one");
     write_owner_only(&bindings, map("one").as_bytes());
     let capture = dekopon_test_support::CaptureLayer::new();
     let reported = || {
@@ -2514,6 +2563,12 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
                 &[("event", "broker_credential_record_invalid")],
             )
             .len()
+    };
+    let recoveries = || {
+        capture.events_where(
+            "dekopon_brokerd",
+            &[("event", "broker_credential_record_recovered")],
+        )
     };
     async {
         let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
@@ -2538,6 +2593,137 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
             (next.clone(), GenerationOutcome::Active)
         );
         assert_eq!(reported(), 2, "a committed change reports once");
+        assert!(recoveries().is_empty());
+
+        fs::remove_file(&record).unwrap();
+        write_owner_only(&bindings, map("three").as_bytes());
+        let (missing, outcome) = owner.prepare(&next, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.commit(&missing, uid), GenerationOutcome::Applied);
+        assert!(
+            recoveries().is_empty(),
+            "a missing record is not a valid record"
+        );
+
+        write_owner_only(&record, SEALED_OAUTH_RECORD);
+        write_owner_only(&bindings, map("four").as_bytes());
+        let (repaired, outcome) = owner.prepare(&missing, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        let recovered = recoveries();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].field("generation.digest"),
+            Some(repaired.as_str())
+        );
+        let record_digest: String = Sha256::digest("drn:secret:oauth/one")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            recovered[0].field("credential.digest"),
+            Some(record_digest.as_str())
+        );
+        assert_eq!(owner.abort(&repaired, uid), GenerationOutcome::Aborted);
+
+        write_owner_only(&bindings, map("five").as_bytes());
+        let (again, outcome) = owner.prepare(&missing, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.commit(&again, uid), GenerationOutcome::Applied);
+        assert_eq!(recoveries().len(), 1);
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+}
+
+#[tokio::test]
+async fn only_the_latest_discarded_oauth_candidate_keeps_recovery_markers() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let directory = broker.directory.path().canonicalize().unwrap();
+    let stale = directory.join("stale.json");
+    let record = directory.join("aborted.json");
+    let unrelated = directory.join("unrelated.json");
+    write_owner_only(&unrelated, SEALED_OAUTH_RECORD);
+    let bindings = enable_managed_oauth(&broker);
+    write_owner_only(
+        &bindings,
+        managed_oauth_map(&unrelated, "boot", "other").as_bytes(),
+    );
+
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let recoveries = || {
+        capture.events_where(
+            "dekopon_brokerd",
+            &[("event", "broker_credential_record_recovered")],
+        )
+    };
+    async {
+        let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let owner = super::Coordination::new(broker.config(), active.unwrap());
+        let uid = current_uid();
+        let active = owner.active().digest.clone();
+        for (record, name) in [(&stale, "stale"), (&record, "new")] {
+            write_owner_only(record, b"{\"state\":");
+            write_owner_only(&bindings, managed_oauth_map(record, name, name).as_bytes());
+            let (aborted, outcome) = owner.prepare(&active, uid).await;
+            assert_eq!(outcome, GenerationOutcome::Prepared);
+            assert_eq!(owner.abort(&aborted, uid), GenerationOutcome::Aborted);
+            assert_eq!(
+                capture
+                    .events_where(
+                        "dekopon_brokerd",
+                        &[
+                            ("event", "broker_credential_record_invalid"),
+                            ("credential", &format!("drn:secret:oauth/{name}")),
+                        ],
+                    )
+                    .len(),
+                1
+            );
+        }
+
+        write_owner_only(
+            &bindings,
+            managed_oauth_map(&unrelated, "next", "other").as_bytes(),
+        );
+        let (next, outcome) = owner.prepare(&active, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.commit(&next, uid), GenerationOutcome::Applied);
+        write_owner_only(&stale, SEALED_OAUTH_RECORD);
+        write_owner_only(
+            &bindings,
+            managed_oauth_map(&stale, "valid-stale", "stale").as_bytes(),
+        );
+        let (current, outcome) = owner.prepare(&next, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.commit(&current, uid), GenerationOutcome::Applied);
+        assert!(recoveries().is_empty());
+
+        write_owner_only(&record, SEALED_OAUTH_RECORD);
+        write_owner_only(
+            &bindings,
+            managed_oauth_map(&record, "repaired", "new").as_bytes(),
+        );
+        let (repaired, outcome) = owner.prepare(&current, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.abort(&repaired, uid), GenerationOutcome::Aborted);
+        let recovered = recoveries();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].field("generation.digest"),
+            Some(repaired.as_str())
+        );
+
+        assert_eq!(
+            owner.prepare(&current, uid).await,
+            (repaired, GenerationOutcome::Prepared)
+        );
+        assert_eq!(recoveries().len(), 1);
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
     .await;

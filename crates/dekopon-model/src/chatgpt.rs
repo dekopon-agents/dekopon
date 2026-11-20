@@ -111,18 +111,37 @@ impl CredentialFile {
         Self::with_endpoints(auth_path, ChatGptEndpoints::production())
     }
 
+    pub fn from_document(auth_path: &Path, bytes: &[u8]) -> Result<Self, ChatGptError> {
+        Ok(Self::with_credentials(
+            auth_path,
+            ChatGptEndpoints::production(),
+            parse_credentials(auth_path, bytes)?,
+        ))
+    }
+
     pub(crate) fn with_endpoints(
         auth_path: &Path,
         endpoints: ChatGptEndpoints,
     ) -> Result<Self, ChatGptError> {
-        let credentials = load_credentials(auth_path)?;
-        Ok(Self {
+        Ok(Self::with_credentials(
+            auth_path,
+            endpoints,
+            load_credentials(auth_path)?,
+        ))
+    }
+
+    fn with_credentials(
+        auth_path: &Path,
+        endpoints: ChatGptEndpoints,
+        credentials: ChatGptCredentials,
+    ) -> Self {
+        Self {
             admission: Arc::new(Semaphore::new(1)),
             tasks: Mutex::new(JoinSet::new()),
             path: auth_path.to_path_buf(),
             credentials: Mutex::new(credentials),
             endpoints,
-        })
+        }
     }
 
     #[must_use]
@@ -985,7 +1004,11 @@ fn load_credentials(path: &Path) -> Result<ChatGptCredentials, ChatGptError> {
             }
         }
     })?;
-    let credentials = serde_json::from_slice::<ChatGptCredentials>(&bytes).map_err(|source| {
+    parse_credentials(path, &bytes)
+}
+
+fn parse_credentials(path: &Path, bytes: &[u8]) -> Result<ChatGptCredentials, ChatGptError> {
+    let credentials = serde_json::from_slice::<ChatGptCredentials>(bytes).map_err(|source| {
         ChatGptError::ParseAuth {
             path: path.to_path_buf(),
             category: source.classify(),
