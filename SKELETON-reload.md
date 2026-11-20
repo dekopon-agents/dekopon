@@ -1,4 +1,4 @@
-# skeleton-reload: design skeleton (round 3)
+# skeleton-reload: design skeleton (round 4)
 
 Step `06-designs/skeleton-reload/design`. Branch `design/skeleton-reload`, PR dekopon-agents/dekopon#982,
 on main `af0dcf4`. The PR is never merged as is: units copy from it or stack on it.
@@ -103,9 +103,10 @@ waits for #979 and D2.
 - **`daemon/watcher-core`** (rank 2, 17 items, 38 tests). The core module, the shared
   projection predicate (and its two moved callers), and the gateway's Config group replacing the 2 s
   tick.
-- **`daemon/broker-self-reload`** (rank 3, 12 items, 29 tests). D1 (including the
+- **`daemon/broker-self-reload`** (rank 3, 14 items, 29 tests). D1 (including the
   deleted variants' match arms in `dekopon-agent` and gatewayd's tests), the broker's groups, the
-  held-open publication on both sides, the commit-woken refresh scheduler, the lock group, the
+  held-open publication on both sides, `serve_with_watcher` (the watcher factory that replaces
+  `lock_poll`, so daemon tests get an `Injector`), the commit-woken refresh scheduler, the lock group, the
   secret map's key paths in the Config watch set, and `docs/deploy.md` ("While the gateway is
   connected, the broker reloads…" loses its condition).
 - **`daemon/reload-consumers`** (rank 4, 8 items, 15 tests). Restart categories as
@@ -170,7 +171,7 @@ waits for #979 and D2.
 | S-reload-21 | `pub(crate) enum GatewayGroup { Config(Box<ReloadState>), ProxyTls(TlsReload) } (impl Reconcile)` | type | `crates/dekopon-gatewayd/src/gateway/reload.rs` | the gateway's groups; Config is Operator, ProxyTls is Machine |
 | S-reload-22 | `ReloadState::watch_set, async ReloadState::reconcile_cause` | async signature | `crates/dekopon-gatewayd/src/gateway/reload.rs` | the watch set is every path `GatewaySources` read; a restart-only candidate that passes boot-only validation exits with `RestartRequired`, otherwise it is refused once and last good serves |
 | S-reload-23 | `pub struct GenerationDigest, CommitSignal, CommitReceiver (+ async changed)` | type | `crates/dekopon-core/src/reload/commit.rs` | latest-only; a new subscriber starts from the active generation; a dropped signal ends every subscriber |
-| S-reload-24 | `async fn broker_generation::follow(client, commits, active)` | async signature | `crates/dekopon-gatewayd/src/gateway/broker_generation.rs` | task owner: the gateway's reload set; reads the digest the broker publishes at connect and each commit; a lost feed reconnects with bounded backoff (the `Unsettled::Monitor` retry today) while serving continues on the last digest, and a mismatch fails closed at Cedar; it never ends the gateway |
+| S-reload-24 | `async fn broker_generation::follow(client, commits, active) -> Infallible` | async signature | `crates/dekopon-gatewayd/src/gateway/broker_generation.rs` | task owner: the gateway's reload set; reads the digest the broker publishes at connect and each commit; a lost feed reconnects with bounded backoff (the `Unsettled::Monitor` retry today) while serving continues on the last digest, and a mismatch fails closed at Cedar; it never ends, so it joins the `JoinSet<GatewaydError>` of S-reload-03 as `async move { match follow(..).await {} }` |
 | S-reload-25 | `ServingGeneration::with_broker(&GenerationDigest)` | type | `crates/dekopon-gatewayd/src/gateway/broker_generation.rs` | folds the published digest into the serving digest without calling prepare |
 | S-reload-26 | `pub(crate) enum BrokerGroup { Config(ConfigGroup), Lock(LockGroup), Signer(SignerGroup) } (impl Reconcile)` | type | `crates/dekopon-brokerd/src/self_reload.rs` | the broker's groups; Config is Operator, Lock and Signer are Machine; `Exit = BrokerStop` through `impl From<ReloadError> for BrokerStop` |
 | S-reload-27 | `async Coordination::reload(&self, Cause); Coordination::watch_set; Coordination::commits() -> CommitReceiver` | async signature | `crates/dekopon-brokerd/src/self_reload.rs` | swaps after its last await, keeping credential retirement, `policy_loaded`, refusal dedup and shutdown drain; publishes each commit; the watch set includes every private source (secret map, policies, GitHub App keys) |
@@ -191,6 +192,8 @@ waits for #979 and D2.
 | S-reload-131 | `async fn serve_observer(stream, commits, limits) -> Result<(), ConnectionError>` | async signature | `crates/dekopon-brokerd/src/server.rs` | task owner: the server's observer set, separate from connection tasks; writes one `Generation` frame per commit |
 | S-reload-132 | `async fn drain_observers(observers: &mut ConnectionTasks)` | async signature | `crates/dekopon-brokerd/src/server.rs` | observers end at admission close, before the connection drain, so a broker stop with a gateway attached never ends in `ShutdownTimeout` |
 | S-reload-133 | `LoadedMap::key_paths(&self) -> Vec<PathBuf>` | type | `crates/dekopon-brokerd/src/secrets.rs` | every key file the secret map names (GitHub App keys) joins the Config group's watch set |
+| S-reload-137 | `async fn serve_with_watcher(config_path, shutdown, deadline, watcher: W) where W: FnOnce(ReloadSettings, Vec<BrokerGroup>) -> Result<Watcher<BrokerGroup>, ReloadError>` | async signature | `crates/dekopon-brokerd/src/lib.rs` | replaces `serve` and its `lock_poll`: `run` passes `Watcher::subscribe`; the factory receives the loaded settings and groups and returns the watcher |
+| S-reload-138 | `#[cfg(test)] fn injected_watcher(sender: oneshot::Sender<Injector>) -> impl FnOnce(..)` | type | `crates/dekopon-brokerd/src/self_reload.rs` | the test factory: builds `Watcher::injected` and sends its `Injector` to the test; the callers at `tests.rs:2978` and `ManagedBroker::serve` (`tests.rs:3841`) move onto it |
 
 ## Tests
 
@@ -294,7 +297,7 @@ waits for #979 and D2.
 ```footprint
 {"unit": "daemon/supervisor", "step": "09-daemon/supervisor/build", "files": ["crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/gateway/reload.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/tests/reload_watch.rs", "crates/dekopon-brokerd/src/lib.rs", "crates/dekopon-brokerd/src/self_reload.rs", "crates/dekopon-brokerd/src/lock_watch.rs", "crates/dekopon-brokerd/src/reload_tests.rs", "crates/dekopon-brokerd/src/tests.rs"], "items": ["S-reload-01", "S-reload-02", "S-reload-03", "S-reload-04", "S-reload-05", "S-reload-129", "S-reload-40", "S-reload-41", "S-reload-42", "S-reload-43", "S-reload-135"], "rank": 1}
 {"unit": "daemon/watcher-core", "step": "09-daemon/watcher-core/build", "files": ["crates/dekopon-core/src/reload/error.rs", "crates/dekopon-core/src/reload/group.rs", "crates/dekopon-core/src/reload/path.rs", "crates/dekopon-core/src/reload/settings.rs", "crates/dekopon-core/src/reload/watcher.rs", "crates/dekopon-core/src/reload/tests.rs", "crates/dekopon-core/src/projection.rs", "crates/dekopon-config/src/projection.rs", "crates/dekopon-brokerd/src/secrets.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/gateway/reload.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests/reload_watch.rs"], "items": ["S-reload-06", "S-reload-07", "S-reload-08", "S-reload-09", "S-reload-10", "S-reload-11", "S-reload-12", "S-reload-13", "S-reload-14", "S-reload-15", "S-reload-16", "S-reload-17", "S-reload-18", "S-reload-19", "S-reload-20", "S-reload-21", "S-reload-22", "S-reload-44", "S-reload-45", "S-reload-46", "S-reload-47", "S-reload-48", "S-reload-49", "S-reload-50", "S-reload-51", "S-reload-52", "S-reload-53", "S-reload-54", "S-reload-55", "S-reload-56", "S-reload-57", "S-reload-58", "S-reload-59", "S-reload-60", "S-reload-61", "S-reload-62", "S-reload-63", "S-reload-64", "S-reload-65", "S-reload-66", "S-reload-67", "S-reload-68", "S-reload-69", "S-reload-70", "S-reload-71", "S-reload-72", "S-reload-73", "S-reload-74", "S-reload-75", "S-reload-76", "S-reload-77", "S-reload-78", "S-reload-79", "S-reload-80", "S-reload-81"], "rank": 2}
-{"unit": "daemon/broker-self-reload", "step": "09-daemon/broker-self-reload/build", "files": ["crates/dekopon-core/src/reload/commit.rs", "crates/dekopon-core/src/reload/tests.rs", "crates/dekopon-brokerd/src/self_reload.rs", "crates/dekopon-brokerd/src/lock_watch.rs", "crates/dekopon-brokerd/src/refresh_scheduler.rs", "crates/dekopon-brokerd/src/lib.rs", "crates/dekopon-brokerd/src/server.rs", "crates/dekopon-brokerd/src/config.rs", "crates/dekopon-brokerd/src/reload_tests.rs", "crates/dekopon-brokerd/src/tests.rs", "crates/dekopon-broker-protocol/src/lib.rs", "crates/dekopon-broker-protocol/src/tests.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/gateway/broker_generation.rs", "crates/dekopon-gatewayd/src/gateway/reload.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/tests/reload_watch.rs", "docs/deploy.md", "crates/dekopon-agent/src/lib.rs", "crates/dekopon-gatewayd/src/tests.rs", "crates/dekopon-gatewayd/src/tests/github_burst.rs", "crates/dekopon-gatewayd/src/tests/jobs_e2e.rs", "crates/dekopon-brokerd/src/secrets.rs"], "items": ["S-reload-23", "S-reload-24", "S-reload-25", "S-reload-26", "S-reload-27", "S-reload-28", "S-reload-29", "S-reload-30", "S-reload-82", "S-reload-83", "S-reload-84", "S-reload-85", "S-reload-86", "S-reload-87", "S-reload-88", "S-reload-89", "S-reload-90", "S-reload-91", "S-reload-92", "S-reload-93", "S-reload-94", "S-reload-95", "S-reload-96", "S-reload-97", "S-reload-98", "S-reload-99", "S-reload-100", "S-reload-101", "S-reload-102", "S-reload-103", "S-reload-104", "S-reload-105", "S-reload-106", "S-reload-107", "S-reload-108", "S-reload-109", "S-reload-130", "S-reload-131", "S-reload-132", "S-reload-133", "S-reload-134"], "rank": 3}
+{"unit": "daemon/broker-self-reload", "step": "09-daemon/broker-self-reload/build", "files": ["crates/dekopon-core/src/reload/commit.rs", "crates/dekopon-core/src/reload/tests.rs", "crates/dekopon-brokerd/src/self_reload.rs", "crates/dekopon-brokerd/src/lock_watch.rs", "crates/dekopon-brokerd/src/refresh_scheduler.rs", "crates/dekopon-brokerd/src/lib.rs", "crates/dekopon-brokerd/src/server.rs", "crates/dekopon-brokerd/src/config.rs", "crates/dekopon-brokerd/src/reload_tests.rs", "crates/dekopon-brokerd/src/tests.rs", "crates/dekopon-broker-protocol/src/lib.rs", "crates/dekopon-broker-protocol/src/tests.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/gateway/broker_generation.rs", "crates/dekopon-gatewayd/src/gateway/reload.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/tests/reload_watch.rs", "docs/deploy.md", "crates/dekopon-agent/src/lib.rs", "crates/dekopon-gatewayd/src/tests.rs", "crates/dekopon-gatewayd/src/tests/github_burst.rs", "crates/dekopon-gatewayd/src/tests/jobs_e2e.rs", "crates/dekopon-brokerd/src/secrets.rs"], "items": ["S-reload-23", "S-reload-24", "S-reload-25", "S-reload-26", "S-reload-27", "S-reload-28", "S-reload-29", "S-reload-30", "S-reload-82", "S-reload-83", "S-reload-84", "S-reload-85", "S-reload-86", "S-reload-87", "S-reload-88", "S-reload-89", "S-reload-90", "S-reload-91", "S-reload-92", "S-reload-93", "S-reload-94", "S-reload-95", "S-reload-96", "S-reload-97", "S-reload-98", "S-reload-99", "S-reload-100", "S-reload-101", "S-reload-102", "S-reload-103", "S-reload-104", "S-reload-105", "S-reload-106", "S-reload-107", "S-reload-108", "S-reload-109", "S-reload-130", "S-reload-131", "S-reload-132", "S-reload-133", "S-reload-134", "S-reload-137", "S-reload-138"], "rank": 3}
 {"unit": "daemon/reload-consumers", "step": "09-daemon/reload-consumers/build", "files": ["crates/dekopon-gatewayd/src/gateway/consumers.rs", "crates/dekopon-gatewayd/src/gateway/reload.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/proxy.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/tests/reload_watch.rs", "crates/dekopon-model-proxy/src/tls.rs", "crates/dekopon-model-proxy/src/tls/reload.rs"], "items": ["S-reload-31", "S-reload-32", "S-reload-33", "S-reload-34", "S-reload-35", "S-reload-36", "S-reload-37", "S-reload-38", "S-reload-110", "S-reload-111", "S-reload-112", "S-reload-113", "S-reload-114", "S-reload-115", "S-reload-116", "S-reload-117", "S-reload-118", "S-reload-119", "S-reload-120", "S-reload-121", "S-reload-122", "S-reload-123", "S-reload-136"], "rank": 4}
 {"unit": "daemon/signer-reload", "step": "09-daemon/signer-reload/build", "files": ["crates/dekopon-brokerd/src/signer_reload.rs", "crates/dekopon-brokerd/src/token_issuer.rs", "crates/dekopon-brokerd/src/secrets.rs", "crates/dekopon-brokerd/src/self_reload.rs", "crates/dekopon-brokerd/src/reload_tests.rs"], "items": ["S-reload-39", "S-reload-124", "S-reload-125", "S-reload-126", "S-reload-127", "S-reload-128"], "rank": 5}
 ```
@@ -302,16 +305,13 @@ waits for #979 and D2.
 ## Gates (this head)
 
 Passed: `git diff --check`; `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
---all-features --locked -- -D warnings`; both daemon dependency-boundary checks and
-`test_daemon_dependency_gates.py`; `cargo machete`; `cargo deny --locked check`;
-`RUSTDOCFLAGS=-D warnings cargo doc --workspace --all-features --no-deps`; `cargo check --release`
-for the three daemons; `wasm32-unknown-unknown` checks of `dekopon-core` and `dekopon-provider-sdk`.
-Test filters: core `reload` 26 ignored; model-proxy `tls` 4 passed, 6 ignored; brokerd
-`reload_tests` 27 ignored, `lock_watch` 6 passed; gatewayd `reload` 20 passed, 32 ignored;
-broker-protocol `generation` 4 passed. Round 2 also ran gatewayd `serve` and the seven converted
-`ServeOutcome` tests by name; no serving body changed since. Not run: the full `cargo test
---workspace` and the provider-example workspaces. The `docs` word-budget job counts
-`SKELETON-reload.md` while it sits at the branch root.
+--all-features --locked -- -D warnings`; `test_daemon_dependency_gates.py`; `cargo machete`;
+`cargo deny --locked check`; `RUSTDOCFLAGS=-D warnings cargo doc --workspace --all-features
+--no-deps`; `cargo check --release` for the three daemons. Test filters: brokerd `reload_tests` 27
+ignored, `lock_watch` 6 passed; gatewayd `reload` 20 passed, 32 ignored. Round 3 ran the wasm32
+checks, both boundary greps and the core, model-proxy and broker-protocol filters; no dependency
+or core change since. Not run: the full `cargo test --workspace` and the provider-example
+workspaces. The `docs` word-budget job counts `SKELETON-reload.md` while it sits at the branch root.
 
 ## Choices I made
 
@@ -331,7 +331,11 @@ broker-protocol `generation` 4 passed. Round 2 also ran gatewayd `serve` and the
 - Not changed (recorded): the 30 s activation bound against a slow probe, the lock-change exit
   status, a task-only join. N1, the default-feature clippy warning at `transport.rs:230`, is
   inherited and unchanged.
+- Round 4: `follow` returns `Infallible` rather than the set taking a unit-or-error output, so the
+  type states it never ends and `match follow(..).await {}` adapts it to the error-typed set; the
+  test factory is a closure-returning stub because a `todo!()` body cannot stand for `impl FnOnce`.
 - Round 3: `Reconcile::Exit` drops its `Error` bound so the broker's stop can be the clean
   `BrokerStop::LockChanged`; `follow` returns `()` because it never ends the gateway; observers get
   their own drain rather than a shorter grace.
+- P1–P8 from the round 2 adjudication and N7–N13 are recorded, not widened.
 - Merged main and added commits instead of force-pushing, so the draft stays in the PR history.
