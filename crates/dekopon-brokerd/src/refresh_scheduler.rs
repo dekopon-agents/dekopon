@@ -1,11 +1,17 @@
-use std::{collections::BTreeMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::{task::JoinSet, time::MissedTickBehavior};
 use tracing::instrument::WithSubscriber as _;
 
 use crate::{
     BrokerdError, ServerError, ShutdownDeadline,
-    secrets::{self, RecordInspectionKey, SourceError, oauth2},
+    secrets::{self, SourceError, oauth2},
 };
 
 const TICK: Duration = Duration::from_secs(5 * 60);
@@ -36,6 +42,7 @@ where
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut retry = BTreeMap::<PathBuf, u64>::new();
+    let mut unreadable = BTreeSet::<PathBuf>::new();
     let mut attempts = JoinSet::<Result<(), SourceError>>::new();
     let mut generation: Option<secrets::ScheduledCatalog> = None;
     loop {
@@ -50,11 +57,12 @@ where
             .is_none_or(|previous| !current.same_generation(previous));
         if new_generation {
             retry.clear();
-            current.record_inspections().start_generation();
+            unreadable.clear();
         }
         generation = Some(current.clone());
         let entries = current.entries();
         retry.retain(|record, _| entries.iter().any(|(_, path, _)| path == record));
+        unreadable.retain(|record| entries.iter().any(|(_, path, _)| path == record));
         for (drn, path, has_seed) in entries {
             let seed_on_boot = new_generation && has_seed;
             let now = now_seconds();
@@ -64,22 +72,20 @@ where
             let uid = crate::socket::current_uid();
             let record = path.clone();
             let inspected = tokio::task::spawn_blocking(move || oauth2::due_at(&record, uid)).await;
-            let key = RecordInspectionKey::of(&drn, &path);
             let due = match inspected {
                 Ok(Ok(due)) => {
-                    current.record_inspections().scheduled_readable(&key);
+                    unreadable.remove(&path);
                     due.is_some_and(|due| due <= now) || seed_on_boot
                 }
                 Ok(Err(error)) => {
-                    let mut inspections = current.record_inspections();
-                    if inspections.scheduled_unreported(key) && !new_generation {
-                        inspections.invalid_reported(key);
+                    if unreadable.insert(path.clone()) && !new_generation {
+                        current.mark_record_invalid(&drn);
                         tracing::error!(event = "broker_credential_record_invalid", credential = %drn, category = error.category(), instruction = "delete the record and provide a new seed", "broker.credential.record.invalid");
                     }
                     false
                 }
                 Err(_join) => {
-                    if current.record_inspections().scheduled_unreported(key) && !new_generation {
+                    if unreadable.insert(path.clone()) && !new_generation {
                         tracing::error!(
                             event = "broker_credential_record_inspection_failed",
                             "broker.credential.record.inspection.failed"

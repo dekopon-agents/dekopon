@@ -3,7 +3,10 @@ use std::{
     fmt,
     num::NonZeroU64,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -338,6 +341,7 @@ struct ResolvedEntry {
     projection: Projection,
     client: reqwest::Client,
     minted: Option<Arc<Minted>>,
+    record_invalid: OnceLock<Arc<AtomicBool>>,
 }
 
 enum Minted {
@@ -363,10 +367,10 @@ struct MapResolver {
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct RecordInspectionKey([u8; 32]);
+struct RecordInspectionKey([u8; 32]);
 
 impl RecordInspectionKey {
-    pub(crate) fn of(drn: &SecretDrn, path: &Path) -> Self {
+    fn of(drn: &SecretDrn, path: &Path) -> Self {
         Self(
             Sha256::new()
                 .chain_update(drn.as_str().len().to_le_bytes())
@@ -379,58 +383,11 @@ impl RecordInspectionKey {
 }
 
 #[derive(Default)]
-struct UnreadableRecord {
-    scheduled_unreadable: bool,
-    recovery_pending: bool,
-}
-
-#[derive(Default)]
-pub(crate) struct RecordInspectionDedup(BTreeMap<RecordInspectionKey, UnreadableRecord>);
-
-impl RecordInspectionDedup {
-    pub(crate) fn start_generation(&mut self) {
-        self.0.retain(|_, failure| {
-            failure.scheduled_unreadable = false;
-            failure.recovery_pending
-        });
-    }
-
-    pub(crate) fn scheduled_readable(&mut self, key: &RecordInspectionKey) {
-        if let Some(failure) = self.0.get_mut(key) {
-            failure.scheduled_unreadable = false;
-            if !failure.recovery_pending {
-                self.0.remove(key);
-            }
-        }
-    }
-
-    pub(crate) fn scheduled_unreported(&mut self, key: RecordInspectionKey) -> bool {
-        !std::mem::replace(
-            &mut self.0.entry(key).or_default().scheduled_unreadable,
-            true,
-        )
-    }
-
-    pub(crate) fn invalid_reported(&mut self, key: RecordInspectionKey) {
-        self.0.entry(key).or_default().recovery_pending = true;
-    }
-
-    fn recovered(&mut self, key: &RecordInspectionKey) -> bool {
-        let Some(failure) = self.0.get_mut(key) else {
-            return false;
-        };
-        let recovered = std::mem::take(&mut failure.recovery_pending);
-        if !failure.scheduled_unreadable {
-            self.0.remove(key);
-        }
-        recovered
-    }
-}
+pub(crate) struct DiscardedRecordMarkers(BTreeMap<RecordInspectionKey, Arc<AtomicBool>>);
 
 #[derive(Clone, Default)]
 pub(crate) struct ScheduledCatalog {
     resolver: Option<Arc<MapResolver>>,
-    record_inspections: Arc<parking_lot::Mutex<RecordInspectionDedup>>,
 }
 
 impl ScheduledCatalog {
@@ -446,12 +403,55 @@ impl ScheduledCatalog {
         self.resolver.as_ref()?.entries.get(drn)
     }
 
-    pub(crate) fn share_record_inspections(&mut self, active: &Self) {
-        self.record_inspections = Arc::clone(&active.record_inspections);
+    pub(crate) fn inherit_record_markers(&self, active: &Self, discarded: &DiscardedRecordMarkers) {
+        let Some(resolver) = &self.resolver else {
+            return;
+        };
+        for (drn, entry) in &resolver.entries {
+            if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
+                // A discard can take the candidate before its inspection has marked the record.
+                entry.record_invalid.get_or_init(|| {
+                    let active_marker = active.entry(drn).and_then(|prior| {
+                        if let SecretSource::OAuth2Refresh {
+                            record_path: prior_path,
+                            ..
+                        } = &prior.source
+                            && prior_path == record_path
+                        {
+                            return prior.record_invalid.get();
+                        }
+                        None
+                    });
+                    active_marker
+                        .or_else(|| discarded.0.get(&RecordInspectionKey::of(drn, record_path)))
+                        .cloned()
+                        .unwrap_or_default()
+                });
+            }
+        }
     }
 
-    pub(crate) fn record_inspections(&self) -> parking_lot::MutexGuard<'_, RecordInspectionDedup> {
-        self.record_inspections.lock()
+    pub(crate) fn retain_discarded_record_markers(&self, discarded: &mut DiscardedRecordMarkers) {
+        let Some(resolver) = &self.resolver else {
+            return;
+        };
+        let markers: BTreeMap<_, _> = resolver
+            .entries
+            .iter()
+            .filter_map(|(drn, entry)| {
+                if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
+                    let marker = entry.record_invalid.get()?;
+                    return Some((
+                        RecordInspectionKey::of(drn, record_path),
+                        Arc::clone(marker),
+                    ));
+                }
+                None
+            })
+            .collect();
+        if !markers.is_empty() {
+            discarded.0 = markers;
+        }
     }
 
     pub(crate) async fn inspect_records(&self, generation: Option<&str>) {
@@ -460,19 +460,18 @@ impl ScheduledCatalog {
         };
         for (drn, entry) in &resolver.entries {
             if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
+                let invalid = Arc::clone(entry.record_invalid.get_or_init(Arc::default));
                 let path = record_path.clone();
                 let credential = drn.clone();
                 let uid = resolver.expected_uid;
                 let generation = generation.map(str::to_owned);
-                let inspections = Arc::clone(&self.record_inspections);
                 let dispatch = tracing::dispatcher::get_default(Clone::clone);
                 if tokio::task::spawn_blocking(move || {
                     tracing::dispatcher::with_default(&dispatch, || {
-                        let key = RecordInspectionKey::of(&credential, &path);
                         match oauth2::inspect_boot(&path, uid, &credential) {
                             oauth2::RecordInspection::Valid => {
                                 if let Some(generation) = generation
-                                    && inspections.lock().recovered(&key)
+                                    && invalid.swap(false, Ordering::Relaxed)
                                 {
                                     let digest: String = Sha256::digest(credential.as_str())
                                         .iter()
@@ -487,7 +486,7 @@ impl ScheduledCatalog {
                                 }
                             }
                             oauth2::RecordInspection::Invalid => {
-                                inspections.lock().invalid_reported(key);
+                                invalid.store(true, Ordering::Relaxed);
                             }
                             oauth2::RecordInspection::Missing => {}
                         }
@@ -502,6 +501,15 @@ impl ScheduledCatalog {
                     );
                 }
             }
+        }
+    }
+
+    pub(crate) fn mark_record_invalid(&self, drn: &SecretDrn) {
+        if let Some(entry) = self.entry(drn) {
+            entry
+                .record_invalid
+                .get_or_init(Arc::default)
+                .store(true, Ordering::Relaxed);
         }
     }
 
@@ -2044,6 +2052,7 @@ async fn validate_map(
                 projection,
                 client,
                 minted: minted_source,
+                record_invalid: OnceLock::new(),
             },
         );
     }
@@ -2059,7 +2068,6 @@ async fn validate_map(
         catalog,
         scheduled: ScheduledCatalog {
             resolver: Some(resolver),
-            ..ScheduledCatalog::default()
         },
         chatgpt: minted.chatgpt,
         minted_digest: minted.minted_digest,

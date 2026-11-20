@@ -13,7 +13,6 @@ fn scheduled_entries(path: &Path, endpoint: &str, names: &[&str]) -> MapResolver
 fn scheduled_resolver(path: &Path, endpoint: &str, names: &[&str]) -> ScheduledCatalog {
     ScheduledCatalog {
         resolver: Some(Arc::new(scheduled_entries(path, endpoint, names))),
-        ..ScheduledCatalog::default()
     }
 }
 
@@ -187,7 +186,6 @@ async fn a_malformed_scheduled_record_is_not_reported_on_each_tick() {
         .extend(scheduled_entries(&live, &api.endpoint, &["live"]).entries);
     let scheduled = ScheduledCatalog {
         resolver: Some(Arc::new(entries)),
-        ..ScheduledCatalog::default()
     };
     let now = Arc::new(AtomicU64::new(22 * 3600));
     let capture = CaptureLayer::new();

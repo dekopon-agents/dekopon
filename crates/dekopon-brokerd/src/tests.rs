@@ -2636,7 +2636,7 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
 }
 
 #[tokio::test]
-async fn an_aborted_oauth_record_can_recover_after_an_unrelated_generation() {
+async fn only_the_latest_discarded_oauth_candidate_keeps_recovery_markers() {
     use dekopon_broker_protocol::GenerationOutcome;
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::prelude::*;
@@ -2644,9 +2644,9 @@ async fn an_aborted_oauth_record_can_recover_after_an_unrelated_generation() {
     let broker = ManagedBroker::gateway();
     broker.publish_lock('1');
     let directory = broker.directory.path().canonicalize().unwrap();
+    let stale = directory.join("stale.json");
     let record = directory.join("aborted.json");
     let unrelated = directory.join("unrelated.json");
-    write_owner_only(&record, b"{\"state\":");
     write_owner_only(&unrelated, SEALED_OAUTH_RECORD);
     let bindings = enable_managed_oauth(&broker);
     write_owner_only(
@@ -2667,25 +2667,25 @@ async fn an_aborted_oauth_record_can_recover_after_an_unrelated_generation() {
         let owner = super::Coordination::new(broker.config(), active.unwrap());
         let uid = current_uid();
         let active = owner.active().digest.clone();
-        write_owner_only(
-            &bindings,
-            managed_oauth_map(&record, "aborted", "new").as_bytes(),
-        );
-        let (aborted, outcome) = owner.prepare(&active, uid).await;
-        assert_eq!(outcome, GenerationOutcome::Prepared);
-        assert_eq!(owner.abort(&aborted, uid), GenerationOutcome::Aborted);
-        assert_eq!(
-            capture
-                .events_where(
-                    "dekopon_brokerd",
-                    &[
-                        ("event", "broker_credential_record_invalid"),
-                        ("credential", "drn:secret:oauth/new"),
-                    ],
-                )
-                .len(),
-            1
-        );
+        for (record, name) in [(&stale, "stale"), (&record, "new")] {
+            write_owner_only(record, b"{\"state\":");
+            write_owner_only(&bindings, managed_oauth_map(record, name, name).as_bytes());
+            let (aborted, outcome) = owner.prepare(&active, uid).await;
+            assert_eq!(outcome, GenerationOutcome::Prepared);
+            assert_eq!(owner.abort(&aborted, uid), GenerationOutcome::Aborted);
+            assert_eq!(
+                capture
+                    .events_where(
+                        "dekopon_brokerd",
+                        &[
+                            ("event", "broker_credential_record_invalid"),
+                            ("credential", &format!("drn:secret:oauth/{name}")),
+                        ],
+                    )
+                    .len(),
+                1
+            );
+        }
 
         write_owner_only(
             &bindings,
@@ -2694,6 +2694,14 @@ async fn an_aborted_oauth_record_can_recover_after_an_unrelated_generation() {
         let (next, outcome) = owner.prepare(&active, uid).await;
         assert_eq!(outcome, GenerationOutcome::Prepared);
         assert_eq!(owner.commit(&next, uid), GenerationOutcome::Applied);
+        write_owner_only(&stale, SEALED_OAUTH_RECORD);
+        write_owner_only(
+            &bindings,
+            managed_oauth_map(&stale, "valid-stale", "stale").as_bytes(),
+        );
+        let (current, outcome) = owner.prepare(&next, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.commit(&current, uid), GenerationOutcome::Applied);
         assert!(recoveries().is_empty());
 
         write_owner_only(&record, SEALED_OAUTH_RECORD);
@@ -2701,7 +2709,7 @@ async fn an_aborted_oauth_record_can_recover_after_an_unrelated_generation() {
             &bindings,
             managed_oauth_map(&record, "repaired", "new").as_bytes(),
         );
-        let (repaired, outcome) = owner.prepare(&next, uid).await;
+        let (repaired, outcome) = owner.prepare(&current, uid).await;
         assert_eq!(outcome, GenerationOutcome::Prepared);
         assert_eq!(owner.abort(&repaired, uid), GenerationOutcome::Aborted);
         let recovered = recoveries();
@@ -2712,7 +2720,7 @@ async fn an_aborted_oauth_record_can_recover_after_an_unrelated_generation() {
         );
 
         assert_eq!(
-            owner.prepare(&next, uid).await,
+            owner.prepare(&current, uid).await,
             (repaired, GenerationOutcome::Prepared)
         );
         assert_eq!(recoveries().len(), 1);

@@ -165,6 +165,7 @@ fn resolver(path: &Path, endpoint: &str, suffixes: &[&str]) -> MapResolver {
                         projection: Projection::default(),
                         client: client.clone(),
                         minted: None,
+                        record_invalid: Default::default(),
                     },
                 )
             })

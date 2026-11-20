@@ -385,12 +385,22 @@ struct Coordination {
 struct GenerationState {
     active: Arc<Candidate>,
     prepared: Option<(u32, Arc<Candidate>, Arc<Candidate>)>,
+    discarded_record_markers: secrets::DiscardedRecordMarkers,
     reported: Option<RawCandidate>,
     rejected: Option<RawCandidate>,
     retired_credentials: Vec<std::sync::Weak<dekopon_model::chatgpt::CredentialFile>>,
 }
 
 impl GenerationState {
+    fn discard_prepared(&mut self) {
+        if let Some((_, _, previous)) = self.prepared.take() {
+            previous
+                .ready
+                .scheduled
+                .retain_discarded_record_markers(&mut self.discarded_record_markers);
+        }
+    }
+
     fn unreported(&mut self, raw: RawCandidate) -> bool {
         self.reported.replace(raw) != Some(raw)
     }
@@ -424,6 +434,7 @@ impl Coordination {
             state: parking_lot::Mutex::new(GenerationState {
                 active: Arc::new(active),
                 prepared: None,
+                discarded_record_markers: secrets::DiscardedRecordMarkers::default(),
                 reported: None,
                 rejected: None,
                 retired_credentials: Vec::new(),
@@ -537,16 +548,17 @@ impl Coordination {
                 return (state.active.digest.clone(), GenerationOutcome::Refused);
             }
             state.reported = None;
+            state.discard_prepared();
             match loaded {
                 Loaded::Unchanged => {
-                    state.prepared = None;
                     state.record_recovery();
                     return (active.digest.clone(), GenerationOutcome::Active);
                 }
-                Loaded::Candidate(mut next) => {
-                    next.ready
-                        .scheduled
-                        .share_record_inspections(&active.ready.scheduled);
+                Loaded::Candidate(next) => {
+                    next.ready.scheduled.inherit_record_markers(
+                        &active.ready.scheduled,
+                        &state.discarded_record_markers,
+                    );
                     let next = Arc::<Candidate>::from(next);
                     state.prepared = Some((uid, active, Arc::clone(&next)));
                     next
@@ -612,7 +624,7 @@ impl Coordination {
                 .as_ref()
                 .is_some_and(|(owner, _, next)| *owner == uid && next.digest == digest)
         {
-            state.prepared = None;
+            state.discard_prepared();
             GenerationOutcome::Aborted
         } else {
             GenerationOutcome::Refused
