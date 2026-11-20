@@ -51,6 +51,29 @@ impl<'de> Deserialize<'de> for CronSchedule {
     }
 }
 
+#[must_use = "a due cron tick is resolved in code before any model is invoked"]
+pub(crate) struct CronTick {
+    pub(crate) wake: dekopon_agent::wake::WakeId,
+    pub(crate) missed: MissedTicks,
+}
+
+pub(crate) enum CronResolution {
+    Deliver(Box<super::Delivery>),
+    Empty,
+    Resolved,
+}
+
+impl CronTick {
+    #[expect(clippy::todo, unused_variables, reason = "skeleton: state/cron-wakes")]
+    pub(crate) fn resolve(
+        self,
+        store: &super::WakeStore,
+        now: SystemTime,
+    ) -> Result<CronResolution, crate::store::StoreFailed> {
+        todo!()
+    }
+}
+
 #[must_use = "a cron registration is stored only by WakeStore::register_cron"]
 pub(crate) struct CronRegistration {
     pub(crate) anchor: super::Anchor,

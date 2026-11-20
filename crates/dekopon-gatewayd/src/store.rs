@@ -9,20 +9,19 @@ mod lock;
 mod record;
 mod schema;
 
-use std::{
-    io,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::{io, path::PathBuf, sync::Arc, time::SystemTime};
 
 use parking_lot::Mutex;
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 use crate::transport::ThreadClaim;
 
+#[expect(unused_imports, reason = "skeleton: state/durable-store")]
+pub(crate) use convert::FollowConversion;
 pub(crate) use convert::{Conversion, LegacyInputs};
 #[expect(unused_imports, reason = "skeleton: state/spend-slice1")]
-pub(crate) use ledger::{Hold, HoldId, HoldOutcome, Ledger, SpendMicros};
+pub(crate) use ledger::{ChargeRow, Hold, HoldId, Ledger, Provenance, Settlement};
 pub(crate) use lock::StoreOwner;
 pub use record::ConversationKey;
 #[expect(unused_imports, reason = "skeleton: state/durable-store")]
@@ -93,16 +92,48 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum SyncMode {
+    Off,
+    #[default]
+    Normal,
+    Full,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DurableSettings {
+    pub(crate) path: PathBuf,
+    pub(crate) sync: SyncMode,
+}
+
+pub(crate) enum Persistence {
+    Durable(Box<Acquired>),
+    Memory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StoreWarning {
+    WaitsLostOnRestart,
+}
+
 pub(crate) struct DurableStore {
     owner: StoreOwner,
     connection: Mutex<rusqlite::Connection>,
+    sync: SyncMode,
+    fatal: StoreFatal,
+}
+
+pub(crate) struct Acquired {
+    pub(crate) store: Arc<DurableStore>,
+    pub(crate) report: BootReport,
+    pub(crate) fatal: FatalWatch,
 }
 
 pub(crate) struct Restored {
     pub(crate) wakes: Vec<WakeRow>,
     pub(crate) follows: Vec<FollowRow>,
     pub(crate) ownership: Vec<(ConversationKey, ThreadClaim)>,
-    pub(crate) interrupted_jobs: Vec<JobRow>,
+    pub(crate) interrupted_jobs: Vec<(ConversationKey, JobRow)>,
 }
 
 pub(crate) struct BootReport {
@@ -114,6 +145,42 @@ pub(crate) struct BootReport {
 pub(crate) struct Migrated {
     pub(crate) from: SchemaVersion,
     pub(crate) backup: PathBuf,
+    pub(crate) at: SystemTime,
+}
+
+struct StoreFatal {
+    first: Mutex<Option<oneshot::Sender<StoreError>>>,
+}
+
+pub(crate) struct FatalWatch(oneshot::Receiver<StoreError>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StoreFailed;
+
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Raised {
+    First,
+    Already,
+}
+
+impl Persistence {
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/durable-store"
+    )]
+    pub(crate) fn at_boot(
+        settings: Option<&DurableSettings>,
+        legacy: &LegacyInputs,
+    ) -> Result<Self, StoreError> {
+        todo!()
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: state/durable-store")]
+    pub(crate) fn warning(&self) -> Option<StoreWarning> {
+        todo!()
+    }
 }
 
 impl DurableStore {
@@ -123,9 +190,9 @@ impl DurableStore {
         reason = "skeleton: state/durable-store"
     )]
     pub(crate) fn acquire(
-        path: &Path,
+        settings: &DurableSettings,
         legacy: &LegacyInputs,
-    ) -> Result<(Self, BootReport), StoreError> {
+    ) -> Result<Acquired, StoreError> {
         todo!()
     }
 
@@ -143,7 +210,35 @@ impl DurableStore {
         unused_variables,
         reason = "skeleton: state/durable-store"
     )]
-    pub(crate) fn commit(&self, changes: Vec<(ConversationKey, Change)>) -> Result<(), StoreError> {
+    pub(crate) fn commit(
+        &self,
+        changes: Vec<(ConversationKey, Change)>,
+    ) -> Result<(), StoreFailed> {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/durable-store"
+    )]
+    pub(crate) fn first_served(&self, at: SystemTime) -> Result<(), StoreFailed> {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/durable-store"
+    )]
+    fn raise(&self, error: StoreError) -> Raised {
+        todo!()
+    }
+}
+
+impl FatalWatch {
+    #[expect(clippy::todo, reason = "skeleton: state/durable-store")]
+    pub(crate) async fn failed(&mut self) -> StoreError {
         todo!()
     }
 }

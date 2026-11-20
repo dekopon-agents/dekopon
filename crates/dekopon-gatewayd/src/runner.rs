@@ -5,6 +5,10 @@
 
 mod receipt;
 
+use std::time::Duration;
+
+use dekopon_broker_protocol::Attestation;
+use dekopon_core::{AgentId, PrincipalId};
 use serde::Deserialize;
 
 use crate::{
@@ -12,7 +16,7 @@ use crate::{
 };
 
 #[expect(unused_imports, reason = "skeleton: rpi/tick-runner")]
-pub(crate) use receipt::{Receipt, ReceiptBatches, ReceiptOutcome, ReceiptOutput};
+pub(crate) use receipt::{Receipt, ReceiptBatches, ReceiptError, ReceiptOutcome, ReceiptOutput};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitSha(String);
@@ -33,11 +37,19 @@ pub(crate) struct IntentId(String);
 
 #[derive(Clone, Debug)]
 pub(crate) struct RunnerEntry {
-    pub(crate) principal: dekopon_core::Subject,
+    pub(crate) principal: PrincipalId,
+    pub(crate) agent: AgentId,
     pub(crate) schedule: CronSchedule,
     pub(crate) epoch: EpochSlug,
     pub(crate) approved: GitSha,
     pub(crate) packets: Destination,
+    pub(crate) deadline: Duration,
+}
+
+pub(crate) enum RunnerState {
+    Ready,
+    Running,
+    Parked(ParkReason),
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +74,9 @@ pub(crate) enum ParkReason {
     Unparseable,
     Refused { intent: IntentId },
     BatchFailed { intents: Vec<IntentId> },
+    Unrepresentable { intent: IntentId },
+    DeadlineExceeded,
+    Interrupted { intents: Vec<IntentId> },
 }
 
 #[derive(Debug)]
@@ -80,6 +95,11 @@ impl GitSha {
 }
 
 impl RunnerEntry {
+    #[expect(clippy::todo, reason = "skeleton: rpi/tick-runner")]
+    pub(crate) fn attestation(&self) -> Attestation {
+        todo!()
+    }
+
     #[expect(clippy::todo, unused_variables, reason = "skeleton: rpi/tick-runner")]
     pub(crate) async fn run_cycle(
         &self,

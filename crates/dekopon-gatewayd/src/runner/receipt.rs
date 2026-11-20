@@ -1,4 +1,5 @@
 use serde::Serialize;
+use thiserror::Error;
 
 use super::IntentId;
 
@@ -19,6 +20,11 @@ pub(crate) enum ReceiptOutput {
         bytes: u64,
         sha256: String,
     },
+    Binary {
+        binary: bool,
+        bytes: u64,
+        sha256: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -27,6 +33,12 @@ pub(crate) struct Receipt {
     pub(crate) capability: String,
     pub(crate) outcome: ReceiptOutcome,
     pub(crate) output: ReceiptOutput,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ReceiptError {
+    #[error("a receipt does not fit in one receipt batch")]
+    Unrepresentable,
 }
 
 #[derive(Default)]
@@ -44,7 +56,7 @@ impl ReceiptOutput {
 
 impl ReceiptBatches {
     #[expect(clippy::todo, unused_variables, reason = "skeleton: rpi/tick-runner")]
-    pub(crate) fn push(&mut self, receipt: &Receipt) {
+    pub(crate) fn push(&mut self, receipt: &Receipt) -> Result<(), ReceiptError> {
         todo!()
     }
 

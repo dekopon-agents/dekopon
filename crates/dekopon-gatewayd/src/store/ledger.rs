@@ -1,17 +1,14 @@
 use std::time::SystemTime;
 
 use dekopon_core::AgentId;
+use dekopon_model_token_governor::{Call, HistoryRow, Tokens};
 use serde::{Deserialize, Serialize};
 
-use super::{DurableStore, StoreError};
+use super::{DurableStore, StoreFailed};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub(crate) struct HoldId(u64);
-
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
-#[serde(transparent)]
-pub(crate) struct SpendMicros(u64);
 
 pub(crate) struct Ledger<'store> {
     store: &'store DurableStore,
@@ -22,13 +19,31 @@ pub(crate) struct Ledger<'store> {
 pub(crate) struct Hold {
     id: HoldId,
     agent: AgentId,
-    estimate: SpendMicros,
+    model: String,
+    estimate: Tokens,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HoldOutcome {
-    Spent(SpendMicros),
+pub(crate) enum Settlement {
+    Spent(Tokens),
     Unreturned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Provenance {
+    Settled,
+    Unreturned,
+    Crashed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChargeRow {
+    pub(crate) agent: AgentId,
+    pub(crate) model: String,
+    pub(crate) at: SystemTime,
+    pub(crate) tokens: Tokens,
+    pub(crate) provenance: Provenance,
 }
 
 impl DurableStore {
@@ -44,11 +59,7 @@ impl Ledger<'_> {
         unused_variables,
         reason = "skeleton: state/spend-slice1"
     )]
-    pub(crate) fn open_hold(
-        &self,
-        agent: &AgentId,
-        estimate: SpendMicros,
-    ) -> Result<Hold, StoreError> {
+    pub(crate) fn open_hold(&self, call: &Call, estimate: Tokens) -> Result<Hold, StoreFailed> {
         todo!()
     }
 
@@ -57,12 +68,7 @@ impl Ledger<'_> {
         unused_variables,
         reason = "skeleton: state/spend-slice1"
     )]
-    pub(crate) fn settle(&self, hold: Hold, outcome: HoldOutcome) -> Result<(), StoreError> {
-        todo!()
-    }
-
-    #[expect(clippy::todo, reason = "skeleton: state/spend-slice1")]
-    pub(crate) fn charge_crashed_holds(&self) -> Result<Vec<(AgentId, SpendMicros)>, StoreError> {
+    pub(crate) fn settle(&self, hold: Hold, settlement: Settlement) -> Result<(), StoreFailed> {
         todo!()
     }
 
@@ -71,11 +77,19 @@ impl Ledger<'_> {
         unused_variables,
         reason = "skeleton: state/spend-slice1"
     )]
-    pub(crate) fn spent(
+    pub(crate) fn charge_crashed_holds(
         &self,
-        agent: &AgentId,
-        since: SystemTime,
-    ) -> Result<SpendMicros, StoreError> {
+        at: SystemTime,
+    ) -> Result<Vec<ChargeRow>, StoreFailed> {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/spend-slice1"
+    )]
+    pub(crate) fn history(&self, since: SystemTime) -> Result<Vec<HistoryRow>, StoreFailed> {
         todo!()
     }
 }

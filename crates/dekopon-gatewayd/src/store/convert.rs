@@ -12,10 +12,14 @@ pub(crate) struct LegacyInputs {
 pub(crate) struct Conversion {
     pub(crate) conversations: Vec<ConversationKey>,
     pub(crate) wakes: usize,
-    pub(crate) follows: usize,
-    pub(crate) ownership_derived: usize,
-    pub(crate) ownership_lost: usize,
-    pub(crate) retained: Option<PathBuf>,
+    pub(crate) retained_wakes: Option<PathBuf>,
+    pub(crate) follows: FollowConversion,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum FollowConversion {
+    None,
+    Retained { markers: usize, journal: PathBuf },
 }
 
 impl LegacyInputs {

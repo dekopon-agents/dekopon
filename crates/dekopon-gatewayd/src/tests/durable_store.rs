@@ -161,3 +161,81 @@ fn a_fatal_exit_joins_every_owned_task_within_the_shutdown_grace() {
 fn a_restart_after_a_fatal_exit_resumes_from_the_store() {
     todo!()
 }
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn the_store_is_acquired_once_at_initial_boot_and_never_by_check_or_reload() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_second_gateway_process_on_the_same_store_fails_at_once() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn conversion_reads_legacy_inputs_through_a_projected_symlink() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn legacy_follow_markers_are_retained_and_counted_never_keyed_by_guess() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_durable_off_gateway_keeps_waits_in_memory_and_warns_they_are_lost_on_restart() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn first_served_is_recorded_once_after_a_migration() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn every_serving_write_failure_raises_one_first_cause_fatal() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_queued_wake_turn_settles_its_ticket_only_when_the_turn_completes() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn an_orphaned_or_rejected_wake_delivery_settles_by_its_disposition() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_restored_delivery_is_admitted_when_serving_starts() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_subscription_synchronize_while_pending_keeps_the_pending_delivery() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn an_interrupted_job_notice_replays_after_a_crash_before_its_acknowledgement() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_tick_result_keeps_its_wake_id_on_every_outcome() {
+    todo!()
+}

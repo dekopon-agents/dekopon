@@ -23,3 +23,9 @@ fn spend_outside_the_budget_window_is_not_rescanned_per_call() {
 fn a_budget_survives_a_restart_and_refuses_an_over_budget_call_with_its_reset() {
     todo!()
 }
+
+#[test]
+#[ignore = "skeleton: state/spend-slice1"]
+fn the_ledger_restores_timed_model_charges_including_crashed_holds() {
+    todo!()
+}

@@ -56,3 +56,15 @@ fn wake_panic_state_is_in_memory_so_a_restart_can_repeat_one_post() {
 fn a_gateway_without_a_notice_channel_posts_nothing() {
     todo!()
 }
+
+#[test]
+#[ignore = "skeleton: daemon/notice-channel"]
+fn a_retired_wake_leaves_no_panic_streak() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: daemon/notice-channel"]
+fn a_lost_transport_exit_writes_the_marker() {
+    todo!()
+}

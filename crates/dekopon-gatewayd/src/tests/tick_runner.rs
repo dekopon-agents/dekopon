@@ -14,7 +14,7 @@ fn a_truncated_tick_plan_applies_nothing_and_parks() {
 
 #[test]
 #[ignore = "skeleton: rpi/tick-runner"]
-fn receipt_batches_stay_within_twenty_kib_and_outputs_of_eight_kib_are_oversize() {
+fn serialized_receipt_batches_stay_within_twenty_kib_and_outputs_over_eight_kib_are_oversize() {
     todo!()
 }
 
@@ -81,5 +81,41 @@ fn ticks_in_flight_are_bounded_by_the_session_gate() {
 #[test]
 #[ignore = "skeleton: rpi/tick-runner"]
 fn a_tick_that_panicked_before_a_restart_runs_again_from_its_row() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: rpi/tick-runner"]
+fn a_non_utf8_output_is_recorded_by_digest_unaltered() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: rpi/tick-runner"]
+fn a_receipt_that_cannot_fit_a_batch_parks_the_cycle() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: rpi/tick-runner"]
+fn a_cycle_interrupted_mid_batch_parks_with_its_receipts_so_far() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: rpi/tick-runner"]
+fn a_cron_tick_while_a_cycle_runs_is_skipped_and_logged() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: rpi/tick-runner"]
+fn a_cycle_past_its_deadline_parks() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: rpi/tick-runner"]
+fn the_runner_attests_as_its_configured_principal_and_agent() {
     todo!()
 }

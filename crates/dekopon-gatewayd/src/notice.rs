@@ -4,7 +4,7 @@
 )]
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
     time::Duration,
@@ -14,7 +14,10 @@ use dekopon_agent::wake::WakeId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::transport::{ChatDriver, ReplyTarget};
+use crate::{
+    transport::{ChatDriver, ReplyTarget},
+    wake::TickEnd,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Destination {
@@ -33,7 +36,11 @@ pub(crate) struct NoticeChannel {
 pub(crate) enum FatalLabel {
     Store,
     Reload,
+    Transports,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub(crate) enum StreakState {}
 
 #[derive(Debug, Error)]
 pub(crate) enum MarkerError {
@@ -53,15 +60,7 @@ impl From<io::Error> for MarkerError {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct ExitMarker {
     pub(crate) causes: Vec<FatalLabel>,
-    pub(crate) restarts: u32,
-    pub(crate) notice: MarkerNotice,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum MarkerNotice {
-    Owed,
-    Posted,
+    pub(crate) streak: StreakState,
 }
 
 pub(crate) struct MarkerFile {
@@ -70,24 +69,15 @@ pub(crate) struct MarkerFile {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum NoticeLine {
-    Fatal {
-        cause: FatalLabel,
-    },
-    Recovered {
-        restarts: u32,
-        causes: Vec<FatalLabel>,
-    },
-    WakePanicked {
-        wake: WakeId,
-    },
-    WakeRecovered {
-        wake: WakeId,
-    },
+    Fatal { cause: FatalLabel },
+    Recovered { causes: Vec<FatalLabel> },
+    WakePanicked { wake: WakeId },
+    WakeRecovered { wake: WakeId },
 }
 
 #[derive(Default)]
 pub(crate) struct WakePanics {
-    open: HashSet<WakeId>,
+    open: HashMap<WakeId, StreakState>,
 }
 
 impl MarkerFile {
@@ -126,7 +116,7 @@ impl WakePanics {
         unused_variables,
         reason = "skeleton: daemon/notice-channel"
     )]
-    pub(crate) fn panicked(&mut self, wake: WakeId) -> Option<NoticeLine> {
+    pub(crate) fn observe(&mut self, end: &TickEnd) -> Option<NoticeLine> {
         todo!()
     }
 
@@ -135,7 +125,7 @@ impl WakePanics {
         unused_variables,
         reason = "skeleton: daemon/notice-channel"
     )]
-    pub(crate) fn succeeded(&mut self, wake: WakeId) -> Option<NoticeLine> {
+    pub(crate) fn retire(&mut self, wake: WakeId) {
         todo!()
     }
 }
