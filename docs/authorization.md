@@ -99,14 +99,6 @@ swapped away from it.
 Every refusal looks the same, so guessing names reveals nothing about the map, though a DRN's public
 path can reveal what the secret is for.
 
-After the decision record is emitted, the broker resolves the DRN once, for this invocation, from
-the store its map entry names, such as a file, a Kubernetes projection, Vault, 1Password Connect or
-a cloud secret manager (`crates/dekopon-brokerd/src/secrets.rs`), or mints it from a ChatGPT
-subscription or a GitHub App key. The bytes go only into an HTTP `Authorization` header, Bearer,
-Basic or Bot, never a URL, body or environment; the invoked provider sees neither name nor value. A
-store is read per invocation, so a rotated secret applies at once and a deleted one fails closed;
-the two minted sources cache their token until shortly before it expires. You write the private map: an owner-only file the gateway can't read.
-
 ## Each outbound request is checked again
 
 A capability decision says nothing about what the provider will send, so every HTTP request passes,
