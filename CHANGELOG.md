@@ -7,6 +7,20 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.90.0] - 2026-11-20
+
+### Fixed
+
+- Report journal write failures during memory summary panic recovery.
+- Show reported token and cache counts on memory summaries, identify the agent and chat session on model completions, and distinguish unknown cache usage from zero.
+- Slack mentions receive replies when conversation metadata is unavailable.
+
+## [dekopon-chart-0.77.0] - 2026-11-20
+
+### Changed
+
+- Chart 0.77.0 targets core v0.90.0 and renders the `v0.90.0` image tag.
+
 ## [0.89.0] - 2026-11-20
 
 ### Added
