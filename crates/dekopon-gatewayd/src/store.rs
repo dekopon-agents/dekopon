@@ -21,7 +21,7 @@ use crate::transport::ThreadClaim;
 pub(crate) use convert::FollowConversion;
 pub(crate) use convert::{Conversion, LegacyInputs};
 #[expect(unused_imports, reason = "skeleton: state/spend-slice1")]
-pub(crate) use ledger::{ChargeRow, Hold, HoldId, Ledger, Provenance, Settlement};
+pub(crate) use ledger::{ChargeRow, GrantRecorder, Hold, HoldId, Ledger, Provenance, Settlement};
 pub(crate) use lock::StoreOwner;
 pub use record::ConversationKey;
 #[expect(unused_imports, reason = "skeleton: state/durable-store")]

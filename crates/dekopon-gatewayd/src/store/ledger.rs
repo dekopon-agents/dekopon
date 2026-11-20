@@ -1,6 +1,7 @@
-use std::time::SystemTime;
+use std::{sync::Arc, time::SystemTime};
 
-use dekopon_core::AgentId;
+use dekopon_agent::grant::{GrantLedger, GrantLedgerFailed, GrantRelease};
+use dekopon_core::{AgentId, VmSession};
 use dekopon_model_token_governor::{Call, HistoryRow, Tokens};
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +13,10 @@ pub(crate) struct HoldId(u64);
 
 pub(crate) struct Ledger<'store> {
     store: &'store DurableStore,
+}
+
+pub(crate) struct GrantRecorder {
+    store: Arc<DurableStore>,
 }
 
 #[must_use = "an open hold is charged its full estimate at the next boot unless it is settled"]
@@ -90,6 +95,56 @@ impl Ledger<'_> {
         reason = "skeleton: state/spend-slice1"
     )]
     pub(crate) fn history(&self, since: SystemTime) -> Result<Vec<HistoryRow>, StoreFailed> {
+        todo!()
+    }
+}
+
+impl GrantRecorder {
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/spend-slice1"
+    )]
+    pub(crate) fn new(store: Arc<DurableStore>) -> Self {
+        todo!()
+    }
+}
+
+impl GrantLedger for GrantRecorder {
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/spend-slice1"
+    )]
+    fn carved(
+        &self,
+        agent: &AgentId,
+        session: &VmSession,
+        model: &str,
+        estimate: Tokens,
+    ) -> Result<(), GrantLedgerFailed> {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/spend-slice1"
+    )]
+    fn tallied(&self, session: &VmSession, spent: Tokens) -> Result<(), GrantLedgerFailed> {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/spend-slice1"
+    )]
+    fn released(
+        &self,
+        session: &VmSession,
+        release: GrantRelease,
+    ) -> Result<(), GrantLedgerFailed> {
         todo!()
     }
 }

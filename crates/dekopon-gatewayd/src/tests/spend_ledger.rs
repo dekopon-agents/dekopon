@@ -29,3 +29,9 @@ fn a_budget_survives_a_restart_and_refuses_an_over_budget_call_with_its_reset() 
 fn the_ledger_restores_timed_model_charges_including_crashed_holds() {
     todo!()
 }
+
+#[test]
+#[ignore = "skeleton: state/spend-slice1"]
+fn grant_carves_tallies_and_releases_are_recorded_in_the_gateway_ledger() {
+    todo!()
+}

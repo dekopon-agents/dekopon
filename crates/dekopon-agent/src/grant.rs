@@ -10,7 +10,33 @@ pub struct SessionGrants {
     metering: Arc<Metering>,
     agent: AgentId,
     open: Mutex<Vec<(VmSession, Admission)>>,
+    ledger: Option<Arc<dyn GrantLedger>>,
 }
+
+pub trait GrantLedger: Send + Sync {
+    fn carved(
+        &self,
+        agent: &AgentId,
+        session: &VmSession,
+        model: &str,
+        estimate: Tokens,
+    ) -> Result<(), GrantLedgerFailed>;
+
+    fn tallied(&self, session: &VmSession, spent: Tokens) -> Result<(), GrantLedgerFailed>;
+
+    fn released(&self, session: &VmSession, release: GrantRelease)
+    -> Result<(), GrantLedgerFailed>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantRelease {
+    Tallied,
+    Unreturned,
+}
+
+#[derive(Clone, Copy, Debug, Error)]
+#[error("the gateway could not record this grant")]
+pub struct GrantLedgerFailed;
 
 #[derive(Debug, Error)]
 pub enum GrantRefusal {
@@ -18,6 +44,8 @@ pub enum GrantRefusal {
     Budget(Refusal),
     #[error("this turn already holds its maximum of open grants")]
     Full,
+    #[error(transparent)]
+    Ledger(#[from] GrantLedgerFailed),
 }
 
 impl SessionGrants {
@@ -28,6 +56,16 @@ impl SessionGrants {
         reason = "skeleton: state/grant-settle"
     )]
     pub fn new(metering: Arc<Metering>, agent: AgentId) -> Self {
+        todo!()
+    }
+
+    #[must_use]
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/spend-slice1"
+    )]
+    pub fn with_ledger(self, ledger: Arc<dyn GrantLedger>) -> Self {
         todo!()
     }
 

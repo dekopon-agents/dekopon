@@ -14,7 +14,7 @@ fn a_truncated_tick_plan_applies_nothing_and_parks() {
 
 #[test]
 #[ignore = "skeleton: rpi/tick-runner"]
-fn serialized_receipt_batches_stay_within_twenty_kib_and_outputs_over_eight_kib_are_oversize() {
+fn serialized_receipt_batches_stay_within_twenty_kib_and_outputs_past_the_threshold_are_oversize() {
     todo!()
 }
 
