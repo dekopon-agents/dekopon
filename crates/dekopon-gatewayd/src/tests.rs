@@ -17758,11 +17758,17 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 
 #[path = "tests/attribution.rs"]
 mod attribution;
+#[path = "tests/cron_wakes.rs"]
+mod cron_wakes;
+#[path = "tests/durable_store.rs"]
+mod durable_store;
 mod github_burst;
 #[path = "tests/github_http_invocation.rs"]
 mod github_http_invocation;
 #[path = "tests/github_invocation.rs"]
 mod github_invocation;
+#[path = "tests/grant_holds.rs"]
+mod grant_holds;
 #[path = "tests/jobs_burn_in.rs"]
 mod jobs_burn_in;
 #[path = "tests/jobs_e2e.rs"]
@@ -17773,6 +17779,8 @@ mod late_forward;
 pub(crate) mod memory;
 #[path = "tests/memory_notice.rs"]
 mod memory_notice;
+#[path = "tests/notice_channel.rs"]
+mod notice_channel;
 mod participants;
 mod pull_request_links;
 #[path = "tests/reload_evidence.rs"]
@@ -17781,13 +17789,19 @@ mod reload_evidence;
 mod reply_attachments;
 #[path = "tests/sealed_handoff.rs"]
 mod sealed_handoff;
+#[path = "tests/spend_ledger.rs"]
+mod spend_ledger;
 #[path = "tests/steering.rs"]
 mod steering;
 #[path = "tests/steering_e2e.rs"]
 mod steering_e2e;
 mod subscriptions;
+#[path = "tests/supervisor.rs"]
+mod supervisor;
 #[path = "tests/task_time.rs"]
 mod task_time;
+#[path = "tests/tick_runner.rs"]
+mod tick_runner;
 mod wake_reason;
 #[path = "tests/wakes.rs"]
 mod wakes;

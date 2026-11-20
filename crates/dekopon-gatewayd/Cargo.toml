@@ -23,6 +23,7 @@ async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
+croner.workspace = true
 dekopon-agent.workspace = true
 dekopon-broker-protocol.workspace = true
 dekopon-config.workspace = true
@@ -44,6 +45,7 @@ hyper-util.workspace = true
 libc.workspace = true
 mime = "0.3.17"
 reqwest = { workspace = true, features = ["multipart"] }
+rusqlite.workspace = true
 rustix.workspace = true
 rustls.workspace = true
 serde.workspace = true
