@@ -11,12 +11,8 @@
 # - `message.im` events (requires `im:history`), so direct messages reach DM routes.
 # - `app_mention` events (requires `app_mentions:read`), so channel routes fire only
 #   when the bot is explicitly addressed. Channel-history events also feed opted-in follow routes.
-# - `channels:read`, `groups:read`, `im:read`, `mpim:read`, so `conversations.info` can say what
-#   kind of conversation a mention arrived in. Slack sends no `channel_type` on `app_mention`, and
-#   without the lookup a mention in a direct message or a multi-person DM would be minted as a
-#   channel and match no `directMessage` or
-#   `groupDirectMessage` route. The result is remembered per conversation, so it costs one call
-#   per conversation the bot is addressed in, and a lookup that fails drops that one message.
+# - `channels:read`, `groups:read`, `im:read`, `mpim:read` let the gateway look up a
+#   mention's conversation kind. If the lookup fails, an addressed message uses channel routing.
 # - `canvases:read`, so provider-slack's `slack.canvas.read` can read the one canvas pinned in its
 #   provider settings.
 # - `chat:write`, so the gateway can reply.
@@ -71,8 +67,6 @@ oauth_config:
     bot:
       - app_mentions:read
       - canvases:read
-      # `*:read` resolve one conversation's kind: an `app_mention` carries no `channel_type`, so
-      # without them a mention in a DM or a group DM is minted as a channel and matches no route.
       - channels:read
       - chat:write
       - files:read

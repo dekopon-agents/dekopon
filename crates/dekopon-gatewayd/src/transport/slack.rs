@@ -737,19 +737,14 @@ impl SlackTransport {
         }
         let kind = match self.lookup_channel_kind(channel).await {
             Ok(kind) => kind,
-            Err(error)
-                if explicitly_addressed
-                    && !matches!(error, ChannelKindLookupError::InvalidChannelId) =>
-            {
-                if !error.is_definitive() {
-                    return Some(SlackChannelKind::Channel);
+            Err(error) => match error.fallback().filter(|_| explicitly_addressed) {
+                Some(ChannelKindFallback::Cache) => SlackChannelKind::Channel,
+                Some(ChannelKindFallback::UseOnce) => return Some(SlackChannelKind::Channel),
+                None => {
+                    error.record_drop(received);
+                    return None;
                 }
-                SlackChannelKind::Channel
-            }
-            Err(error) => {
-                error.record_drop(received);
-                return None;
-            }
+            },
         };
         self.channel_kinds.insert(channel.to_owned(), kind);
         Some(kind)
@@ -828,12 +823,17 @@ enum ChannelKindLookupError {
     Flags,
 }
 
+enum ChannelKindFallback {
+    Cache,
+    UseOnce,
+}
+
 impl ChannelKindLookupError {
-    fn is_definitive(&self) -> bool {
-        matches!(
-            self,
-            Self::Response(TransportError::Service { code })
-                if matches!(
+    fn fallback(&self) -> Option<ChannelKindFallback> {
+        match self {
+            Self::InvalidChannelId => None,
+            Self::Response(TransportError::Service { code }) => {
+                let fallback = if matches!(
                     code.as_str(),
                     "missing_scope"
                         | "access_denied"
@@ -841,8 +841,42 @@ impl ChannelKindLookupError {
                         | "channel_not_found"
                         | "no_permission"
                         | "not_allowed_token_type"
-                )
-        )
+                        | "team_access_not_granted"
+                ) {
+                    ChannelKindFallback::Cache
+                } else {
+                    ChannelKindFallback::UseOnce
+                };
+                Some(fallback)
+            }
+            Self::RateLimited
+            | Self::Request(_)
+            | Self::Flags
+            | Self::Response(
+                TransportError::AssetType { .. }
+                | TransportError::Attachment(_)
+                | TransportError::AttachmentTask { .. }
+                | TransportError::MissingCredential { .. }
+                | TransportError::EmptyCredential { .. }
+                | TransportError::NonUtf8Credential { .. }
+                | TransportError::Request(_)
+                | TransportError::AssetTooLarge { .. }
+                | TransportError::AssetRefused { .. }
+                | TransportError::DisallowedIntents
+                | TransportError::Response
+                | TransportError::MalformedResponse(_)
+                | TransportError::PartialDelivery { .. }
+                | TransportError::AttachmentsMissing { .. }
+                | TransportError::ConnectTimeout
+                | TransportError::RecoveryExhausted { .. }
+                | TransportError::IdentityChanged
+                | TransportError::Closed
+                | TransportError::Io(_)
+                | TransportError::InsecureSocket { .. }
+                | TransportError::Subject(_)
+                | TransportError::Entropy(_),
+            ) => Some(ChannelKindFallback::UseOnce),
+        }
     }
 
     fn record_drop(&self, received: &Span) {
@@ -3848,6 +3882,59 @@ mod driver_tests {
             "one lookup per conversation, not one per message: {:?}",
             mock.calls()
         );
+    }
+
+    #[tokio::test]
+    async fn a_mention_caches_the_channel_kind_when_team_access_is_not_granted() {
+        let mock = spawn_slack_mock(|_, _| {
+            (
+                200,
+                json!({"ok": false, "error": "team_access_not_granted"}),
+            )
+        });
+        let mut transport = transport(&mock.base, SlackExperience::Classic);
+
+        for ts in [INBOUND_TS, POSTED_TS] {
+            let mention = json!({
+                "type": "app_mention",
+                "channel": CHANNEL,
+                "user": USER,
+                "ts": ts,
+                "text": "how are things?",
+            });
+            let routed = transport
+                .routable(TEAM, &mention, &Span::none())
+                .await
+                .expect("readable")
+                .expect("the mention routes through a definitive rejection");
+            assert_eq!(routed.conversation.kind, ConversationKind::Channel);
+        }
+        assert_eq!(
+            mock.body(&format!("/api/conversations.info?channel={CHANNEL}")),
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mention_with_an_invalid_channel_id_drops_without_a_lookup() {
+        let mock = spawn_slack_mock(accepting);
+        let mut transport = transport(&mock.base, SlackExperience::Classic);
+        let mention = json!({
+            "type": "app_mention",
+            "channel": "C0123/ABC",
+            "user": USER,
+            "ts": INBOUND_TS,
+            "text": "how are things?",
+        });
+
+        assert!(
+            transport
+                .routable(TEAM, &mention, &Span::none())
+                .await
+                .expect("readable")
+                .is_none()
+        );
+        assert!(mock.calls().is_empty());
     }
 
     #[tokio::test]
