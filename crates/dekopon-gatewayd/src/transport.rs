@@ -12,6 +12,7 @@ use dekopon_agent::wake::WakeId;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, Trigger};
 use dekopon_core::{AttestedSubject, Backoff, Subject};
 use dekopon_model::ModelText;
+use dekopon_telemetry::egress::{Timeout, client_builder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -815,18 +816,12 @@ pub(crate) fn credential_value(name: &str, value: String) -> Result<String, Tran
 }
 
 pub(crate) fn credential_client(timeout: Duration) -> reqwest::ClientBuilder {
-    credential_client_from(reqwest::Client::builder(), timeout)
-}
-
-fn credential_client_from(
-    builder: reqwest::ClientBuilder,
-    timeout: Duration,
-) -> reqwest::ClientBuilder {
-    builder
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .retry(reqwest::retry::never())
-        .timeout(timeout)
+    client_builder(
+        reqwest::Client::builder(),
+        Timeout::Request(timeout),
+        crate::EGRESS_USER_AGENT,
+        [],
+    )
 }
 
 pub(crate) fn bound_inbound(text: &str) -> String {
@@ -1163,12 +1158,12 @@ fn ceil_boundary(text: &str, index: usize) -> usize {
 mod tests {
     use std::{collections::HashSet, time::Duration};
 
+    use dekopon_telemetry::egress::{Timeout, client_builder};
     use serde_json::json;
 
     use super::{
-        RECONNECT_JITTER_MS, SeenIds, TextUnit, TransportIdentity, asset_buffer,
-        credential_client_from, is_stop_word, jitter_below, reconnect_backoff, reserve_for_chunk,
-        retry_after_from_body, split_message,
+        RECONNECT_JITTER_MS, SeenIds, TextUnit, TransportIdentity, asset_buffer, is_stop_word,
+        jitter_below, reconnect_backoff, reserve_for_chunk, retry_after_from_body, split_message,
     };
 
     #[test]
@@ -1225,7 +1220,12 @@ mod tests {
 
         let rendered = format!(
             "{:?}",
-            credential_client_from(proxied_builder(), Duration::from_secs(30))
+            client_builder(
+                proxied_builder(),
+                Timeout::Request(Duration::from_secs(30)),
+                crate::EGRESS_USER_AGENT,
+                [],
+            )
         );
 
         assert!(

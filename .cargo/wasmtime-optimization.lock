@@ -1226,6 +1226,7 @@ dependencies = [
  "bytes",
  "dekopon-core",
  "dekopon-model-token-governor",
+ "dekopon-telemetry",
  "futures-util",
  "http",
  "http-body",

@@ -15,6 +15,7 @@ include = ["src/**", "README.md", "Cargo.toml"]
 
 [features]
 cli = ["exporter", "dep:clap"]
+egress = ["dep:reqwest"]
 exporter = [
     "dep:async-trait",
     "dep:dekopon-core",
@@ -24,7 +25,7 @@ exporter = [
     "dep:opentelemetry-http",
     "dep:opentelemetry-otlp",
     "dep:opentelemetry_sdk",
-    "dep:reqwest",
+    "egress",
     "dep:serde",
     "dep:thiserror",
     "dep:tokio",

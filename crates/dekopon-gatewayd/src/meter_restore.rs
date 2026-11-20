@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use dekopon_model_token_governor::{HistoryRow, Metering, Tokens, UnixMillis};
+use dekopon_telemetry::egress::{Timeout, client_builder};
 use serde::Deserialize;
 use serde_json::json;
 use thiserror::Error;
@@ -145,18 +146,19 @@ async fn query(
     ca_certificate: Option<Vec<u8>>,
     window: Window,
 ) -> Result<Vec<HistoryRow>, RestoreError> {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .timeout(config.timeout());
-    if let Some(pem) = ca_certificate {
-        for certificate in
-            reqwest::Certificate::from_pem_bundle(&pem).map_err(RestoreError::Client)?
-        {
-            builder = builder.add_root_certificate(certificate);
-        }
-    }
-    let client = builder.build().map_err(RestoreError::Client)?;
+    let certificates = ca_certificate
+        .as_deref()
+        .map(reqwest::Certificate::from_pem_bundle)
+        .transpose()
+        .map_err(RestoreError::Client)?;
+    let client = client_builder(
+        reqwest::Client::builder(),
+        Timeout::Request(config.timeout()),
+        crate::EGRESS_USER_AGENT,
+        certificates.into_iter().flatten(),
+    )
+    .build()
+    .map_err(RestoreError::Client)?;
     match config {
         RestoreConfig::Openobserve {
             endpoint,
