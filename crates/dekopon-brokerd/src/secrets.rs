@@ -44,7 +44,7 @@ use crate::github_app::{
     Downscope, GithubAppCredential, GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES, Installation,
 };
 
-use crate::token_issuer::{SelfSignedIssuer, SignedJwtConfig, SignedJwtConfigError, TokenIssuer};
+use crate::token_issuer::{SelfSignedIssuer, SignedJwtConfig, SignedJwtConfigError};
 
 pub(crate) mod chatgpt;
 pub(crate) mod oauth2;
@@ -1538,12 +1538,14 @@ fn sanitized_yaml_diagnostic(error: &serde_yaml::Error, bytes: &[u8]) -> String 
         "kind",
         "bindings",
         "projection",
+        "iss",
     ];
-    let unknown = message
+    let named_field = message
         .split_once("unknown field `")
+        .or_else(|| message.split_once("missing field `"))
         .and_then(|(_, rest)| rest.split_once('`'))
         .map(|(name, _)| name);
-    let field = if let Some(name) = unknown {
+    let field = if let Some(name) = named_field {
         FIELDS.iter().copied().find(|field| *field == name)
     } else if class == "unknown variant" && message.contains("`lazy` or `scheduled`") {
         Some("refresh")
@@ -2009,16 +2011,17 @@ fn signed_jwt_binding_problems(
         .map(|(persona, _)| persona)
         .collect::<BTreeSet<_>>();
     let mut problems = Vec::new();
+    let mut capabilities = BTreeMap::<_, BTreeSet<_>>::new();
     for binding in bindings {
+        capabilities
+            .entry((binding.sink, &binding.secret))
+            .or_default()
+            .extend(&binding.capabilities);
         let jwt = personas.contains(&binding.secret);
         if jwt != (binding.sink == SecretSinkKind::VmExecStdin)
             || jwt
                 && (binding.allow_query
                     || binding.max_injections != 1
-                    || binding
-                        .capabilities
-                        .iter()
-                        .any(|id| id.as_str() != "vm.exec")
                     || binding.allowed_methods.as_slice() != ["POST"])
         {
             problems.push(SignedJwtProblem {
@@ -2028,15 +2031,15 @@ fn signed_jwt_binding_problems(
         }
     }
     for (secret, runner) in runners {
+        let persona_capabilities = capabilities.get(&(SecretSinkKind::VmExecStdin, secret));
         if personas.contains(runner)
-            || !bindings.iter().any(|binding| {
-                &binding.secret == runner
-                    && binding.sink == SecretSinkKind::HttpBearer
-                    && binding
-                        .capabilities
-                        .iter()
-                        .any(|id| id.as_str() == "vm.exec")
-            })
+            || capabilities
+                .get(&(SecretSinkKind::HttpBearer, runner))
+                .is_none_or(|runner_capabilities| {
+                    runner_capabilities.is_empty()
+                        || persona_capabilities
+                            .is_some_and(|required| !required.is_subset(runner_capabilities))
+                })
         {
             problems.push(SignedJwtProblem {
                 secret: secret.clone(),

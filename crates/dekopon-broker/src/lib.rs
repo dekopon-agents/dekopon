@@ -2539,20 +2539,6 @@ where
             });
         }
         let outcome = self.registry.run_command(word, argv, stdin_piped).await?;
-        if let CommandRunOutcome::Proposed {
-            capability,
-            secret_use: Some(proposal @ SecretUseProposal::VmExecStdin { .. }),
-            ..
-        } = &outcome
-            && (stdin_piped || self.secrets.binding(capability, proposal).is_none())
-        {
-            return Ok(CommandRunOutcome::Failed {
-                error: dekopon_broker_host::ComponentFailure {
-                    code: "secret-denied".to_owned(),
-                    message: "signed exec secret use was refused".to_owned(),
-                },
-            });
-        }
         if matches!(
             &outcome,
             CommandRunOutcome::Proposed { capability, .. } if {

@@ -28,6 +28,8 @@ use crate::github_app::GithubAppKey;
 
 const KEY: &[u8] = include_bytes!("../../tests/fixture/github-app-test-only.pem");
 const RUNNER: &str = "runner.example.test";
+const ISSUER: &str = "https://issuer.example.test";
+const SECOND_ISSUER: &str = "https://issuer.example.test/alternate";
 const RUNNER_BEARER: &str = "fixture-runner-bearer";
 const PERSONA: &str = "drn:secret:login/alpha";
 const SECOND_PERSONA: &str = "drn:secret:login/beta";
@@ -43,7 +45,7 @@ async fn secret_map(directory: &Path, ttl: u32, aud: &str, mode: u32) -> std::pa
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
     let runner = directory.join("runner");
     write(&runner, RUNNER_BEARER.as_bytes()).await;
-    let persona = |drn, id, aud| {
+    let persona = |drn, id, iss, aud| {
         format!(
             r#"  - drn: {drn}
     destinations: [{RUNNER}]
@@ -51,6 +53,7 @@ async fn secret_map(directory: &Path, ttl: u32, aud: &str, mode: u32) -> std::pa
       kind: signedJwt
       privateKey: {key}
       kid: receipt-key
+      iss: "{iss}"
       aud: "{aud}"
       ttl: {ttl}
       runnerSecret: {RUNNER_DRN}
@@ -84,8 +87,13 @@ secrets:
         maxInjections: 2
 {alpha}{beta}"#,
         runner = runner.display(),
-        alpha = persona(PERSONA, "alpha", aud),
-        beta = persona(SECOND_PERSONA, "beta", "https://beta.example.test"),
+        alpha = persona(PERSONA, "alpha", ISSUER, aud),
+        beta = persona(
+            SECOND_PERSONA,
+            "beta",
+            SECOND_ISSUER,
+            "https://beta.example.test"
+        ),
     );
     let path = directory.join("map.yaml");
     write(&path, document.as_bytes()).await;
@@ -167,7 +175,68 @@ async fn duplicate_personas_report_every_signed_jwt_conflict() {
     }));
 }
 
-fn assert_jwt(token: &str, aud: &str) -> String {
+#[tokio::test]
+async fn signed_jwt_boot_requires_an_absolute_https_issuer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = secret_map(directory.path(), 300, "https://alpha.example.test", 0o600).await;
+    let document = tokio::fs::read_to_string(&path).await.unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let issuer_line = format!("      iss: \"{ISSUER}\"\n");
+    let missing = document.replacen(&issuer_line, "", 1);
+    write(&path, missing.as_bytes()).await;
+    let error = load(&path, uid).await.unwrap_err();
+    assert!(matches!(
+        error,
+        SecretMapError::Decode { diagnostic }
+            if diagnostic.starts_with("missing field") && diagnostic.ends_with("(iss)")
+    ));
+
+    for invalid in ["http://issuer.example.test", "../issuer"] {
+        let invalid = document.replacen(ISSUER, invalid, 1);
+        write(&path, invalid.as_bytes()).await;
+        let error = load(&path, uid).await.unwrap_err();
+        let SecretMapError::SignedJwtValidation { jwt_problems, .. } = error else {
+            panic!("expected a typed issuer error: {error}");
+        };
+        assert!(matches!(
+            jwt_problems.as_slice(),
+            [problem] if problem.secret.as_str() == PERSONA
+                && matches!(problem.source, SignedJwtConfigError::Issuer)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn signed_jwt_requires_runner_coverage_for_each_configured_capability() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = secret_map(directory.path(), 300, "https://alpha.example.test", 0o600).await;
+    let document = tokio::fs::read_to_string(&path).await.unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let covered = document.replace("[vm.exec]", "[vm.exec, vm.login]");
+    write(&path, covered.as_bytes()).await;
+    load(&path, uid).await.unwrap();
+
+    let uncovered = covered.replacen("[vm.exec, vm.login]", "[vm.exec]", 1);
+    write(&path, uncovered.as_bytes()).await;
+    let error = load(&path, uid).await.unwrap_err();
+    let SecretMapError::SignedJwtValidation { jwt_problems, .. } = error else {
+        panic!("expected a typed runner binding error: {error}");
+    };
+    assert_eq!(
+        jwt_problems
+            .iter()
+            .map(|problem| problem.secret.as_str())
+            .collect::<Vec<_>>(),
+        [PERSONA, SECOND_PERSONA],
+    );
+    assert!(
+        jwt_problems
+            .iter()
+            .all(|problem| matches!(problem.source, SignedJwtConfigError::RunnerBinding))
+    );
+}
+
+fn assert_jwt(token: &str, aud: &str, iss: &str) -> String {
     let (input, signature) = token.rsplit_once('.').expect("JWT signature");
     let key = GithubAppKey::from_pem(KEY).expect("fixture key");
     UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.public_key())
@@ -192,7 +261,7 @@ fn assert_jwt(token: &str, aud: &str) -> String {
     assert_eq!(
         claims,
         json!({
-            "iss": "https://id.xavierlange.com/dekopon",
+            "iss": iss,
             "iat": iat, "exp": exp, "aud": aud, "jti": jti,
             "sub": "user-fixture", "org": "org-fixture", "role": "reviewer-fixture", "email": "email-fixture@example.test"
         })
@@ -299,8 +368,6 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             Arc::new(InMemoryAuditLog::new(32).unwrap()),
             BrokerLimits::default(),
         )
-        .unwrap()
-        .with_secret_catalog(catalog)
         .unwrap();
         let actor = AuthenticatedContext::new(
             "gateway".parse().unwrap(),
@@ -315,17 +382,23 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             "agent".parse().unwrap(),
         );
         let argv = ARGV.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let outcome = broker
-            .run_command(
-                &actor,
-                Some(&attestor),
-                Some(&attestation),
-                "ssh",
-                &argv,
-                false,
-            )
-            .await
-            .unwrap();
+        let propose = async |broker: &Broker<InMemoryAuditLog>| {
+            broker
+                .run_command(
+                    &actor,
+                    Some(&attestor),
+                    Some(&attestation),
+                    "ssh",
+                    &argv,
+                    false,
+                )
+                .await
+                .unwrap()
+        };
+        let unmapped = propose(&broker).await;
+        let broker = broker.with_secret_catalog(catalog).unwrap();
+        let outcome = propose(&broker).await;
+        assert_eq!(unmapped, outcome);
         let wire = serde_json::to_vec(&ResponseEnvelope::command_run(outcome)).unwrap();
         let CommandRunOutcome::Proposed {
             capability,
@@ -345,6 +418,12 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
                 "jwt-beta",
                 SecretUseProposal::VmExecStdin {
                     secret: SECOND_PERSONA.parse().unwrap(),
+                },
+            ),
+            (
+                "jwt-unmapped",
+                SecretUseProposal::VmExecStdin {
+                    secret: "drn:secret:login/missing".parse().unwrap(),
                 },
             ),
             (
@@ -385,7 +464,7 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
                 .unwrap();
             let mut stdout = Vec::new();
             reader.read_to_end(&mut stdout).unwrap();
-            if id == "jwt-reserved-runner" {
+            if matches!(id, "jwt-unmapped" | "jwt-reserved-runner") {
                 assert_eq!(outcome.result.outcome, InvocationOutcome::Denied);
                 continue;
             }
@@ -413,12 +492,11 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
         let observed = transport.requests();
         assert_eq!(observed.len(), 4);
         let mut jtis = Vec::new();
-        for ((calls, (frame, stdout)), aud) in observed
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(execs)
-            .zip(["https://alpha.example.test", "https://beta.example.test"])
+        for ((calls, (frame, stdout)), (aud, iss)) in
+            observed.as_chunks::<2>().0.iter().zip(execs).zip([
+                ("https://alpha.example.test", ISSUER),
+                ("https://beta.example.test", SECOND_ISSUER),
+            ])
         {
             let [create, exec] = calls;
             assert_eq!(create.sent.body, create.guest.body);
@@ -443,7 +521,7 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             assert_eq!(sent["deadlineMs"], guest["deadlineMs"]);
             let jwt = sent["stdin"].as_str().unwrap();
             assert!(!frame.contains(jwt) && !String::from_utf8(stdout).unwrap().contains(jwt));
-            let jti = assert_jwt(jwt, aud);
+            let jti = assert_jwt(jwt, aud, iss);
             for record in captured.records() {
                 let (Record::Event { fields, .. } | Record::Span { fields, .. }) = &record;
                 for attribute in fields.values() {
@@ -454,7 +532,7 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
                         "org-fixture",
                         "reviewer-fixture",
                         "email-fixture@example.test",
-                        "https://id.xavierlange.com/dekopon",
+                        iss,
                     ]) {
                         assert!(
                             !attribute.contains(hidden),

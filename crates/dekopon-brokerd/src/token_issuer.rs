@@ -13,7 +13,6 @@ use thiserror::Error;
 
 use crate::github_app::{GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES};
 
-const ISSUER: &str = "https://id.xavierlange.com/dekopon";
 const MAX_TTL_SECONDS: u32 = 300;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -22,6 +21,7 @@ pub(crate) struct SignedJwtConfig {
     pub(crate) private_key: PathBuf,
     pub(crate) runner_secret: SecretDrn,
     kid: String,
+    iss: String,
     aud: String,
     ttl: u32,
     claims: PersonaClaims,
@@ -40,6 +40,8 @@ struct PersonaClaims {
 pub enum SignedJwtConfigError {
     #[error("signedJwt ttl must be in 1..=300 seconds")]
     Ttl,
+    #[error("signedJwt iss must be an absolute HTTPS URL")]
+    Issuer,
     #[error("signedJwt aud must be one exact HTTPS origin")]
     Audience,
     #[error("signedJwt kid must be nonempty")]
@@ -52,14 +54,12 @@ pub enum SignedJwtConfigError {
     KeyRead(#[source] FileHygieneError),
     #[error("signedJwt privateKey could not be loaded: {reason}")]
     KeyFormat { reason: String },
-    #[error("signedJwt requires a dedicated runnerSecret with a vm.exec httpBearer binding")]
+    #[error(
+        "signedJwt requires a dedicated runnerSecret with httpBearer bindings for the persona capabilities"
+    )]
     RunnerBinding,
-    #[error("signedJwt and vmExecStdin must be bound together, exclusively on vm.exec")]
+    #[error("signedJwt and vmExecStdin must be bound together for one POST without a query")]
     SinkBinding,
-}
-
-pub(crate) trait TokenIssuer {
-    fn issue(&self) -> Result<IssuedToken, IssueError>;
 }
 
 pub(crate) struct IssuedToken {
@@ -104,6 +104,9 @@ impl SelfSignedIssuer {
         let mut errors = Vec::new();
         if !(1..=MAX_TTL_SECONDS).contains(&config.ttl) {
             errors.push(SignedJwtConfigError::Ttl);
+        }
+        if !Url::parse(&config.iss).is_ok_and(|url| url.scheme() == "https" && url.has_host()) {
+            errors.push(SignedJwtConfigError::Issuer);
         }
         if !Url::parse(&config.aud).is_ok_and(|url| {
             url.scheme() == "https" && url.origin().ascii_serialization() == config.aud
@@ -156,14 +159,12 @@ impl SelfSignedIssuer {
         digest.update(&pem);
         Ok(Self { key, config })
     }
-}
 
-impl TokenIssuer for SelfSignedIssuer {
     #[expect(
         clippy::map_err_ignore,
         reason = "ring errors have no diagnostic detail"
     )]
-    fn issue(&self) -> Result<IssuedToken, IssueError> {
+    pub(crate) fn issue(&self) -> Result<IssuedToken, IssueError> {
         let iat = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let exp = iat
             .checked_add(u64::from(self.config.ttl))
@@ -178,7 +179,7 @@ impl TokenIssuer for SelfSignedIssuer {
         );
         let claims = URL_SAFE_NO_PAD.encode(
             serde_json::json!({
-                "iss": ISSUER,
+                "iss": self.config.iss,
                 "iat": iat,
                 "exp": exp,
                 "jti": jti,
