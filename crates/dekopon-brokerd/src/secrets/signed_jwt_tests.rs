@@ -127,6 +127,46 @@ async fn signed_jwt_boot_reports_invalid_ttl_audience_and_private_key_together()
     assert!(problems.next().is_none());
 }
 
+#[tokio::test]
+async fn duplicate_personas_report_every_signed_jwt_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = secret_map(directory.path(), 301, "", 0o600).await;
+    let document = tokio::fs::read_to_string(&path).await.unwrap();
+    let document = document.replace(SECOND_PERSONA, PERSONA).replacen(
+        &format!("runnerSecret: {RUNNER_DRN}"),
+        "runnerSecret: drn:secret:login/missing",
+        1,
+    );
+    write(&path, document.as_bytes()).await;
+
+    let error = load(&path, rustix::process::geteuid().as_raw())
+        .await
+        .unwrap_err();
+    let SecretMapError::SignedJwtValidation {
+        problems,
+        jwt_problems,
+    } = error
+    else {
+        panic!("expected typed signedJwt conflicts: {error}");
+    };
+    assert!(problems.contains(&format!("duplicate DRN {PERSONA}")));
+    assert_eq!(
+        jwt_problems
+            .iter()
+            .filter(|problem| matches!(problem.source, SignedJwtConfigError::Ttl))
+            .count(),
+        2
+    );
+    assert!(jwt_problems.iter().any(|problem| {
+        problem.secret.as_str() == PERSONA
+            && matches!(problem.source, SignedJwtConfigError::Audience)
+    }));
+    assert!(jwt_problems.iter().any(|problem| {
+        problem.secret.as_str() == PERSONA
+            && matches!(problem.source, SignedJwtConfigError::RunnerBinding)
+    }));
+}
+
 fn assert_jwt(token: &str, aud: &str) -> String {
     let (input, signature) = token.rsplit_once('.').expect("JWT signature");
     let key = GithubAppKey::from_pem(KEY).expect("fixture key");

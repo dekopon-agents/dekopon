@@ -1620,7 +1620,8 @@ pub(crate) async fn load_shapes(
 ) -> Result<SecretCatalog, SecretMapError> {
     let (file, _) = read_map::<SecretMapFile>(path, expected_uid).await?;
     let mut problems = Vec::new();
-    let runners = signed_jwt_runners(file.secrets.iter().map(|entry| (&entry.drn, &entry.source)));
+    let runners =
+        signed_jwt_runners(file.secrets.iter().map(|entry| (&entry.drn, &entry.source))).collect();
     let bindings = file
         .secrets
         .into_iter()
@@ -1636,17 +1637,14 @@ pub(crate) async fn load_shapes(
 
 fn signed_jwt_runners<'a>(
     sources: impl IntoIterator<Item = (&'a SecretDrn, &'a SecretSource)>,
-) -> BTreeMap<SecretDrn, SecretDrn> {
-    sources
-        .into_iter()
-        .filter_map(|(drn, source)| {
-            if let SecretSource::SignedJwt(config) = source {
-                Some((drn.clone(), config.runner_secret.clone()))
-            } else {
-                None
-            }
-        })
-        .collect()
+) -> impl Iterator<Item = (SecretDrn, SecretDrn)> {
+    sources.into_iter().filter_map(|(drn, source)| {
+        if let SecretSource::SignedJwt(config) = source {
+            Some((drn.clone(), config.runner_secret.clone()))
+        } else {
+            None
+        }
+    })
 }
 
 fn entry_bindings(
@@ -1751,7 +1749,7 @@ async fn validate_map(
     let mut material_paths = BTreeSet::new();
     let mut binding_ids = BTreeSet::new();
     let mut binding_keys = BTreeSet::new();
-    let mut entries = BTreeMap::new();
+    let mut entries = Vec::new();
     let mut bindings = Vec::new();
     for entry in file.secrets {
         if !seen.insert(entry.drn.clone()) {
@@ -1859,7 +1857,7 @@ async fn validate_map(
             }
             bindings.push(resolved);
         }
-        entries.insert(drn, (source, projection));
+        entries.push((drn, (source, projection)));
     }
     if bootstrap_paths.contains(map_path) {
         problems
@@ -1895,6 +1893,7 @@ async fn validate_map(
             bindings.len()
         ));
     }
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
     for (drn, (source, _)) in &entries {
         if let SecretSource::OAuth2Refresh {
             seed_path: Some(path),
@@ -1912,7 +1911,8 @@ async fn validate_map(
             }
         }
     }
-    let runners = signed_jwt_runners(entries.iter().map(|(drn, (source, _))| (drn, source)));
+    let runners = signed_jwt_runners(entries.iter().map(|(drn, (source, _))| (drn, source)))
+        .collect::<Vec<_>>();
     let jwt_problems = signed_jwt_binding_problems(&runners, &bindings);
     if runners.is_empty() && jwt_problems.is_empty() && !problems.is_empty() {
         return Err(SecretMapError::Validation { problems });
@@ -1974,7 +1974,7 @@ async fn validate_map(
     });
     let dyn_resolver: Arc<dyn SecretResolver> = Arc::<MapResolver>::clone(&resolver);
     let catalog = SecretCatalog::new(bindings, dyn_resolver)
-        .map(|catalog| catalog.with_signed_jwt_runners(runners))
+        .map(|catalog| catalog.with_signed_jwt_runners(runners.into_iter().collect()))
         .and_then(|catalog| catalog.with_authority_revision(file.map_revision))
         .map_err(|source| SecretMapError::Catalog { source })?;
     Ok(ValidatedMap {
@@ -2001,12 +2001,16 @@ struct MintedSources {
 }
 
 fn signed_jwt_binding_problems(
-    runners: &BTreeMap<SecretDrn, SecretDrn>,
+    runners: &[(SecretDrn, SecretDrn)],
     bindings: &[SecretUseBinding],
 ) -> Vec<SignedJwtProblem> {
+    let personas = runners
+        .iter()
+        .map(|(persona, _)| persona)
+        .collect::<BTreeSet<_>>();
     let mut problems = Vec::new();
     for binding in bindings {
-        let jwt = runners.contains_key(&binding.secret);
+        let jwt = personas.contains(&binding.secret);
         if jwt != (binding.sink == SecretSinkKind::VmExecStdin)
             || jwt
                 && (binding.allow_query
@@ -2024,7 +2028,7 @@ fn signed_jwt_binding_problems(
         }
     }
     for (secret, runner) in runners {
-        if runners.contains_key(runner)
+        if personas.contains(runner)
             || !bindings.iter().any(|binding| {
                 &binding.secret == runner
                     && binding.sink == SecretSinkKind::HttpBearer
