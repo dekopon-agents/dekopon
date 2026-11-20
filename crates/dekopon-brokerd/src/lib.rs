@@ -270,6 +270,31 @@ where
     }
 }
 
+#[expect(
+    clippy::todo,
+    unused_variables,
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload"
+)]
+async fn serve_with_watcher<F, W>(
+    config_path: &Path,
+    shutdown: F,
+    deadline: ShutdownDeadline,
+    watcher: W,
+) -> Result<(), BrokerdError>
+where
+    F: Future<Output = ()> + Send,
+    W: FnOnce(
+        dekopon_core::reload::ReloadSettings,
+        Vec<self_reload::BrokerGroup>,
+    ) -> Result<
+        dekopon_core::reload::Watcher<self_reload::BrokerGroup>,
+        dekopon_core::reload::ReloadError,
+    >,
+{
+    todo!()
+}
+
 async fn stopped<F>(
     shutdown: F,
     lock: Option<&lock_watch::LoadedLock>,

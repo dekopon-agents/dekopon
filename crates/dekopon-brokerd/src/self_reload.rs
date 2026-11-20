@@ -83,3 +83,18 @@ impl Coordination {
 pub(crate) async fn reload_ended(task: &mut JoinSet<BrokerStop>) -> Result<(), BrokerdError> {
     todo!()
 }
+
+#[cfg(test)]
+#[expect(
+    clippy::todo,
+    unused_variables,
+    reason = "skeleton: daemon/broker-self-reload"
+)]
+pub(crate) fn injected_watcher(
+    sender: tokio::sync::oneshot::Sender<dekopon_core::reload::Injector>,
+) -> impl FnOnce(
+    dekopon_core::reload::ReloadSettings,
+    Vec<BrokerGroup>,
+) -> Result<dekopon_core::reload::Watcher<BrokerGroup>, ReloadError> {
+    move |settings, groups| todo!()
+}

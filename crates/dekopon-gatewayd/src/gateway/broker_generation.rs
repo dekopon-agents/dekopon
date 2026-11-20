@@ -1,6 +1,6 @@
 #![expect(dead_code, reason = "skeleton: daemon/broker-self-reload")]
 
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
 use arc_swap::ArcSwap;
 use dekopon_broker_protocol::BrokerClient;
@@ -18,7 +18,7 @@ pub(crate) async fn follow(
     client: BrokerClient,
     commits: CommitSignal,
     active: Arc<ArcSwap<ServingGeneration>>,
-) {
+) -> Infallible {
     todo!()
 }
 
