@@ -84,7 +84,7 @@ fn a_reconnected_gateway_learns_the_broker_digest_at_connect() {}
 
 #[test]
 #[ignore = "skeleton: daemon/broker-self-reload"]
-fn a_lost_broker_feed_stops_the_gateway_with_its_cause() {}
+fn a_lost_broker_feed_reconnects_and_serves_the_last_digest_meanwhile() {}
 
 #[test]
 #[ignore = "skeleton: daemon/broker-self-reload"]
@@ -121,3 +121,7 @@ fn a_proxy_tls_change_applies_in_signaled_mode() {}
 #[test]
 #[ignore = "skeleton: daemon/reload-consumers"]
 fn a_refused_tls_bundle_is_reported_once_per_change() {}
+
+#[test]
+#[ignore = "skeleton: daemon/reload-consumers"]
+fn a_panicking_tls_prepare_stops_the_gateway_with_its_cause() {}

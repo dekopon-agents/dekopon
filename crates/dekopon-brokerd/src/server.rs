@@ -78,6 +78,32 @@ impl ShutdownDeadline {
 
 type ConnectionTasks = JoinSet<Result<(), ConnectionError>>;
 
+#[expect(
+    clippy::todo,
+    unused_variables,
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload"
+)]
+async fn serve_observer(
+    stream: UnixStream,
+    commits: dekopon_core::reload::CommitReceiver,
+    limits: FrameLimits,
+) -> Result<(), ConnectionError> {
+    todo!()
+}
+
+// A held-open observer carries no work in flight, so it ends at admission close instead of holding
+// the connection drain to its deadline and turning every broker stop into `ShutdownTimeout`.
+#[expect(
+    clippy::todo,
+    unused_variables,
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload"
+)]
+async fn drain_observers(observers: &mut ConnectionTasks) {
+    todo!()
+}
+
 pub struct BrokerServer<A>
 where
     A: AuditLog,

@@ -56,7 +56,7 @@ impl ReloadState {
     unused_variables,
     reason = "skeleton: daemon/reload-consumers"
 )]
-async fn reconcile_tls(tls: &mut TlsReload, cause: Cause) -> Reconciled {
+async fn reconcile_tls(tls: &mut TlsReload, cause: Cause) -> Result<Reconciled, GatewaydError> {
     todo!()
 }
 

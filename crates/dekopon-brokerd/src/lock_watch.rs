@@ -4,7 +4,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use dekopon_core::reload::{Reconciled, WatchSet};
 
-use crate::{BrokerdError, provider_manager};
+use crate::{provider_manager, self_reload::BrokerStop};
 
 pub(crate) const POLL: Duration = Duration::from_secs(2);
 const WINDOW: u8 = 3;
@@ -36,7 +36,7 @@ impl LockGroup {
         dead_code,
         reason = "skeleton: daemon/broker-self-reload"
     )]
-    pub(crate) async fn verify(&mut self) -> Result<Reconciled, BrokerdError> {
+    pub(crate) async fn verify(&mut self) -> Result<Reconciled, BrokerStop> {
         todo!()
     }
 }

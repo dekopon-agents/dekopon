@@ -97,3 +97,11 @@ fn a_second_renewal_replaces_the_staged_key() {}
 #[test]
 #[ignore = "skeleton: daemon/signer-reload"]
 fn a_restarted_broker_signs_with_the_mounted_key() {}
+
+#[test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+fn a_held_open_observer_ends_at_shutdown_without_a_timeout() {}
+
+#[test]
+#[ignore = "skeleton: daemon/supervisor"]
+fn a_lock_change_through_the_reload_task_ends_the_broker_cleanly() {}

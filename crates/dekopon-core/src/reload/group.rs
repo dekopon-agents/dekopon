@@ -25,7 +25,7 @@ pub enum Reconciled {
 }
 
 pub trait Reconcile: Send + 'static {
-    type Exit: std::error::Error + From<ReloadError> + Send + 'static;
+    type Exit: From<ReloadError> + Send + 'static;
 
     fn input(&self) -> Input;
 
