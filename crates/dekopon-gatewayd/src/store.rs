@@ -186,9 +186,4 @@ impl DurableStore {
     pub(crate) fn expire(&self, now: SystemTime) -> Result<Vec<WakeRow>, StoreError> {
         todo!()
     }
-
-    #[expect(clippy::todo, reason = "skeleton: state/spend-slice1")]
-    pub(crate) fn ledger(&self) -> Ledger<'_> {
-        todo!()
-    }
 }

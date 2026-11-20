@@ -24,6 +24,13 @@ pub(crate) enum HoldOutcome {
     Crashed,
 }
 
+impl DurableStore {
+    #[expect(clippy::todo, reason = "skeleton: state/spend-slice1")]
+    pub(crate) fn ledger(&self) -> Ledger<'_> {
+        todo!()
+    }
+}
+
 impl Ledger<'_> {
     #[expect(
         clippy::todo,
