@@ -25,6 +25,11 @@ pub(crate) struct Delivery {
     pub(crate) ticket: DeliveryTicket,
 }
 
+pub(crate) enum TickEnd {
+    Resolved(Option<Box<Delivery>>),
+    Panicked { wake: WakeId },
+}
+
 impl DeliveryTicket {
     #[expect(
         clippy::todo,

@@ -17796,8 +17796,6 @@ mod steering;
 #[path = "tests/steering_e2e.rs"]
 mod steering_e2e;
 mod subscriptions;
-#[path = "tests/supervisor.rs"]
-mod supervisor;
 #[path = "tests/task_time.rs"]
 mod task_time;
 #[path = "tests/tick_runner.rs"]

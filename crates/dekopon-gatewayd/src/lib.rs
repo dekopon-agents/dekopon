@@ -32,7 +32,6 @@ mod routes;
 mod runner;
 mod session;
 mod store;
-mod supervise;
 mod threads;
 mod transport;
 mod wake;

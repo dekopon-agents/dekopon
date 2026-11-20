@@ -14,10 +14,7 @@ use dekopon_agent::wake::WakeId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{
-    supervise::FatalLabel,
-    transport::{ChatDriver, ReplyTarget},
-};
+use crate::transport::{ChatDriver, ReplyTarget};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Destination {
@@ -29,6 +26,13 @@ pub(crate) struct Destination {
 pub(crate) struct NoticeChannel {
     pub(crate) destination: Destination,
     pub(crate) stability: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum FatalLabel {
+    Store,
+    Reload,
 }
 
 #[derive(Debug, Error)]
