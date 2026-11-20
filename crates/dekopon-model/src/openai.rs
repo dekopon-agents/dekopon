@@ -211,8 +211,7 @@ impl InferenceModel for OpenAiClient {
     ) -> Result<AssistantTurn, InferenceError> {
         self.http
             .generation(
-                &self.name,
-                &self.model,
+                (&self.name, &self.model),
                 "openai-compatible",
                 "chat-completions",
                 request.options,

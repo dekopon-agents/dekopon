@@ -106,8 +106,7 @@ impl InferenceHttp {
 
     pub(crate) async fn generation(
         &self,
-        name: &str,
-        model: &str,
+        (name, model): (&str, &str),
         provider: &str,
         dialect: &str,
         options: &CompletionOptions,
@@ -587,8 +586,7 @@ mod tests {
         let capture = crate::trace_capture::TraceCapture::default();
         let result = http
             .generation(
-                "refusal",
-                "fixture",
+                ("refusal", "fixture"),
                 "fixture",
                 "fixture",
                 &CompletionOptions::default(),
@@ -647,8 +645,7 @@ mod tests {
         let control =
             TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(2)).unwrap();
         let (result, span) = crate::trace_capture::exported_model_span(http.generation(
-            "tls",
-            "fixture",
+            ("tls", "fixture"),
             "fixture",
             "fixture",
             &CompletionOptions::default(),
