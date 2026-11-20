@@ -22,11 +22,8 @@
 # - `reactions:write`: optional working/seen reactions; leave both off when removing it.
 # - `message.im`/`im:history`: direct-message prompts.
 # - `app_mention`/`app_mentions:read`: explicitly addressed channel prompts.
-# - `channels:read`, `groups:read`, `im:read`, `mpim:read`: `conversations.info`, which is the only
-#   thing that says what kind of conversation a mention arrived in — `app_mention` carries no
-#   `channel_type`, so without them a mention in a direct message or a multi-person DM is minted as
-#   a channel and matches no `directMessage` or `groupDirectMessage` route. The answer is
-#   remembered per conversation, so it costs one call per conversation the bot is addressed in.
+# - `channels:read`, `groups:read`, `im:read`, `mpim:read` let the gateway look up a
+#   mention's conversation kind. If the lookup fails, an addressed message uses channel routing.
 # - `message.channels`/`channels:history` and `message.groups`/`groups:history`: receive channel
 #   traffic for exact freshly authorized sender/thread continuations and opted-in thread follow.
 #   Other ambient messages are dropped before routing, authorization, telemetry, or inference.
@@ -60,8 +57,6 @@ oauth_config:
       - assistant:write
       - canvases:read
       - channels:history
-      # `*:read` resolve one conversation's kind: an `app_mention` carries no `channel_type`, so
-      # without them a mention in a DM or a group DM is minted as a channel and matches no route.
       - channels:read
       - chat:write
       - files:read

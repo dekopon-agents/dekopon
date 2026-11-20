@@ -498,14 +498,18 @@ impl SlackTransport {
         // the authoritative app_mention event arrives.
         let explicitly_addressed = event["type"].as_str() == Some("app_mention")
             || self.identity.is_addressed(&bound_inbound(top_text));
-        if !self.seen.insert(format!("{channel}:{ts}")) {
+        let delivery_key = format!("{channel}:{ts}");
+        if self.seen.contains(&delivery_key) {
             return Ok(None);
         }
-        let Some(posted_in) = self.channel_kind(channel, event, received).await else {
+        let Some(posted_in) = self
+            .channel_kind(channel, event, received, explicitly_addressed)
+            .await
+        else {
             return Ok(None);
         };
         let kind = posted_in.conversation_kind(thread_ts.is_some());
-        let follow_conversation = Conversation {
+        let mut conversation = Conversation {
             kind,
             container: Some(team.to_ascii_lowercase()),
             id: channel.to_ascii_lowercase(),
@@ -521,7 +525,7 @@ impl SlackTransport {
                 generation
                     .as_ref()?
                     .routes
-                    .find(&self.name, &follow_conversation, &subject)
+                    .find(&self.name, &conversation, &subject)
                     .filter(|(_, route)| route.ambient.pull_request_links)?;
                 crate::pull_request_links::PullRequestLinkContext::parse(top_text)
             })
@@ -530,7 +534,7 @@ impl SlackTransport {
         let follow_route = generation.as_ref().and_then(|active| {
             active
                 .routes
-                .follow_routes(&self.name, &follow_conversation)
+                .follow_routes(&self.name, &conversation)
                 .next()
         });
         let followed = follow_route.is_some_and(|route| {
@@ -538,7 +542,7 @@ impl SlackTransport {
                 &route.transport,
                 route.agent.as_str(),
                 &route.conversation,
-                &follow_conversation.key(),
+                &conversation.key(),
             );
             self.generation
                 .as_ref()
@@ -576,12 +580,9 @@ impl SlackTransport {
         };
         // The joined thread must come from reply_thread, not thread_ts, since Slack omits thread_ts
         // on a thread's own opening message, which would misfile that first turn if read directly.
-        let conversation = Conversation {
-            kind,
-            container: Some(team.to_ascii_lowercase()),
-            id: channel.to_ascii_lowercase(),
-            thread: reply_thread.clone(),
-        };
+        conversation.thread.clone_from(&reply_thread);
+        let subject = AttestedSubject::one(subject).map_err(TransportError::Subject)?;
+        self.seen.insert(delivery_key);
         record_conversation(received, &conversation);
         // The conversation key is minted once and carried rather than re-derived, since a Stop
         // button spelling it a second way would name no session at all.
@@ -591,7 +592,7 @@ impl SlackTransport {
             pull_request_links,
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Slack,
-            subject: AttestedSubject::one(subject).map_err(TransportError::Subject)?,
+            subject,
             conversation,
             message_id: MessageId::Native(ts.to_owned()),
             text: projection.text,
@@ -726,6 +727,7 @@ impl SlackTransport {
         channel: &str,
         event: &Value,
         received: &Span,
+        explicitly_addressed: bool,
     ) -> Option<SlackChannelKind> {
         if let Some(channel_type) = event["channel_type"].as_str() {
             return Some(SlackChannelKind::of_channel_type(channel_type));
@@ -733,21 +735,30 @@ impl SlackTransport {
         if let Some(kind) = self.channel_kinds.get(channel).copied() {
             return Some(kind);
         }
-        let unresolved = |cause: &'static str| -> Option<SlackChannelKind> {
-            received.record("drop.reason", "conversation-unresolved");
-            tracing::debug!(
-                event = "gateway_conversation_unresolved",
-                transport = "slack",
-                cause,
-                "gateway.conversation.unresolved"
-            );
-            None
+        let kind = match self.lookup_channel_kind(channel).await {
+            Ok(kind) => kind,
+            Err(error) => match error.fallback().filter(|_| explicitly_addressed) {
+                Some(ChannelKindFallback::Cache) => SlackChannelKind::Channel,
+                Some(ChannelKindFallback::UseOnce) => return Some(SlackChannelKind::Channel),
+                None => {
+                    error.record_drop(received);
+                    return None;
+                }
+            },
         };
+        self.channel_kinds.insert(channel.to_owned(), kind);
+        Some(kind)
+    }
+
+    async fn lookup_channel_kind(
+        &self,
+        channel: &str,
+    ) -> Result<SlackChannelKind, ChannelKindLookupError> {
         if channel.is_empty() || !channel.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-            return unresolved("channel-id");
+            return Err(ChannelKindLookupError::InvalidChannelId);
         }
         if self.replier.progress_cooldown().is_some() {
-            return unresolved("rate-limited");
+            return Err(ChannelKindLookupError::RateLimited);
         }
         let response = self
             .http
@@ -761,44 +772,16 @@ impl SlackTransport {
             )
             .timeout(LIVENESS_REQUEST_TIMEOUT)
             .send()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(source) => {
-                tracing::debug!(
-                    event = "gateway_conversation_unresolved",
-                    transport = "slack",
-                    cause = "request",
-                    cause_type = %source,
-                    "gateway.conversation.unresolved"
-                );
-                received.record("drop.reason", "conversation-unresolved");
-                return None;
-            }
-        };
+            .await
+            .map_err(ChannelKindLookupError::Request)?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             self.replier.begin_cooldown(retry_after(response.headers()));
-            return unresolved("rate-limited");
+            return Err(ChannelKindLookupError::RateLimited);
         }
-        let body = match check_ok(response).await {
-            Ok(body) => body,
-            Err(error) => {
-                tracing::debug!(
-                    event = "gateway_conversation_unresolved",
-                    transport = "slack",
-                    cause = "response",
-                    cause_type = %error,
-                    "gateway.conversation.unresolved"
-                );
-                received.record("drop.reason", "conversation-unresolved");
-                return None;
-            }
-        };
-        let Some(kind) = SlackChannelKind::of_info(&body["channel"]) else {
-            return unresolved("channel-flags");
-        };
-        self.channel_kinds.insert(channel.to_owned(), kind);
-        Some(kind)
+        let body = check_ok(response)
+            .await
+            .map_err(ChannelKindLookupError::Response)?;
+        SlackChannelKind::of_info(&body["channel"]).ok_or(ChannelKindLookupError::Flags)
     }
 
     fn session_stopped(
@@ -829,6 +812,91 @@ impl SlackTransport {
                 .to_string(),
             via: CancelVia::NativeStop,
         }))
+    }
+}
+
+enum ChannelKindLookupError {
+    InvalidChannelId,
+    RateLimited,
+    Request(reqwest::Error),
+    Response(TransportError),
+    Flags,
+}
+
+enum ChannelKindFallback {
+    Cache,
+    UseOnce,
+}
+
+impl ChannelKindLookupError {
+    fn fallback(&self) -> Option<ChannelKindFallback> {
+        match self {
+            Self::InvalidChannelId => None,
+            Self::Response(TransportError::Service { code }) => {
+                let fallback = if matches!(
+                    code.as_str(),
+                    "missing_scope"
+                        | "access_denied"
+                        | "channel_is_limited_access"
+                        | "channel_not_found"
+                        | "no_permission"
+                        | "not_allowed_token_type"
+                        | "team_access_not_granted"
+                ) {
+                    ChannelKindFallback::Cache
+                } else {
+                    ChannelKindFallback::UseOnce
+                };
+                Some(fallback)
+            }
+            Self::RateLimited
+            | Self::Request(_)
+            | Self::Flags
+            | Self::Response(
+                TransportError::AssetType { .. }
+                | TransportError::Attachment(_)
+                | TransportError::AttachmentTask { .. }
+                | TransportError::MissingCredential { .. }
+                | TransportError::EmptyCredential { .. }
+                | TransportError::NonUtf8Credential { .. }
+                | TransportError::Request(_)
+                | TransportError::AssetTooLarge { .. }
+                | TransportError::AssetRefused { .. }
+                | TransportError::DisallowedIntents
+                | TransportError::Response
+                | TransportError::MalformedResponse(_)
+                | TransportError::PartialDelivery { .. }
+                | TransportError::AttachmentsMissing { .. }
+                | TransportError::ConnectTimeout
+                | TransportError::RecoveryExhausted { .. }
+                | TransportError::IdentityChanged
+                | TransportError::Closed
+                | TransportError::Io(_)
+                | TransportError::InsecureSocket { .. }
+                | TransportError::Subject(_)
+                | TransportError::Entropy(_),
+            ) => Some(ChannelKindFallback::UseOnce),
+        }
+    }
+
+    fn record_drop(&self, received: &Span) {
+        let (cause, cause_type) = match self {
+            Self::InvalidChannelId => ("channel-id", None),
+            Self::RateLimited => ("rate-limited", None),
+            Self::Request(error) if error.is_timeout() => ("request", Some("timeout")),
+            Self::Request(error) if error.is_connect() => ("request", Some("connect")),
+            Self::Request(_) => ("request", None),
+            Self::Response(error) => ("response", Some(error.category())),
+            Self::Flags => ("channel-flags", None),
+        };
+        received.record("drop.reason", "conversation-unresolved");
+        tracing::debug!(
+            event = "gateway_conversation_unresolved",
+            transport = "slack",
+            cause,
+            cause_type,
+            "gateway.conversation.unresolved"
+        );
     }
 }
 
@@ -3817,43 +3885,167 @@ mod driver_tests {
     }
 
     #[tokio::test]
-    async fn a_mention_whose_kind_cannot_be_resolved_is_dropped_naming_its_cause() {
-        let capture = CaptureLayer::workspace();
-        let _subscriber = tracing_subscriber::registry()
-            .with(capture.clone())
-            .set_default();
-        let mut transport = transport(UNREACHABLE, SlackExperience::Classic);
-        let span = receive_span(ChatTransportKind::Slack);
-
-        let routed = transport
-            .routable(
-                TEAM,
-                &json!({
-                    "type": "app_mention",
-                    "channel": CHANNEL,
-                    "user": USER,
-                    "ts": INBOUND_TS,
-                    "text": "<@B0123ABC> how are things?",
-                }),
-                &span,
+    async fn a_mention_caches_the_channel_kind_when_team_access_is_not_granted() {
+        let mock = spawn_slack_mock(|_, _| {
+            (
+                200,
+                json!({"ok": false, "error": "team_access_not_granted"}),
             )
-            .instrument(span.clone())
-            .await
-            .expect("a drop is not a transport failure");
-        drop(span);
+        });
+        let mut transport = transport(&mock.base, SlackExperience::Classic);
 
-        assert!(routed.is_none(), "an unplaceable mention is not routed");
-        assert!(
-            capture
-                .spans_text()
-                .contains("drop.reason=\"conversation-unresolved\""),
-            "{}",
-            capture.spans_text()
+        for ts in [INBOUND_TS, POSTED_TS] {
+            let mention = json!({
+                "type": "app_mention",
+                "channel": CHANNEL,
+                "user": USER,
+                "ts": ts,
+                "text": "how are things?",
+            });
+            let routed = transport
+                .routable(TEAM, &mention, &Span::none())
+                .await
+                .expect("readable")
+                .expect("the mention routes through a definitive rejection");
+            assert_eq!(routed.conversation.kind, ConversationKind::Channel);
+        }
+        assert_eq!(
+            mock.body(&format!("/api/conversations.info?channel={CHANNEL}")),
+            Value::Null
         );
+    }
+
+    #[tokio::test]
+    async fn a_mention_with_an_invalid_channel_id_drops_without_a_lookup() {
+        let mock = spawn_slack_mock(accepting);
+        let mut transport = transport(&mock.base, SlackExperience::Classic);
+        let mention = json!({
+            "type": "app_mention",
+            "channel": "C0123/ABC",
+            "user": USER,
+            "ts": INBOUND_TS,
+            "text": "how are things?",
+        });
+
         assert!(
-            capture.saw("cause=\"request\""),
-            "the drop names which step failed: {}",
-            capture.events_text()
+            transport
+                .routable(TEAM, &mention, &Span::none())
+                .await
+                .expect("readable")
+                .is_none()
+        );
+        assert!(mock.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mention_retries_conversation_lookup_after_a_transient_failure() {
+        for (status, code) in [
+            (503, "service_unavailable"),
+            (200, "internal_error"),
+            (429, "ratelimited"),
+        ] {
+            let failure = Mutex::new(Some((status, json!({"ok": false, "error": code}))));
+            let mock = spawn_slack_mock(move |path, body| {
+                failure
+                    .lock()
+                    .take()
+                    .unwrap_or_else(|| accepting(path, body))
+            });
+            let mut transport = transport(&mock.base, SlackExperience::Classic);
+            let mut mention = json!({
+                "type": "app_mention",
+                "channel": CHANNEL,
+                "user": USER,
+                "ts": INBOUND_TS,
+                "text": "how are things?",
+            });
+
+            let first = transport
+                .routable(TEAM, &mention, &Span::none())
+                .await
+                .expect("readable")
+                .expect("the mention routes through a transient failure");
+            assert_eq!(
+                first.conversation.kind,
+                ConversationKind::Channel,
+                "{status} {code}"
+            );
+            assert!(
+                transport.channel_kinds.get(CHANNEL).is_none(),
+                "{status} {code}"
+            );
+            assert_eq!(
+                transport.replier.progress_cooldown().is_some(),
+                status == 429
+            );
+
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            tokio::time::resume();
+            assert!(
+                transport
+                    .routable(TEAM, &mention, &Span::none())
+                    .await
+                    .expect("readable")
+                    .is_none(),
+                "a routed mention is deduplicated"
+            );
+            assert_eq!(mock.calls().len(), 1, "a duplicate makes no lookup");
+
+            mention["ts"] = json!(POSTED_TS);
+            assert!(
+                transport
+                    .routable(TEAM, &mention, &Span::none())
+                    .await
+                    .expect("readable")
+                    .is_some(),
+                "a subsequent mention routes after retrying the lookup"
+            );
+            assert_eq!(
+                mock.calls(),
+                vec![
+                    (
+                        format!("/api/conversations.info?channel={CHANNEL}"),
+                        Value::Null
+                    );
+                    2
+                ],
+                "{status} {code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unaddressed_unresolved_message_is_reconsidered_when_redelivered() {
+        let mock = spawn_slack_mock(|_, _| (200, json!({"ok": false, "error": "missing_scope"})));
+        let mut transport = transport(&mock.base, SlackExperience::Classic);
+        let message = json!({
+            "type": "message",
+            "channel": CHANNEL,
+            "user": USER,
+            "ts": INBOUND_TS,
+            "text": "just chatting",
+        });
+
+        for _ in 0..2 {
+            assert!(
+                transport
+                    .routable(TEAM, &message, &Span::none())
+                    .await
+                    .expect("readable")
+                    .is_none(),
+                "an unresolved unaddressed delivery drops"
+            );
+        }
+        assert_eq!(
+            mock.calls(),
+            vec![
+                (
+                    format!("/api/conversations.info?channel={CHANNEL}"),
+                    Value::Null
+                );
+                2
+            ]
         );
     }
 
