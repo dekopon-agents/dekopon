@@ -1723,6 +1723,21 @@ pub struct BrokerClient {
 }
 
 #[cfg(unix)]
+#[expect(dead_code, reason = "skeleton: daemon/broker-self-reload")]
+pub struct GenerationFeed {
+    stream: tokio::net::UnixStream,
+    limits: FrameLimits,
+}
+
+#[cfg(unix)]
+impl GenerationFeed {
+    #[expect(clippy::todo, reason = "skeleton: daemon/broker-self-reload")]
+    pub async fn next(&mut self) -> Result<String, ClientError> {
+        todo!()
+    }
+}
+
+#[cfg(unix)]
 const CONNECT_BACKOFF: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const MAX_CONNECT_BACKOFF: Duration = Duration::from_secs(1);
@@ -2087,6 +2102,11 @@ impl BrokerClient {
     pub async fn abort_generation(&self, digest: String) -> Result<GenerationOutcome, ClientError> {
         self.generation(BrokerRequest::AbortGeneration { digest })
             .await
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/broker-self-reload")]
+    pub async fn observe_generations(&self) -> Result<GenerationFeed, ClientError> {
+        todo!()
     }
 
     pub async fn observe_generation(&self) -> Result<(String, GenerationOutcome), ClientError> {

@@ -23,7 +23,9 @@ allow = [
   "Unicode-3.0",
   "Zlib",
 ]
-exceptions = []
+exceptions = [
+  { crate = "notify", allow = ["CC0-1.0"] },
+]
 
 [bans]
 multiple-versions = "deny"

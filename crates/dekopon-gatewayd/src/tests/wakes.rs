@@ -718,10 +718,10 @@ async fn a_fired_wake_with_no_route_sends_only_the_orphan_notice() {
     .await
     .expect("the due wake reaches its original chat");
     shutdown_tx.send(()).expect("serving shutdown receiver");
-    assert_eq!(
+    assert!(matches!(
         serving.await.expect("serving joins"),
         crate::ServeOutcome::Shutdown
-    );
+    ));
     assert_eq!(driver.replies(), ["check the PR"]);
     assert!(store.list(anchor().subject(), SystemTime::now()).is_empty());
 }
