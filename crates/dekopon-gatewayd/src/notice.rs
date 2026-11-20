@@ -40,7 +40,7 @@ pub(crate) enum FatalLabel {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub(crate) enum StreakState {}
+pub(crate) enum StandinState {}
 
 #[derive(Debug, Error)]
 pub(crate) enum MarkerError {
@@ -59,8 +59,16 @@ impl From<io::Error> for MarkerError {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct ExitMarker {
-    pub(crate) causes: Vec<FatalLabel>,
-    pub(crate) streak: StreakState,
+    pub(crate) streak: StandinState,
+    pub(crate) first_exit_ms: u64,
+    pub(crate) notice: MarkerNotice,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum MarkerNotice {
+    Owed,
+    Posted,
 }
 
 pub(crate) struct MarkerFile {
@@ -69,15 +77,24 @@ pub(crate) struct MarkerFile {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum NoticeLine {
-    Fatal { cause: FatalLabel },
-    Recovered { causes: Vec<FatalLabel> },
-    WakePanicked { wake: WakeId },
-    WakeRecovered { wake: WakeId },
+    Fatal {
+        cause: FatalLabel,
+    },
+    Recovered {
+        restarts: u32,
+        causes: Vec<FatalLabel>,
+    },
+    WakePanicked {
+        wake: WakeId,
+    },
+    WakeRecovered {
+        wake: WakeId,
+    },
 }
 
 #[derive(Default)]
 pub(crate) struct WakePanics {
-    open: HashMap<WakeId, StreakState>,
+    open: HashMap<WakeId, StandinState>,
 }
 
 impl MarkerFile {
