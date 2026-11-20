@@ -23,7 +23,9 @@ mod provider_manager;
 mod reaper;
 mod refresh_scheduler;
 mod secrets;
+mod self_reload;
 mod server;
+mod signer_reload;
 mod socket;
 mod workflows;
 
@@ -1706,6 +1708,10 @@ pub enum BrokerdError {
         "the provider lock never read as one stable file; the broker drained so a restart rereads it"
     )]
     ProviderLockUnsettled,
+    #[error("the provider lock changed; restarting to verify the new provider set")]
+    ProviderLockChanged,
+    #[error("configuration reload stopped")]
+    Reload(#[from] dekopon_core::reload::ReloadError),
     #[error("check could not prepare its private directory {path}")]
     CheckDirectory {
         path: PathBuf,
@@ -1759,6 +1765,8 @@ fn render_errors(problems: &[BrokerdError]) -> String {
         .join("; ")
 }
 
+#[cfg(test)]
+mod reload_tests;
 #[cfg(test)]
 mod tests;
 

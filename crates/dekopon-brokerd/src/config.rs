@@ -618,6 +618,20 @@ pub async fn load(
         .map(|(resolved, _)| resolved)
 }
 
+#[expect(
+    clippy::todo,
+    unused_variables,
+    dead_code,
+    reason = "skeleton: daemon/watcher-core"
+)]
+async fn load_directory_reporting(
+    directory: PathBuf,
+    expected_uid: u32,
+    mode: LoadMode<'_>,
+) -> (Option<ResolvedConfig>, Vec<ConfigError>) {
+    todo!()
+}
+
 #[allow(
     clippy::map_err_ignore,
     reason = "the policy file's FromUtf8Error would carry its offending bytes back into a log line; PolicyNotUtf8 names the file and deliberately stops there"

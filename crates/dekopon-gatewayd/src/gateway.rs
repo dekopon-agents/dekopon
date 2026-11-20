@@ -30,6 +30,10 @@ use crate::{
     via_label, wake,
 };
 
+mod broker_generation;
+mod consumers;
+mod reload;
+
 pub(crate) struct Gateway {
     runner: Arc<SessionRunner>,
     active: Arc<ArcSwap<ServingGeneration>>,
@@ -1176,6 +1180,7 @@ fn reload_reason(problem: &GatewaydError) -> &'static str {
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
+        | GatewaydError::Reload(_)
         | GatewaydError::Problems { .. } => "preparation",
     }
 }
@@ -1235,6 +1240,7 @@ pub(crate) fn reload_problem(problem: &GatewaydError) -> String {
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
+        | GatewaydError::Reload(_)
         | GatewaydError::Problems { .. } => error_chain(problem),
     }
 }
@@ -1263,6 +1269,7 @@ fn reload_entries(problem: &GatewaydError) -> Vec<(&'static str, String)> {
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
         | GatewaydError::Probe(_)
+        | GatewaydError::Reload(_)
         | GatewaydError::Problems { .. } => vec![(reload_reason(problem), reload_problem(problem))],
     }
 }

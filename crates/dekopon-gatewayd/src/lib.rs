@@ -1410,6 +1410,8 @@ pub enum GatewaydError {
     Probe(Box<ProbeProblem>),
     #[error("{}", render_problems(.problems))]
     Problems { problems: Vec<GatewaydError> },
+    #[error("configuration reload stopped")]
+    Reload(#[from] dekopon_core::reload::ReloadError),
 }
 
 impl GatewaydError {

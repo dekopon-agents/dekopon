@@ -2,7 +2,9 @@ use std::{path::PathBuf, time::Duration};
 
 use tokio::time::{Instant, MissedTickBehavior};
 
-use crate::provider_manager;
+use dekopon_core::reload::{Reconciled, VerificationWindow, WatchSet};
+
+use crate::{BrokerdError, provider_manager};
 
 pub(crate) const POLL: Duration = Duration::from_secs(2);
 const WINDOW: u8 = 3;
@@ -11,6 +13,33 @@ const WINDOW: u8 = 3;
 pub struct LoadedLock {
     pub(crate) path: PathBuf,
     pub(crate) digest: String,
+}
+
+#[expect(dead_code, reason = "skeleton: daemon/broker-self-reload")]
+pub(crate) struct LockGroup {
+    lock: LoadedLock,
+    uid: u32,
+    window: VerificationWindow,
+}
+
+impl LockGroup {
+    #[expect(
+        clippy::todo,
+        dead_code,
+        reason = "skeleton: daemon/broker-self-reload"
+    )]
+    pub(crate) fn watch_set(&self) -> WatchSet {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        dead_code,
+        reason = "skeleton: daemon/broker-self-reload"
+    )]
+    pub(crate) async fn verify(&mut self) -> Result<Reconciled, BrokerdError> {
+        todo!()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

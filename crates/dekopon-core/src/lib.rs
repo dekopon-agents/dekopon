@@ -30,6 +30,8 @@ mod offload;
 #[cfg(unix)]
 pub mod private_file;
 mod redaction;
+#[cfg(all(unix, feature = "reload"))]
+pub mod reload;
 mod skill;
 mod space;
 mod subject;

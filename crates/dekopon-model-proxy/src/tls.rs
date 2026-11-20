@@ -26,6 +26,11 @@ use tokio_rustls::TlsAcceptor;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(unix)]
+mod reload;
+#[cfg(unix)]
+pub use reload::TlsGroup;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TlsFiles {
     pub cert: PathBuf,

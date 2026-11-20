@@ -43,6 +43,8 @@ use tracing::{Instrument as _, Span, field::Empty};
 use dialect::Problem;
 pub use dialect::{Dialect, SANDBOX};
 use tee::{Shape, Timing};
+#[cfg(unix)]
+pub use tls::TlsGroup;
 
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const SUBJECT_HEADER: &str = "x-dekopon-vm-subject";

@@ -17777,6 +17777,8 @@ mod participants;
 mod pull_request_links;
 #[path = "tests/reload_evidence.rs"]
 mod reload_evidence;
+#[path = "tests/reload_watch.rs"]
+mod reload_watch;
 #[path = "tests/reply_attachments.rs"]
 mod reply_attachments;
 #[path = "tests/sealed_handoff.rs"]
