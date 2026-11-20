@@ -17,7 +17,12 @@ use dekopon_broker_host::{
 };
 use dekopon_core::{
     AncestorOwners, AncestorPolicy, FileHygieneError, FileTier, ProviderId,
-    check_trusted_ancestors, check_trusted_metadata, read_trusted_file,
+    check_trusted_ancestors, check_trusted_metadata,
+    private_file::{
+        TemporarySweep, replace_private_file, replace_private_file_noclobber,
+        sweep_stale_temporaries, sync_directory,
+    },
+    read_trusted_file,
 };
 use futures_util::StreamExt as _;
 use http_auth::parser::ChallengeParser;
@@ -28,7 +33,6 @@ use reqwest::{
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::Instrument as _;
@@ -41,6 +45,8 @@ pub const HARD_MAX_PROVIDER_STATE_BYTES: usize = 1024 * 1024;
 pub const HARD_MAX_PROVIDER_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const HARD_MAX_PROVIDER_STORE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const HARD_MAX_PROVIDER_STORE_BLOBS: usize = 1024;
+
+const BLOB_TEMPORARY_PREFIX: &str = ".provider-";
 
 const REGISTRY_CA_BUNDLE_ENV: &str = "DEKOPON_REGISTRY_CA_BUNDLE";
 
@@ -1748,7 +1754,7 @@ impl ProviderStore {
         }
         self.ensure_capacity(descriptor.size)?;
         let temporary = tempfile::Builder::new()
-            .prefix(".provider-")
+            .prefix(BLOB_TEMPORARY_PREFIX)
             .tempfile_in(&self.sha256)
             .map_err(|source| {
                 ProviderManagerError::io_at(
@@ -1775,14 +1781,16 @@ impl ProviderStore {
             ProviderManagerError::io("could not synchronize provider blob", source)
         })?;
         drop(file);
-        temporary.persist_noclobber(&destination).map_err(|error| {
-            ProviderManagerError::io_at(
-                "could not atomically publish provider blob",
-                destination.clone(),
-                error.error,
-            )
-        })?;
-        sync_directory(&self.sha256)?;
+        replace_private_file_noclobber(&destination, temporary.into_temp_path()).map_err(
+            |error| {
+                let reason = if error.path == self.sha256 {
+                    SYNC_PROVIDER_DIRECTORY
+                } else {
+                    "could not atomically publish provider blob"
+                };
+                ProviderManagerError::io_at(reason, error.path, error.source)
+            },
+        )?;
         socket::validate_owned_file(&destination, self.uid)
             .map_err(|error| ProviderManagerError::file_security(&destination, error))?;
         Ok(true)
@@ -1801,6 +1809,20 @@ impl ProviderStore {
             let path = entry.path();
             socket::validate_owned_file(&path, self.uid)
                 .map_err(|error| ProviderManagerError::file_security(&path, error))?;
+            if entry
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(BLOB_TEMPORARY_PREFIX.as_bytes())
+            {
+                fs::remove_file(&path).map_err(|source| {
+                    ProviderManagerError::io_at(
+                        "could not remove abandoned provider blob temporary file",
+                        &path,
+                        source,
+                    )
+                })?;
+                continue;
+            }
             let metadata = entry.metadata().map_err(|source| {
                 ProviderManagerError::io_at(SCAN_STORE_DIRECTORY, path.clone(), source)
             })?;
@@ -2076,7 +2098,9 @@ fn ensure_private_directory(path: &Path, expected_uid: u32) -> Result<(), Provid
                 }
             }
             validate_directory(path, expected_uid, true)?;
-            sync_directory(parent)
+            sync_directory(parent).map_err(|source| {
+                ProviderManagerError::io_at(SYNC_PROVIDER_DIRECTORY, parent, source)
+            })
         }
         Err(source) => Err(ProviderManagerError::io_at(
             INSPECT_STORE_PATH,
@@ -2092,43 +2116,22 @@ fn atomic_write(path: &Path, bytes: &[u8], expected_uid: u32) -> Result<(), Prov
     if let Ok(metadata) = fs::symlink_metadata(&path) {
         validate_file_metadata(&metadata, &path, expected_uid, false)?;
     }
-    let parent = path.parent().ok_or_else(|| {
-        ProviderManagerError::config_detail(PATH_HAS_NO_PARENT, path.display().to_string())
-    })?;
-    let mut temporary = NamedTempFile::new_in(parent).map_err(|source| {
+    for outcome in sweep_stale_temporaries(&path, None) {
+        if let TemporarySweep::Failed { path, source } = outcome {
+            return Err(ProviderManagerError::io_at(
+                "could not remove abandoned provider-lock temporary file",
+                path,
+                source,
+            ));
+        }
+    }
+    replace_private_file(&path, bytes).map_err(|error| {
         ProviderManagerError::io_at(
-            "could not create provider-lock temporary file",
-            parent,
-            source,
+            "could not durably publish provider lock",
+            error.path,
+            error.source,
         )
-    })?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|source| ProviderManagerError::io(WRITE_LOCK_TEMPORARY, source))?;
-    temporary
-        .write_all(bytes)
-        .map_err(|source| ProviderManagerError::io(WRITE_LOCK_TEMPORARY, source))?;
-    temporary.as_file_mut().sync_all().map_err(|source| {
-        ProviderManagerError::io("could not synchronize provider-lock temporary file", source)
-    })?;
-    temporary.persist(&path).map_err(|error| {
-        ProviderManagerError::io_at(
-            "could not atomically publish provider lock",
-            path.clone(),
-            error.error,
-        )
-    })?;
-    sync_directory(parent)?;
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<(), ProviderManagerError> {
-    fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| {
-            ProviderManagerError::io_at("could not synchronize provider directory", path, source)
-        })
+    })
 }
 
 async fn bounded_response_bytes(
@@ -2271,7 +2274,7 @@ const READ_PROVIDER_STATE: &str = "could not read provider state";
 const INSPECT_STORE_PATH: &str = "could not inspect provider store path";
 const SCAN_STORE_DIRECTORY: &str = "could not inspect provider store directory";
 const LOCK_STORE_OPERATION: &str = "could not lock provider store operation";
-const WRITE_LOCK_TEMPORARY: &str = "could not write provider-lock temporary file";
+const SYNC_PROVIDER_DIRECTORY: &str = "could not synchronize provider directory";
 const STATE_TOO_LARGE: &str = "provider state exceeds its hard byte ceiling";
 const COMPONENT_SIZE: &str = "provider component size is outside its hard bounds";
 const INVALID_DIGEST: &str =
@@ -2777,6 +2780,7 @@ mod tests {
         component: Arc<Vec<u8>>,
         manifests: Arc<AtomicUsize>,
         blobs: Arc<AtomicUsize>,
+        competing_blob: Option<PathBuf>,
     }
 
     #[derive(Clone)]
@@ -2809,6 +2813,13 @@ mod tests {
 
     impl TestRegistry {
         async fn start(component: Vec<u8>) -> Self {
+            Self::start_with_competing_blob(component, None).await
+        }
+
+        async fn start_with_competing_blob(
+            component: Vec<u8>,
+            competing_blob: Option<PathBuf>,
+        ) -> Self {
             let component_digest = prefixed_sha256(&component);
             let manifest = serde_json::to_vec(&serde_json::json!({
                 "schemaVersion": 2,
@@ -2834,6 +2845,7 @@ mod tests {
                 component: Arc::new(component),
                 manifests: Arc::new(AtomicUsize::new(0)),
                 blobs: Arc::new(AtomicUsize::new(0)),
+                competing_blob,
             };
             let app = Router::new()
                 .route("/v2/{*path}", get(registry_response))
@@ -2885,7 +2897,19 @@ mod tests {
             return response;
         }
         if path.contains("/blobs/") {
-            state.blobs.fetch_add(1, Ordering::Relaxed);
+            let previous = state.blobs.fetch_add(1, Ordering::Relaxed);
+            if previous == 0
+                && let Some(path) = &state.competing_blob
+            {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .expect("publish competing blob")
+                    .write_all(&state.component)
+                    .expect("write competing blob");
+            }
             return Response::new(Body::from(state.component.as_ref().clone()));
         }
         Response::builder()
@@ -2942,6 +2966,84 @@ mod tests {
         .await
         .expect("manager fixture");
         (manager, paths)
+    }
+
+    #[tokio::test]
+    async fn blob_download_clears_abandoned_staging_and_refuses_a_competing_blob() {
+        let directory = tempfile::tempdir().expect("manager fixture");
+        let store =
+            ProviderStore::open(&directory.path().join("store"), socket::current_uid(), true)
+                .unwrap();
+        let _operation = store.lock().unwrap();
+        let component = cli_probe_component();
+        let descriptor = LayerDescriptor {
+            digest: prefixed_sha256(&component),
+            size: component.len() as u64,
+        };
+        let destination = store.blob_path(&descriptor.digest).unwrap();
+        let abandoned = store
+            .sha256
+            .join(format!("{BLOB_TEMPORARY_PREFIX}abandoned"));
+        fs::write(&abandoned, b"partial").unwrap();
+        let registry =
+            TestRegistry::start_with_competing_blob(component.clone(), Some(destination.clone()))
+                .await;
+        let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
+        let source = format!("{}/test/provider:1.0.0", registry.authority);
+
+        assert!(matches!(
+            store.install_blob(&client, &source, &descriptor).await,
+            Err(ProviderManagerError::Io { path: Some(path), source, .. })
+                if path == destination && source.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(!abandoned.exists());
+        assert_eq!(fs::read(&destination).unwrap(), component);
+        assert!(
+            !store
+                .install_blob(&client, &source, &descriptor)
+                .await
+                .unwrap()
+        );
+
+        fs::remove_file(&destination).unwrap();
+        assert!(
+            store
+                .install_blob(&client, &source, &descriptor)
+                .await
+                .unwrap()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), component);
+        assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(fs::read_dir(&store.sha256).unwrap().count(), 1);
+        registry.stop().await;
+    }
+
+    #[test]
+    fn provider_lock_write_preserves_a_destination_matching_the_legacy_temporary_pattern() {
+        let directory = tempfile::tempdir().expect("manager fixture");
+        let path = directory.path().join("providers.tmp-123");
+        let uid = socket::current_uid();
+        let _operation = lock_activation(&path, uid).unwrap();
+        atomic_write(&path, b"previous lock", uid).unwrap();
+
+        let blocked = directory.path().join("providers.tmp-456");
+        fs::create_dir(&blocked).unwrap();
+        assert!(matches!(
+            atomic_write(&path, b"replacement lock", uid),
+            Err(ProviderManagerError::Io { path: Some(path), .. }) if path == blocked
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"previous lock");
+        fs::remove_dir(&blocked).unwrap();
+
+        let abandoned = directory
+            .path()
+            .join("providers.tmp-123.tmp-private-abandoned");
+        fs::write(&abandoned, b"partial").unwrap();
+        atomic_write(&path, b"replacement lock", uid).unwrap();
+
+        assert!(!abandoned.exists());
+        assert_eq!(fs::read(&path).unwrap(), b"replacement lock");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
     }
 
     #[tokio::test(flavor = "multi_thread")]
