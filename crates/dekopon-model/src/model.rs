@@ -5,6 +5,7 @@ use base64::{display::Base64Display, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
+use dekopon_core::AgentId;
 use dekopon_model_token_governor::ModelUsage;
 
 use crate::{error::InferenceError, stream::TurnEvent};
@@ -596,9 +597,32 @@ pub struct CompletionOptions {
     prompt_cache_key: Option<String>,
     stable_prefix: Option<usize>,
     stable_system: Option<usize>,
+    pub(crate) session: Option<CompletionSession>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletionSession {
+    pub(crate) agent: AgentId,
+    pub(crate) conversation_id: String,
+    pub(crate) conversation_kind: &'static str,
 }
 
 impl CompletionOptions {
+    #[must_use]
+    pub fn with_session(
+        mut self,
+        agent: AgentId,
+        conversation_id: impl Into<String>,
+        conversation_kind: &'static str,
+    ) -> Self {
+        self.session = Some(CompletionSession {
+            agent,
+            conversation_id: conversation_id.into(),
+            conversation_kind,
+        });
+        self
+    }
+
     #[must_use]
     pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
         let key = key.into();

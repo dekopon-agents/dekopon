@@ -314,10 +314,10 @@ impl InferenceModel for CodexClient {
     ) -> Result<AssistantTurn, InferenceError> {
         self.http
             .generation(
-                &self.name,
-                &self.model,
+                (&self.name, &self.model),
                 "chatgpt-subscription",
                 "codex-responses",
+                request.options,
                 async {
                     let mut progress = Progress::new();
                     (

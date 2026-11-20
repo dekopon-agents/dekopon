@@ -361,6 +361,8 @@ fn summarize_span(task: &SlotTask, since: &Instant) -> tracing::Span {
         memory.summary.queue_wait_ms = since.elapsed().as_millis() as u64,
         gen_ai.request.model = tracing::field::Empty,
         gen_ai.response.model = tracing::field::Empty,
+        usage.input_tokens = tracing::field::Empty,
+        usage.cached_input_tokens = tracing::field::Empty,
     )
 }
 
@@ -720,13 +722,22 @@ fn complete_request(
         ),
     };
     meter.finish(usage, bytes, outcome, kind);
+    let span = tracing::Span::current();
+    if let Some(usage) = usage {
+        let count = |tokens| i64::try_from(tokens).unwrap_or(i64::MAX);
+        span.record("usage.input_tokens", usage.input_tokens.map(count));
+        span.record(
+            "usage.cached_input_tokens",
+            usage.cached_input_tokens.map(count),
+        );
+    }
     if let Some(reported) = result
         .as_ref()
         .ok()
         .and_then(AssistantTurn::model_key)
         .and_then(ModelKey::reported)
     {
-        tracing::Span::current().record("gen_ai.response.model", reported);
+        span.record("gen_ai.response.model", reported);
     }
     let slot = match result {
         Ok(turn) => match turn
