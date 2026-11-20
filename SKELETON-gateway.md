@@ -1,7 +1,7 @@
 # Skeleton: gateway (wakes, durable store, notices, grants, tick runner)
 
 Step `06-designs/skeleton-gateway/design`, check round-1 repair. Branch `design/skeleton-gateway`,
-PR dekopon-agents/dekopon#983, code head `103869d` (supersedes the kickoff's `477f866` and the
+PR dekopon-agents/dekopon#983, code head `f8ea7ee` (supersedes the kickoff's `477f866` and the
 reviewed `053d9fa`). Base main `af0dcf4`, merged rather than rebased. This file is removed from the
 branch once the coordinator fetches it.
 
@@ -70,12 +70,12 @@ I checked both runs with a local copy of the rule the coordinator stated. The re
 `footprint-edges.py` was not run here.
 
 ```footprint
-{"unit": "state/grant-settle", "step": "10-state/grant-settle/build", "files": ["crates/dekopon-agent/src/grant.rs", "crates/dekopon-agent/src/lib.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/tests/grant_holds.rs"], "rank": 1, "items": ["S-gateway-91", "S-gateway-92", "S-gateway-93", "S-gateway-111", "S-gateway-129"]}
+{"unit": "state/grant-settle", "step": "10-state/grant-settle/build", "files": ["crates/dekopon-agent/src/grant.rs", "crates/dekopon-agent/src/lib.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/tests/grant_holds.rs"], "rank": 1, "items": ["S-gateway-91", "S-gateway-92", "S-gateway-93", "S-gateway-111", "S-gateway-129", "S-gateway-138"]}
 {"unit": "state/durable-store", "step": "10-state/durable-store/build", "files": ["crates/dekopon-gatewayd/src/store.rs", "crates/dekopon-gatewayd/src/store/lock.rs", "crates/dekopon-gatewayd/src/store/schema.rs", "crates/dekopon-gatewayd/src/store/record.rs", "crates/dekopon-gatewayd/src/store/convert.rs", "crates/dekopon-gatewayd/src/wake.rs", "crates/dekopon-gatewayd/src/wake/store.rs", "crates/dekopon-gatewayd/src/wake/delivery.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/collection.rs", "crates/dekopon-gatewayd/src/follow.rs", "crates/dekopon-gatewayd/src/memory/journal.rs", "crates/dekopon-gatewayd/src/jobs.rs", "crates/dekopon-gatewayd/src/transport/slack.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests.rs", "crates/dekopon-gatewayd/src/tests/wakes.rs", "crates/dekopon-gatewayd/src/tests/attribution.rs", "crates/dekopon-gatewayd/src/tests/digests.rs", "crates/dekopon-gatewayd/src/tests/memory.rs", "crates/dekopon-gatewayd/src/tests/wake_reason.rs", "crates/dekopon-gatewayd/src/tests/jobs_e2e.rs", "crates/dekopon-gatewayd/src/tests/thread_budget.rs", "crates/dekopon-gatewayd/src/tests/subscriptions.rs", "crates/dekopon-gatewayd/src/tests/github_burst.rs", "crates/dekopon-gatewayd/src/tests/durable_store.rs", "crates/dekopon-gatewayd/tests/gateway.rs", "crates/dekopon-gatewayd/tests/gateway/fauxlack.rs", "crates/dekopon-gatewayd/tests/gateway/subscriptions.rs"], "rank": 2, "items": ["S-gateway-01", "S-gateway-02", "S-gateway-03", "S-gateway-04", "S-gateway-05", "S-gateway-10", "S-gateway-11", "S-gateway-12", "S-gateway-13", "S-gateway-14", "S-gateway-15", "S-gateway-16", "S-gateway-17", "S-gateway-18", "S-gateway-19", "S-gateway-20", "S-gateway-23", "S-gateway-25", "S-gateway-41", "S-gateway-42", "S-gateway-43", "S-gateway-44", "S-gateway-45", "S-gateway-46", "S-gateway-47", "S-gateway-48", "S-gateway-49", "S-gateway-50", "S-gateway-51", "S-gateway-52", "S-gateway-53", "S-gateway-54", "S-gateway-55", "S-gateway-56", "S-gateway-57", "S-gateway-58", "S-gateway-59", "S-gateway-60", "S-gateway-61", "S-gateway-62", "S-gateway-63", "S-gateway-72", "S-gateway-73", "S-gateway-74", "S-gateway-75", "S-gateway-104", "S-gateway-105", "S-gateway-106", "S-gateway-107", "S-gateway-108", "S-gateway-109", "S-gateway-113", "S-gateway-114", "S-gateway-115", "S-gateway-116", "S-gateway-117", "S-gateway-118", "S-gateway-119", "S-gateway-120", "S-gateway-121", "S-gateway-122", "S-gateway-123", "S-gateway-124", "S-gateway-125", "S-gateway-126"]}
 {"unit": "state/cron-wakes", "step": "10-state/cron-wakes/build", "files": ["crates/dekopon-gatewayd/src/wake.rs", "crates/dekopon-gatewayd/src/wake/cron.rs", "crates/dekopon-gatewayd/src/wake/store.rs", "crates/dekopon-agent/src/wake.rs", "crates/dekopon-gatewayd/src/tests/cron_wakes.rs"], "rank": 3, "items": ["S-gateway-31", "S-gateway-32", "S-gateway-85", "S-gateway-86", "S-gateway-87", "S-gateway-88", "S-gateway-89", "S-gateway-90", "S-gateway-110"]}
 {"unit": "rpi/tick-runner", "step": "11-rpi/tick-runner/build", "files": ["crates/dekopon-gatewayd/src/runner.rs", "crates/dekopon-gatewayd/src/runner/receipt.rs", "crates/dekopon-gatewayd/src/restart.rs", "crates/dekopon-gatewayd/src/transport.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/wake/store.rs", "crates/dekopon-gatewayd/src/tests/tick_runner.rs"], "rank": 4, "items": ["S-gateway-22", "S-gateway-24", "S-gateway-34", "S-gateway-35", "S-gateway-36", "S-gateway-37", "S-gateway-38", "S-gateway-39", "S-gateway-40", "S-gateway-64", "S-gateway-65", "S-gateway-66", "S-gateway-67", "S-gateway-68", "S-gateway-69", "S-gateway-70", "S-gateway-71", "S-gateway-98", "S-gateway-99", "S-gateway-100", "S-gateway-101", "S-gateway-102", "S-gateway-103", "S-gateway-112", "S-gateway-131", "S-gateway-132", "S-gateway-133", "S-gateway-134", "S-gateway-135", "S-gateway-136"]}
 {"unit": "daemon/notice-channel", "step": "09-daemon/notice-channel/build", "files": ["crates/dekopon-gatewayd/src/notice.rs", "crates/dekopon-gatewayd/src/gateway.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests/notice_channel.rs"], "rank": 5, "items": ["S-gateway-21", "S-gateway-26", "S-gateway-27", "S-gateway-28", "S-gateway-29", "S-gateway-30", "S-gateway-76", "S-gateway-77", "S-gateway-78", "S-gateway-79", "S-gateway-80", "S-gateway-81", "S-gateway-82", "S-gateway-83", "S-gateway-84", "S-gateway-127", "S-gateway-128"]}
-{"unit": "state/spend-slice1", "step": "10-state/spend-slice1/build", "files": ["crates/dekopon-gatewayd/src/store.rs", "crates/dekopon-gatewayd/src/store/ledger.rs", "crates/dekopon-gatewayd/src/store/schema.rs", "crates/dekopon-gatewayd/src/metering.rs", "crates/dekopon-gatewayd/src/meter_restore.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests/spend_ledger.rs"], "rank": 6, "items": ["S-gateway-33", "S-gateway-94", "S-gateway-95", "S-gateway-96", "S-gateway-97", "S-gateway-130"]}
+{"unit": "state/spend-slice1", "step": "10-state/spend-slice1/build", "files": ["crates/dekopon-agent/src/grant.rs", "crates/dekopon-gatewayd/src/store.rs", "crates/dekopon-gatewayd/src/store/ledger.rs", "crates/dekopon-gatewayd/src/store/schema.rs", "crates/dekopon-gatewayd/src/metering.rs", "crates/dekopon-gatewayd/src/meter_restore.rs", "crates/dekopon-gatewayd/src/session.rs", "crates/dekopon-gatewayd/src/lib.rs", "crates/dekopon-gatewayd/src/config.rs", "crates/dekopon-gatewayd/src/tests/spend_ledger.rs"], "rank": 6, "items": ["S-gateway-33", "S-gateway-94", "S-gateway-95", "S-gateway-96", "S-gateway-97", "S-gateway-130", "S-gateway-137", "S-gateway-139"]}
 ```
 
 ## Items
@@ -135,6 +135,8 @@ The Unit column is the owning unit. "kept" means the id names the same item, pos
 | S-gateway-110 | cron-wakes | `wake/cron.rs`: `CronTick::resolve`, `CronResolution` | new (A18) |
 | S-gateway-111 | grant-settle | `dekopon-agent/src/grant.rs`: `SessionGrants::{new, carve, tally, release, release_all}`, `GrantRefusal`; `BrokerLeg::with_grants` | new (A2) |
 | S-gateway-112 | tick-runner | `restart.rs`: `record_tick_panic` | new, split from 23 |
+| S-gateway-138 | grant-settle | `dekopon-agent/src/grant.rs`: `GrantLedger` (`carved`, `tallied`, `released`), `GrantRelease`, `GrantLedgerFailed`, `GrantRefusal::Ledger`. The carrier calls the hook when one is attached. | new (round-2 F1) |
+| S-gateway-139 | spend-slice1 | `SessionGrants::with_ledger`; `store/ledger.rs`: `GrantRecorder` implements `GrantLedger` over the durable store | new (round-2 F1) |
 
 ## Stubs
 
@@ -208,7 +210,7 @@ The Unit column is the owning unit. "kept" means the id names the same item, pos
 | S-gateway-130 | state/spend-slice1 | `spend_ledger.rs` | `the_ledger_restores_timed_model_charges_including_crashed_holds` | new |
 | S-gateway-98 | rpi/tick-runner | `tick_runner.rs` | `a_refused_effect_stops_the_cycle_and_records_the_receipts_so_far` |  |
 | S-gateway-99 | rpi/tick-runner | `tick_runner.rs` | `a_truncated_tick_plan_applies_nothing_and_parks` |  |
-| S-gateway-100 | rpi/tick-runner | `tick_runner.rs` | `serialized_receipt_batches_stay_within_twenty_kib_and_outputs_over_eight_kib_are_oversize` | renamed from `receipt_batches_stay_within_twenty_kib_and_outputs_of_eight_kib_are_oversize` |
+| S-gateway-100 | rpi/tick-runner | `tick_runner.rs` | `serialized_receipt_batches_stay_within_twenty_kib_and_outputs_past_the_threshold_are_oversize` | renamed from `receipt_batches_stay_within_twenty_kib_and_outputs_of_eight_kib_are_oversize`; the boundary waits on stop 3 |
 | S-gateway-101 | rpi/tick-runner | `tick_runner.rs` | `a_runner_cycle_resumes_on_schedule_across_a_gateway_restart` |  |
 | S-gateway-102 | rpi/tick-runner | `tick_runner.rs` | `a_failed_receipt_batch_parks_with_its_intent_ids` |  |
 | S-gateway-103 | rpi/tick-runner | `tick_runner.rs` | `an_agent_cannot_register_a_wake_for_the_rpi_coordinator_principal` |  |
@@ -226,8 +228,9 @@ The Unit column is the owning unit. "kept" means the id names the same item, pos
 | S-gateway-134 | rpi/tick-runner | `tick_runner.rs` | `a_cron_tick_while_a_cycle_runs_is_skipped_and_logged` | new |
 | S-gateway-135 | rpi/tick-runner | `tick_runner.rs` | `a_cycle_past_its_deadline_parks` | new |
 | S-gateway-136 | rpi/tick-runner | `tick_runner.rs` | `the_runner_attests_as_its_configured_principal_and_agent` | new |
+| S-gateway-137 | state/spend-slice1 | `spend_ledger.rs` | `grant_carves_tallies_and_releases_are_recorded_in_the_gateway_ledger` | new (round-2 F1) |
 
-There are 86 stubs: the 62 draft stubs (two renamed, twelve moved by ruling) and 24 new ones.
+There are 87 stubs: the 62 draft stubs (two renamed, twelve moved by ruling) and 25 new ones.
 
 ## Owners, bounds and shutdown
 
@@ -288,6 +291,8 @@ There are 86 stubs: the 62 draft stubs (two renamed, twelve moved by ruling) and
   in `spawn_tick` (F4). tick-runner only observes it.
 - **Jobs (A9).** `JobRow` stays until its interrupted-job notice is settled; that settlement
   commits `JobEnded`. A crash before settlement replays the notice.
+- **Durable-off (owner-ruled, IDEA-0140:72).** Without `sessions.durable`, `Persistence::Memory`
+  holds waits in memory, and `StoreWarning::WaitsLostOnRestart` warns that a restart loses them.
 - **Retention (owner-ruled, IDEA-0140:86).**
   - A wait expires after thirty days and the agent is told.
   - A record is deleted once nothing in it is pending.
@@ -309,8 +314,9 @@ There are 86 stubs: the 62 draft stubs (two renamed, twelve moved by ruling) and
 - **Attestation.** `attestation()` is stubbed. The broker-side attestation for principal
   `rpi-coordinator` is a declared missing stop owned by the broker design: broker-protocol has no
   attestation path for a service principal today.
-- **Verify against 11-D2..D4:** the configured approved SHA and the 8 KiB threshold. 11-D3 says
-  "over 8 KiB", and this skeleton follows it.
+- **Verify against 11-D2..D4:** the configured approved SHA.
+- **Threshold:** owner stop 3. The skeleton does not decide whether an output of exactly
+  8,192 bytes is inline or oversize.
 - **Receipts.**
   - Size is measured on the serialized form, and a batch stays within 20 KiB.
   - Output that is not UTF-8 is recorded by digest, never altered.
@@ -341,7 +347,10 @@ There are 86 stubs: the 62 draft stubs (two renamed, twelve moved by ruling) and
   - `history(since)` returns timed, model-aware rows, crashed holds included.
   - The budget restore reads it instead of `meter_restore.rs`.
   - Out-of-window rows are never rescanned.
-- **Adoption.** It adopts grant-settle's meter-backed holds.
+- **Adoption.** It adopts grant-settle's meter-backed holds through the `GrantLedger` hook
+  (S-gateway-138): `SessionGrants::with_ledger(GrantRecorder)` records each carve, tally and
+  release in the gateway ledger. The storage stays in `gatewayd`; `dekopon-agent` names only the
+  trait.
 - **Fatal.** A settlement write failure is fatal through 105.
 - **Out of scope:** no slice2 prices or caps.
 
@@ -349,17 +358,18 @@ There are 86 stubs: the 62 draft stubs (two renamed, twelve moved by ruling) and
 
 Each names its question; none is decided here.
 
-1. **Durable-off (A5).** What runs without `sessions.durable`? The skeleton carries
-   `Persistence::Memory` plus `StoreWarning::WaitsLostOnRestart` (waits held in memory, with a
-   restart-loss warning). No ruling was found.
-2. **Legacy follows and ownership (A8, W1-05).** `.followed` markers hold only a route-and-
+1. **Legacy follows and ownership (A8, W1-05).** `.followed` markers hold only a route-and-
    conversation hash and two timestamps, so neither a `ConversationKey` nor a `ThreadClaim` can
    be recovered. Conversion counts and keeps them (`FollowConversion::Retained`); nothing is
    guessed or dropped. Should the store keep follows by hash (lossless), or adopt a loss policy?
    Thread ownership was never persisted, so it starts empty at cutover. Approve?
-3. **Fatal-exit scope (A19, G2-10, F16).** IDEA-0155:111 says a fatal exit writes the marker.
+2. **Fatal-exit scope (A19, G2-10, F16).** IDEA-0155:111 says a fatal exit writes the marker.
    The skeleton carries `Store`, `Reload` and `Transports` (lost transports and terminally stopped
    readers both exit non-zero today). Does every non-zero exit write it?
+3. **Receipt threshold (A16, round-2 F2).** PLAN.md:847 says outputs of "8 KiB or more" are
+   oversize; 11-rpi/DECISIONS.md:29 says "over" 8 KiB. Is an output of exactly 8,192 bytes inline
+   or oversize? The stub (S-gateway-100) and `ReceiptOutput::of` stay neutral until this is
+   answered.
 
 ## Declared missing dependencies
 
@@ -368,7 +378,7 @@ Each names its question; none is decided here.
 | The broker's grant-required response and tally return | skeleton-broker |
 | A broker attestation for principal `rpi-coordinator` | broker design |
 | The `standin` type | 09-daemon/standin-streak |
-| 11-D2..D4 checks: the approved SHA config and the receipt threshold | to verify |
+| 11-D2..D4 check: the approved SHA config | to verify |
 
 ## Not real
 
@@ -380,8 +390,11 @@ The adjudicator found W1-04, W1-06, W1-07/F14, G2-5 and F23 not real; no work wa
 2. Ranks are G1, D2, C3, T4, N5, S6. Durable-store after grant-settle is a `session.rs` edge, not
    a reversal. Notice-channel after tick-runner (`config.rs`, `gateway.rs`) keeps tick-runner off
    spend-slice1.
-3. Grant-settle's carrier lives in `dekopon-agent`, next to `BrokerLeg`, which already depends on
-   the token governor. A gateway trait object with one implementer would break the Dispatch rule.
+3. Grant-settle's carrier `SessionGrants` is a concrete type in `dekopon-agent`, next to
+   `BrokerLeg`, which already depends on the token governor. Only its persistence is a trait,
+   `GrantLedger` (round-2 F1), because `dekopon-agent` cannot name the gateway's store. The trait
+   follows the existing cross-crate seams `ProgressSink` and `JobControl`, which the gateway also
+   implements.
 4. One `DeliveryTicket` type covers wakes and interrupted jobs. It rides in the existing
    `Dispositions`, the per-message completion carrier, instead of a new channel.
 5. A serving write failure returns the `Copy` marker `StoreFailed` to its caller. The cause
@@ -391,16 +404,18 @@ The adjudicator found W1-04, W1-06, W1-07/F14, G2-5 and F23 not real; no work wa
 7. `ReceiptOutput::Binary` adds `{"binary": true, "bytes", "sha256"}` beside `Oversize`. That is a
    receipt wire shape for the kickoff to confirm.
 8. `FatalLabel::Transports` is carried so the broad reading of IDEA-0155 compiles. The scope is
-   owner stop 3.
+   owner stop 2.
 9. `StandinState` is an uninhabited enum, so the notice callers cannot be filled before the core
    type lands.
 10. Two draft stubs were renamed, with their ids kept: `open_holds_are_bounded_by_concurrent_vm_exec_calls`,
     because a grant is retained across calls (A2), and the receipt-batch stub, which now reads
-    "serialized" and "over 8 KiB" (A16).
+    "serialized" and "past the threshold" so it picks no side of stop 3 (A16, round-2 F2).
+11. Durable-off is no longer a stop: IDEA-0140:72 rules it, and the round-1 carriers already
+    implement it (round-2 N3).
 
-## Gates on `103869d`
+## Gates on `f8ea7ee`
 
-Passed on `112fd86`:
+Passed:
 
 - `git diff --check` and `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
@@ -409,13 +424,10 @@ Passed on `112fd86`:
 - `test_daemon_dependency_gates.py`
 - `cargo test -p dekopon-agent --lib`: 203 passed
 
-`103869d` changes only `notice.rs`, and gatewayd clippy `--all-targets --all-features -D warnings`
-passes on it.
-
 `cargo test -p dekopon-gatewayd --lib --all-features`, filtered to wakes and the six stub modules,
-gave 30 passed, 86 ignored and 1 failed. The failure is
+gave 30 passed, 87 ignored and 1 failed. The failure is
 `tests::wakes::a_failed_write_fires_nothing_and_leaves_the_wake_pending`; the container runs as
 uid 0, which ignores the read-only mode the test sets.
 
 Not run: `cargo test --workspace`, the Wasm and ARM64 lanes, and the real `footprint-edges.py`
-(emulated from the coordinator's stated rule).
+(emulated from the coordinator's stated rule; the chain above is unchanged by round 2).
