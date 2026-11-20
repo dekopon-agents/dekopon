@@ -23,12 +23,16 @@ mod memory;
 use memory::journal;
 mod meter_restore;
 mod metering;
+mod notice;
 mod probe;
 mod progress;
 mod proxy;
 mod pull_request_links;
+mod restart;
 mod routes;
+mod runner;
 mod session;
+mod store;
 mod threads;
 mod transport;
 mod wake;
@@ -62,6 +66,7 @@ pub use config::{
 pub use probe::{NotProbed, ProbeError, ProbeProblem, ProbeScope};
 pub use routes::{RouteError, RouteProblem};
 pub use session::SessionError;
+pub use store::{ConversationKey, StoreError};
 pub use transport::TransportError;
 pub use wake::WakeStoreError;
 
@@ -1404,6 +1409,8 @@ pub enum GatewaydError {
     CacheKeySecret(#[from] cache_key::CacheKeySecretError),
     #[error(transparent)]
     WakeStore(#[from] WakeStoreError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
     #[error("guest model proxy could not start")]
     Proxy(#[source] proxy::ProxyStartError),
     #[error(transparent)]

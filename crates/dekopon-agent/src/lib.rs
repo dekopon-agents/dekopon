@@ -50,6 +50,7 @@ use crate::attachment::{ChatAssetInputs, ChatAssetRefusal, ReplyAttachments};
 use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
 
 pub mod attachment;
+pub mod grant;
 pub mod improvement;
 pub mod memory;
 pub mod memory_tools;
@@ -431,6 +432,16 @@ impl BrokerLeg {
     pub fn with_progress_notes(mut self) -> Self {
         self.notes_enabled = true;
         self
+    }
+
+    #[must_use]
+    #[expect(
+        clippy::todo,
+        unused_variables,
+        reason = "skeleton: state/grant-settle"
+    )]
+    pub fn with_grants(self, grants: Arc<grant::SessionGrants>) -> Self {
+        todo!()
     }
 
     fn emit(&self, event: ProgressEvent) {
