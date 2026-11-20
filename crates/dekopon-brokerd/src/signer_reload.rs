@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use dekopon_core::reload::{Reconciled, Settle, VerificationWindow, WatchSet};
+use dekopon_core::reload::{Reconciled, WatchSet};
 
 use crate::BrokerdError;
 
@@ -15,10 +15,9 @@ pub(crate) struct StagedKey {
 }
 
 pub(crate) struct SignerGroup {
-    secret_directory: PathBuf,
+    key: PathBuf,
     active: KeyId,
     staged: Option<StagedKey>,
-    window: VerificationWindow,
 }
 
 impl SignerGroup {
@@ -37,7 +36,7 @@ impl SignerGroup {
         unused_variables,
         reason = "skeleton: daemon/signer-reload"
     )]
-    async fn jwks_serves(&self, kid: &KeyId) -> Settle<()> {
+    async fn jwks_serves(&self, kid: &KeyId) -> bool {
         todo!()
     }
 }

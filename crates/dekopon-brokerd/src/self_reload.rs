@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
-use dekopon_core::reload::{
-    Cause, CommitReceiver, CommitSignal, Input, Reconcile, Reconciled, Stop, WatchSet,
-};
+use dekopon_core::reload::{Cause, Input, Reconcile, Reconciled, WatchSet};
+use tokio::sync::watch;
 
-use crate::{BrokerdError, Coordination, lock_watch::LockGroup, signer_reload::SignerGroup};
+use crate::{
+    BrokerdError, Candidate, Coordination, lock_watch::LockGroup, signer_reload::SignerGroup,
+};
 
 pub(crate) enum BrokerGroup {
     Config(ConfigGroup),
@@ -16,7 +17,6 @@ pub(crate) enum BrokerGroup {
 
 pub(crate) struct ConfigGroup {
     coordination: Arc<Coordination>,
-    commits: CommitSignal,
 }
 
 impl Reconcile for BrokerGroup {
@@ -48,11 +48,7 @@ impl Coordination {
         unused_variables,
         reason = "skeleton: daemon/broker-self-reload"
     )]
-    async fn reload_self(
-        &self,
-        cause: Cause,
-        commits: &CommitSignal,
-    ) -> Result<Reconciled, BrokerdError> {
+    async fn reload(&self, cause: Cause) -> Result<Reconciled, BrokerdError> {
         todo!()
     }
 
@@ -60,16 +56,9 @@ impl Coordination {
     fn watch_set(&self) -> WatchSet {
         todo!()
     }
-}
 
-impl ConfigGroup {
     #[expect(clippy::todo, reason = "skeleton: daemon/broker-self-reload")]
-    pub(crate) fn commits(&self) -> CommitReceiver {
+    pub(crate) fn commits(&self) -> watch::Receiver<Arc<Candidate>> {
         todo!()
     }
-}
-
-#[expect(clippy::todo, unused_variables, reason = "skeleton: daemon/supervisor")]
-pub(crate) fn stopped(stop: Stop<BrokerdError>) -> BrokerdError {
-    todo!()
 }

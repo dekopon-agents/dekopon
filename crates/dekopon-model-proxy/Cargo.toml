@@ -17,7 +17,7 @@ include = ["src/**", "README.md", "Cargo.toml"]
 arc-swap.workspace = true
 axum.workspace = true
 bytes.workspace = true
-dekopon-core = { workspace = true, features = ["reload"] }
+dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-model-token-governor.workspace = true
 futures-util.workspace = true

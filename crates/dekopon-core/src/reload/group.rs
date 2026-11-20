@@ -1,9 +1,6 @@
 use std::future::Future;
 
-use super::{GenerationDigest, WatchSet};
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct GroupId(u8);
+use super::{ReloadError, WatchSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Cause {
@@ -19,20 +16,23 @@ pub enum Input {
     Machine,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reconciled {
-    Applied { generation: GenerationDigest },
+    Applied,
     Unchanged,
     Refused,
 }
 
 pub trait Reconcile: Send + 'static {
-    type Exit: std::error::Error + Send + 'static;
+    type Exit: std::error::Error + From<ReloadError> + Send + 'static;
 
     fn input(&self) -> Input;
 
     fn watch_set(&self) -> WatchSet;
 
+    // The watcher drops this future at shutdown and at the activation bound, so a group changes
+    // what it serves only after its last await.
     fn reconcile(
         &mut self,
         cause: Cause,

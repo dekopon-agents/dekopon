@@ -30,7 +30,6 @@ use crate::{
     via_label, wake,
 };
 
-mod broker_generation;
 mod consumers;
 mod reload;
 

@@ -35,15 +35,13 @@ where
     dead_code,
     reason = "skeleton: daemon/broker-self-reload"
 )]
-pub(crate) async fn serve_on_commits<F, C>(
+pub(crate) async fn serve_on_commits<F>(
     server: F,
-    catalog: C,
-    commits: dekopon_core::reload::CommitReceiver,
+    commits: tokio::sync::watch::Receiver<Arc<crate::Candidate>>,
     deadline: ShutdownDeadline,
 ) -> Result<(), BrokerdError>
 where
     F: Future<Output = Result<(), BrokerdError>>,
-    C: Fn() -> secrets::ScheduledCatalog,
 {
     todo!()
 }

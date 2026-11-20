@@ -1,14 +1,14 @@
 #![expect(dead_code, reason = "skeleton: daemon/watcher-core")]
 
-use dekopon_core::reload::{Cause, Input, Reconcile, Reconciled, Stop, WatchSet};
-use dekopon_model_proxy::TlsGroup;
+use dekopon_core::reload::{Cause, Input, Reconcile, Reconciled, WatchSet};
+use dekopon_model_proxy::tls::TlsReload;
 
 use super::ReloadState;
 use crate::GatewaydError;
 
 pub(crate) enum GatewayGroup {
     Config(Box<ReloadState>),
-    ProxyTls(TlsGroup),
+    ProxyTls(TlsReload),
 }
 
 impl Reconcile for GatewayGroup {
@@ -50,7 +50,11 @@ impl ReloadState {
     }
 }
 
-#[expect(clippy::todo, unused_variables, reason = "skeleton: daemon/supervisor")]
-pub(crate) fn stopped(stop: Stop<GatewaydError>) -> GatewaydError {
+#[expect(
+    clippy::todo,
+    unused_variables,
+    reason = "skeleton: daemon/reload-consumers"
+)]
+async fn reconcile_tls(tls: &TlsReload, cause: Cause) -> Reconciled {
     todo!()
 }

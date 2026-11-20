@@ -6,7 +6,7 @@ use thiserror::Error;
 pub enum ReloadError {
     #[error("could not watch {path}")]
     Register { path: PathBuf, kind: io::ErrorKind },
-    #[error("{path} is delivered once and never changes, so it cannot be watched")]
+    #[error("{path} is mounted as a single file that never changes, so it cannot be watched")]
     Unwatchable { path: PathBuf },
     #[error("the file watcher backend failed")]
     Backend { kind: io::ErrorKind },
@@ -23,12 +23,4 @@ impl ReloadError {
     pub const fn category(&self) -> &'static str {
         todo!()
     }
-}
-
-#[derive(Debug, Error)]
-pub enum Stop<E> {
-    #[error(transparent)]
-    Mechanism(ReloadError),
-    #[error(transparent)]
-    Consumer(E),
 }

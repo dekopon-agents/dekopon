@@ -1,45 +1,33 @@
 #![expect(dead_code, reason = "skeleton: daemon/reload-consumers")]
 
-use std::{convert::Infallible, sync::Arc};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use dekopon_core::reload::{Cause, Input, Reconcile, Reconciled, WatchSet};
 use tokio_rustls::TlsAcceptor;
 
-use super::{Listener, TlsFiles};
+use super::{Listener, TlsError, TlsFiles};
 
-pub struct TlsGroup {
+#[derive(Clone)]
+pub struct TlsReload {
     files: TlsFiles,
     identity: String,
     acceptor: Arc<ArcSwap<TlsAcceptor>>,
 }
 
-impl Reconcile for TlsGroup {
-    type Exit = Infallible;
-
-    #[expect(clippy::todo, reason = "skeleton: daemon/reload-consumers")]
-    fn input(&self) -> Input {
-        todo!()
+impl TlsReload {
+    pub const fn files(&self) -> &TlsFiles {
+        &self.files
     }
 
     #[expect(clippy::todo, reason = "skeleton: daemon/reload-consumers")]
-    fn watch_set(&self) -> WatchSet {
-        todo!()
-    }
-
-    #[expect(
-        clippy::todo,
-        unused_variables,
-        reason = "skeleton: daemon/reload-consumers"
-    )]
-    async fn reconcile(&mut self, cause: Cause) -> Result<Reconciled, Infallible> {
+    pub fn reload(&self) -> Result<(), TlsError> {
         todo!()
     }
 }
 
 impl Listener {
     #[expect(clippy::todo, reason = "skeleton: daemon/reload-consumers")]
-    pub fn reload_group(&self) -> TlsGroup {
+    pub fn tls_reload(&self) -> TlsReload {
         todo!()
     }
 }
@@ -48,25 +36,13 @@ impl Listener {
 mod tests {
     #[test]
     #[ignore = "skeleton: daemon/reload-consumers"]
-    fn the_acceptor_swaps_on_a_tls_volume_change_with_no_per_connection_stat() {}
+    fn a_reload_swaps_the_acceptor_and_accepting_stats_nothing() {}
 
     #[test]
     #[ignore = "skeleton: daemon/reload-consumers"]
-    fn a_refused_bundle_keeps_the_old_acceptor_and_reports_once_per_change() {}
-
-    #[test]
-    #[ignore = "skeleton: daemon/reload-consumers"]
-    fn a_half_swapped_bundle_is_retried_not_served() {}
-
-    #[test]
-    #[ignore = "skeleton: daemon/reload-consumers"]
-    fn an_aborted_tls_reload_keeps_the_old_acceptor() {}
+    fn a_half_swapped_bundle_is_refused_and_the_old_acceptor_serves() {}
 
     #[test]
     #[ignore = "skeleton: daemon/reload-consumers"]
     fn a_retired_acceptor_drains_with_its_connections() {}
-
-    #[test]
-    #[ignore = "skeleton: daemon/reload-consumers"]
-    fn a_restarted_proxy_loads_the_mounted_bundle() {}
 }

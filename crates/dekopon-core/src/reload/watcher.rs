@@ -1,6 +1,7 @@
 #![expect(dead_code, reason = "skeleton: daemon/watcher-core")]
 
 use std::{
+    collections::BTreeSet,
     io,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
@@ -8,7 +9,7 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use super::{GroupId, Reconcile, ReloadError, ReloadSettings, Stop, WatchSet};
+use super::{Cause, Reconcile, ReloadError, ReloadSettings, WatchSet, path::Registration};
 
 // A full queue sets `overflowed` instead of blocking notify's thread; the run loop turns it into
 // one rescan of every group, so a burst coalesces and no change is lost.
@@ -31,9 +32,16 @@ enum Hangup {
     Injected,
 }
 
+struct Slot<G> {
+    group: G,
+    watching: WatchSet,
+    pending: Option<Cause>,
+}
+
 pub struct Watcher<G: Reconcile> {
     settings: ReloadSettings,
-    groups: Vec<(GroupId, G, WatchSet)>,
+    slots: Vec<Slot<G>>,
+    registered: BTreeSet<Registration>,
     backend: Backend,
     events: mpsc::Receiver<Event>,
     overflowed: Arc<AtomicBool>,
@@ -62,7 +70,7 @@ impl<G: Reconcile> Watcher<G> {
     }
 
     #[expect(clippy::todo, reason = "skeleton: daemon/watcher-core")]
-    pub async fn run(self) -> Stop<G::Exit> {
+    pub async fn run(self) -> G::Exit {
         todo!()
     }
 }

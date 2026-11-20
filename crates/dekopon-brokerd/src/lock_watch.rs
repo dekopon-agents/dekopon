@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use tokio::time::{Instant, MissedTickBehavior};
 
-use dekopon_core::reload::{Reconciled, VerificationWindow, WatchSet};
+use dekopon_core::reload::{Reconciled, WatchSet};
 
 use crate::{BrokerdError, provider_manager};
 
@@ -19,7 +19,6 @@ pub struct LoadedLock {
 pub(crate) struct LockGroup {
     lock: LoadedLock,
     uid: u32,
-    window: VerificationWindow,
 }
 
 impl LockGroup {

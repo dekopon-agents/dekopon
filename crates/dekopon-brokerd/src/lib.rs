@@ -1708,8 +1708,6 @@ pub enum BrokerdError {
         "the provider lock never read as one stable file; the broker drained so a restart rereads it"
     )]
     ProviderLockUnsettled,
-    #[error("the provider lock changed; restarting to verify the new provider set")]
-    ProviderLockChanged,
     #[error("configuration reload stopped")]
     Reload(#[from] dekopon_core::reload::ReloadError),
     #[error("check could not prepare its private directory {path}")]
