@@ -137,3 +137,27 @@ fn a_leave_drops_the_follow_and_the_thread_ownership_in_one_transaction() {
 fn follows_and_thread_ownership_survive_a_restart() {
     todo!()
 }
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_denied_wake_store_write_yields_one_cause_bearing_exit_and_a_nonzero_status() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_store_that_is_writable_again_after_the_restart_recovers() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_fatal_exit_joins_every_owned_task_within_the_shutdown_grace() {
+    todo!()
+}
+
+#[test]
+#[ignore = "skeleton: state/durable-store"]
+fn a_restart_after_a_fatal_exit_resumes_from_the_store() {
+    todo!()
+}

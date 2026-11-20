@@ -28,6 +28,7 @@ mod probe;
 mod progress;
 mod proxy;
 mod pull_request_links;
+mod restart;
 mod routes;
 mod runner;
 mod session;
