@@ -3019,18 +3019,26 @@ mod tests {
     }
 
     #[test]
-    fn provider_lock_write_recovers_abandoned_staging_without_touching_the_old_lock() {
+    fn provider_lock_write_preserves_a_destination_matching_the_legacy_temporary_pattern() {
         let directory = tempfile::tempdir().expect("manager fixture");
-        let path = directory.path().join("providers.lock.yaml");
+        let path = directory.path().join("providers.tmp-123");
         let uid = socket::current_uid();
         let _operation = lock_activation(&path, uid).unwrap();
         atomic_write(&path, b"previous lock", uid).unwrap();
 
+        let blocked = directory.path().join("providers.tmp-456");
+        fs::create_dir(&blocked).unwrap();
+        assert!(matches!(
+            atomic_write(&path, b"replacement lock", uid),
+            Err(ProviderManagerError::Io { path: Some(path), .. }) if path == blocked
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"previous lock");
+        fs::remove_dir(&blocked).unwrap();
+
         let abandoned = directory
             .path()
-            .join("providers.lock.yaml.tmp-private-abandoned");
+            .join("providers.tmp-123.tmp-private-abandoned");
         fs::write(&abandoned, b"partial").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"previous lock");
         atomic_write(&path, b"replacement lock", uid).unwrap();
 
         assert!(!abandoned.exists());

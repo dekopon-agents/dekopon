@@ -175,12 +175,13 @@ pub fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) -> Vec<Temporar
         return Vec::new();
     };
     let mut results = Vec::new();
+    let destination = path.file_name();
     for entry in entries.flatten() {
         let stale = entry.path();
-        if Some(stale.as_path()) == keep {
+        let name = entry.file_name();
+        if Some(name.as_os_str()) == destination || Some(stale.as_path()) == keep {
             continue;
         }
-        let name = entry.file_name();
         let name = name.as_encoded_bytes();
         let legacy = name
             .strip_prefix(legacy_prefix.as_encoded_bytes())
