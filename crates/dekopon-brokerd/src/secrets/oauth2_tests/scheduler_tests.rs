@@ -84,6 +84,7 @@ async fn scheduled_refresh_forces_at_hour_22_with_long_lived_access() {
     entry.entries.get_mut(&drn("one")).unwrap().source = serde_json::from_value(source).unwrap();
     let scheduled = ScheduledCatalog {
         resolver: Some(Arc::new(entry)),
+        ..ScheduledCatalog::default()
     };
     let capture = CaptureLayer::default();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
@@ -135,6 +136,7 @@ async fn scheduled_and_authorized_use_share_the_record_lock() {
     entry.entries.get_mut(&drn("one")).unwrap().source = serde_json::from_value(source).unwrap();
     let scheduled = ScheduledCatalog {
         resolver: Some(Arc::new(entry)),
+        ..ScheduledCatalog::default()
     };
     let now: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(|| 22 * 3600);
     let key = drn("one");
@@ -187,6 +189,7 @@ async fn a_record_that_becomes_unreadable_mid_run_is_reported_once_and_never_ref
     }
     let scheduled = ScheduledCatalog {
         resolver: Some(Arc::new(entry)),
+        ..ScheduledCatalog::default()
     };
     let inspections = Arc::new(AtomicU64::new(0));
     let capture = CaptureLayer::new();
@@ -265,6 +268,7 @@ async fn transient_due_attempt_retries_after_five_minutes() {
     entry.entries.get_mut(&drn("one")).unwrap().source = serde_json::from_value(source).unwrap();
     let scheduled = ScheduledCatalog {
         resolver: Some(Arc::new(entry)),
+        ..ScheduledCatalog::default()
     };
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(refresh_scheduler::serve_with_clock(
@@ -324,6 +328,7 @@ async fn reboot_recomputes_a_failed_due_attempt_from_the_record() {
     entry.entries.get_mut(&drn("one")).unwrap().source = serde_json::from_value(source).unwrap();
     let scheduled = ScheduledCatalog {
         resolver: Some(Arc::new(entry)),
+        ..ScheduledCatalog::default()
     };
     for expected in [1, 2] {
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -385,6 +390,7 @@ async fn shutdown_drains_an_in_flight_scheduled_refresh() {
     entry.entries.get_mut(&drn("one")).unwrap().source = serde_json::from_value(source).unwrap();
     let scheduled = ScheduledCatalog {
         resolver: Some(Arc::new(entry)),
+        ..ScheduledCatalog::default()
     };
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(refresh_scheduler::serve_with_clock(
@@ -432,6 +438,7 @@ async fn idle_scheduler_rotates_without_provider_traffic_and_stops_with_server()
     entry.entries.get_mut(&drn("one")).unwrap().source = serde_json::from_value(source).unwrap();
     let scheduled = ScheduledCatalog {
         resolver: Some(Arc::new(entry)),
+        ..ScheduledCatalog::default()
     };
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(refresh_scheduler::serve_with_clock(

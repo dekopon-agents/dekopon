@@ -543,15 +543,11 @@ impl Coordination {
                     state.record_recovery();
                     return (active.digest.clone(), GenerationOutcome::Active);
                 }
-                Loaded::Candidate(next) => {
+                Loaded::Candidate(mut next) => {
+                    next.ready
+                        .scheduled
+                        .share_record_inspections(&active.ready.scheduled);
                     let next = Arc::<Candidate>::from(next);
-                    next.ready.scheduled.inherit_record_markers(
-                        &active.ready.scheduled,
-                        state
-                            .prepared
-                            .as_ref()
-                            .map(|(_, _, prior)| &prior.ready.scheduled),
-                    );
                     state.prepared = Some((uid, active, Arc::clone(&next)));
                     next
                 }

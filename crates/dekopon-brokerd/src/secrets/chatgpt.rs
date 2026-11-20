@@ -41,8 +41,10 @@ impl ChatGptSubscription {
             expected_uid,
             FileTier::Private,
             HARD_MAX_CHATGPT_AUTH_BYTES,
-        )
-        .map_err(|source| {
+        );
+        #[cfg(test)]
+        crate::private_read_witness::record(auth_file, &bytes);
+        let bytes = bytes.map_err(|source| {
             format!(
                 "{drn} authFile {} is not trusted input ({}): {}",
                 auth_file.display(),
@@ -50,7 +52,7 @@ impl ChatGptSubscription {
                 error_chain(&source)
             )
         })?;
-        let auth_digest = Sha256::digest(bytes).into();
+        let auth_digest = Sha256::digest(&bytes).into();
         // The auth-file parent must be writable, since a read-only parent would leave a
         // rotated-but-unsaved retired token on disk for reuse.
         socket::validate_private_parent(auth_file, expected_uid).map_err(|source| {
@@ -73,7 +75,7 @@ impl ChatGptSubscription {
                 auth_file.display()
             ));
         }
-        let credential = CredentialFile::open(auth_file).map_err(|source| {
+        let credential = CredentialFile::from_document(auth_file, &bytes).map_err(|source| {
             format!(
                 "{drn} authFile {} is not a Dekopon ChatGPT credential: {}",
                 auth_file.display(),

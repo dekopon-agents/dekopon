@@ -3,10 +3,7 @@ use std::{
     fmt,
     num::NonZeroU64,
     path::{Component, Path, PathBuf},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -341,7 +338,6 @@ struct ResolvedEntry {
     projection: Projection,
     client: reqwest::Client,
     minted: Option<Arc<Minted>>,
-    record_invalid: OnceLock<Arc<AtomicBool>>,
 }
 
 enum Minted {
@@ -366,9 +362,75 @@ struct MapResolver {
     expected_uid: u32,
 }
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct RecordInspectionKey([u8; 32]);
+
+impl RecordInspectionKey {
+    pub(crate) fn of(drn: &SecretDrn, path: &Path) -> Self {
+        Self(
+            Sha256::new()
+                .chain_update(drn.as_str().len().to_le_bytes())
+                .chain_update(drn.as_str())
+                .chain_update(path.as_os_str().as_encoded_bytes())
+                .finalize()
+                .into(),
+        )
+    }
+}
+
+#[derive(Default)]
+struct UnreadableRecord {
+    scheduled_unreadable: bool,
+    recovery_pending: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct RecordInspectionDedup(BTreeMap<RecordInspectionKey, UnreadableRecord>);
+
+impl RecordInspectionDedup {
+    pub(crate) fn start_generation(&mut self) {
+        self.0.retain(|_, failure| {
+            failure.scheduled_unreadable = false;
+            failure.recovery_pending
+        });
+    }
+
+    pub(crate) fn scheduled_readable(&mut self, key: &RecordInspectionKey) {
+        if let Some(failure) = self.0.get_mut(key) {
+            failure.scheduled_unreadable = false;
+            if !failure.recovery_pending {
+                self.0.remove(key);
+            }
+        }
+    }
+
+    pub(crate) fn scheduled_unreported(&mut self, key: RecordInspectionKey) -> bool {
+        !std::mem::replace(
+            &mut self.0.entry(key).or_default().scheduled_unreadable,
+            true,
+        )
+    }
+
+    pub(crate) fn invalid_reported(&mut self, key: RecordInspectionKey) {
+        self.0.entry(key).or_default().recovery_pending = true;
+    }
+
+    fn recovered(&mut self, key: &RecordInspectionKey) -> bool {
+        let Some(failure) = self.0.get_mut(key) else {
+            return false;
+        };
+        let recovered = std::mem::take(&mut failure.recovery_pending);
+        if !failure.scheduled_unreadable {
+            self.0.remove(key);
+        }
+        recovered
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ScheduledCatalog {
     resolver: Option<Arc<MapResolver>>,
+    record_inspections: Arc<parking_lot::Mutex<RecordInspectionDedup>>,
 }
 
 impl ScheduledCatalog {
@@ -384,31 +446,12 @@ impl ScheduledCatalog {
         self.resolver.as_ref()?.entries.get(drn)
     }
 
-    pub(crate) fn inherit_record_markers(&self, active: &Self, prepared: Option<&Self>) {
-        let Some(resolver) = &self.resolver else {
-            return;
-        };
-        for (drn, entry) in &resolver.entries {
-            if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
-                let prior = std::iter::once(active)
-                    .chain(prepared)
-                    .filter_map(|catalog| catalog.entry(drn))
-                    .find_map(|entry| {
-                        if let SecretSource::OAuth2Refresh {
-                            record_path: prior_path,
-                            ..
-                        } = &entry.source
-                            && prior_path == record_path
-                        {
-                            return entry.record_invalid.get();
-                        }
-                        None
-                    });
-                if let Some(prior) = prior {
-                    entry.record_invalid.get_or_init(|| Arc::clone(prior));
-                }
-            }
-        }
+    pub(crate) fn share_record_inspections(&mut self, active: &Self) {
+        self.record_inspections = Arc::clone(&active.record_inspections);
+    }
+
+    pub(crate) fn record_inspections(&self) -> parking_lot::MutexGuard<'_, RecordInspectionDedup> {
+        self.record_inspections.lock()
     }
 
     pub(crate) async fn inspect_records(&self, generation: Option<&str>) {
@@ -417,51 +460,48 @@ impl ScheduledCatalog {
         };
         for (drn, entry) in &resolver.entries {
             if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
-                let invalid = entry.record_invalid.get_or_init(Arc::default);
                 let path = record_path.clone();
                 let credential = drn.clone();
                 let uid = resolver.expected_uid;
+                let generation = generation.map(str::to_owned);
+                let inspections = Arc::clone(&self.record_inspections);
                 let dispatch = tracing::dispatcher::get_default(Clone::clone);
-                let outcome = tokio::task::spawn_blocking(move || {
+                if tokio::task::spawn_blocking(move || {
                     tracing::dispatcher::with_default(&dispatch, || {
-                        oauth2::inspect_boot(&path, uid, &credential)
-                    })
-                })
-                .await;
-                match outcome {
-                    Ok(oauth2::RecordInspection::Valid) => {
-                        if let Some(generation) = generation
-                            && invalid.swap(false, Ordering::Relaxed)
-                        {
-                            let digest: String = Sha256::digest(drn.to_string())
-                                .iter()
-                                .map(|byte| format!("{byte:02x}"))
-                                .collect();
-                            tracing::info!(
-                                event = "broker_credential_record_recovered",
-                                generation.digest = generation,
-                                credential.digest = %digest,
-                                "broker.credential.record.recovered"
-                            );
+                        let key = RecordInspectionKey::of(&credential, &path);
+                        match oauth2::inspect_boot(&path, uid, &credential) {
+                            oauth2::RecordInspection::Valid => {
+                                if let Some(generation) = generation
+                                    && inspections.lock().recovered(&key)
+                                {
+                                    let digest: String = Sha256::digest(credential.as_str())
+                                        .iter()
+                                        .map(|byte| format!("{byte:02x}"))
+                                        .collect();
+                                    tracing::info!(
+                                        event = "broker_credential_record_recovered",
+                                        generation.digest = generation,
+                                        credential.digest = %digest,
+                                        "broker.credential.record.recovered"
+                                    );
+                                }
+                            }
+                            oauth2::RecordInspection::Invalid => {
+                                inspections.lock().invalid_reported(key);
+                            }
+                            oauth2::RecordInspection::Missing => {}
                         }
-                    }
-                    Ok(oauth2::RecordInspection::Invalid) => invalid.store(true, Ordering::Relaxed),
-                    Ok(oauth2::RecordInspection::Missing) => {}
-                    Err(_) => tracing::error!(
+                    });
+                })
+                .await
+                .is_err()
+                {
+                    tracing::error!(
                         event = "broker_credential_record_inspection_failed",
                         "broker.credential.record.inspection.failed"
-                    ),
+                    );
                 }
             }
-        }
-    }
-
-    pub(crate) fn mark_record_invalid(&self, drn: &SecretDrn) {
-        if let Some(entry) = self.entry(drn) {
-            entry
-                .record_invalid
-                .get_or_init(Arc::default)
-                .store(true, Ordering::Relaxed);
         }
     }
 
@@ -2004,7 +2044,6 @@ async fn validate_map(
                 projection,
                 client,
                 minted: minted_source,
-                record_invalid: OnceLock::new(),
             },
         );
     }
@@ -2020,6 +2059,7 @@ async fn validate_map(
         catalog,
         scheduled: ScheduledCatalog {
             resolver: Some(resolver),
+            ..ScheduledCatalog::default()
         },
         chatgpt: minted.chatgpt,
         minted_digest: minted.minted_digest,
@@ -3425,6 +3465,16 @@ secrets:
         let auth = directory.join("auth.json");
         let before = chatgpt_auth_document();
         write_owner_only(&auth, before.as_bytes());
+        const ROTATED: &str = "rotated-fixture-refresh-token";
+        const BEFORE_EXPIRY: &str = "4102444800000";
+        const AFTER_EXPIRY: &str = "4102444800001";
+        let rotated = before
+            .replace("fixture-refresh-token", ROTATED)
+            .replace(BEFORE_EXPIRY, AFTER_EXPIRY);
+        let replacement = directory.join("replacement.json");
+        write_owner_only(&replacement, rotated.as_bytes());
+        let reads = crate::private_read_witness::TrackedRead::new(&auth);
+        reads.replace_after_next_read(replacement);
 
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(broker.config()).unwrap()).unwrap();
@@ -3448,7 +3498,6 @@ secrets:
                 &[("event", "broker_chatgpt_credential_loaded")],
             )
         };
-        const ROTATED: &str = "rotated-fixture-refresh-token";
         async {
             let (candidate, report) =
                 candidate_or_refusal(&broker.config(), crate::Mode::Boot).await;
@@ -3456,18 +3505,8 @@ secrets:
             let owner = crate::Coordination::new(broker.config(), candidate.unwrap());
             let digest = owner.active().digest.clone();
             assert_eq!(loaded().len(), 1);
-            for _ in 0..10 {
-                assert_eq!(
-                    owner.prepare(&digest, uid()).await,
-                    (digest.clone(), GenerationOutcome::Active)
-                );
-            }
-            assert_eq!(loaded().len(), 1);
-
-            write_owner_only(
-                &auth,
-                before.replace("fixture-refresh-token", ROTATED).as_bytes(),
-            );
+            assert_eq!(loaded()[0].field("expires_at"), Some(BEFORE_EXPIRY));
+            assert_eq!(std::fs::read(&auth).unwrap(), rotated.as_bytes());
             assert_eq!(
                 owner.prepare(&digest, uid()).await,
                 (digest.clone(), GenerationOutcome::Prepared)
@@ -3480,16 +3519,20 @@ secrets:
                 (digest.clone(), GenerationOutcome::Prepared)
             );
             assert_eq!(owner.commit(&digest, uid()), GenerationOutcome::Applied);
-            assert_eq!(
-                owner.prepare(&digest, uid()).await,
-                (digest.clone(), GenerationOutcome::Active)
-            );
+            for _ in 0..10 {
+                assert_eq!(
+                    owner.prepare(&digest, uid()).await,
+                    (digest.clone(), GenerationOutcome::Active)
+                );
+            }
         }
         .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
         .await;
 
+        assert_eq!(reads.count(), 13);
         let events = loaded();
         assert_eq!(events.len(), 2);
+        assert_eq!(events[1].field("expires_at"), Some(AFTER_EXPIRY));
         for event in events {
             assert_eq!(event.field("credential"), Some("drn:secret:chatgpt/image"));
             assert_eq!(event.field("path"), auth.to_str());

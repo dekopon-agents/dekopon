@@ -2514,6 +2514,29 @@ async fn a_refused_reload_is_reported_once_until_a_repair_commits() {
     assert!(!error.contains("PRIVATE KEY"), "{error}");
 }
 
+fn enable_managed_oauth(broker: &ManagedBroker) -> std::path::PathBuf {
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
+    document["secretMapPath"] = json!("bindings.yaml");
+    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+        "allowedHosts": ["a.example.test"],
+        "allowedMethods": ["GET"], "maxRequests": 1,
+        "maxRequestBytes": 1024, "maxResponseBytes": 1024
+    });
+    write_config(&broker.config(), &document);
+    broker.directory.path().join("bindings.yaml")
+}
+
+fn managed_oauth_map(record: &Path, revision: &str, name: &str) -> String {
+    format!(
+        "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: {revision}\nsecrets:\n  - drn: drn:secret:oauth/{name}\n    source: {{ kind: oauth2Refresh, recordPath: {}, tokenEndpoint: https://auth.example.test/token, clientId: public-client-id }}\n    destinations: [a.example.test]\n    bindings:\n      - id: api-token\n        capabilities: [cli-probe.upper]\n        sink: httpBearer\n        allowedHosts: [a.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
+        record.display()
+    )
+}
+
+const SEALED_OAUTH_RECORD: &[u8] =
+    br#"{"version":2,"state":"sealed","since":10,"cause":"reauthorization-required"}"#;
+
 #[tokio::test]
 async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_per_poll() {
     use dekopon_broker_protocol::GenerationOutcome;
@@ -2529,22 +2552,8 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
         .unwrap()
         .join("record.json");
     write_owner_only(&record, b"{\"state\":");
-    let bindings = broker.directory.path().join("bindings.yaml");
-    let map = |revision: &str| {
-        format!(
-            "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: {revision}\nsecrets:\n  - drn: drn:secret:oauth/one\n    source: {{ kind: oauth2Refresh, recordPath: {}, tokenEndpoint: https://auth.example.test/token, clientId: public-client-id }}\n    destinations: [a.example.test]\n    bindings:\n      - id: api-token\n        capabilities: [cli-probe.upper]\n        sink: httpBearer\n        allowedHosts: [a.example.test]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1/thing }}]\n",
-            record.display()
-        )
-    };
-    let mut document: serde_json::Value =
-        serde_json::from_slice(&fs::read(broker.config()).unwrap()).unwrap();
-    document["secretMapPath"] = json!("bindings.yaml");
-    document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
-        "allowedHosts": ["a.example.test"],
-        "allowedMethods": ["GET"], "maxRequests": 1,
-        "maxRequestBytes": 1024, "maxResponseBytes": 1024
-    });
-    write_config(&broker.config(), &document);
+    let bindings = enable_managed_oauth(&broker);
+    let map = |revision: &str| managed_oauth_map(&record, revision, "one");
     write_owner_only(&bindings, map("one").as_bytes());
     let capture = dekopon_test_support::CaptureLayer::new();
     let reported = || {
@@ -2596,10 +2605,7 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
             "a missing record is not a valid record"
         );
 
-        write_owner_only(
-            &record,
-            br#"{"version":2,"state":"sealed","since":10,"cause":"reauthorization-required"}"#,
-        );
+        write_owner_only(&record, SEALED_OAUTH_RECORD);
         write_owner_only(&bindings, map("four").as_bytes());
         let (repaired, outcome) = owner.prepare(&missing, uid).await;
         assert_eq!(outcome, GenerationOutcome::Prepared);
@@ -2623,6 +2629,92 @@ async fn a_malformed_oauth_record_is_reported_at_boot_and_per_real_change_not_pe
         let (again, outcome) = owner.prepare(&missing, uid).await;
         assert_eq!(outcome, GenerationOutcome::Prepared);
         assert_eq!(owner.commit(&again, uid), GenerationOutcome::Applied);
+        assert_eq!(recoveries().len(), 1);
+    }
+    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+    .await;
+}
+
+#[tokio::test]
+async fn an_aborted_oauth_record_can_recover_after_an_unrelated_generation() {
+    use dekopon_broker_protocol::GenerationOutcome;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let broker = ManagedBroker::gateway();
+    broker.publish_lock('1');
+    let directory = broker.directory.path().canonicalize().unwrap();
+    let record = directory.join("aborted.json");
+    let unrelated = directory.join("unrelated.json");
+    write_owner_only(&record, b"{\"state\":");
+    write_owner_only(&unrelated, SEALED_OAUTH_RECORD);
+    let bindings = enable_managed_oauth(&broker);
+    write_owner_only(
+        &bindings,
+        managed_oauth_map(&unrelated, "boot", "other").as_bytes(),
+    );
+
+    let capture = dekopon_test_support::CaptureLayer::new();
+    let recoveries = || {
+        capture.events_where(
+            "dekopon_brokerd",
+            &[("event", "broker_credential_record_recovered")],
+        )
+    };
+    async {
+        let (active, report) = candidate_or_refusal(&broker.config(), super::Mode::Boot).await;
+        assert!(report.problems.is_empty(), "{report:?}");
+        let owner = super::Coordination::new(broker.config(), active.unwrap());
+        let uid = current_uid();
+        let active = owner.active().digest.clone();
+        write_owner_only(
+            &bindings,
+            managed_oauth_map(&record, "aborted", "new").as_bytes(),
+        );
+        let (aborted, outcome) = owner.prepare(&active, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.abort(&aborted, uid), GenerationOutcome::Aborted);
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_brokerd",
+                    &[
+                        ("event", "broker_credential_record_invalid"),
+                        ("credential", "drn:secret:oauth/new"),
+                    ],
+                )
+                .len(),
+            1
+        );
+
+        write_owner_only(
+            &bindings,
+            managed_oauth_map(&unrelated, "next", "other").as_bytes(),
+        );
+        let (next, outcome) = owner.prepare(&active, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.commit(&next, uid), GenerationOutcome::Applied);
+        assert!(recoveries().is_empty());
+
+        write_owner_only(&record, SEALED_OAUTH_RECORD);
+        write_owner_only(
+            &bindings,
+            managed_oauth_map(&record, "repaired", "new").as_bytes(),
+        );
+        let (repaired, outcome) = owner.prepare(&next, uid).await;
+        assert_eq!(outcome, GenerationOutcome::Prepared);
+        assert_eq!(owner.abort(&repaired, uid), GenerationOutcome::Aborted);
+        let recovered = recoveries();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].field("generation.digest"),
+            Some(repaired.as_str())
+        );
+
+        assert_eq!(
+            owner.prepare(&next, uid).await,
+            (repaired, GenerationOutcome::Prepared)
+        );
         assert_eq!(recoveries().len(), 1);
     }
     .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
