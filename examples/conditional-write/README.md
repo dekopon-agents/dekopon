@@ -7,7 +7,7 @@ never see it.
 
 ## Run it
 
-1. Create a Slack app from [`manifest-agent.yaml`](../slack/manifest-agent.yaml). Note both
+1. Create a Slack app from [`manifest.yaml`](../slack/manifest.yaml). Note both
    tokens, the team ID and your member ID.
 2. Copy `secret-map.yaml.example` to `secret-map.yaml`, `chmod 600` it, and write your API's bearer
    token to the `0600` file its `path` names.

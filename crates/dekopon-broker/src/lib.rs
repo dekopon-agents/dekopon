@@ -57,7 +57,7 @@ use dekopon_capability::{
 use dekopon_core::{
     Actor, AgentId, AttestedSubject, CapabilityId, InvocationId, PrincipalId, PrincipalKind,
     ProviderFailureDetail, ProviderId, Redacted, RiskLevel, SecretBytes, SecretDrn, SecretSinkKind,
-    SecretUseProposal, Subject, SubjectKind, SubjectScope, TraceId, error_chain,
+    SecretUseProposal, Subject, SubjectKind, SubjectScope, TraceId, error_chain, offload,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{
@@ -4030,13 +4030,11 @@ where
             None => None,
             Some(preparation) => {
                 let span = tracing::Span::current();
-                let materialized = tokio::task::spawn_blocking(move || {
-                    span.in_scope(|| preparation.materialize())
-                })
-                .await
-                .map_err(|source| BrokerError::StorageTask {
-                    source: dekopon_core::TaskOutcome::from_join_error(source),
-                })?;
+                let materialized = offload(move || span.in_scope(|| preparation.materialize()))
+                    .await
+                    .map_err(|source| BrokerError::StorageTask {
+                        source: dekopon_core::TaskOutcome::from(source),
+                    })?;
                 Some(materialized.map_err(|source| {
                     if source.namespace_reset() {
                         tracing::Span::current().record("storage.reset", true);

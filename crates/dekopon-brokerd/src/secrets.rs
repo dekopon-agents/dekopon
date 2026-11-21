@@ -14,8 +14,9 @@ use dekopon_broker::{
     SecretResolver, SecretUseBinding,
 };
 use dekopon_capability::{HttpPathRule, SecretUseGrantError};
+use dekopon_core::OffloadTrace;
 use dekopon_core::{
-    CapabilityId, FileHygieneError, FileTier, Redacted, SecretDrn, SecretSinkKind,
+    CapabilityId, FileHygieneError, FileTier, Redacted, SecretDrn, SecretSinkKind, offload,
     read_trusted_file,
 };
 use dekopon_telemetry::egress::{Timeout, client_builder};
@@ -387,14 +388,10 @@ impl ScheduledCatalog {
                 let path = record_path.clone();
                 let drn = drn.clone();
                 let uid = resolver.expected_uid;
-                let dispatch = tracing::dispatcher::get_default(Clone::clone);
-                if tokio::task::spawn_blocking(move || {
-                    tracing::dispatcher::with_default(&dispatch, || {
-                        oauth2::inspect_boot(&path, uid, &drn)
-                    })
-                })
-                .await
-                .is_err()
+                let trace = OffloadTrace::capture(None);
+                if offload(move || trace.in_scope(|| oauth2::inspect_boot(&path, uid, &drn)))
+                    .await
+                    .is_err()
                 {
                     tracing::error!(
                         event = "broker_credential_record_inspection_failed",
@@ -1891,14 +1888,12 @@ async fn validate_map(
         })
         .map(|(drn, (source, _))| (drn.clone(), source.clone()))
         .collect::<Vec<_>>();
-    let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    let mut minted = tokio::task::spawn_blocking(move || {
-        tracing::dispatcher::with_default(&dispatch, || mint_sources(minting, expected_uid))
-    })
-    .await
-    .map_err(|_join| SecretMapError::Validation {
-        problems: vec!["minted secret sources could not be opened".to_owned()],
-    })??;
+    let trace = OffloadTrace::capture(None);
+    let mut minted = offload(move || trace.in_scope(|| mint_sources(minting, expected_uid)))
+        .await
+        .map_err(|_join| SecretMapError::Validation {
+            problems: vec!["minted secret sources could not be opened".to_owned()],
+        })??;
     let client = client_builder(
         reqwest::Client::builder(),
         Timeout::Request(Duration::from_millis(MAX_TIMEOUT_MS)),
@@ -2215,7 +2210,7 @@ fn parse_token(bytes: Vec<u8>) -> Result<Redacted<String>, SourceError> {
 )]
 async fn read_private_file(path: &Path, uid: u32, maximum: usize) -> Result<Vec<u8>, SourceError> {
     let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    offload(move || {
         let result = read_trusted_file(&owned, uid, FileTier::Private, maximum);
         #[cfg(test)]
         crate::private_read_witness::record(&owned, &result);

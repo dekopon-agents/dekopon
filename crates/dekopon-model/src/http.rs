@@ -5,7 +5,7 @@ use crate::{
         AuthError, FailurePhase, InferenceError, ProtocolFailure, ProviderFailure, RateLimitError,
         RequestError, TransportFailure,
     },
-    model::{AssistantTurn, MAX_ERROR_BODY_BYTES},
+    model::{AssistantTurn, CompletionOptions, MAX_ERROR_BODY_BYTES},
     sse::{SseEvent, read_async_stream},
     stream::TurnEvent,
 };
@@ -107,14 +107,18 @@ impl InferenceHttp {
 
     pub(crate) async fn generation(
         &self,
-        name: &str,
-        model: &str,
+        (name, model): (&str, &str),
         provider: &str,
         dialect: &str,
+        options: &CompletionOptions,
         operation: impl Future<Output = (Result<AssistantTurn, InferenceError>, Progress)> + Send,
     ) -> Result<AssistantTurn, InferenceError> {
+        let session = options.session.as_ref();
         let span = tracing::info_span!(
             "model.complete",
+            gen_ai.agent.name = session.map(|session| session.agent.as_str()),
+            conversation.id = session.map(|session| session.conversation_id.as_str()),
+            conversation.kind = session.map(|session| session.conversation_kind),
             model = model,
             model.name = name,
             model.backend = provider,
@@ -582,23 +586,29 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         let capture = crate::trace_capture::TraceCapture::default();
         let result = http
-            .generation("refusal", "fixture", "fixture", "fixture", async {
-                let result = async {
-                    let response = http
-                        .send(
-                            http.post(&server.base_url()).body("{}"),
-                            &control,
-                            DiagnosticSecrets::default(),
-                        )
-                        .await?;
-                    match response.check(&control, DiagnosticSecrets::default()).await {
-                        Err(error) => Err(error),
-                        Ok(_) => panic!("expected refusal"),
+            .generation(
+                ("refusal", "fixture"),
+                "fixture",
+                "fixture",
+                &CompletionOptions::default(),
+                async {
+                    let result = async {
+                        let response = http
+                            .send(
+                                http.post(&server.base_url()).body("{}"),
+                                &control,
+                                DiagnosticSecrets::default(),
+                            )
+                            .await?;
+                        match response.check(&control, DiagnosticSecrets::default()).await {
+                            Err(error) => Err(error),
+                            Ok(_) => panic!("expected refusal"),
+                        }
                     }
-                }
-                .await;
-                (result, Progress::new())
-            })
+                    .await;
+                    (result, Progress::new())
+                },
+            )
             .with_subscriber(capture.subscriber())
             .await;
         let Err(InferenceError::Provider(error)) = result else {
@@ -636,10 +646,10 @@ mod tests {
         let control =
             TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(2)).unwrap();
         let (result, span) = crate::trace_capture::exported_model_span(http.generation(
-            "tls",
+            ("tls", "fixture"),
             "fixture",
             "fixture",
-            "fixture",
+            &CompletionOptions::default(),
             async {
                 let result = async {
                     http.send(

@@ -604,7 +604,7 @@ fn run_console(cli: &Cli, mut builder: tokio::runtime::Builder) -> Result<(), Co
         .shutdown()
         .map_err(|_sensitive_error| telemetry::TelemetryError::Shutdown);
     drop(_entered);
-    // A timed-out structured shell may leave unabortable spawn_blocking work behind. The
+    // A timed-out structured shell may leave unabortable blocking work behind. The
     // RESULT/END has already been flushed; do not let runtime Drop wait for that worker forever.
     shutdown_console_runtime(runtime, cli.structured, std::time::Duration::from_secs(5));
     result?;

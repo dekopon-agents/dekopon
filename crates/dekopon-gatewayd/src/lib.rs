@@ -45,6 +45,7 @@ use std::{
 
 use dekopon_broker_protocol::BrokerClient;
 use dekopon_config::LocalCatalog;
+use dekopon_core::offload;
 use dekopon_process::ShellThreads;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet};
@@ -243,14 +244,12 @@ where
     }
 
     let journal_dir = config.journal.as_ref().map(|journal| journal.dir.clone());
-    let cache_keys = tokio::task::spawn_blocking(move || match journal_dir {
+    let cache_keys = offload(move || match journal_dir {
         Some(dir) => cache_key::CacheKeySecret::load_or_create(&dir),
         None => cache_key::CacheKeySecret::generate(),
     })
     .await
-    .map_err(|source| {
-        GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
-    })??;
+    .map_err(|source| GatewaydError::TransportTask(dekopon_core::TaskOutcome::from(source)))??;
     if journal.is_some() {
         for route in generation.load().routes.routes() {
             memory::generation::report_policy(route);
@@ -258,10 +257,10 @@ where
     }
     let wakes = match config.wakes.clone() {
         Some(wakes) => Some(Arc::new(
-            tokio::task::spawn_blocking(move || wake::WakeStore::open(&wakes))
+            offload(move || wake::WakeStore::open(&wakes))
                 .await
                 .map_err(|source| {
-                    GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
+                    GatewaydError::TransportTask(dekopon_core::TaskOutcome::from(source))
                 })??,
         )),
         None => None,
@@ -275,7 +274,7 @@ where
     let conversations = config.sessions.max_conversations;
     let budget = config.sessions.asset_retention_bytes;
     let journal_assets = journal.clone();
-    let assets = tokio::task::spawn_blocking(move || {
+    let assets = offload(move || {
         let store = AssetStore::with_retention(conversations, ONE_SHOT_ASSET_IDLE, budget);
         let store = match assets_path {
             Some(path) => store
@@ -299,9 +298,7 @@ where
         Ok::<_, GatewaydError>(Arc::new(store))
     })
     .await
-    .map_err(|source| {
-        GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
-    })??;
+    .map_err(|source| GatewaydError::TransportTask(dekopon_core::TaskOutcome::from(source)))??;
     let models = Arc::new(ModelCache::new(
         Arc::clone(&configured) as Arc<dyn session::ModelFactory>
     ));
@@ -485,7 +482,7 @@ async fn open_journal(
         .collect();
     let max_bytes_per_agent = memory.retention.max_bytes_per_agent.get();
     let queue = memory.summaries.queue;
-    let journal = tokio::task::spawn_blocking(move || {
+    let journal = offload(move || {
         let (mut journal, boot) = journal::Journal::boot(
             &config.dir,
             max_age,
@@ -501,9 +498,7 @@ async fn open_journal(
         Ok::<_, journal::JournalError>((journal, boot))
     })
     .await
-    .map_err(|source| {
-        GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
-    })?
+    .map_err(|source| GatewaydError::TransportTask(dekopon_core::TaskOutcome::from(source)))?
     .map_err(|error| GatewaydError::Journal {
         kind: match error {
             journal::JournalError::Io { kind } => kind,
@@ -523,11 +518,9 @@ async fn load_follow_table(
     let journal = Arc::clone(journal.as_ref().ok_or(GatewaydError::Journal {
         kind: std::io::ErrorKind::InvalidInput,
     })?);
-    let table = tokio::task::spawn_blocking(move || follow::FollowTable::load(journal))
+    let table = offload(move || follow::FollowTable::load(journal))
         .await
-        .map_err(|source| {
-            GatewaydError::TransportTask(dekopon_core::TaskOutcome::from_join_error(source))
-        })?
+        .map_err(|source| GatewaydError::TransportTask(dekopon_core::TaskOutcome::from(source)))?
         .map_err(|error| GatewaydError::Journal {
             kind: match error {
                 journal::JournalError::Io { kind } => kind,
