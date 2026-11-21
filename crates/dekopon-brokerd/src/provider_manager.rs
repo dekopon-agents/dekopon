@@ -17,7 +17,7 @@ use dekopon_broker_host::{
 };
 use dekopon_core::{
     AncestorOwners, AncestorPolicy, FileHygieneError, FileTier, ProviderId,
-    check_trusted_ancestors, check_trusted_metadata,
+    check_trusted_ancestors, check_trusted_metadata, offload,
     private_file::{
         TemporarySweep, replace_private_file, replace_private_file_noclobber,
         sweep_stale_temporaries, sync_directory,
@@ -394,10 +394,10 @@ impl ProviderManager {
         )
         .await?;
         let out = out.to_path_buf();
-        tokio::task::spawn_blocking(move || export_skills(&sources, &out))
+        offload(move || export_skills(&sources, &out))
             .await
             .map_err(|source| ProviderManagerError::SkillExportTask {
-                source: dekopon_core::TaskOutcome::from_join_error(source),
+                source: dekopon_core::TaskOutcome::from(source),
             })?
     }
 
@@ -1985,29 +1985,27 @@ async fn read_secure_file(
     let path = absolute(path)?;
     validate_file_parent(&path, expected_uid)?;
     let owned = path.clone();
-    tokio::task::spawn_blocking(move || {
-        read_trusted_file(&owned, expected_uid, FileTier::NotWorldWritable, maximum)
-    })
-    .await
-    .map_err(|join| {
-        ProviderManagerError::io_at(
-            READ_PROVIDER_STATE,
-            path.clone(),
-            io::Error::other(dekopon_core::TaskOutcome::from_join_error(join)),
-        )
-    })?
-    .map_err(|error| match error {
-        FileHygieneError::Io { path, source } => {
-            ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source)
-        }
-        FileHygieneError::TooLarge {
-            length, maximum, ..
-        } => ProviderManagerError::config_detail(
-            STATE_TOO_LARGE,
-            format!("provider state is {length} bytes; maximum is {maximum}"),
-        ),
-        insecure => ProviderManagerError::file_hygiene(path, insecure),
-    })
+    offload(move || read_trusted_file(&owned, expected_uid, FileTier::NotWorldWritable, maximum))
+        .await
+        .map_err(|join| {
+            ProviderManagerError::io_at(
+                READ_PROVIDER_STATE,
+                path.clone(),
+                io::Error::other(dekopon_core::TaskOutcome::from(join)),
+            )
+        })?
+        .map_err(|error| match error {
+            FileHygieneError::Io { path, source } => {
+                ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source)
+            }
+            FileHygieneError::TooLarge {
+                length, maximum, ..
+            } => ProviderManagerError::config_detail(
+                STATE_TOO_LARGE,
+                format!("provider state is {length} bytes; maximum is {maximum}"),
+            ),
+            insecure => ProviderManagerError::file_hygiene(path, insecure),
+        })
 }
 
 fn validate_file_metadata(

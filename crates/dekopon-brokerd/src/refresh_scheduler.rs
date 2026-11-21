@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use dekopon_core::offload;
 use tokio::{task::JoinSet, time::MissedTickBehavior};
 use tracing::instrument::WithSubscriber as _;
 
@@ -71,7 +72,7 @@ where
             }
             let uid = crate::socket::current_uid();
             let record = path.clone();
-            let inspected = tokio::task::spawn_blocking(move || oauth2::due_at(&record, uid)).await;
+            let inspected = offload(move || oauth2::due_at(&record, uid)).await;
             let due = match inspected {
                 Ok(Ok(due)) => {
                     unreadable.remove(&path);

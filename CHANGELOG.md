@@ -7,6 +7,59 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- `examples/slack/manifest.yaml` is now the Agent profile, paired with `experience: agent`; the classic profile moved to `examples/slack/manifest-legacy.yaml`. Installed apps are unaffected until reinstalled.
+
+## [0.90.0] - 2026-11-20
+
+### Fixed
+
+- Report journal write failures during memory summary panic recovery.
+- Show reported token and cache counts on memory summaries, identify the agent and chat session on model completions, and distinguish unknown cache usage from zero.
+- Slack mentions receive replies when conversation metadata is unavailable.
+
+## [dekopon-chart-0.77.0] - 2026-11-20
+
+### Changed
+
+- Chart 0.77.0 targets core v0.90.0 and renders the `v0.90.0` image tag.
+
+## [0.89.0] - 2026-11-20
+
+### Added
+
+- brokerd raises its soft open-file limit at startup and logs broker.fd_budget with the spool cap, provider count, in-flight bounds and fd limits.
+- OpenRouter-backed models answer the Messages dialect (`/v1/messages`), passed through unchanged.
+
+### Changed
+
+- The example Slack app manifests request canvases:read, so provider-slack's canvas read works on a fresh install.
+- broker_connection_failed reports task failures with category panicked or cancelled instead of task-panicked or task-cancelled.
+- gateway hydration failures log reason panicked or cancelled instead of panic.
+- routes listing push, create, star or deployment events no longer fire.
+- Broker reconnect attempts use jitter during restarts while retaining their retry window and delay cap.
+
+### Fixed
+
+- WhatsApp webhook redeliveries no longer queue the same message id twice.
+- the broker refuses at startup a secret map where one OAuth2 record path or ChatGPT authFile serves two entries, naming every conflict.
+- the wake store is written with file and directory fsync, so a power cut can no longer leave it empty or truncated.
+- Messages requests preserve repeated generation fields for inherited models.
+
+### Security
+
+- Panic payloads no longer reach logs, error chains or model-visible text; gatewayd and brokerd install a panic hook that prints only the panic location and class.
+- GitHub webhook events take their family from the signed body, and bodies with no recognizable family are ignored.
+- a provider call holds at most maxLiveSpoolsPerInvocation (default 32) live asset spools; over it, allocate returns an error naming the limit.
+- Update Wasmtime to 49.0.7 in the default build.
+
+## [dekopon-chart-0.76.0] - 2026-11-20
+
+### Changed
+
+- Chart 0.76.0 targets core v0.89.0 and renders the `v0.89.0` image tag.
+
 ## [0.88.0] - 2026-11-06
 
 ### Changed

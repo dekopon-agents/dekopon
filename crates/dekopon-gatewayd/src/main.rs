@@ -8,6 +8,7 @@
     )
 )]
 #[cfg(unix)]
+use dekopon_core::offload;
 use dekopon_gatewayd::cli;
 #[cfg(unix)]
 mod auth;
@@ -313,7 +314,7 @@ async fn serve(
         }
     };
 
-    match tokio::task::spawn_blocking(move || telemetry.shutdown()).await {
+    match offload(move || telemetry.shutdown()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::error!(
             event = "gateway_telemetry_shutdown_failed",
@@ -322,7 +323,7 @@ async fn serve(
         ),
         Err(error) => eprintln!(
             "dekopon-gatewayd: telemetry flush failed: {}",
-            dekopon_core::TaskOutcome::from_join_error(error)
+            dekopon_core::TaskOutcome::from(error)
         ),
     }
     code

@@ -1,7 +1,8 @@
 use std::{future::Future, time::Duration};
 
+use dekopon_core::offload;
 use dekopon_storage_host::{RetentionPolicies, StorageHost, StorageHostError, SweepSummary};
-use tokio::{task::JoinError, time::MissedTickBehavior};
+use tokio::time::MissedTickBehavior;
 
 use crate::{BrokerdError, ServerError, ShutdownDeadline};
 
@@ -30,7 +31,7 @@ where
         }
         let host = storage.clone();
         let policies = policies();
-        let mut sweep = tokio::task::spawn_blocking(move || host.sweep(&policies));
+        let mut sweep = offload(move || host.sweep(&policies));
         tokio::select! {
             result = &mut server => {
                 return drain_after_server(result, sweep, &deadline).await;
@@ -42,7 +43,7 @@ where
 
 async fn drain_after_server(
     server: Result<(), ServerError>,
-    sweep: tokio::task::JoinHandle<Result<SweepSummary, StorageHostError>>,
+    sweep: dekopon_core::Offload<Result<SweepSummary, StorageHostError>>,
     deadline: &ShutdownDeadline,
 ) -> Result<(), BrokerdError> {
     // Native deletion finishes before the storage root lease is released; past the shutdown
@@ -65,7 +66,7 @@ fn sweep_interval() -> tokio::time::Interval {
 }
 
 fn finish(
-    result: Result<Result<SweepSummary, StorageHostError>, JoinError>,
+    result: Result<Result<SweepSummary, StorageHostError>, dekopon_core::OffloadError>,
 ) -> Result<(), BrokerdError> {
     match result {
         Ok(Ok(_)) => Ok(()),
@@ -78,7 +79,7 @@ fn finish(
             Ok(())
         }
         Err(error) => {
-            let failure = dekopon_core::TaskOutcome::from_join_error(error);
+            let failure = dekopon_core::TaskOutcome::from(error);
             tracing::error!(
                 event = "storage_sweep_task_failed",
                 failure = failure.category(),
@@ -187,11 +188,11 @@ mod tests {
     fn parked_sweep() -> (
         std::sync::mpsc::Sender<()>,
         oneshot::Receiver<()>,
-        tokio::task::JoinHandle<Result<SweepSummary, StorageHostError>>,
+        dekopon_core::Offload<Result<SweepSummary, StorageHostError>>,
     ) {
         let (release, released) = std::sync::mpsc::channel();
         let (started, ready) = oneshot::channel();
-        let sweep = tokio::task::spawn_blocking(move || {
+        let sweep = offload(move || {
             started.send(()).unwrap();
             released.recv().unwrap();
             Ok(SweepSummary::default())

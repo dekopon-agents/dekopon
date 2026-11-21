@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 
 use dekopon_core::error_chain;
+use dekopon_core::offload;
 use dekopon_telemetry::Install;
 
 pub(crate) fn finish(
@@ -52,13 +53,13 @@ pub(crate) async fn observed<E: std::error::Error>(
         .as_ref()
         .and_then(dekopon_brokerd::ShutdownDeadline::get)
     {
-        None => match tokio::task::spawn_blocking(move || telemetry.shutdown()).await {
+        None => match offload(move || telemetry.shutdown()).await {
             Ok(flushed) => flushed,
             Err(error) => {
                 return diagnostic(
                     &format!(
                         "dekopon-brokerd: telemetry flush failed: {}\n",
-                        dekopon_core::TaskOutcome::from_join_error(error)
+                        dekopon_core::TaskOutcome::from(error)
                     ),
                     code,
                 );
@@ -71,14 +72,14 @@ pub(crate) async fn observed<E: std::error::Error>(
             );
         }
         Some(deadline) => {
-            let flush = tokio::task::spawn_blocking(move || telemetry.shutdown());
+            let flush = offload(move || telemetry.shutdown());
             match tokio::time::timeout_at(deadline, flush).await {
                 Ok(Ok(flushed)) => flushed,
                 Ok(Err(error)) => {
                     return diagnostic(
                         &format!(
                             "dekopon-brokerd: telemetry flush failed: {}\n",
-                            dekopon_core::TaskOutcome::from_join_error(error)
+                            dekopon_core::TaskOutcome::from(error)
                         ),
                         code,
                     );

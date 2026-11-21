@@ -1,6 +1,7 @@
 use std::{num::NonZeroU8, sync::Arc, time::SystemTime};
 
 use dekopon_agent::memory::CapturedTurn;
+use dekopon_core::offload;
 use tracing::Instrument as _;
 
 use super::{
@@ -126,7 +127,7 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
     let subscriber = tracing::dispatcher::get_default(Clone::clone);
     let span = tracing::Span::current();
     let store = Arc::clone(&runner.assets);
-    let written = tokio::task::spawn_blocking(move || {
+    let written = offload(move || {
         tracing::dispatcher::with_default(&subscriber, || {
             let _entered = span.enter();
             let journal = journal?;
@@ -237,7 +238,7 @@ async fn drain_turn(runner: &SessionRunner, deferred: Deferred) {
         ),
     }
     if !follows.is_empty() {
-        let written = tokio::task::spawn_blocking(move || {
+        let written = offload(move || {
             for follow in follows {
                 follow.write();
             }

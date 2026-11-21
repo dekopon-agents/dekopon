@@ -23,7 +23,7 @@ use dekopon_broker_protocol::{
     DeliveryIdentity, FrameLimits, InvocationOutcome, ResolvedBrokerSocket, TraceParent, Trigger,
 };
 use dekopon_config::Skill;
-use dekopon_core::{AgentId, AttestedSubject, Subject};
+use dekopon_core::{AgentId, AttestedSubject, Subject, offload};
 use dekopon_model::{
     blocking::BlockingModel,
     chatgpt::{self, ChatGptError},
@@ -513,7 +513,7 @@ pub async fn run_turn(
 ) -> Result<History, SessionError> {
     // Tokio does not inherit tracing context on its blocking pool. Enter only on that thread.
     let span = tracing::Span::current();
-    tokio::task::spawn_blocking(move || {
+    offload(move || {
         let _entered = span.enter();
         let sequence = Sequence::default();
         let calls = CallBudget::new(options.prompt_limits.max_capability_calls);
@@ -607,7 +607,7 @@ pub async fn run_turn(
         history
     })
     .await
-    .map_err(SessionError::Task)
+    .map_err(|error| SessionError::Task(error.into()))
 }
 
 #[doc(hidden)]

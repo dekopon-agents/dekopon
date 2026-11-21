@@ -108,8 +108,8 @@ fn both_slack_manifests_request_canvas_read_and_follow_events_while_only_agent_e
         serde_yaml::from_slice::<serde_yaml::Value>(&bytes)
             .unwrap_or_else(|error| panic!("{} decodes: {error}", path.display()))
     };
-    let classic = load("manifest.yaml");
-    let agent = load("manifest-agent.yaml");
+    let classic = load("manifest-legacy.yaml");
+    let agent = load("manifest.yaml");
 
     assert!(classic["features"].get("agent_view").is_none());
     assert!(agent["features"].get("agent_view").is_some());

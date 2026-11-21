@@ -20,7 +20,7 @@ use dekopon_core::{
     Actor, AgentId, FileHygieneError, FileTier, GroupId, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
     ProviderId, SecretDrn, Subject,
     fragments::{self, FragmentError, MergeRules},
-    read_trusted_file,
+    offload, read_trusted_file,
 };
 use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
@@ -764,14 +764,12 @@ pub(crate) async fn read_not_world_writable(
     maximum: usize,
 ) -> Result<Vec<u8>, FileHygieneError> {
     let owned = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        read_trusted_file(&owned, expected_uid, FileTier::NotWorldWritable, maximum)
-    })
-    .await
-    .map_err(|join| FileHygieneError::Io {
-        path: path.to_path_buf(),
-        source: io::Error::other(dekopon_core::TaskOutcome::from_join_error(join)),
-    })?
+    offload(move || read_trusted_file(&owned, expected_uid, FileTier::NotWorldWritable, maximum))
+        .await
+        .map_err(|join| FileHygieneError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::other(dekopon_core::TaskOutcome::from(join)),
+        })?
 }
 
 #[expect(
