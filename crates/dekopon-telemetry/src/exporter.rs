@@ -15,6 +15,8 @@ use opentelemetry_sdk::{
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::egress::{Timeout, client_builder};
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Transport {
@@ -229,16 +231,15 @@ fn otlp_client_from(
     timeout: Duration,
     ca_certificate: Option<&[u8]>,
 ) -> Result<reqwest::ClientBuilder, reqwest::Error> {
-    let mut builder = builder
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy();
-    if let Some(pem) = ca_certificate {
-        for certificate in reqwest::Certificate::from_pem_bundle(pem)? {
-            builder = builder.add_root_certificate(certificate);
-        }
-    }
-    Ok(builder)
+    let certificates = ca_certificate
+        .map(reqwest::Certificate::from_pem_bundle)
+        .transpose()?;
+    Ok(client_builder(
+        builder,
+        Timeout::Request(timeout),
+        concat!("dekopon-telemetry/", env!("CARGO_PKG_VERSION")),
+        certificates.into_iter().flatten(),
+    ))
 }
 
 impl OtlpHttpClient {
@@ -415,6 +416,31 @@ mod tests {
             rendered.contains("redirect_policy: Policy(None)"),
             "the ingest header must not follow a redirect: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_egress_client_disables_retries() {
+        const UNAVAILABLE: &str =
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let receiver = Receiver::start(UNAVAILABLE).await;
+        let builder = reqwest::Client::builder().retry(
+            reqwest::retry::for_host("127.0.0.1")
+                .no_budget()
+                .max_retries_per_request(1)
+                .classify_fn(|exchange| exchange.retryable()),
+        );
+        let client = otlp_client_from(builder, Duration::from_secs(5), None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let response = client
+            .post(format!("{}/v1/logs", receiver.endpoint))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(receiver.requests().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

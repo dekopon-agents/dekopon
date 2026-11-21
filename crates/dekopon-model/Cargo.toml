@@ -20,6 +20,7 @@ parking_lot.workspace = true
 base64.workspace = true
 dekopon-core = { workspace = true, features = ["offload-tracing"] }
 dekopon-model-token-governor.workspace = true
+dekopon-telemetry = { workspace = true, features = ["egress"] }
 futures-util.workspace = true
 http.workspace = true
 reqwest.workspace = true

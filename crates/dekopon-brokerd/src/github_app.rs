@@ -5,10 +5,10 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use dekopon_core::{Redacted, error_chain};
+use dekopon_telemetry::egress::{Timeout, client_builder};
 use reqwest::{
     StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue},
-    redirect,
 };
 use ring::{
     rand::SystemRandom,
@@ -36,8 +36,10 @@ pub(crate) enum GithubAppError {
     NotPem,
     #[error("privateKey is not a usable RSA key ({reason})")]
     KeyRejected { reason: String },
+    #[error("the GitHub App downscope could not be encoded")]
+    Downscope(#[source] serde_json::Error),
     #[error("the GitHub API client could not be built")]
-    Client,
+    Client(#[source] reqwest::Error),
 }
 
 pub(crate) struct GithubAppKey(RsaKeyPair);
@@ -157,14 +159,15 @@ impl GithubAppCredential {
             .as_ref()
             .map(serde_json::to_vec)
             .transpose()
-            .map_err(|_serialize| GithubAppError::Client)?;
-        let client = reqwest::Client::builder()
-            .redirect(redirect::Policy::none())
-            .no_proxy()
-            .timeout(REFRESH_TIMEOUT)
-            .user_agent(concat!("dekopon-brokerd/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_build| GithubAppError::Client)?;
+            .map_err(GithubAppError::Downscope)?;
+        let client = client_builder(
+            reqwest::Client::builder(),
+            Timeout::Request(REFRESH_TIMEOUT),
+            crate::EGRESS_USER_AGENT,
+            [],
+        )
+        .build()
+        .map_err(GithubAppError::Client)?;
         Ok(Self {
             name,
             app_id: installation.app_id,

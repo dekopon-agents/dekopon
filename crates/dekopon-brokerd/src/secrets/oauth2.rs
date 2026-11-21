@@ -14,7 +14,7 @@ use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
-use super::{SourceError, classified};
+use super::{SourceError, classified, classify_http_failure};
 
 const RECORD_BYTES: usize = 64 * 1024;
 const CYCLE: u64 = 22 * 60 * 60;
@@ -580,16 +580,10 @@ async fn post(
         ("client_id", client_id),
     ]);
     tokio::time::timeout(timeout, async {
-        let response = request.send().await.map_err(|source| {
-            classified(
-                if source.is_timeout() {
-                    SourceError::Timeout
-                } else {
-                    SourceError::Transport
-                },
-                &source,
-            )
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|source| classify_http_failure(&source))?;
         let status = response.status();
         if !super::headers_within_limits(&response) {
             return Err(SourceError::TooLarge);
@@ -597,16 +591,7 @@ async fn post(
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|source| {
-                classified(
-                    if source.is_timeout() {
-                        SourceError::Timeout
-                    } else {
-                        SourceError::Transport
-                    },
-                    &source,
-                )
-            })?;
+            let chunk = chunk.map_err(|source| classify_http_failure(&source))?;
             if body.len().saturating_add(chunk.len()) > RECORD_BYTES {
                 return Err(SourceError::Malformed);
             }
