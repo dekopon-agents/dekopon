@@ -77,7 +77,7 @@ struct StreamBody {
     span: tracing::Span,
     parts: VecDeque<Part>,
     active: Option<ActiveFile>,
-    pending: Option<tokio::task::JoinHandle<Completed<io::Result<Chunk>>>>,
+    pending: Option<dekopon_core::Offload<Completed<io::Result<Chunk>>>>,
     remaining: u64,
 }
 
@@ -158,7 +158,7 @@ impl Body for StreamBody {
                     Ok(Err(error)) => return Poll::Ready(Some(Err(error))),
                     Err(error) => {
                         return Poll::Ready(Some(Err(io::Error::other(
-                            dekopon_core::TaskOutcome::from_join_error(error),
+                            dekopon_core::TaskOutcome::from(error),
                         ))));
                     }
                 };

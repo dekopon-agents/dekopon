@@ -7,6 +7,7 @@ use dekopon_capability::AssetConstraints;
 use dekopon_core::{
     AssetNumber,
     base64::{self, Validator},
+    offload,
 };
 use dekopon_http_host::{
     CHUNK_BYTES, FilePart, Representation,
@@ -208,7 +209,7 @@ impl AssetState {
         origin: String,
     ) -> Result<Self, AssetAdmissionError> {
         let jobs = AssetJobs::default();
-        tokio::task::spawn_blocking(move || {
+        offload(move || {
             if inputs.rows.len() > MAX_ASSET_ROWS {
                 return Err(AssetAdmissionError::TooManyRows);
             }

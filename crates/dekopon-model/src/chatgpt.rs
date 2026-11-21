@@ -10,8 +10,9 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use dekopon_core::OffloadTrace;
 use dekopon_core::{
-    Redacted,
+    Redacted, offload,
     private_file::{self, PrivateFileLock, TemporarySweep},
 };
 use serde::{Deserialize, Serialize};
@@ -267,15 +268,13 @@ impl CredentialFile {
             }
             let path = self.path.clone();
             let permit = Arc::clone(permit);
-            let attempt = tokio::task::spawn_blocking(move || {
+            let attempt = offload(move || {
                 let _permit = permit;
                 PrivateFileLock::try_acquire(&path)
             })
             .await
             .map_err(|source| {
-                ChatGptError::RefreshTask(io::Error::other(
-                    dekopon_core::TaskOutcome::from_join_error(source),
-                ))
+                ChatGptError::RefreshTask(io::Error::other(dekopon_core::TaskOutcome::from(source)))
             })?
             .map_err(|error| ChatGptError::LockAuth {
                 path: error.path,
@@ -306,17 +305,16 @@ impl CredentialFile {
         let result = async {
             let _lock = lock;
             let owner = Arc::clone(self);
-            let (mut credentials, adopted) = tokio::task::spawn_blocking(move || {
+            let (mut credentials, adopted) = offload(move || {
                 owner.adopt(rejected.as_ref())
-            }).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(dekopon_core::TaskOutcome::from_join_error(source))))??;
+            }).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(dekopon_core::TaskOutcome::from(source))))??;
             if adopted {
                 return Ok(resolved(credentials, Some(RefreshOutcome::Adopted)));
             }
             credentials = refresh_credentials(&client.http, client.timeout, &self.endpoints, &credentials).await?;
             let owner = Arc::clone(self);
-            let save_span = tracing::Span::current();
-            let save_dispatch = tracing::dispatcher::get_default(Clone::clone);
-            let (credentials, outcome) = tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&save_dispatch, || save_span.in_scope(|| {
+            let trace = OffloadTrace::capture(Some(tracing::Span::current()));
+            let (credentials, outcome) = offload(move || trace.in_scope(|| {
                 let outcome = match save_credentials(&owner.path, &credentials) {
                     Ok(()) => RefreshOutcome::Rotated,
                     Err(error) => {
@@ -326,7 +324,7 @@ impl CredentialFile {
                 };
                 owner.install(&credentials);
                 (credentials, outcome)
-            }))).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(dekopon_core::TaskOutcome::from_join_error(source))))?;
+            })).await.map_err(|source| ChatGptError::RefreshTask(io::Error::other(dekopon_core::TaskOutcome::from(source))))?;
             Ok(resolved(credentials, Some(outcome)))
         }.instrument(span.clone()).await;
         match &result {
@@ -422,12 +420,10 @@ async fn login_with_endpoints(
     let authorization = poll_device_login(&http, &endpoints, &device).await?;
     let credentials = exchange_authorization(&http, &endpoints, &authorization).await?;
     let saved_path = path.clone();
-    tokio::task::spawn_blocking(move || save_credentials(&saved_path, &credentials))
+    offload(move || save_credentials(&saved_path, &credentials))
         .await
         .map_err(|source| {
-            ChatGptError::RefreshTask(io::Error::other(
-                dekopon_core::TaskOutcome::from_join_error(source),
-            ))
+            ChatGptError::RefreshTask(io::Error::other(dekopon_core::TaskOutcome::from(source)))
         })??;
     Ok(path)
 }

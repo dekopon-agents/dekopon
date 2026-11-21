@@ -361,10 +361,10 @@ impl InferenceModel for OpenRouterClient {
     ) -> Result<AssistantTurn, InferenceError> {
         self.http
             .generation(
-                &self.name,
-                &self.model,
+                (&self.name, &self.model),
                 "openrouter",
                 "chat-completions",
+                request.options,
                 async {
                     let mut progress = Progress::new();
                     (

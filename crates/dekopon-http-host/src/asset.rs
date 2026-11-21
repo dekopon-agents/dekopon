@@ -1,3 +1,4 @@
+use dekopon_core::offload;
 use std::{
     fs::File,
     io::{self, Write as _},
@@ -86,11 +87,11 @@ impl AssetJobs {
     pub(crate) fn spawn<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> T + Send + 'static,
-    ) -> tokio::task::JoinHandle<Completed<T>> {
+    ) -> dekopon_core::Offload<Completed<T>> {
         self.0.active.fetch_add(1, Ordering::AcqRel);
         let pending = Pending(Arc::clone(&self.0));
         let span = tracing::Span::current();
-        tokio::task::spawn_blocking(move || Completed {
+        offload(move || Completed {
             value: span.in_scope(work),
             _pending: pending,
         })
@@ -103,7 +104,7 @@ impl AssetJobs {
             .await
             .map_err(|failure| {
                 tracing::error!(
-                    failure = dekopon_core::TaskOutcome::from_join_error(failure).category(),
+                    failure = dekopon_core::TaskOutcome::from(failure).category(),
                     "http.asset.worker.failed"
                 );
                 AssetIoError::Worker

@@ -25,7 +25,7 @@ dekopon-http-host.workspace = true
 dekopon-model.workspace = true
 dekopon-broker-protocol.workspace = true
 dekopon-capability.workspace = true
-dekopon-core = { workspace = true, features = ["cli", "tokio-task"] }
+dekopon-core = { workspace = true, features = ["cli", "offload-tracing"] }
 dekopon-storage-host.workspace = true
 dekopon-telemetry = { workspace = true, features = ["cli", "exporter"] }
 tracing-opentelemetry.workspace = true

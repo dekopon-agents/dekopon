@@ -297,7 +297,7 @@ Own only what you store; a clone that satisfies the borrow checker is a design s
 
 tokio is the runtime; the `bindgen!` host traits are already `async fn` in traits, so ours are too.
 
-- Yes: `trait Sink { fn write(&mut self, chunk: &[u8]) -> impl Future<Output = io::Result<()>> + Send; }` where a spawn needs it; `tokio::task::spawn_blocking(move || blob.read())`.
+- Yes: `trait Sink { fn write(&mut self, chunk: &[u8]) -> impl Future<Output = io::Result<()>> + Send; }` where a spawn needs it; `dekopon_core::offload(move || blob.read()).await`.
 - No: `#[async_trait]`, `Pin<Box<dyn Future<Output = …>>>` in a signature, `std::fs::read` inside an `async fn`.
 
 ### Concurrency
@@ -308,9 +308,10 @@ it); if something does, add nothing, and prefer deleting a redundant primitive t
 [`clippy.toml`](clippy.toml) bans the raw forms below through `disallowed-methods` and
 `disallowed-types`, beside the workspace `await_holding_*` lints. A production use needs a site
 `#[expect(clippy::disallowed_methods, reason = "owner: …; bound: …")]`: the reason is the registry,
-and rustc fails an expectation that stops firing. Tests are exempt at each crate root.
+and rustc fails an expectation that stops firing. Raw Tokio blocking spawns are confined to
+`dekopon_core::offload`. Tests are exempt at each crate root.
 
-- Yes: tasks in a `JoinSet` the owner joins at shutdown; `mpsc::channel(N)` with the full-queue policy named; `Arc::clone(&permits).try_acquire_owned()` **before** spawning, the permit moved into the task; `parking_lot::Mutex` for bookkeeping, locked, copied out and dropped; `watch` for latest state, `oneshot` for one reply; an awaited `spawn_blocking`, carrying its permit into the closure when the job can outlive its caller; `Handle::block_on` only on a blocking thread.
+- Yes: tasks in a `JoinSet` the owner joins at shutdown; `mpsc::channel(N)` with the full-queue policy named; `Arc::clone(&permits).try_acquire_owned()` **before** spawning, the permit moved into the task; `parking_lot::Mutex` for bookkeeping, locked, copied out and dropped; `watch` for latest state, `oneshot` for one reply; an awaited `dekopon_core::offload`, carrying its permit into the closure when the job can outlive its caller; `Handle::block_on` only on a blocking thread.
 - No: `tokio::spawn` with a dropped `JoinHandle`; `unbounded_channel`; a `Condvar` drain; a lock held across `block_on`, network I/O or a channel wait; `tokio::sync::Mutex` for plain bookkeeping; `std::thread::spawn`; cancellation machinery for native work that is correct to let finish (a token rotation); a CI script, registry file or grep gate to enforce any of this.
 - Yes: one owner of a terminal race's compare-and-swap, returning a `#[must_use]` result.
 

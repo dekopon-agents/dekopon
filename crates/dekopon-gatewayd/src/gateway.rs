@@ -7,7 +7,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dekopon_broker_protocol::{BrokerClient, Conversation, ConversationKind, GenerationOutcome};
-use dekopon_core::{MAX_RENDERED_PROBLEMS, Subject, bounded_problems, error_chain};
+use dekopon_core::{MAX_RENDERED_PROBLEMS, Subject, bounded_problems, error_chain, offload};
 use dekopon_model_proxy::{CurrentProxy, ModelProxy};
 use dekopon_model_token_governor::Metering;
 use sha2::{Digest, Sha256};
@@ -420,7 +420,7 @@ impl Gateway {
                 } => {
                     let Some(store) = wakes.clone() else { continue };
                     let reading = Arc::clone(&store);
-                    let due = tokio::task::spawn_blocking(move || reading.take_due(SystemTime::now())).await;
+                    let due = offload(move || reading.take_due(SystemTime::now())).await;
                     match due {
                         Ok(Ok(due)) => {
                             for fired in due.fired {
@@ -437,7 +437,7 @@ impl Gateway {
                         Err(error) => {
                             tracing::error!(
                                 event = "gateway_wake_store_failed",
-                                failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
+                                failure = dekopon_core::TaskOutcome::from(error).category(),
                                 wakes = "stopped",
                                 "gateway.wake.store.failed"
                             );
@@ -883,7 +883,7 @@ impl Gateway {
         );
         let table = Arc::clone(table);
         sessions.spawn(async move {
-            match tokio::task::spawn_blocking(move || table.leave(&key)).await {
+            match offload(move || table.leave(&key)).await {
                 Ok(Ok(())) => {}
                 _ => tracing::warn!(
                     audit.event = "gateway.follow",
@@ -969,7 +969,7 @@ impl Gateway {
                 let agent = route.agent.clone();
                 let closed = event.action.as_ref().is_some_and(|action| action.as_str() == "closed");
                 let store_span = tracing::Span::current();
-                let delivery = tokio::task::spawn_blocking(move || store_span.in_scope(|| store.deliver_subscriptions(&agent, &event, SystemTime::now()))).await;
+                let delivery = offload(move || store_span.in_scope(|| store.deliver_subscriptions(&agent, &event, SystemTime::now()))).await;
                 let delivery = match delivery {
                     Ok(Ok(delivery)) => delivery,
                     Ok(Err(error)) => {
@@ -978,7 +978,7 @@ impl Gateway {
                         return;
                     }
                     Err(error) => {
-                        tracing::error!(event = "gateway_wake_store_failed", failure = dekopon_core::TaskOutcome::from_join_error(error).category(), "gateway.wake.store.failed");
+                        tracing::error!(event = "gateway_wake_store_failed", failure = dekopon_core::TaskOutcome::from(error).category(), "gateway.wake.store.failed");
                         ticket.answer(transport::github::Acked::Busy);
                         return;
                     }

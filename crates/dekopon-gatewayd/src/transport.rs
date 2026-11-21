@@ -452,6 +452,7 @@ pub(crate) trait ChatTransport: Send {
 pub(crate) trait ThreadOwnership: Send + Sync {
     fn claim(&self, claim: ThreadClaim);
     fn revoke(&self, claim: &ThreadClaim);
+    fn release_thread(&self, claim: &ThreadClaim);
 }
 
 #[derive(Debug)]

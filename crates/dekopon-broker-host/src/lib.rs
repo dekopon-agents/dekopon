@@ -19,7 +19,7 @@ use std::{
 };
 
 use dekopon_capability::{AuthorizedInvocation, ChatSlotValues, ExecutionConstraints};
-use dekopon_core::{CapabilityId, ProviderId};
+use dekopon_core::{CapabilityId, ProviderId, offload};
 pub use dekopon_provider_sdk::{
     CommandRunOutcome, ComponentFailure, ProviderApiVersion, ProviderCapability, ProviderManifest,
 };
@@ -1424,13 +1424,11 @@ pub async fn precompile(
     cwasm_dir: PathBuf,
 ) -> Result<PrecompileReport, BrokerHostError> {
     let parent = tracing::Span::current();
-    tokio::task::spawn_blocking(move || {
-        parent.in_scope(|| precompile_sources(&sources, &cwasm_dir))
-    })
-    .await
-    .map_err(|source| BrokerHostError::PrecompileWorker {
-        source: dekopon_core::TaskOutcome::from_join_error(source),
-    })?
+    offload(move || parent.in_scope(|| precompile_sources(&sources, &cwasm_dir)))
+        .await
+        .map_err(|source| BrokerHostError::PrecompileWorker {
+            source: dekopon_core::TaskOutcome::from(source),
+        })?
 }
 
 fn precompile_sources(
@@ -1569,12 +1567,12 @@ impl BrokerProviderRegistry {
                 let task_runtime = Arc::clone(&runtime);
                 let task_source = source.clone();
                 let span = tracing::Span::current();
-                let compiling = tokio::task::spawn_blocking(move || {
+                let compiling = offload(move || {
                     span.in_scope(|| compile_component(&task_runtime, task_source))
                 });
                 let compiled = compiling.await.map_err(|join| BrokerHostError::Compile {
                     path: source.path,
-                    source: wasmtime::Error::new(dekopon_core::TaskOutcome::from_join_error(join)),
+                    source: wasmtime::Error::new(dekopon_core::TaskOutcome::from(join)),
                 })??;
                 let provider = BrokerWasmProvider::load(Arc::clone(&runtime), compiled).await?;
                 scan.record(&provider.manifest, providers.len());
@@ -1899,7 +1897,7 @@ impl BrokerProviderRegistry {
             (Some(_), None) => return Err(BrokerHostError::MissingStorageGrant.into()),
             #[allow(
                 clippy::map_err_ignore,
-                reason = "a `JoinError` from `spawn_blocking` distinguishes only a panic from \
+                reason = "an offload join failure distinguishes only a panic from \
                           runtime cancellation, and the panic hook has already printed the panic \
                           with its location; `storage::StorageState::call` classes the same \
                           failure as `Io` for the same reason"
@@ -1921,7 +1919,7 @@ impl BrokerProviderRegistry {
                     .ok_or(BrokerHostError::StorageDisabled)?
                     .clone();
                 Some(
-                    tokio::task::spawn_blocking(move || host.begin(grant))
+                    offload(move || host.begin(grant))
                         .await
                         .map_err(|_| BrokerHostError::Storage {
                             source: dekopon_storage_host::StorageHostError::Io,

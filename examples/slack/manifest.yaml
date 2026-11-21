@@ -1,68 +1,57 @@
-# Slack app manifest for the dekopon-gatewayd gateway.
+# Slack app manifest for the dekopon-gatewayd gateway: the Agent profile, and the default.
 #
-# Create the app at https://api.slack.com/apps → "Create New App" → "From a manifest",
-# pick the workspace, and paste this file.
+# Create the app at https://api.slack.com/apps → "Create New App" → "From a manifest", pick the
+# workspace, and paste this file. To update an existing app, paste it under "App Manifest", keeping
+# your own `display_information` and `bot_user` names, then Save and Reinstall; the tokens stay the
+# same. It pairs with the transport's default, `experience: agent`.
 #
-# This classic/free-workspace profile requests the reply surface plus the explicitly configured
-# tangerine-reaction liveness fallback:
+# Agent DMs are thread-scoped and `agents.sessions.setStatus(processing)` creates Slack's native
+# Working/Stop UI. After one explicitly addressed message is freshly authorized, the same
+# authenticated sender may continue inside that exact thread without repeating the mention. Dekopon
+# handles `agent_session_stopped` cooperatively and queues a best-effort return to `active`.
+# Slack also requires the `app_home_opened` bot event whenever `agent_view` is enabled; opening App
+# Home is not itself a prompt, so dekopon-gatewayd safely acknowledges and ignores that event.
 #
-# - Socket Mode, so events arrive over an outbound WebSocket wakeup and the gateway
-#   needs no public HTTP endpoint.
-# - `message.im` events (requires `im:history`), so direct messages reach DM routes.
-# - `app_mention` events (requires `app_mentions:read`), so channel routes fire only
-#   when the bot is explicitly addressed. Channel-history events also feed opted-in follow routes.
-# - `channels:read`, `groups:read`, `im:read`, `mpim:read`, so `conversations.info` can say what
-#   kind of conversation a mention arrived in. Slack sends no `channel_type` on `app_mention`, and
-#   without the lookup a mention in a direct message or a multi-person DM would be minted as a
-#   channel and match no `directMessage` or
-#   `groupDirectMessage` route. The result is remembered per conversation, so it costs one call
-#   per conversation the bot is addressed in, and a lookup that fails drops that one message.
-# - `canvases:read`, so provider-slack's `slack.canvas.read` can read the one canvas pinned in its
+# Slack's Agent features depend on the workspace plan and admin policy. Without them, Agent status
+# returns `feature_disabled` and dekopon-gatewayd uses the fixed `:tangerine:` reaction when
+# `indicators.reaction.working: auto` opts in, then nothing if reactions are unavailable. There is
+# no Stop control then: Slack's is plan-gated and `indicators.cancelButton` needs
+# `experience: classic`; stop words still cancel. For a Stop button on such a workspace, use
+# manifest-legacy.yaml with `experience: classic`. Final replies are independent of all of these.
+#
+# The bot scope split is:
+# - `assistant:write`: declares the installed app as an Agent.
+# - `canvases:read`: lets provider-slack's `slack.canvas.read` read the one canvas pinned in its
 #   provider settings.
-# - `chat:write`, so the gateway can reply.
-# - `files:write`, so an explicitly image-enabled route can share its one generated PNG.
-# - `reactions:write`, so `indicators.mode: native` with `reaction.working: auto`
-#   can add and later remove the fixed `:tangerine:` in-flight marker. Remove this scope and leave
-#   working and seen reactions off when cosmetic message mutations are unwanted.
-# - `chat:write` also covers editing and deleting the gateway's own progress message, which is what
-#   `indicators.progress: message` posts and then finalizes as the answer.
-# - Interactivity, so a press of the Stop button `indicators.cancelButton: true` renders arrives as a
-#   `block_actions` envelope over the same socket.
+# - `chat:write`: posts replies and manages Agent session status.
+# - `reactions:write`: optional working/seen reactions; leave both off when removing it.
+# - `message.im`/`im:history`: direct-message prompts.
+# - `app_mention`/`app_mentions:read`: explicitly addressed channel prompts.
+# - `channels:read`, `groups:read`, `im:read`, `mpim:read` let the gateway look up a
+#   mention's conversation kind. If the lookup fails, an addressed message uses channel routing.
+# - `message.channels`/`channels:history` and `message.groups`/`groups:history`: receive channel
+#   traffic for exact freshly authorized sender/thread continuations and opted-in thread follow.
+#   Other ambient messages are dropped before routing, authorization, telemetry, or inference.
+# - `files:read`: lazy access to attachments the sender included.
+# - `files:write`: shares the one bounded PNG an explicitly image-enabled route generated.
 #
-# Two tokens exist after creation, and neither lives in any Dekopon config file —
-# dekopon-gatewayd reads both from environment variables named in its `transports` entry:
-#
-# 1. App-level token (`xapp-...`): "Basic Information" → "App-Level Tokens" →
-#    "Generate Token and Scopes" with the `connections:write` scope. Manifests cannot
-#    declare app-level tokens; this step is always manual. This token opens the
-#    Socket Mode connection.
-# 2. Bot token (`xoxb-...`): "Install App" → install to the workspace. This token
-#    sends the configured reaction, the progress message, and replies.
-#
-# `message.channels`/`channels:history` and `message.groups`/`groups:history` deliver replies
-# for `follow: true`; unmentioned messages outside followed threads are ignored.
-#
-# `files:read` is what lets the gateway open an attachment. An attachment is part of
-# the message that carried it — Slack just delivers it by reference rather than by
-# value — and resolving that reference is how the gateway hears the whole request.
-# Without the scope Slack withholds the file's id and URL, and every upload is
-# reported to the model as something it cannot open.
-#
-# The gateway does not read a file just because one arrived. Each is named in the
-# prompt as `chat-asset:N`, and the bytes are fetched only if the model calls
-# `fetch_chat_asset` with that number. Nothing else in Dekopon gains authority from
-# this scope: no policy and no provider credential. `files:write` below is the separate,
-# explicit presentation permission used only for generated reply images.
+# An xapp token with app-level `connections:write` is still generated manually; app manifests do
+# not declare app-level tokens. Reinstall the app whenever bot scopes change.
 display_information:
   name: dekopon
   description: Your fresh and zesty agent
   background_color: "#ff6a3d"
 features:
-  # Without the messages tab, Slack renders "Sending messages to this app has been
-  # turned off" in the DM view and the gateway's primary route is unreachable.
   app_home:
     messages_tab_enabled: true
     messages_tab_read_only_enabled: false
+  agent_view:
+    agent_description: A fresh and zesty agent for safely completing bounded tasks.
+    suggested_prompts:
+      - title: Review a pull request
+        message: Review this pull request and summarize the important findings.
+      - title: Check an incident
+        message: Help me investigate this incident and identify the next safe step.
   bot_user:
     display_name: dekopon
     always_online: true
@@ -70,17 +59,15 @@ oauth_config:
   scopes:
     bot:
       - app_mentions:read
+      - assistant:write
       - canvases:read
-      # `*:read` resolve one conversation's kind: an `app_mention` carries no `channel_type`, so
-      # without them a mention in a DM or a group DM is minted as a channel and matches no route.
+      - channels:history
       - channels:read
       - chat:write
       - files:read
       - files:write
-      - groups:read
-      # `*:history` let `memory.recall: platform` read the thread or DM a cold window rebuilds from.
-      - channels:history
       - groups:history
+      - groups:read
       - im:history
       - im:read
       - mpim:history
@@ -92,15 +79,15 @@ oauth_config:
 settings:
   event_subscriptions:
     bot_events:
+      - agent_session_stopped
+      - app_home_opened
       - app_mention
-      # History events feed only explicitly enabled follow routes.
       - message.channels
       - message.groups
       - message.im
+      - message.mpim
       - reaction_added
   interactivity:
-    # Socket Mode delivers `block_actions`, so the gateway's Stop button (`indicators.cancelButton`)
-    # reaches it without a request URL. Off, Slack never sends the press and the button is inert.
     is_enabled: true
   org_deploy_enabled: false
   socket_mode_enabled: true
