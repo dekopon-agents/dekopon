@@ -20,7 +20,7 @@ use dekopon_core::{
     check_trusted_ancestors, check_trusted_metadata, offload,
     private_file::{
         TemporarySweep, replace_private_file, replace_private_file_noclobber,
-        sweep_stale_temporaries, sync_directory,
+        sweep_private_temporaries, sync_directory,
     },
     read_trusted_file,
 };
@@ -2114,7 +2114,7 @@ fn atomic_write(path: &Path, bytes: &[u8], expected_uid: u32) -> Result<(), Prov
     if let Ok(metadata) = fs::symlink_metadata(&path) {
         validate_file_metadata(&metadata, &path, expected_uid, false)?;
     }
-    for outcome in sweep_stale_temporaries(&path, None) {
+    for outcome in sweep_private_temporaries(&path) {
         if let TemporarySweep::Failed { path, source } = outcome {
             return Err(ProviderManagerError::io_at(
                 "could not remove abandoned provider-lock temporary file",
@@ -3017,29 +3017,22 @@ mod tests {
     }
 
     #[test]
-    fn provider_lock_write_preserves_a_destination_matching_the_legacy_temporary_pattern() {
+    fn a_provider_lock_write_leaves_sibling_locks_named_like_legacy_temporaries() {
         let directory = tempfile::tempdir().expect("manager fixture");
-        let path = directory.path().join("providers.tmp-123");
         let uid = socket::current_uid();
-        let _operation = lock_activation(&path, uid).unwrap();
+        let sibling = directory.path().join("providers.tmp-123");
+        let path = directory.path().join("providers.tmp-456");
+        atomic_write(&sibling, b"sibling lock", uid).unwrap();
         atomic_write(&path, b"previous lock", uid).unwrap();
-
-        let blocked = directory.path().join("providers.tmp-456");
-        fs::create_dir(&blocked).unwrap();
-        assert!(matches!(
-            atomic_write(&path, b"replacement lock", uid),
-            Err(ProviderManagerError::Io { path: Some(path), .. }) if path == blocked
-        ));
-        assert_eq!(fs::read(&path).unwrap(), b"previous lock");
-        fs::remove_dir(&blocked).unwrap();
 
         let abandoned = directory
             .path()
-            .join("providers.tmp-123.tmp-private-abandoned");
+            .join("providers.tmp-456.tmp-private-abandoned");
         fs::write(&abandoned, b"partial").unwrap();
         atomic_write(&path, b"replacement lock", uid).unwrap();
 
         assert!(!abandoned.exists());
+        assert_eq!(fs::read(&sibling).unwrap(), b"sibling lock");
         assert_eq!(fs::read(&path).unwrap(), b"replacement lock");
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
     }
