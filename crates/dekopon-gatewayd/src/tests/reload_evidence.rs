@@ -233,11 +233,26 @@ async fn repeated_invalid_gateway_sources_emit_once_until_edit_or_repair() {
     }
     let refused =
         || capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_refused")]);
-    assert_eq!(refused().len(), 1);
+    let first = refused();
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].field("active_generation.digest"),
+        Some(active.as_str())
+    );
+    let first_rejected = first[0].field("rejected_generation.digest").unwrap();
+    assert_eq!(first_rejected.len(), 64);
+    assert!(first_rejected.bytes().all(|byte| byte.is_ascii_hexdigit()));
     config["routes"][0]["agent"] = json!("unknown-second");
     write_config(root.path(), &config);
     gateway.reconcile().await;
-    assert_eq!(refused().len(), 2);
+    let second = refused();
+    assert_eq!(second.len(), 2);
+    assert_eq!(
+        second[1].field("active_generation.digest"),
+        Some(active.as_str())
+    );
+    let second_rejected = second[1].field("rejected_generation.digest").unwrap();
+    assert_ne!(first_rejected, second_rejected);
     config["routes"][0]["agent"] = json!("reviewer");
     write_config(root.path(), &config);
     let mut broker = BrokerFixture::answering(
@@ -255,6 +270,17 @@ async fn repeated_invalid_gateway_sources_emit_once_until_edit_or_repair() {
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].field("category.count"), Some("0"));
     assert_eq!(applied[0].field("generation.digest"), Some(active.as_str()));
+    let recovered =
+        capture.events_where("dekopon_gatewayd", &[("event", "gateway_reload_recovered")]);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].field("generation.digest"),
+        Some(active.as_str())
+    );
+    assert_eq!(
+        recovered[0].field("rejected_generation.digest"),
+        Some(second_rejected)
+    );
     config["routes"][0]["agent"] = json!("unknown-second");
     write_config(root.path(), &config);
     gateway.reconcile().await;

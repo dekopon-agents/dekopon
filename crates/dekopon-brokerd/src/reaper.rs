@@ -23,6 +23,7 @@ where
     };
     tokio::pin!(server);
     let mut interval = sweep_interval();
+    let mut progress = SweepProgress::default();
     loop {
         tokio::select! {
             biased;
@@ -34,9 +35,9 @@ where
         let mut sweep = offload(move || host.sweep(&policies));
         tokio::select! {
             result = &mut server => {
-                return drain_after_server(result, sweep, &deadline).await;
+                return drain_after_server(result, sweep, &deadline, progress).await;
             }
-            result = &mut sweep => finish(result)?,
+            result = &mut sweep => progress.finish(result)?,
         }
     }
 }
@@ -45,15 +46,16 @@ async fn drain_after_server(
     server: Result<(), ServerError>,
     sweep: dekopon_core::Offload<Result<SweepSummary, StorageHostError>>,
     deadline: &ShutdownDeadline,
+    mut progress: SweepProgress,
 ) -> Result<(), BrokerdError> {
     // Native deletion finishes before the storage root lease is released; past the shutdown
     // deadline the process exits holding both, and the lease dies with it.
     let cleanup = match deadline.get() {
         Some(deadline) => match tokio::time::timeout_at(deadline, sweep).await {
-            Ok(result) => finish(result),
+            Ok(result) => progress.finish(result),
             Err(_) => Err(BrokerdError::Server(ServerError::ShutdownTimeout)),
         },
-        None => finish(sweep.await),
+        None => progress.finish(sweep.await),
     };
     server?;
     cleanup
@@ -65,29 +67,56 @@ fn sweep_interval() -> tokio::time::Interval {
     interval
 }
 
-fn finish(
-    result: Result<Result<SweepSummary, StorageHostError>, dekopon_core::OffloadError>,
-) -> Result<(), BrokerdError> {
-    match result {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => {
-            tracing::warn!(
-                event = "storage_sweep_failed",
-                error = %dekopon_core::error_chain(&error),
-                "storage.sweep.failed"
-            );
-            Ok(())
+#[derive(Default)]
+struct SweepProgress {
+    sequence: u64,
+    failures: u64,
+}
+
+impl SweepProgress {
+    fn finish(
+        &mut self,
+        result: Result<Result<SweepSummary, StorageHostError>, dekopon_core::OffloadError>,
+    ) -> Result<(), BrokerdError> {
+        self.sequence += 1;
+        match result {
+            Ok(Ok(summary)) if summary.errors > 0 => self.record_failure(summary.errors, None),
+            Ok(Ok(_)) => {
+                let failures = std::mem::take(&mut self.failures);
+                if failures > 0 {
+                    tracing::info!(
+                        event = "storage_sweep_recovered",
+                        sweep.sequence = self.sequence,
+                        failed_sweep.count = failures,
+                        "storage.sweep.recovered"
+                    );
+                }
+            }
+            Ok(Err(error)) => self.record_failure(1, Some(&error)),
+            Err(error) => {
+                let failure = dekopon_core::TaskOutcome::from(error);
+                tracing::error!(
+                    event = "storage_sweep_task_failed",
+                    failure = failure.category(),
+                    error = %failure,
+                    "storage.sweep.task.failed"
+                );
+                return Err(BrokerdError::StorageReaper(failure));
+            }
         }
-        Err(error) => {
-            let failure = dekopon_core::TaskOutcome::from(error);
-            tracing::error!(
-                event = "storage_sweep_task_failed",
-                failure = failure.category(),
-                error = %failure,
-                "storage.sweep.task.failed"
-            );
-            Err(BrokerdError::StorageReaper(failure))
-        }
+        Ok(())
+    }
+
+    fn record_failure(&mut self, errors: u64, error: Option<&StorageHostError>) {
+        self.failures += 1;
+        let error = error.map(|error| dekopon_core::error_chain(error));
+        tracing::warn!(
+            event = "storage_sweep_failed",
+            sweep.sequence = self.sequence,
+            sweep.error_count = errors,
+            error = error.as_deref(),
+            "storage.sweep.failed"
+        );
     }
 }
 
@@ -169,6 +198,45 @@ mod tests {
         task.await.unwrap().unwrap();
     }
 
+    #[test]
+    fn each_failed_sweep_pass_is_reported_and_the_next_clean_pass_closes_the_run() {
+        use tracing_subscriber::prelude::*;
+
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().canonicalize().unwrap().join("storage");
+        let (host, policies, _) = expired_resource(&storage);
+        let bad_entry = storage.join("namespaces").join("bad-entry");
+        fs::write(&bad_entry, []).unwrap();
+        let capture = dekopon_test_support::CaptureLayer::new();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(capture.clone()),
+            || {
+                let mut progress = SweepProgress::default();
+                progress.finish(Ok(Err(StorageHostError::Busy))).unwrap();
+                progress.finish(Ok(host.sweep(&policies))).unwrap();
+                fs::remove_file(bad_entry).unwrap();
+                for _ in 0..2 {
+                    progress.finish(Ok(host.sweep(&policies))).unwrap();
+                }
+            },
+        );
+        let failed = capture.events_where(
+            "dekopon_brokerd::reaper",
+            &[("event", "storage_sweep_failed")],
+        );
+        assert_eq!(failed.len(), 2);
+        assert_eq!(failed[0].field("sweep.sequence"), Some("1"));
+        assert_eq!(failed[1].field("sweep.sequence"), Some("2"));
+        assert_eq!(failed[1].field("sweep.error_count"), Some("1"));
+        let recovered = capture.events_where(
+            "dekopon_brokerd::reaper",
+            &[("event", "storage_sweep_recovered")],
+        );
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].field("sweep.sequence"), Some("3"));
+        assert_eq!(recovered[0].field("failed_sweep.count"), Some("2"));
+    }
+
     #[tokio::test]
     async fn a_stopped_server_does_not_start_cleanup() {
         let root = tempfile::tempdir().unwrap();
@@ -207,7 +275,12 @@ mod tests {
         ready.await.unwrap();
         let deadline = ShutdownDeadline::default();
         deadline.start(Duration::from_secs(60));
-        let drain = drain_after_server(Err(ServerError::ShutdownTimeout), sweep, &deadline);
+        let drain = drain_after_server(
+            Err(ServerError::ShutdownTimeout),
+            sweep,
+            &deadline,
+            SweepProgress::default(),
+        );
         tokio::pin!(drain);
         tokio::select! {
             biased;
@@ -227,7 +300,7 @@ mod tests {
         ready.await.unwrap();
         let deadline = ShutdownDeadline::default();
         deadline.start(Duration::from_millis(50));
-        let result = drain_after_server(Ok(()), sweep, &deadline).await;
+        let result = drain_after_server(Ok(()), sweep, &deadline, SweepProgress::default()).await;
         release.send(()).unwrap();
         assert!(matches!(
             result,

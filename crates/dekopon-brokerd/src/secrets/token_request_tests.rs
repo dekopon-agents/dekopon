@@ -83,6 +83,7 @@ async fn resolver(root: &Path, endpoint: &str) -> MapResolver {
                 .await
                 .expect("cluster CA"),
                 minted: None,
+                record_invalid: Default::default(),
             },
         )]),
         expected_uid: rustix::process::geteuid().as_raw(),
