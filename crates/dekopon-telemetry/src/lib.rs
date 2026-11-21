@@ -7,6 +7,8 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
+#[cfg(feature = "egress")]
+pub mod egress;
 #[cfg(feature = "exporter")]
 mod exporter;
 #[cfg(feature = "exporter")]

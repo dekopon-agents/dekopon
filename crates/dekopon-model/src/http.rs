@@ -9,6 +9,7 @@ use crate::{
     sse::{SseEvent, read_async_stream},
     stream::TurnEvent,
 };
+use dekopon_telemetry::egress::{Timeout, client_builder};
 use std::{
     future::Future,
     ops::ControlFlow,
@@ -43,12 +44,12 @@ impl InferenceHttp {
         if timeout.is_zero() {
             return Err(RequestError::ZeroTimeout.into());
         }
-        let mut builder = builder
-            .use_rustls_tls()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(timeout.min(Duration::from_secs(10)));
+        let mut builder = client_builder(
+            builder.use_rustls_tls(),
+            Timeout::Connect(timeout.min(Duration::from_secs(10))),
+            concat!("dekopon-model/", env!("CARGO_PKG_VERSION")),
+            [],
+        );
         for pem in extra_ca_bundles {
             let certificates = reqwest::Certificate::from_pem_bundle(pem.expose().as_bytes())
                 .map_err(|_error| RequestError::InvalidCaBundle)?;
