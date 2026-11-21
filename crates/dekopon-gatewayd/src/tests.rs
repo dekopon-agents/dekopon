@@ -4321,6 +4321,7 @@ impl CancelButton for RecordingCancelButton {
 struct RecordingThreadOwnership {
     claimed: Mutex<Vec<ThreadClaim>>,
     revoked: Mutex<Vec<ThreadClaim>>,
+    released: Mutex<Vec<ThreadClaim>>,
 }
 
 impl ThreadOwnership for RecordingThreadOwnership {
@@ -4330,6 +4331,10 @@ impl ThreadOwnership for RecordingThreadOwnership {
 
     fn revoke(&self, claim: &ThreadClaim) {
         self.revoked.lock().push(claim.clone());
+    }
+
+    fn release_thread(&self, claim: &ThreadClaim) {
+        self.released.lock().push(claim.clone());
     }
 }
 
@@ -23411,6 +23416,87 @@ async fn slack_follow_human_thumbs_down_leaves_once_ignoring_bots_and_other_auth
         mention.subject,
         dekopon_core::AttestedSubject::one(Subject::slack_user(TEAM, "u8other").unwrap())
             .expect("one-form subject")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_leave_releases_the_agent_thread_for_every_sender() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let leaving: AvailableCapability = serde_json::from_value(json!({
+        "provider": "dekopon-provider-follow",
+        "capability": {
+            "id": "dekopon-provider-follow.leave",
+            "description": "Leave the followed conversation",
+            "effect": "local-write", "risk": "Low",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }
+    }))
+    .expect("test-only provider declaration");
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![leaving], vec!["follow".into()], BTreeMap::new()),
+            ResponseEnvelope::command_run(serde_json::from_value(json!({
+                "outcome": "proposed", "capability": "dekopon-provider-follow.leave", "input": {}
+            })).unwrap()),
+            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("follow leave"), answer("Bye.")]);
+    let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    let message = owned_slack_message("<@u0botbot> leave", false);
+    let claim = message
+        .thread_continuation
+        .as_ref()
+        .expect("Agent claim")
+        .claim
+        .clone();
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &message.conversation.key(),
+    );
+    table.stay_and_write(&key, SystemTime::now()).unwrap();
+    runner.follow = Some(Arc::clone(&table));
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    runner.thread_ownership.insert(
+        "scientist-slack".to_owned(),
+        Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+    );
+    let driver = Arc::new(RecordingDriver::default());
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_session(
+            Arc::new(runner),
+            route,
+            message,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ),
+    )
+    .await
+    .expect("leave session completes");
+
+    assert_eq!(driver.replies(), ["Bye."]);
+    assert_eq!(*ownership.claimed.lock(), std::slice::from_ref(&claim));
+    assert_eq!(*ownership.released.lock(), [claim]);
+    assert_eq!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
     );
 }
 
