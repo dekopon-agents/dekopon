@@ -718,8 +718,12 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             let resolved = match (config.providers.is_empty(), providers) {
                 (true, Some(providers)) => {
                     provider_lock_file = Some(providers.store.join(PROVIDER_LOCK_FILE));
+                    let candidate_cwasm = providers.store.join("store/cwasm");
                     match resolve_provider_set(providers, uid).await {
                         Ok(sources) => {
+                            if let Some(cwasm) = config.host_options.cwasm_dir.as_mut() {
+                                *cwasm = candidate_cwasm;
+                            }
                             config.providers = sources
                                 .iter()
                                 .map(|source| source.path().to_path_buf())

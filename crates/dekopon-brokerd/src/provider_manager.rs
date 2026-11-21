@@ -2532,7 +2532,7 @@ impl ProviderManagerError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{
         OnceLock,
         atomic::{AtomicUsize, Ordering},
@@ -2698,8 +2698,8 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct SyncCompileState {
-        stages: BTreeMap<PathBuf, usize>,
+    pub(crate) struct SyncCompileState {
+        pub(crate) stages: BTreeMap<PathBuf, usize>,
     }
 
     struct SyncCompileStages(Arc<parking_lot::Mutex<SyncCompileState>>);
@@ -2760,7 +2760,7 @@ mod tests {
         }
     }
 
-    fn sync_compile_probe() -> Arc<parking_lot::Mutex<SyncCompileState>> {
+    pub(crate) fn sync_compile_probe() -> Arc<parking_lot::Mutex<SyncCompileState>> {
         static PROBE: OnceLock<Arc<parking_lot::Mutex<SyncCompileState>>> = OnceLock::new();
         Arc::clone(PROBE.get_or_init(|| {
             let state = Arc::new(parking_lot::Mutex::new(SyncCompileState::default()));

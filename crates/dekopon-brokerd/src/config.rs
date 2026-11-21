@@ -1314,13 +1314,7 @@ async fn resolve(
         host_options: BrokerHostOptions {
             cwasm_dir: managed_provider_paths
                 .as_ref()
-                .filter(|_| {
-                    !config.compile_on_load
-                        && match mode {
-                            LoadMode::Boot | LoadMode::Reload { .. } => true,
-                            LoadMode::Check => false,
-                        }
-                })
+                .filter(|_| !config.compile_on_load)
                 .map(|(_, store)| store.join("cwasm")),
             compiled_cache_mode: dekopon_broker_host::CompiledCacheMode::Reader,
             max_total_memory_bytes: config.host_limits.max_total_memory_bytes,

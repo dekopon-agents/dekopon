@@ -3588,63 +3588,110 @@ async fn check_and_boot_refuse_request_shapes_from_the_same_policy_file() {
     }
 }
 
-#[tokio::test]
-async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_object() {
-    let root = tempfile::tempdir().expect("create configuration fixture");
-    let store = root.path().join("check-store");
-    let blobs = store.join("store/blobs/sha256");
-    for directory in [
-        store.clone(),
-        store.join("store"),
-        store.join("store/blobs"),
-        blobs.clone(),
-    ] {
-        fs::create_dir(&directory).expect("create store directory");
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-            .expect("private store directory");
-    }
-    let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm"))
-        .expect("checked cli-probe component");
-    let digest = Sha256::digest(&component)
-        .iter()
-        .fold(String::new(), |mut text, byte| {
-            use std::fmt::Write as _;
-            write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
-            text
-        });
-    write_owner_only(&blobs.join(format!("{digest}.wasm")), &component);
-    write_owner_only(
+struct ProviderSetCheck {
+    _root: tempfile::TempDir,
+    config: std::path::PathBuf,
+    provider_set: std::path::PathBuf,
+    store: std::path::PathBuf,
+    component: std::path::PathBuf,
+}
+
+impl ProviderSetCheck {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("create configuration fixture");
+        let store = root.path().join("check-store");
+        let blobs = store.join("store/blobs/sha256");
+        for directory in [
+            store.clone(),
+            store.join("store"),
+            store.join("store/blobs"),
+            blobs.clone(),
+        ] {
+            fs::create_dir(&directory).expect("create store directory");
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("private store directory");
+        }
+        let component = fs::read(example_path("examples/providers/cli-probe-provider.wasm"))
+            .expect("checked cli-probe component");
+        let digest = Sha256::digest(&component)
+            .iter()
+            .fold(String::new(), |mut text, byte| {
+                use std::fmt::Write as _;
+                write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
+                text
+            });
+        let component_path = blobs.join(format!("{digest}.wasm"));
+        write_owner_only(&component_path, &component);
+        write_owner_only(
         &store.join("providers.lock.yaml"),
         format!(
             "apiVersion: dekopon.dev/provider-lock/v1alpha1\nproviders:\n  - source: ghcr.io/example/cli-probe:1.0.0\n    resolvedVersion: 1.0.0\n    manifestDigest: sha256:{}\n    componentDigest: sha256:{digest}\n    componentBytes: {}\n    providerId: cli-probe\n",
             "1".repeat(64), component.len()
         ).as_bytes(),
     );
-    let provider_set = root.path().join("providers.yaml");
-    write_owner_only(
+        let provider_set = root.path().join("providers.yaml");
+        write_owner_only(
         &provider_set,
         b"apiVersion: dekopon.dev/provider-set/v1alpha1\nproviders:\n  - source: ghcr.io/example/cli-probe:1.0.0\n",
     );
-    let mut document = attested_document(current_uid());
-    document
-        .as_object_mut()
-        .expect("config object")
-        .remove("providers");
-    document["providerSet"] = json!({"lockPath": "providers.lock.yaml", "storePath": "store"});
-    let config = root.path().join("broker.yaml");
-    write_config(&config, &document);
-    write_owner_only(&root.path().join("policies.cedar"), POLICIES.as_bytes());
-    let check = || {
+        let mut document = attested_document(current_uid());
+        document
+            .as_object_mut()
+            .expect("config object")
+            .remove("providers");
+        document["providerSet"] = json!({"lockPath": "providers.lock.yaml", "storePath": "store"});
+        let config = root.path().join("broker.yaml");
+        write_config(&config, &document);
+        write_owner_only(&root.path().join("policies.cedar"), POLICIES.as_bytes());
+        Self {
+            _root: root,
+            config,
+            provider_set,
+            store,
+            component: component_path,
+        }
+    }
+
+    async fn check(&self) -> super::CheckReport {
         super::check(
-            &config,
+            &self.config,
             Some(super::CheckProviders {
-                provider_set: provider_set.clone(),
-                store: store.clone(),
+                provider_set: self.provider_set.clone(),
+                store: self.store.clone(),
             }),
             None,
         )
-    };
-    let report = check().await;
+        .await
+    }
+}
+
+#[tokio::test]
+async fn a_provider_set_check_maps_the_candidate_cache_and_never_compiles_a_load() {
+    let fixture = ProviderSetCheck::new();
+    let probe = super::provider_manager::tests::sync_compile_probe();
+    let compiles = || probe.lock().stages.insert(fixture.component.clone(), 0);
+    compiles();
+    let report = fixture.check().await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    compiles();
+    let report = fixture.check().await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(compiles(), Some(0));
+    let objects = fixture.store.join("store/cwasm/v1/sha256");
+    for object in fs::read_dir(&objects).expect("compiled objects") {
+        fs::remove_file(object.expect("object entry").path()).expect("drop compiled object");
+    }
+    let report = fixture.check().await;
+    assert!(report.problems.is_empty(), "{report:?}");
+    assert_eq!(fs::read_dir(&objects).expect("compiled objects").count(), 1);
+    assert_eq!(probe.lock().stages.remove(&fixture.component), Some(1));
+}
+
+#[tokio::test]
+async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_object() {
+    let fixture = ProviderSetCheck::new();
+    let store = &fixture.store;
+    let report = fixture.check().await;
     assert!(report.problems.is_empty(), "{report:?}");
     #[cfg(target_os = "linux")]
     assert!(report.peak_rss_bytes.expect("process peak RSS") > 0);
@@ -3661,7 +3708,7 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
     write_owner_only(&old_generation.join("stale.json"), b"stale");
     let unreferenced = objects.join("unreferenced.cwasm");
     write_owner_only(&unreferenced, b"unreferenced");
-    let report = check().await;
+    let report = fixture.check().await;
     assert!(report.problems.is_empty(), "{report:?}");
     assert!(!old_generation.exists());
     assert!(!unreferenced.exists());
