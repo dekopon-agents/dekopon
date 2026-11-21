@@ -3,7 +3,7 @@
 # Create the app at https://api.slack.com/apps → "Create New App" → "From a manifest", pick the
 # workspace, and paste this file. To update an existing app, paste it under "App Manifest", keeping
 # your own `display_information` and `bot_user` names, then Save and Reinstall; the tokens stay the
-# same. Pair it with the transport's `experience: agent`.
+# same. It pairs with the transport's default, `experience: agent`.
 #
 # Agent DMs are thread-scoped and `agents.sessions.setStatus(processing)` creates Slack's native
 # Working/Stop UI. After one explicitly addressed message is freshly authorized, the same

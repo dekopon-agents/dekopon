@@ -1,9 +1,9 @@
 # Slack app manifest for the dekopon-gatewayd gateway: the classic profile.
 #
 # manifest.yaml is the default. Use this one when the workspace plan or admin policy turns off
-# Slack's Agent features and you want the Stop button. Pair it with `experience: classic`, the
-# gateway default. In classic, a channel thread needs the mention on every message unless the route
-# follows the thread.
+# Slack's Agent features and you want the Stop button. Set the transport's `experience: classic`;
+# the default is `agent`. In classic, a channel thread needs the mention on every message unless the
+# route follows the thread.
 #
 # Create the app at https://api.slack.com/apps → "Create New App" → "From a manifest",
 # pick the workspace, and paste this file.
