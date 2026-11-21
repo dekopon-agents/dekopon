@@ -7,6 +7,10 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- `examples/slack/manifest.yaml` is now the Agent profile, paired with `experience: agent`; the classic profile moved to `examples/slack/manifest-legacy.yaml`. Installed apps are unaffected until reinstalled.
+
 ## [0.90.0] - 2026-11-20
 
 ### Fixed

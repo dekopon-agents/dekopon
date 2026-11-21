@@ -90,7 +90,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
     def test_load_bearing_examples_and_provider_helper_run_rust(self) -> None:
         for path in (
             "examples/conditional-write/broker.yaml",
-            "examples/slack/manifest-agent.yaml",
+            "examples/slack/manifest.yaml",
             "examples/providers/build-component.sh",
         ):
             with self.subTest(path=path):
