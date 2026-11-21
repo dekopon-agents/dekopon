@@ -5505,8 +5505,8 @@ mod owned_thread_tests {
         owned.claim(key("4.000004", "u1"));
         owned.claim(key("5.000005", "u1"));
         assert!(
-            !owned.contains(&elsewhere),
-            "released keys left no stale slots in the eviction order"
+            owned.contains(&requester),
+            "released keys left no stale slots that would evict the re-claimed requester early"
         );
     }
 }

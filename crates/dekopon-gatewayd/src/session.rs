@@ -3704,13 +3704,11 @@ async fn session_turn(
             | MessageOutcome::Busy
             | MessageOutcome::RouteLost => false,
         };
-        if answered && leave_request.load(std::sync::atomic::Ordering::Acquire) {
-            release_thread_ownership(runner, message);
-        }
         if answered
             && leave_request.load(std::sync::atomic::Ordering::Acquire)
             && let Some(table) = runner.follow.as_ref()
         {
+            release_thread_ownership(runner, message);
             let table = Arc::clone(table);
             let follow_key = crate::follow::follow_key(
                 &route.transport,

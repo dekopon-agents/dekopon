@@ -23492,7 +23492,7 @@ async fn a_successful_leave_releases_the_agent_thread_for_every_sender() {
     .expect("leave session completes");
 
     assert_eq!(driver.replies(), ["Bye."]);
-    assert_eq!(*ownership.claimed.lock(), [claim.clone()]);
+    assert_eq!(*ownership.claimed.lock(), std::slice::from_ref(&claim));
     assert_eq!(*ownership.released.lock(), [claim]);
     assert_eq!(
         table.ticket(&key, SystemTime::now()),
