@@ -10,6 +10,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use dekopon_core::offload;
 use http_body::{Body, Frame, SizeHint};
 
 #[derive(Debug, thiserror::Error)]
@@ -108,7 +109,7 @@ struct ReadChunk {
 pub struct SliceBody {
     chunks: VecDeque<Chunk>,
     active: Option<ReadChunk>,
-    pending: Option<tokio::task::JoinHandle<io::Result<ReadChunk>>>,
+    pending: Option<dekopon_core::Offload<io::Result<ReadChunk>>>,
     reusable: Bytes,
     remaining: u64,
 }
@@ -154,9 +155,7 @@ impl Body for SliceBody {
                     Ok(Ok(read)) => read,
                     Ok(Err(error)) => return this.fail(error),
                     Err(error) => {
-                        return this.fail(io::Error::other(
-                            dekopon_core::TaskOutcome::from_join_error(error),
-                        ));
+                        return this.fail(io::Error::other(dekopon_core::TaskOutcome::from(error)));
                     }
                 };
                 let bytes = std::mem::take(&mut read.bytes);
@@ -169,7 +168,7 @@ impl Body for SliceBody {
             }
             if let Some(mut read) = this.active.take() {
                 read.bytes = std::mem::take(&mut this.reusable);
-                let pending = tokio::task::spawn_blocking(move || read_chunk(read));
+                let pending = offload(move || read_chunk(read));
                 this.pending = Some(pending);
                 continue;
             }

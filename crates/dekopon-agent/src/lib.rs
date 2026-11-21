@@ -980,7 +980,7 @@ impl BrokerLeg {
         if !self.capabilities.contains_key(capability) {
             return CapabilityCallResult::NotFound;
         }
-        // Safe only because this runs on a spawn_blocking thread; calling block_on here from an
+        // Safe only because this runs on a blocking thread; calling block_on here from an
         // ordinary runtime worker would deadlock the executor.
         let dispatcher = tracing::dispatcher::get_default(Clone::clone);
         // A child script runs on its own scoped thread, never inside this future: its broker calls

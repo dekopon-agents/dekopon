@@ -4321,6 +4321,7 @@ impl CancelButton for RecordingCancelButton {
 struct RecordingThreadOwnership {
     claimed: Mutex<Vec<ThreadClaim>>,
     revoked: Mutex<Vec<ThreadClaim>>,
+    released: Mutex<Vec<ThreadClaim>>,
 }
 
 impl ThreadOwnership for RecordingThreadOwnership {
@@ -4330,6 +4331,10 @@ impl ThreadOwnership for RecordingThreadOwnership {
 
     fn revoke(&self, claim: &ThreadClaim) {
         self.revoked.lock().push(claim.clone());
+    }
+
+    fn release_thread(&self, claim: &ThreadClaim) {
+        self.released.lock().push(claim.clone());
     }
 }
 
@@ -10565,6 +10570,149 @@ async fn a_redelivered_slack_envelope_is_routed_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn slack_mentions_are_answered_when_conversation_lookup_lacks_scope() {
+    use dekopon_test_support::Record;
+
+    const FIRST: &str = "1700000000.000001";
+    const SECOND: &str = "1700000000.000002";
+    const LOOKUP: &str = "/api/conversations.info?channel=";
+    let mut unaddressed = channel_message("u9xyz", "1700000000.000003", None, "just chatting");
+    unaddressed["channel"] = json!("c0456def");
+    unaddressed.as_object_mut().unwrap().remove("channel_type");
+    let socket = spawn_socket_mock(vec![
+        events_envelope(
+            "first",
+            app_mention("u9xyz", FIRST, None, "<@u0botbot> first question"),
+        ),
+        events_envelope(
+            "second",
+            app_mention("u9xyz", SECOND, None, "<@u0botbot> second question"),
+        ),
+        events_envelope("unaddressed", unaddressed),
+        events_envelope(
+            "dm",
+            direct_message("u9xyz", "1700000000.000004", "direct question"),
+        ),
+    ]);
+    let handler = slack_handler(vec![socket.url.clone()]);
+    let http = spawn_http_mock(move |path, body| {
+        if path.starts_with(LOOKUP) {
+            json!({"ok": false, "error": "missing_scope"})
+        } else {
+            handler(path, body)
+        }
+    });
+    let mut transport = slack(&http.base);
+    let identity = transport.connect().await.expect("Slack connects");
+
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    doc["routes"][0]["transport"] = json!("scientist-slack");
+    doc["routes"][0]["conversation"] = json!({"kind": ["channel", "directMessage"]});
+    doc["routes"][0]["memory"] = json!({"mode": "oneShot"});
+    doc["transports"][0] = json!({
+        "name": "scientist-slack", "kind": "slackSocketMode", "appTokenEnv": "APP", "botTokenEnv": "BOT",
+    });
+    let config = resolved(directory.path(), &doc).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        answer("First answer."),
+        answer("Second answer."),
+        answer("Direct answer."),
+    ]);
+    let runner = runner(broker, models, 1);
+    let mut dispatcher = Dispatcher::new(&runner, &routes)
+        .with_identities(BTreeMap::from([("scientist-slack".to_owned(), identity)]))
+        .with_drivers(BTreeMap::from([(
+            "scientist-slack".to_owned(),
+            transport.driver(),
+        )]));
+    let (capture, _guard) = capture_spans();
+
+    for ts in [FIRST, SECOND] {
+        let mention = next_message(&mut transport).await;
+        assert_eq!(mention.message_id, MessageId::Native(ts.to_owned()));
+        assert_eq!(mention.conversation.kind, ConversationKind::Channel);
+        dispatcher.dispatch(NO_STOP_WORDS, mention);
+        dispatcher
+            .sessions
+            .join_next()
+            .await
+            .expect("the mention starts a gateway session")
+            .expect("the session completes");
+    }
+    let lookups = || {
+        http.calls()
+            .into_iter()
+            .filter_map(|(path, _)| path.starts_with(LOOKUP).then_some(path))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(lookups(), ["/api/conversations.info?channel=c0123abc"]);
+
+    let dm = next_message(&mut transport).await;
+    assert_eq!(dm.conversation.kind, ConversationKind::DirectMessage);
+    dispatcher.dispatch(NO_STOP_WORDS, dm);
+    dispatcher
+        .sessions
+        .join_next()
+        .await
+        .expect("the DM starts a gateway session")
+        .expect("the session completes");
+    assert_eq!(
+        lookups(),
+        [
+            "/api/conversations.info?channel=c0123abc",
+            "/api/conversations.info?channel=c0456def"
+        ],
+    );
+
+    let unresolved = capture.events_where(
+        "dekopon_gatewayd::transport::slack",
+        &[("event", "gateway_conversation_unresolved")],
+    );
+    assert!(
+        matches!(&unresolved[..], [Record::Event { level: "DEBUG", .. }]),
+        "{unresolved:?}"
+    );
+    assert_eq!(unresolved[0].field("cause"), Some("response"));
+    assert_eq!(
+        capture
+            .records()
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record,
+                    Record::Span {
+                        name: "transport.receive",
+                        ..
+                    }
+                ) && record.field("drop.reason") == Some("conversation-unresolved")
+            })
+            .count(),
+        1,
+    );
+
+    let replies = http
+        .calls()
+        .into_iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .map(|(_, body)| serde_json::from_str::<Value>(&body).expect("reply body is JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 3);
+    for (reply, (channel, thread, text)) in replies.iter().zip([
+        ("c0123abc", json!(FIRST), "First answer."),
+        ("c0123abc", json!(SECOND), "Second answer."),
+        ("d0123abc", Value::Null, "Direct answer."),
+    ]) {
+        assert_eq!(reply["channel"], channel);
+        assert_eq!(reply["thread_ts"], thread);
+        assert_eq!(reply["text"], text);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_slack_envelope_is_acknowledged_before_its_session_posts_a_markdown_answer() {
     // Slack redelivers an unacknowledged event in about three seconds, far sooner than a session
     // can finish, so acknowledging after the work would guarantee duplicate replies.
@@ -14419,7 +14567,7 @@ pub(crate) fn capture_spans() -> (
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct SpanSink(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+pub(crate) struct SpanSink(pub(crate) Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
 
 impl opentelemetry_sdk::trace::SpanExporter for SpanSink {
     async fn export(
@@ -23268,6 +23416,87 @@ async fn slack_follow_human_thumbs_down_leaves_once_ignoring_bots_and_other_auth
         mention.subject,
         dekopon_core::AttestedSubject::one(Subject::slack_user(TEAM, "u8other").unwrap())
             .expect("one-form subject")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successful_leave_releases_the_agent_thread_for_every_sender() {
+    let directory = temporary();
+    let journal_dir = temporary();
+    let leaving: AvailableCapability = serde_json::from_value(json!({
+        "provider": "dekopon-provider-follow",
+        "capability": {
+            "id": "dekopon-provider-follow.leave",
+            "description": "Leave the followed conversation",
+            "effect": "local-write", "risk": "Low",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        }
+    }))
+    .expect("test-only provider declaration");
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![leaving], vec!["follow".into()], BTreeMap::new()),
+            ResponseEnvelope::command_run(serde_json::from_value(json!({
+                "outcome": "proposed", "capability": "dekopon-provider-follow.leave", "input": {}
+            })).unwrap()),
+            ResponseEnvelope::invocation(record_success(), Vec::new(), Vec::new(), Vec::new()),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("follow leave"), answer("Bye.")]);
+    let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
+    let journal = Arc::new(
+        crate::journal::Journal::open(
+            journal_dir.path(),
+            Duration::from_secs(7 * 86400),
+            Duration::from_secs(7 * 86400),
+        )
+        .unwrap(),
+    );
+    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let mut route = route(model_config());
+    route.follow = true;
+    let message = owned_slack_message("<@u0botbot> leave", false);
+    let claim = message
+        .thread_continuation
+        .as_ref()
+        .expect("Agent claim")
+        .claim
+        .clone();
+    let key = crate::follow::follow_key(
+        &route.transport,
+        route.agent.as_str(),
+        &route.conversation,
+        &message.conversation.key(),
+    );
+    table.stay_and_write(&key, SystemTime::now()).unwrap();
+    runner.follow = Some(Arc::clone(&table));
+    let ownership = Arc::new(RecordingThreadOwnership::default());
+    runner.thread_ownership.insert(
+        "scientist-slack".to_owned(),
+        Arc::clone(&ownership) as Arc<dyn ThreadOwnership>,
+    );
+    let driver = Arc::new(RecordingDriver::default());
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_session(
+            Arc::new(runner),
+            route,
+            message,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ),
+    )
+    .await
+    .expect("leave session completes");
+
+    assert_eq!(driver.replies(), ["Bye."]);
+    assert_eq!(*ownership.claimed.lock(), std::slice::from_ref(&claim));
+    assert_eq!(*ownership.released.lock(), [claim]);
+    assert_eq!(
+        table.ticket(&key, SystemTime::now()),
+        crate::follow::FollowTicket::Absent
     );
 }
 

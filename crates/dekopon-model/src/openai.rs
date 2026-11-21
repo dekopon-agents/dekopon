@@ -12,6 +12,7 @@ use crate::{
     stream::{ModelText, TurnEvent},
 };
 use dekopon_core::Redacted;
+use dekopon_core::offload;
 use dekopon_model_token_governor::ModelUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -211,10 +212,10 @@ impl InferenceModel for OpenAiClient {
     ) -> Result<AssistantTurn, InferenceError> {
         self.http
             .generation(
-                &self.name,
-                &self.model,
+                (&self.name, &self.model),
                 "openai-compatible",
                 "chat-completions",
+                request.options,
                 async {
                     let mut progress = Progress::new();
                     (
@@ -506,15 +507,11 @@ impl<'a> WireMessage<'a> {
                     ContentPart::Image { data, .. } | ContentPart::File { data, .. } => {
                         let reference = data.clone();
                         let span = tracing::Span::current();
-                        match tokio::task::spawn_blocking(move || {
-                            span.in_scope(|| reference.read())
-                        })
-                        .await
-                        .map_err(|source| {
-                            TransportFailure::Blocking(dekopon_core::TaskOutcome::from_join_error(
-                                source,
-                            ))
-                        })? {
+                        match offload(move || span.in_scope(|| reference.read()))
+                            .await
+                            .map_err(|source| {
+                                TransportFailure::Blocking(dekopon_core::TaskOutcome::from(source))
+                            })? {
                             Ok(bytes) => {
                                 data.record_preparation(crate::asset::Preparation::Original);
                                 Some(bytes)

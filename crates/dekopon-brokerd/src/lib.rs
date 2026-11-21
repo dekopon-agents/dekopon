@@ -45,7 +45,7 @@ use dekopon_broker_host::BrokerProviderRegistry;
 pub use dekopon_broker_host::enable_test_component_memoization;
 use dekopon_broker_protocol::ResponseEnvelope;
 use dekopon_capability::EffectKind;
-use dekopon_core::{SecretDrn, bounded_problems, error_chain};
+use dekopon_core::{SecretDrn, bounded_problems, error_chain, offload};
 use thiserror::Error;
 
 pub use config::{
@@ -1055,7 +1055,7 @@ impl RawCandidate {
         use std::io::Read as _;
 
         use sha2::{Digest as _, Sha256};
-        let digest = tokio::task::spawn_blocking(move || {
+        let digest = offload(move || {
             let mut paths = std::fs::read_dir(&config).map_or_else(
                 |_| vec![config.clone()],
                 |entries| {

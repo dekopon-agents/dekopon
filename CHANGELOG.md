@@ -7,6 +7,24 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- `examples/slack/manifest.yaml` is now the Agent profile, paired with `experience: agent`; the classic profile moved to `examples/slack/manifest-legacy.yaml`. Installed apps are unaffected until reinstalled.
+
+## [0.90.0] - 2026-11-20
+
+### Fixed
+
+- Report journal write failures during memory summary panic recovery.
+- Show reported token and cache counts on memory summaries, identify the agent and chat session on model completions, and distinguish unknown cache usage from zero.
+- Slack mentions receive replies when conversation metadata is unavailable.
+
+## [dekopon-chart-0.77.0] - 2026-11-20
+
+### Changed
+
+- Chart 0.77.0 targets core v0.90.0 and renders the `v0.90.0` image tag.
+
 ## [0.89.0] - 2026-11-20
 
 ### Added

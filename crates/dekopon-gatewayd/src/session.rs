@@ -28,7 +28,8 @@ use dekopon_broker_protocol::{
     ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA, ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED,
     InvocationOutcome, InvocationResult, SessionRefusal,
 };
-use dekopon_core::{AttestedSubject, PrincipalId, Subject};
+use dekopon_core::OffloadTrace;
+use dekopon_core::{AttestedSubject, PrincipalId, Subject, offload};
 use dekopon_model::error::InferenceError;
 use dekopon_model::{
     blocking::BlockingModel,
@@ -1366,10 +1367,8 @@ impl Recall<'_> {
                 let journal = Arc::clone(self.runner.journal.as_ref()?);
                 let stem = key.journal_stem();
                 let grant = GrantDigest::of(granted);
-                let recalled = tokio::task::spawn_blocking(move || {
-                    journal.recall(&stem, &grant, window, SystemTime::now())
-                })
-                .await;
+                let recalled =
+                    offload(move || journal.recall(&stem, &grant, window, SystemTime::now())).await;
                 match recalled {
                     Ok(Ok(recalled)) => {
                         span.record("conversation.recall_source", "journal");
@@ -2686,20 +2685,18 @@ async fn session_turn(
                 span.record("conversation.carried_assets", recalled_assets.len());
                 let store = Arc::clone(&runner.assets);
                 let access = assets.clone();
-                let subscriber = tracing::dispatcher::get_default(Clone::clone);
-                let restore_span = span.clone();
-                if let Err(error) = tokio::task::spawn_blocking(move || {
-                    tracing::dispatcher::with_default(&subscriber, || {
-                        let _entered = restore_span.enter();
-                        store.restore(&access, recalled_assets, next_asset_id, Instant::now());
-                    });
+                let trace = OffloadTrace::capture(Some(span));
+                if let Err(error) = offload(move || {
+                    trace.in_scope(|| {
+                        store.restore(&access, recalled_assets, next_asset_id, Instant::now())
+                    })
                 })
                 .await
                 {
                     tracing::error!(
                         event = "gateway_session_failed",
                         category = "asset-task",
-                        failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
+                        failure = dekopon_core::TaskOutcome::from(error).category(),
                         "gateway.session.failed"
                     );
                     return MessageOutcome::Failed.into();
@@ -2762,11 +2759,9 @@ async fn session_turn(
     let store = Arc::clone(&runner.assets);
     let access = asset_access.clone();
     let arriving = message.assets.clone();
-    let asset_subscriber = tracing::dispatcher::get_default(Clone::clone);
-    let asset_span = tracing::Span::current();
-    let (delta, registered) = match tokio::task::spawn_blocking(move || {
-        tracing::dispatcher::with_default(&asset_subscriber, || {
-            let _entered = asset_span.enter();
+    let trace = OffloadTrace::capture(Some(tracing::Span::current()));
+    let (delta, registered) = match offload(move || {
+        trace.in_scope(|| {
             let delta = delta
                 .and_then(|delta| delta.block(&store, &access))
                 .map(ConversationTurn::unanswered);
@@ -2781,7 +2776,7 @@ async fn session_turn(
             tracing::error!(
                 event = "gateway_session_failed",
                 category = "asset-task",
-                failure = dekopon_core::TaskOutcome::from_join_error(error).category(),
+                failure = dekopon_core::TaskOutcome::from(error).category(),
                 "gateway.session.failed"
             );
             return MessageOutcome::Failed.into();
@@ -2878,7 +2873,13 @@ async fn session_turn(
     };
     // Built here per request rather than passed to the shared factory, so a cached client's cache
     // key never gets baked in from the first conversation and silently mislabels every later one.
-    let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
+    let options = CompletionOptions::default()
+        .with_prompt_cache_key(cache_key.clone())
+        .with_session(
+            route.agent.clone(),
+            message.conversation.id.as_str(),
+            message.conversation.kind.as_str(),
+        );
 
     let liveness = route
         .indicators
@@ -3707,6 +3708,7 @@ async fn session_turn(
             && leave_request.load(std::sync::atomic::Ordering::Acquire)
             && let Some(table) = runner.follow.as_ref()
         {
+            release_thread_ownership(runner, message);
             let table = Arc::clone(table);
             let follow_key = crate::follow::follow_key(
                 &route.transport,
@@ -3716,7 +3718,7 @@ async fn session_turn(
             );
             let index = route.route_index;
             let transitioned = table.suspend(&follow_key);
-            match tokio::task::spawn_blocking(move || table.leave(&follow_key)).await {
+            match offload(move || table.leave(&follow_key)).await {
                 Ok(Ok(())) if transitioned => tracing::info!(
                     audit.event = "gateway.follow",
                     operation = "self-left",
@@ -3747,9 +3749,7 @@ async fn session_turn(
                 &message.conversation.key(),
             );
             let index = route.route_index;
-            match tokio::task::spawn_blocking(move || table.refresh(&follow_key, SystemTime::now()))
-                .await
-            {
+            match offload(move || table.refresh(&follow_key, SystemTime::now())).await {
                 Ok(Ok(())) => tracing::info!(
                     audit.event = "gateway.follow",
                     operation = "refreshed",
@@ -3835,7 +3835,7 @@ async fn sealed_conversation(
     };
     let journal = Arc::clone(journal);
     let stem = key.journal_stem();
-    let result = tokio::task::spawn_blocking(move || journal.sealed(&stem, forget_after)).await;
+    let result = offload(move || journal.sealed(&stem, forget_after)).await;
     let reason = match result {
         Ok(Ok(sealed)) => return sealed,
         Ok(Err(error)) => error.label(),
@@ -3866,7 +3866,7 @@ pub(crate) async fn seal_conversation(
             &route.conversation,
             &message.conversation.key(),
         );
-        let left = tokio::task::spawn_blocking(move || table.leave(&follow_key)).await;
+        let left = offload(move || table.leave(&follow_key)).await;
         match left {
             Ok(Ok(())) => tracing::info!(
                 audit.event = "gateway.follow",
@@ -3899,7 +3899,7 @@ pub(crate) async fn seal_conversation(
     };
     let journal = Arc::clone(journal);
     let stem = key.journal_stem();
-    let result = tokio::task::spawn_blocking(move || journal.seal(&stem, seal.at)).await;
+    let result = offload(move || journal.seal(&stem, seal.at)).await;
     let reason = match result {
         Ok(Ok(())) => return true,
         Ok(Err(error)) => error.label(),
@@ -3982,6 +3982,16 @@ fn claim_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
     };
     if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
         ownership.claim(continuation.claim.clone());
+    }
+}
+
+// A leave ends continuation for every sender in the thread, so only a fresh mention wakes the agent.
+fn release_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
+    let Some(continuation) = &message.thread_continuation else {
+        return;
+    };
+    if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
+        ownership.release_thread(&continuation.claim);
     }
 }
 

@@ -11,7 +11,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use dekopon_core::{AgentId, AssetNumber};
+use dekopon_core::{AgentId, AssetNumber, OffloadError, OffloadTrace, TaskOutcome, offload};
 use dekopon_model::{
     error::{InferenceError, TransportFailure},
     model::{AssistantTurn, ChatModel, CompletionOptions, ModelKey, ModelMessage},
@@ -21,7 +21,7 @@ use dekopon_model::{
 use dekopon_model_token_governor::{Call, Estimate, Metering, Outcome, Sizes, Tokens, Via};
 use tokio::{
     sync::{mpsc, watch},
-    task::{Id, JoinSet},
+    task::{AbortHandle, Id, JoinSet},
 };
 use tracing::Instrument as _;
 
@@ -113,7 +113,15 @@ struct RunningTask {
 
 enum Stage {
     Summary,
-    PanicWrite,
+    PanicWrite { _abort: AbortOnDrop },
+}
+
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 type AssetReservations = Arc<parking_lot::Mutex<HashSet<(String, RecordId, AssetNumber)>>>;
@@ -228,10 +236,9 @@ impl Sender {
                 let journal = Arc::clone(&self.journal);
                 let counts = Arc::clone(&self.counts);
                 let span = summarize_span(&queued.task, &queued.since);
-                let subscriber = tracing::dispatcher::get_default(Clone::clone);
-                let result = tokio::task::spawn_blocking(move || {
-                    let _subscriber = tracing::dispatcher::set_default(&subscriber);
-                    span.in_scope(|| {
+                let trace = OffloadTrace::capture(Some(span));
+                let result = offload(move || {
+                    trace.in_scope(|| {
                         let count = mark_later(
                             &journal,
                             &queued.task,
@@ -264,7 +271,7 @@ async fn dispatch(
 ) {
     let cancel = CancelOnDrop(sender.cancel.clone(), Arc::clone(&sender.in_flight));
     let mut stopped = cancel.0.subscribe();
-    let mut running = JoinSet::new();
+    let mut running = JoinSet::<Result<Next, OffloadError>>::new();
     let mut tasks: HashMap<Id, RunningTask> = HashMap::new();
     loop {
         if *stopped.borrow() {
@@ -273,45 +280,54 @@ async fn dispatch(
         tokio::select! {
             _ = stopped.changed() => break,
             result = running.join_next_with_id(), if !running.is_empty() => {
+                let (id, result) = match result {
+                    Some(Ok((id, result))) => (id, result.map_err(TaskOutcome::from)),
+                    Some(Err(error)) => (error.id(), Err(TaskOutcome::from_join_error(error))),
+                    None => continue,
+                };
+                let Some(mut task) = tasks.remove(&id) else { continue; };
                 match result {
-                    Some(Ok((id, next))) => {
-                        if let Some(running) = tasks.remove(&id) {
-                            sender.release(&running.task);
-                            match (running.stage, running.task.subject, next) {
-                                (Stage::Summary, Subject::Record, Next::Continue(part)) => sender.enqueue(SlotTask { part, ..running.task }).await,
-                                (Stage::Summary, Subject::Record, Next::Stop)
-                                | (Stage::Summary, Subject::Asset(_), Next::Continue(_) | Next::Stop)
-                                | (Stage::PanicWrite, Subject::Record | Subject::Asset(_), Next::Continue(_) | Next::Stop) => {}
-                            }
+                    Ok(next) => {
+                        sender.release(&task.task);
+                        match (task.stage, task.task.subject, next) {
+                            (Stage::Summary, Subject::Record, Next::Continue(part)) => sender.enqueue(SlotTask { part, ..task.task }).await,
+                            (Stage::Summary, Subject::Record, Next::Stop)
+                            | (Stage::Summary, Subject::Asset(_), Next::Continue(_) | Next::Stop)
+                            | (Stage::PanicWrite { .. }, Subject::Record | Subject::Asset(_), Next::Continue(_) | Next::Stop) => {}
                         }
                     }
-                    Some(Err(error)) => {
-                        if let Some(mut task) = tasks.remove(&error.id()) {
-                            match (error.is_panic(), &task.stage) {
-                                (true, Stage::Summary) => {
-                                    let journal = Arc::clone(&resources.journal);
-                                    let turn = *task.binding.lock();
-                                    let write = task.task.clone();
-                                    let subscriber = tracing::dispatcher::get_default(Clone::clone);
-                                    let span = task.span.clone();
-                                    let cancelled = stopped.clone();
-                                    let handle = running.spawn_blocking(move || {
-                                        let _subscriber = tracing::dispatcher::set_default(&subscriber);
-                                        span.in_scope(|| {
-                                            if !*cancelled.borrow() {
-                                                let _written = mark_later(&journal, &write, turn, SummaryFailure::Panicked, "summary task panicked");
-                                            }
-                                            Next::Stop
-                                        })
-                                    });
-                                    task.stage = Stage::PanicWrite;
-                                    tasks.insert(handle.id(), task);
-                                }
-                                (false, Stage::Summary | Stage::PanicWrite) | (true, Stage::PanicWrite) => sender.release(&task.task),
+                    Err(failure) => {
+                        match (matches!(failure, TaskOutcome::Panicked), &task.stage) {
+                            (true, Stage::Summary) => {
+                                let journal = Arc::clone(&resources.journal);
+                                let turn = *task.binding.lock();
+                                let write = task.task.clone();
+                                let trace = OffloadTrace::capture(Some(task.span.clone()));
+                                let cancelled = stopped.clone();
+                                let job = offload(move || {
+                                    trace.in_scope(|| {
+                                        if !*cancelled.borrow()
+                                            && let Err(error) = mark_later(&journal, &write, turn, SummaryFailure::Panicked, "summary task panicked")
+                                        {
+                                            tracing::warn!(
+                                                event = "gateway_memory_summary_write_failed",
+                                                memory.record.id = write.record.0.get(),
+                                                memory.summary.part = write.part.get(),
+                                                error = %error,
+                                                "could not persist summary panic"
+                                            );
+                                        }
+                                        Next::Stop
+                                    })
+                                });
+                                // Aborting the async joiner alone can leave the blocking write queued.
+                                task.stage = Stage::PanicWrite { _abort: AbortOnDrop(job.abort_handle()) };
+                                let handle = running.spawn(job);
+                                tasks.insert(handle.id(), task);
                             }
+                            (false, Stage::Summary) | (_, Stage::PanicWrite { .. }) => sender.release(&task.task),
                         }
                     }
-                    None => {}
                 }
             }
             queued = receiver.recv(), if running.len() < concurrency.get() => {
@@ -319,7 +335,8 @@ async fn dispatch(
                 let task = queued.task.clone();
                 let binding: Binding = Arc::default();
                 let span = summarize_span(&task, &queued.since);
-                let handle = running.spawn(run(Arc::clone(&resources), queued, cancel.0.subscribe(), Arc::clone(&binding), span.clone()));
+                let summary = run(Arc::clone(&resources), queued, cancel.0.subscribe(), Arc::clone(&binding), span.clone());
+                let handle = running.spawn(async move { Ok(summary.await) });
                 tasks.insert(handle.id(), RunningTask { task, binding, span, stage: Stage::Summary });
             }
         }
@@ -344,6 +361,8 @@ fn summarize_span(task: &SlotTask, since: &Instant) -> tracing::Span {
         memory.summary.queue_wait_ms = since.elapsed().as_millis() as u64,
         gen_ai.request.model = tracing::field::Empty,
         gen_ai.response.model = tracing::field::Empty,
+        usage.input_tokens = tracing::field::Empty,
+        usage.cached_input_tokens = tracing::field::Empty,
     )
 }
 
@@ -703,13 +722,22 @@ fn complete_request(
         ),
     };
     meter.finish(usage, bytes, outcome, kind);
+    let span = tracing::Span::current();
+    if let Some(usage) = usage {
+        let count = |tokens| i64::try_from(tokens).unwrap_or(i64::MAX);
+        span.record("usage.input_tokens", usage.input_tokens.map(count));
+        span.record(
+            "usage.cached_input_tokens",
+            usage.cached_input_tokens.map(count),
+        );
+    }
     if let Some(reported) = result
         .as_ref()
         .ok()
         .and_then(AssistantTurn::model_key)
         .and_then(ModelKey::reported)
     {
-        tracing::Span::current().record("gen_ai.response.model", reported);
+        span.record("gen_ai.response.model", reported);
     }
     let slot = match result {
         Ok(turn) => match turn
