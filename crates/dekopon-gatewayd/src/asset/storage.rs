@@ -1,4 +1,7 @@
 use super::*;
+use dekopon_core::private_file::{
+    TemporarySweep, replace_private_file_with, sweep_stale_temporaries,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -242,6 +245,11 @@ impl Retention {
             Err(error) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => return Err(error.into()),
         }
+        for outcome in sweep_stale_temporaries(&dir.join("index.json"), None) {
+            if let TemporarySweep::Failed { source, .. } = outcome {
+                return Err(source.into());
+            }
+        }
         store.persist()?;
         Ok(store)
     }
@@ -270,23 +278,16 @@ impl Retention {
             if self.persisted == Some(digest) {
                 return Ok(());
             }
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .mode(0o600)
-                .open(dir.join("index.pending"))?;
-            if file.metadata()?.uid() != crate::current_uid() {
-                return Err(BlobError::Io(io::ErrorKind::PermissionDenied));
-            }
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            serde_json::to_writer(&mut file, &self.index).map_err(|error| {
-                BlobError::Io(error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData))
-            })?;
-            file.sync_all()?;
-            fs::rename(dir.join("index.pending"), dir.join("index.json"))?;
-            File::open(dir)?.sync_all()?;
+            validate_pending_index(&dir.join("index.pending"))?;
+            replace_private_file_with(&dir.join("index.json"), |file| {
+                if file.metadata()?.uid() != crate::current_uid() {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                serde_json::to_writer(file, &self.index).map_err(|error| {
+                    io::Error::from(error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData))
+                })
+            })
+            .map_err(|error| error.source)?;
             self.persisted = Some(digest);
         }
         Ok(())
@@ -910,5 +911,62 @@ impl Drop for Publication {
         self.range
             .end
             .fetch_min(self.access.next_asset_id(), Ordering::AcqRel);
+    }
+}
+
+fn validate_pending_index(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(io::Error::from_raw_os_error(libc::ELOOP))
+        }
+        Ok(metadata) if metadata.uid() != crate::current_uid() => {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+        Ok(metadata) if !metadata.is_file() => Err(io::Error::from(io::ErrorKind::InvalidData)),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn index_restart_preserves_the_published_index_and_retries_abandoned_writes() {
+        let directory = crate::tests::temporary();
+        let path = directory.path().join("index.json");
+        let pending = directory.path().join("index.pending");
+        let abandoned = directory.path().join("index.json.tmp-private-abandoned");
+        let mut store = Retention::open(directory.path(), 8).unwrap();
+        store.index.clock = 1;
+        store.persist().unwrap();
+        let previous = fs::read(&path).unwrap();
+        drop(store);
+
+        for stage in [&pending, &abandoned] {
+            fs::write(stage, b"{partial").unwrap();
+        }
+        let mut store = Retention::open(directory.path(), 8).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), previous);
+        assert_eq!(store.index.clock, 1);
+        assert!(!pending.exists());
+        assert!(!abandoned.exists());
+
+        symlink(&path, &pending).unwrap();
+        store.index.clock = 2;
+        assert!(
+            matches!(store.persist(), Err(BlobError::Io(kind)) if kind == io::Error::from_raw_os_error(libc::ELOOP).kind())
+        );
+        assert_eq!(fs::read(&path).unwrap(), previous);
+        fs::remove_file(&pending).unwrap();
+
+        store.persist().unwrap();
+        let index: Index = serde_json::from_reader(File::open(&path).unwrap()).unwrap();
+        assert_eq!(index.clock, 2);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
     }
 }

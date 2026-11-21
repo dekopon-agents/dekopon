@@ -1,11 +1,14 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, Read as _, Write as _},
-    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
+    fs,
+    io::{self, Read as _},
+    os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
 };
 
-use dekopon_core::AgentId;
+use dekopon_core::{
+    AgentId,
+    private_file::{TemporarySweep, replace_private_file, sweep_stale_temporaries},
+};
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::{Sha256, digest::Update};
 use thiserror::Error;
@@ -136,14 +139,12 @@ fn write(path: &Path, bytes: &[u8; SECRET_BYTES]) -> io::Result<()> {
     {
         return Err(error);
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&staging)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&staging, path)
+    for outcome in sweep_stale_temporaries(path, None) {
+        if let TemporarySweep::Failed { source, .. } = outcome {
+            return Err(source);
+        }
+    }
+    replace_private_file(path, bytes).map_err(|error| error.source)
 }
 
 pub(crate) fn absorb(digest: &mut impl Update, part: &[u8]) {
@@ -157,4 +158,42 @@ fn finish(prefix: &str, mac: Hmac<Sha256>) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     format!("{prefix}-{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    #[test]
+    fn a_cache_key_write_recovers_abandoned_staging_and_syncs_the_directory() {
+        let directory = crate::tests::temporary();
+        let path = directory.path().join(SECRET_FILE);
+        write(&path, &[1; SECRET_BYTES]).expect("previous key");
+        for staging in [
+            path.with_extension("secret.tmp"),
+            dekopon_core::private_file::temporary_path(&path),
+            directory
+                .path()
+                .join("prompt-cache-key.secret.tmp-private-abandoned"),
+        ] {
+            fs::write(&staging, [2; 5]).expect("interrupted write");
+            assert_eq!(fs::read(&path).unwrap(), [1; SECRET_BYTES]);
+        }
+
+        write(&path, &[3; SECRET_BYTES]).expect("retry");
+        assert_eq!(fs::read(&path).unwrap(), [3; SECRET_BYTES]);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+
+        if crate::current_uid() == 0 {
+            return;
+        }
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        let result = write(&path, &[4; SECRET_BYTES]);
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&path).unwrap(), [4; SECRET_BYTES]);
+    }
 }
