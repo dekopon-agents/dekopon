@@ -2168,6 +2168,11 @@ impl ThreadOwnership for SlackThreadOwnership {
         let key = SlackThreadKey::from_claim(claim);
         self.owned.lock().revoke(&key);
     }
+
+    fn release_thread(&self, claim: &ThreadClaim) {
+        let key = SlackThreadKey::from_claim(claim);
+        self.owned.lock().release_thread(&key);
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2232,6 +2237,16 @@ impl OwnedThreads {
         if self.owned.remove(key) {
             self.order.retain(|candidate| candidate != key);
         }
+    }
+
+    fn release_thread(&mut self, key: &SlackThreadKey) {
+        let same_thread = |candidate: &SlackThreadKey| {
+            candidate.team_id == key.team_id
+                && candidate.channel_id == key.channel_id
+                && candidate.thread_ts == key.thread_ts
+        };
+        self.owned.retain(|candidate| !same_thread(candidate));
+        self.order.retain(|candidate| !same_thread(candidate));
     }
 }
 
@@ -5461,6 +5476,37 @@ mod owned_thread_tests {
         assert!(
             owned.contains(&other_sender),
             "revocation is exact to one sender/thread"
+        );
+    }
+
+    #[test]
+    fn releasing_a_thread_drops_every_sender_and_keeps_other_threads() {
+        let requester = key("1.000001", "u1");
+        let bystander = key("1.000001", "u2");
+        let elsewhere = key("2.000002", "u1");
+        let mut owned = OwnedThreads::new(4);
+        owned.claim(requester.clone());
+        owned.claim(bystander.clone());
+        owned.claim(elsewhere.clone());
+
+        owned.release_thread(&bystander);
+
+        assert!(
+            !owned.contains(&requester),
+            "the requester's claim goes too"
+        );
+        assert!(!owned.contains(&bystander));
+        assert!(
+            owned.contains(&elsewhere),
+            "other threads keep their claims"
+        );
+        owned.claim(requester.clone());
+        owned.claim(key("3.000003", "u1"));
+        owned.claim(key("4.000004", "u1"));
+        owned.claim(key("5.000005", "u1"));
+        assert!(
+            !owned.contains(&elsewhere),
+            "released keys left no stale slots in the eviction order"
         );
     }
 }
