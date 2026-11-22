@@ -30,8 +30,8 @@ metadata:
 spec:
   description: Finds recurring tool gaps without making external changes
   enabled: false
-  # Needs a turso.exec grant with storage scope agent.
   skills:
     - skills/learned-skills
+    - skills/learned-facts
   modelClass: analysis
 status: Disabled
