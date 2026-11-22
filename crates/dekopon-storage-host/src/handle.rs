@@ -1,6 +1,6 @@
 use crate::{
     StorageEvidence, StorageGrant, StorageHostError,
-    key::{DOMAIN_LOGICAL_PATH, DOMAIN_OPERATION_EVIDENCE, commitment, token},
+    key::{DOMAIN_OPERATION_EVIDENCE, commitment, logical_path_token},
     layout::{ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
     namespace::{Namespace, deadline_after, lock_exclusive, logical_file},
     quota::{QuotaLedger, Reservation},
@@ -295,13 +295,10 @@ impl StorageHandle {
 
     pub(crate) fn logical_token(&self, name: &str) -> Result<String, StorageHostError> {
         Self::validate_name(name)?;
-        Ok(token(
-            DOMAIN_LOGICAL_PATH,
-            &[
-                self.namespace.base_token.as_bytes(),
-                self.namespace.generation_token.as_bytes(),
-                name.as_bytes(),
-            ],
+        Ok(logical_path_token(
+            &self.namespace.base_token,
+            &self.namespace.generation_token,
+            name,
         ))
     }
 

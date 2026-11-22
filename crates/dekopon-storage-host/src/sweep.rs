@@ -135,8 +135,7 @@ fn eligible(
         tracing::warn!(storage.namespace = %token, reason = "no-identity", "storage.sweep.preserved");
         return Ok(false);
     };
-    let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
-    if crate::key::token(crate::key::DOMAIN_NAMESPACE_PATH, &fields) != token {
+    if crate::namespace_token(&values) != token {
         return Err(base.corrupt("identity", "storage-resource-identity"));
     }
     let provider = match scope {
@@ -146,7 +145,14 @@ fn eligible(
         {
             &values[1]
         }
-        StorageScope::Agent if values.len() == 3 && values[0] == "agent-v1" => &values[1],
+        StorageScope::Agent if values.len() == 3 && values[0] == crate::AGENT_SCOPE_VERSION => {
+            &values[1]
+        }
+        StorageScope::Instance
+            if values.len() == 4 && values[0] == crate::INSTANCE_SCOPE_VERSION =>
+        {
+            &values[1]
+        }
         StorageScope::Space if values.len() == 3 && values[0] == "space-v1" => &values[1],
         _ => return Err(base.corrupt("identity", "storage-resource-identity")),
     };
@@ -172,7 +178,7 @@ fn eligible(
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
 )]
-fn remove_entry(
+pub(crate) fn remove_entry(
     parent: &Directory,
     name: &str,
     remaining: &mut u64,

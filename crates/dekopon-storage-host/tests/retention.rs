@@ -113,6 +113,73 @@ fn old_marker(path: &std::path::Path) {
 }
 
 #[test]
+fn an_instance_survives_transport_changes_and_is_private_to_its_agent_and_principal() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let host = StorageHost::open(&root, StorageLimits::default()).unwrap();
+    let at = |agent, principal, discord| {
+        let (subject, kind, transport, conversation) = if discord {
+            (
+                "drn:discord:user::123",
+                "discord",
+                "scientist-discord",
+                "456",
+            )
+        } else {
+            (
+                "drn:slack:user:t0123abc:u9xyz",
+                "slack",
+                "scientist-slack",
+                "thread-1",
+            )
+        };
+        request_at(
+            StorageScope::Instance,
+            subject,
+            agent,
+            "storage-probe",
+            kind,
+            transport,
+            conversation,
+            b"same",
+        )
+        .with_principal(principal)
+    };
+    let alice = "alice".parse::<dekopon_core::PrincipalId>().unwrap();
+    let slack = host
+        .prepare_grant(at("reviewer", alice.clone(), false))
+        .unwrap();
+    let namespace = slack.namespace().to_owned();
+    assert_eq!(
+        namespace,
+        host.prepare_grant(at("reviewer", alice.clone(), true))
+            .unwrap()
+            .namespace()
+    );
+    assert_ne!(
+        namespace,
+        host.prepare_grant(at("reviewer", "bob".parse().unwrap(), false))
+            .unwrap()
+            .namespace()
+    );
+    assert_ne!(
+        namespace,
+        host.prepare_grant(at("other", alice, false))
+            .unwrap()
+            .namespace()
+    );
+
+    drop(slack.materialize().unwrap());
+    old_marker(&base(&root, &namespace).join("last-used"));
+    let policies = BTreeMap::from([(
+        ("storage-probe".parse().unwrap(), StorageScope::Instance),
+        StorageRetention::IdleTtl(Duration::from_secs(30)),
+    )]);
+    assert_eq!(host.sweep(&policies).unwrap().deleted, 1);
+    assert!(!base(&root, &namespace).exists());
+}
+
+#[test]
 fn private_shared_and_agent_scopes_have_distinct_resolved_identities() {
     let temporary = tempfile::tempdir().unwrap();
     let host = StorageHost::open(
@@ -248,7 +315,9 @@ fn private_shared_and_agent_scopes_have_distinct_resolved_identities() {
                 ));
                 elsewhere.finish_read().unwrap();
             }
-            StorageScope::PrivateConversation | StorageScope::Space => unreachable!(),
+            StorageScope::PrivateConversation | StorageScope::Space | StorageScope::Instance => {
+                unreachable!()
+            }
         }
     }
 }

@@ -129,13 +129,31 @@ fn agent_request(
     access: StorageAccess,
     namespace: Option<&str>,
 ) -> StorageGrantRequest {
+    durable_request(
+        invocation,
+        provider,
+        agent,
+        access,
+        namespace,
+        StorageScope::Agent,
+    )
+}
+
+fn durable_request(
+    invocation: &str,
+    provider: &str,
+    agent: &str,
+    access: StorageAccess,
+    namespace: Option<&str>,
+    scope: StorageScope,
+) -> StorageGrantRequest {
     StorageGrantRequest::new(
         invocation.parse().expect("invocation"),
         format!("{provider}.exec").parse().expect("capability"),
         provider.parse().expect("provider"),
         StorageInterface::DurableFiles,
         access,
-        StorageScope::Agent,
+        scope,
         agent.parse().expect("agent"),
         "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
         "slack",
@@ -186,6 +204,49 @@ fn an_agent_namespace_without_a_shared_name_keeps_its_directory() {
             .expect("preparation");
         assert_eq!(preparation.namespace(), today, "{namespace:?}");
     }
+}
+
+#[test]
+fn an_instance_request_without_an_authenticated_principal_is_refused() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    assert!(matches!(
+        host.prepare_grant(durable_request(
+            "missing-principal",
+            "turso",
+            "reviewer",
+            StorageAccess::ReadOnly,
+            None,
+            StorageScope::Instance,
+        )),
+        Err(StorageHostError::InvalidArgument)
+    ));
+}
+
+#[test]
+fn a_named_instance_namespace_uses_the_same_token_across_providers() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
+    let prepare = |provider, namespace| {
+        host.prepare_grant(
+            durable_request(
+                "named-instance",
+                provider,
+                "reviewer",
+                StorageAccess::ReadOnly,
+                namespace,
+                StorageScope::Instance,
+            )
+            .with_principal("alice".parse().expect("principal")),
+        )
+        .expect("preparation")
+    };
+    let turso = prepare("turso", None);
+    assert_eq!(
+        turso.namespace(),
+        prepare("python", Some("turso")).namespace()
+    );
+    assert_ne!(turso.namespace(), prepare("python", None).namespace());
 }
 
 #[test]
