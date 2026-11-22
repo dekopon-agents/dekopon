@@ -7,6 +7,22 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.93.0] - 2026-11-22
+
+### Added
+
+- Show WhatsApp message types, declared media formats, and admission decisions in receive traces.
+
+### Fixed
+
+- `check-broker` loads providers from the candidate store's compiled cache instead of compiling each component.
+
+## [dekopon-chart-0.80.0] - 2026-11-22
+
+### Changed
+
+- Chart 0.80.0 targets core v0.93.0 and renders the `v0.93.0` image tag.
+
 ## [0.92.0] - 2026-11-22
 
 ### Added
