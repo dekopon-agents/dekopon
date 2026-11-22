@@ -7,9 +7,28 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.91.0] - 2026-11-22
+
+### Added
+
+- Report daemon reload, storage sweep, and OAuth record recovery, and log ChatGPT credential loads once per committed change.
+
 ### Changed
 
+- Slack transports default to `experience: agent`; an app installed from `examples/slack/manifest-legacy.yaml` must set `experience: classic`, and `check` refuses `indicators.cancelButton` on a transport that relied on the old default.
+- Dekopon identifies outbound chat, model, telemetry, and secret requests with a versioned User-Agent and disables automatic retries for telemetry and secret requests.
 - `examples/slack/manifest.yaml` is now the Agent profile, paired with `experience: agent`; the classic profile moved to `examples/slack/manifest-legacy.yaml`. Installed apps are unaffected until reinstalled.
+
+### Fixed
+
+- A successful `follow leave` on a Slack Agent thread releases the thread for every sender, so the original requester's unmentioned messages stop waking the agent until a fresh mention.
+- Preserve the gateway prompt cache key across power loss after it is saved.
+
+## [dekopon-chart-0.78.0] - 2026-11-22
+
+### Changed
+
+- Chart 0.78.0 targets core v0.91.0 and renders the `v0.91.0` image tag.
 
 ## [0.90.0] - 2026-11-20
 
