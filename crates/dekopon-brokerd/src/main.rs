@@ -33,7 +33,7 @@ use tokio::signal::unix::{SignalKind, signal};
 #[command(
     name = "dekopon-brokerd",
     version,
-    about = "Run the authenticated broker or manage its provider set"
+    about = "Run the authenticated broker or maintain its providers and storage"
 )]
 struct Cli {
     /// Tokio worker threads (1 to 4096); otherwise TOKIO_WORKER_THREADS or the available CPU count.
@@ -75,6 +75,46 @@ enum Command {
     /// Run startup validation on a configuration without serving: no socket is bound and no
     /// secret source, asset root or storage root is read or created.
     Check(CheckArgs),
+    /// Maintain provider storage with the broker stopped.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Debug, Subcommand)]
+enum StorageCommand {
+    /// Copy the agent database to an unused instance. Run as the broker's UID and pass --config before storage.
+    Copy {
+        /// Provider or shared namespace identifier.
+        #[arg(long)]
+        provider: dekopon_core::ProviderId,
+        /// Source scope.
+        #[arg(long, value_enum)]
+        from: CopySource,
+        /// Destination scope.
+        #[arg(long, value_enum)]
+        to: CopyDestination,
+        /// Agent owning both namespaces.
+        #[arg(long)]
+        agent: dekopon_core::AgentId,
+        /// Principal owning the destination.
+        #[arg(long)]
+        principal: dekopon_core::PrincipalId,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CopySource {
+    Agent,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CopyDestination {
+    Instance,
 }
 
 #[cfg(unix)]
@@ -268,7 +308,7 @@ fn main() -> ExitCode {
     if cli.log.log_file.is_some() {
         match &cli.command {
             None => {}
-            Some(Command::Probe { .. } | Command::Provider(_) | Command::Check(_)) => {
+            Some(_) => {
                 eprintln!("dekopon-brokerd: --log-file is accepted only when serving");
                 return ExitCode::from(2);
             }
@@ -277,7 +317,7 @@ fn main() -> ExitCode {
     if let Some(env_file) = &cli.env_file {
         match &cli.command {
             None => {}
-            Some(Command::Probe { .. } | Command::Provider(_) | Command::Check(_)) => {
+            Some(_) => {
                 eprintln!("dekopon-brokerd: --env-file is accepted only when serving");
                 return ExitCode::from(2);
             }
@@ -322,6 +362,11 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
             ErrorKind::MissingRequiredArgument,
             "--config <PATH> is required when serving the broker",
         )),
+        (Some(Command::Storage { .. }), None) => Err(Cli::command().error(
+            ErrorKind::MissingRequiredArgument,
+            "--config <PATH> is required for storage maintenance",
+        )),
+        (Some(Command::Storage { .. }), Some(_)) => Ok(()),
         (Some(_), Some(_)) => Err(Cli::command().error(
             ErrorKind::ArgumentConflict,
             "--config cannot be used with an offline operator command",
@@ -352,6 +397,17 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
 
 #[cfg(unix)]
 async fn execute(cli: Cli, log: Option<dekopon_telemetry::LogFile>) -> ExitCode {
+    let operator_console = || {
+        Install::new(Console {
+            format: ConsoleFormat::Text {
+                ansi: None,
+                target: true,
+                timestamps: true,
+            },
+            writer: ConsoleWriter::Stderr,
+            filter: ConsoleFilter::Environment("warn".to_owned()),
+        })
+    };
     match cli.command {
         Some(Command::Probe { socket }) => match probe(&socket).await {
             Ok(()) => ExitCode::SUCCESS,
@@ -361,16 +417,7 @@ async fn execute(cli: Cli, log: Option<dekopon_telemetry::LogFile>) -> ExitCode 
             }
         },
         Some(Command::Provider(provider)) => {
-            let install = Install::new(Console {
-                format: ConsoleFormat::Text {
-                    ansi: None,
-                    target: true,
-                    timestamps: true,
-                },
-                writer: ConsoleWriter::Stderr,
-                filter: ConsoleFilter::Environment("warn".to_owned()),
-            });
-            observed(install, execute_provider(provider), None).await
+            observed(operator_console(), execute_provider(provider), None).await
         }
         Some(Command::Check(check)) => {
             let install = Install::new(Console {
@@ -383,6 +430,12 @@ async fn execute(cli: Cli, log: Option<dekopon_telemetry::LogFile>) -> ExitCode 
                 filter: ConsoleFilter::Environment("error".to_owned()),
             });
             observed(install, execute_check(check), None).await
+        }
+        Some(Command::Storage { command }) => {
+            let config = cli
+                .config
+                .expect("validate_cli requires storage configuration");
+            observed(operator_console(), execute_storage(&config, command), None).await
         }
         None => {
             let config = cli
@@ -422,6 +475,37 @@ async fn execute(cli: Cli, log: Option<dekopon_telemetry::LogFile>) -> ExitCode 
             )
             .await
         }
+    }
+}
+
+#[cfg(unix)]
+async fn execute_storage(
+    config: &std::path::Path,
+    command: StorageCommand,
+) -> Result<(), AppError> {
+    let storage = dekopon_brokerd::load_storage_config(config)
+        .await
+        .map_err(AppError::StorageConfig)?
+        .ok_or(AppError::MissingStorage)?;
+    match command {
+        StorageCommand::Copy {
+            provider,
+            from: CopySource::Agent,
+            to: CopyDestination::Instance,
+            agent,
+            principal,
+        } => dekopon_core::offload(move || {
+            dekopon_storage_host::copy_agent_database(
+                &storage.root_path,
+                &storage.limits,
+                &provider,
+                &agent,
+                &principal,
+            )
+        })
+        .await
+        .map_err(AppError::StorageWorker)?
+        .map_err(AppError::StorageCopy),
     }
 }
 
@@ -731,6 +815,14 @@ enum AppError {
     Output(#[source] serde_json::Error),
     #[error("configuration check found {problems} problem(s)")]
     CheckFailed { problems: usize },
+    #[error("could not load the broker configuration for storage maintenance")]
+    StorageConfig(#[source] dekopon_brokerd::ConfigError),
+    #[error("broker configuration has no storage block")]
+    MissingStorage,
+    #[error("storage maintenance worker failed")]
+    StorageWorker(#[source] dekopon_core::OffloadError),
+    #[error("could not copy the agent database")]
+    StorageCopy(#[source] dekopon_storage_host::StorageCopyError),
 }
 
 #[cfg(all(test, unix))]
@@ -764,6 +856,133 @@ mod tests {
     #[test]
     fn cli_definition_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[tokio::test]
+    async fn storage_copy_preserves_the_source_and_refuses_an_existing_instance() {
+        use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
+        use dekopon_storage_host::{
+            ContinuityPolicy, OpenOptions, StorageCopyError, StorageGrantRequest, StorageHost,
+            StorageHostError, StorageLimits,
+        };
+        use std::{os::unix::fs::OpenOptionsExt as _, process::ExitCode};
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
+        let root = dir.join("storage");
+        let config = dir.join("broker.json");
+        let limits = StorageLimits::default();
+        let mut storage = serde_json::to_value(&limits).unwrap();
+        storage["rootPath"] = serde_json::json!(root);
+        let document = serde_json::json!({
+            "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
+            "socketPath": dir.join("broker.sock"),
+            "providers": [dekopon_test_support::provider_fixture("cli-probe-provider.wasm")],
+            "storage": storage,
+        });
+        serde_json::to_writer(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config)
+                .unwrap(),
+            &document,
+        )
+        .unwrap();
+        let command = || {
+            let cli = Cli::try_parse_from([
+                "dekopon-brokerd",
+                "--config",
+                config.to_str().unwrap(),
+                "storage",
+                "copy",
+                "--provider",
+                "turso",
+                "--from",
+                "agent",
+                "--to",
+                "instance",
+                "--agent",
+                "reviewer",
+                "--principal",
+                "alice",
+            ])
+            .unwrap();
+            validate_cli(&cli).unwrap();
+            cli
+        };
+        let grant = |scope, access, surface: &[u8]| {
+            StorageGrantRequest::new(
+                "storage-copy".parse().unwrap(),
+                "turso.exec".parse().unwrap(),
+                "turso".parse().unwrap(),
+                StorageInterface::DurableFiles,
+                access,
+                scope,
+                "reviewer".parse().unwrap(),
+                "drn:slack:user:t0123abc:u9xyz".parse().unwrap(),
+                "slack",
+                "scientist-slack",
+                "d0123abc",
+                "d0123abc",
+                if scope == StorageScope::Agent {
+                    ContinuityPolicy::Paranoid
+                } else {
+                    ContinuityPolicy::Relaxed
+                },
+                surface.to_vec(),
+            )
+            .with_principal("alice".parse().unwrap())
+        };
+        let host = StorageHost::open(&root, limits.clone()).unwrap();
+        for bytes in [b"old".as_slice(), b"current".as_slice()] {
+            let request = grant(StorageScope::Agent, StorageAccess::ReadWrite, bytes);
+            let mut handle = host.begin(host.grant(request).unwrap()).unwrap();
+            let file = handle
+                .vfs_open(
+                    "main.db",
+                    OpenOptions {
+                        write: true,
+                        create_new: true,
+                        ..OpenOptions::default()
+                    },
+                )
+                .unwrap();
+            handle.vfs_write_at(file, 0, bytes).unwrap();
+            handle.vfs_close(file).unwrap();
+            handle.commit().unwrap();
+        }
+        drop(host);
+
+        assert_eq!(super::execute(command(), None).await, ExitCode::SUCCESS);
+        let Some(Command::Storage { command: copy }) = command().command else {
+            panic!("storage command");
+        };
+        assert!(matches!(
+            super::execute_storage(&config, copy).await,
+            Err(super::AppError::StorageCopy(StorageCopyError::Storage(
+                StorageHostError::AlreadyExists
+            )))
+        ));
+
+        let host = StorageHost::open(&root, limits).unwrap();
+        for scope in [StorageScope::Agent, StorageScope::Instance] {
+            let request = grant(scope, StorageAccess::ReadOnly, b"current");
+            let mut handle = host.begin(host.grant(request).unwrap()).unwrap();
+            let file = handle
+                .vfs_open(
+                    "main.db",
+                    OpenOptions {
+                        read: true,
+                        ..OpenOptions::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(handle.vfs_read_at(file, 0, 16).unwrap(), b"current");
+            handle.vfs_close(file).unwrap();
+            handle.finish_read().unwrap();
+        }
     }
 
     #[test]

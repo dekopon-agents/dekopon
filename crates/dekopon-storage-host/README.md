@@ -1,3 +1,4 @@
 # dekopon-storage-host
 
-The broker's storage engine behind provider storage imports: scope-bound namespaces, quotas and writes, independent of Wasmtime.
+Stop the broker and run the storage copy as its UID. Keep source retention set to `keep` for
+rollback. See `dekopon-brokerd storage copy --help`.
