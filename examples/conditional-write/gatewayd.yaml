@@ -25,7 +25,7 @@ transports:
     # missing variable is reported by name. ../slack/ holds the app manifests.
     appTokenEnv: DEKOPON_GATEWAYD_SLACK_APP_TOKEN
     botTokenEnv: DEKOPON_GATEWAYD_SLACK_BOT_TOKEN
-    # This example uses examples/slack/manifest-agent.yaml. Agent DMs are thread-scoped; if the
+    # This example uses examples/slack/manifest.yaml. Agent DMs are thread-scoped; if the
     # workspace plan/admin disables Agent status, the fixed tangerine reaction is used instead.
     experience: agent
     indicators:

@@ -14,7 +14,7 @@ use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
-use super::{SourceError, classified};
+use super::{SourceError, classified, classify_http_failure};
 
 const RECORD_BYTES: usize = 64 * 1024;
 const CYCLE: u64 = 22 * 60 * 60;
@@ -580,16 +580,10 @@ async fn post(
         ("client_id", client_id),
     ]);
     tokio::time::timeout(timeout, async {
-        let response = request.send().await.map_err(|source| {
-            classified(
-                if source.is_timeout() {
-                    SourceError::Timeout
-                } else {
-                    SourceError::Transport
-                },
-                &source,
-            )
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|source| classify_http_failure(&source))?;
         let status = response.status();
         if !super::headers_within_limits(&response) {
             return Err(SourceError::TooLarge);
@@ -597,16 +591,7 @@ async fn post(
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|source| {
-                classified(
-                    if source.is_timeout() {
-                        SourceError::Timeout
-                    } else {
-                        SourceError::Transport
-                    },
-                    &source,
-                )
-            })?;
+            let chunk = chunk.map_err(|source| classify_http_failure(&source))?;
             if body.len().saturating_add(chunk.len()) > RECORD_BYTES {
                 return Err(SourceError::Malformed);
             }
@@ -635,18 +620,29 @@ async fn post(
     .map_err(|source| classified(SourceError::Timeout, &source))?
 }
 
-pub(super) fn inspect_boot(path: &Path, uid: u32, credential: &SecretDrn) {
+pub(super) enum RecordInspection {
+    Missing,
+    Invalid,
+    Valid,
+}
+
+pub(super) fn inspect_boot(path: &Path, uid: u32, credential: &SecretDrn) -> RecordInspection {
     match read_record(path, uid) {
         Ok(OAuth2Record::Sealed { since, cause, .. }) => {
             tracing::info!(target: "dekopon_brokerd::audit", { audit.event = "broker.credential.sealed", credential = %credential, since, cause = cause.label(), instruction = "provide a new seed" }, "broker.credential.sealed");
+            RecordInspection::Valid
         }
         Err(SourceError::Io)
             if std::fs::symlink_metadata(path)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
-        Err(error) => {
-            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category(), instruction = "delete the record and provide a new seed", "broker.credential.record.invalid")
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            RecordInspection::Missing
         }
-        Ok(OAuth2Record::Live { .. }) => {}
+        Err(error) => {
+            tracing::error!(event = "broker_credential_record_invalid", credential = %credential, category = error.category(), instruction = "delete the record and provide a new seed", "broker.credential.record.invalid");
+            RecordInspection::Invalid
+        }
+        Ok(OAuth2Record::Live { .. }) => RecordInspection::Valid,
     }
 }
 

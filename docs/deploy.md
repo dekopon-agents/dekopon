@@ -133,10 +133,9 @@ administrator:
 
 ## Slack
 
-1. Create the app from [`manifest-agent.yaml`](../examples/slack/manifest-agent.yaml) with the
-   transport's `experience: agent`. When the workspace plan or admin policy doesn't allow Slack's
-   Agent features, use [`manifest.yaml`](../examples/slack/manifest.yaml) with the default
-   `experience: classic`.
+1. Create the app from [`manifest.yaml`](../examples/slack/manifest.yaml). Without Slack's Agent
+   features, [`manifest-legacy.yaml`](../examples/slack/manifest-legacy.yaml) with the transport's
+   `experience: classic` keeps a Stop button.
 2. Generate an app-level token (`xapp-…`) with the `connections:write` scope, which no manifest can
    declare, then install the app for its bot token (`xoxb-…`).
 3. Put both in the gateway's environment under the names `appTokenEnv` and `botTokenEnv` give: its

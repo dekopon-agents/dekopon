@@ -3708,6 +3708,7 @@ async fn session_turn(
             && leave_request.load(std::sync::atomic::Ordering::Acquire)
             && let Some(table) = runner.follow.as_ref()
         {
+            release_thread_ownership(runner, message);
             let table = Arc::clone(table);
             let follow_key = crate::follow::follow_key(
                 &route.transport,
@@ -3981,6 +3982,16 @@ fn claim_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
     };
     if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
         ownership.claim(continuation.claim.clone());
+    }
+}
+
+// A leave ends continuation for every sender in the thread, so only a fresh mention wakes the agent.
+fn release_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
+    let Some(continuation) = &message.thread_continuation else {
+        return;
+    };
+    if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
+        ownership.release_thread(&continuation.claim);
     }
 }
 

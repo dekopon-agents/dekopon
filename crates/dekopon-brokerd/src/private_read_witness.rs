@@ -10,6 +10,7 @@ use dekopon_core::FileHygieneError;
 struct State {
     reads: usize,
     last_bytes: Vec<u8>,
+    replacement: Option<PathBuf>,
 }
 
 fn registry() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<State>>>> {
@@ -41,6 +42,10 @@ impl TrackedRead {
         self.state.lock().unwrap().last_bytes.clone()
     }
 
+    pub(crate) fn replace_after_next_read(&self, replacement: PathBuf) {
+        self.state.lock().unwrap().replacement = Some(replacement);
+    }
+
     pub(crate) fn reset(&self) {
         *self.state.lock().unwrap() = State::default();
     }
@@ -59,6 +64,9 @@ pub(crate) fn record(path: &Path, result: &Result<Vec<u8>, FileHygieneError>) {
         state.reads += 1;
         if let Ok(bytes) = result {
             state.last_bytes.clone_from(bytes);
+        }
+        if let Some(replacement) = state.replacement.take() {
+            std::fs::rename(replacement, path).unwrap();
         }
     }
 }

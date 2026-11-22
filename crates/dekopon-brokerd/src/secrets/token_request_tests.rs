@@ -75,8 +75,15 @@ async fn resolver(root: &Path, endpoint: &str) -> MapResolver {
             ResolvedEntry {
                 source,
                 projection: Projection::default(),
-                client: kubernetes_client(root, "ca.crt").await.expect("cluster CA"),
+                client: kubernetes_client(
+                    root,
+                    "ca.crt",
+                    Duration::from_millis(super::DEFAULT_TIMEOUT_MS),
+                )
+                .await
+                .expect("cluster CA"),
                 minted: None,
+                record_invalid: Default::default(),
             },
         )]),
         expected_uid: rustix::process::geteuid().as_raw(),

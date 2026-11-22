@@ -3,7 +3,10 @@ use std::{
     fmt,
     num::NonZeroU64,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -19,6 +22,7 @@ use dekopon_core::{
     CapabilityId, FileHygieneError, FileTier, Redacted, SecretDrn, SecretSinkKind, offload,
     read_trusted_file,
 };
+use dekopon_telemetry::egress::{Timeout, client_builder};
 use futures_util::StreamExt as _;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use reqwest::{Method, Url, header};
@@ -54,6 +58,7 @@ pub const HARD_MAX_SECRETS: usize = 256;
 pub const HARD_MAX_SECRET_BYTES: usize = dekopon_http_host::MAX_CREDENTIAL_BYTES;
 pub const HARD_MAX_SOURCE_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_BOOTSTRAP_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_DOCUMENT_SCALAR_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_RESPONSE_HEADERS: usize = 128;
@@ -339,6 +344,7 @@ struct ResolvedEntry {
     projection: Projection,
     client: reqwest::Client,
     minted: Option<Arc<Minted>>,
+    record_invalid: OnceLock<Arc<AtomicBool>>,
 }
 
 enum Minted {
@@ -363,6 +369,25 @@ struct MapResolver {
     expected_uid: u32,
 }
 
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct RecordInspectionKey([u8; 32]);
+
+impl RecordInspectionKey {
+    fn of(drn: &SecretDrn, path: &Path) -> Self {
+        Self(
+            Sha256::new()
+                .chain_update(drn.as_str().len().to_le_bytes())
+                .chain_update(drn.as_str())
+                .chain_update(path.as_os_str().as_encoded_bytes())
+                .finalize()
+                .into(),
+        )
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct DiscardedRecordMarkers(BTreeMap<RecordInspectionKey, Arc<AtomicBool>>);
+
 #[derive(Clone, Default)]
 pub(crate) struct ScheduledCatalog {
     resolver: Option<Arc<MapResolver>>,
@@ -377,19 +402,99 @@ impl ScheduledCatalog {
         }
     }
 
-    pub(crate) async fn inspect_records(&self) {
+    fn entry(&self, drn: &SecretDrn) -> Option<&ResolvedEntry> {
+        self.resolver.as_ref()?.entries.get(drn)
+    }
+
+    pub(crate) fn inherit_record_markers(&self, active: &Self, discarded: &DiscardedRecordMarkers) {
         let Some(resolver) = &self.resolver else {
             return;
         };
         for (drn, entry) in &resolver.entries {
             if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
+                // A discard can take the candidate before its inspection has marked the record.
+                entry.record_invalid.get_or_init(|| {
+                    let active_marker = active.entry(drn).and_then(|prior| {
+                        if let SecretSource::OAuth2Refresh {
+                            record_path: prior_path,
+                            ..
+                        } = &prior.source
+                            && prior_path == record_path
+                        {
+                            return prior.record_invalid.get();
+                        }
+                        None
+                    });
+                    active_marker
+                        .or_else(|| discarded.0.get(&RecordInspectionKey::of(drn, record_path)))
+                        .cloned()
+                        .unwrap_or_default()
+                });
+            }
+        }
+    }
+
+    pub(crate) fn retain_discarded_record_markers(&self, discarded: &mut DiscardedRecordMarkers) {
+        let Some(resolver) = &self.resolver else {
+            return;
+        };
+        let markers: BTreeMap<_, _> = resolver
+            .entries
+            .iter()
+            .filter_map(|(drn, entry)| {
+                if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
+                    let marker = entry.record_invalid.get()?;
+                    return Some((
+                        RecordInspectionKey::of(drn, record_path),
+                        Arc::clone(marker),
+                    ));
+                }
+                None
+            })
+            .collect();
+        if !markers.is_empty() {
+            discarded.0 = markers;
+        }
+    }
+
+    pub(crate) async fn inspect_records(&self, generation: Option<&str>) {
+        let Some(resolver) = &self.resolver else {
+            return;
+        };
+        for (drn, entry) in &resolver.entries {
+            if let SecretSource::OAuth2Refresh { record_path, .. } = &entry.source {
+                let invalid = Arc::clone(entry.record_invalid.get_or_init(Arc::default));
                 let path = record_path.clone();
-                let drn = drn.clone();
+                let credential = drn.clone();
                 let uid = resolver.expected_uid;
+                let generation = generation.map(str::to_owned);
                 let trace = OffloadTrace::capture(None);
-                if offload(move || trace.in_scope(|| oauth2::inspect_boot(&path, uid, &drn)))
-                    .await
-                    .is_err()
+                if offload(move || {
+                    trace.in_scope(|| match oauth2::inspect_boot(&path, uid, &credential) {
+                        oauth2::RecordInspection::Valid => {
+                            if let Some(generation) = generation
+                                && invalid.swap(false, Ordering::Relaxed)
+                            {
+                                let digest: String = Sha256::digest(credential.as_str())
+                                    .iter()
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect();
+                                tracing::info!(
+                                    event = "broker_credential_record_recovered",
+                                    generation.digest = generation,
+                                    credential.digest = %digest,
+                                    "broker.credential.record.recovered"
+                                );
+                            }
+                        }
+                        oauth2::RecordInspection::Invalid => {
+                            invalid.store(true, Ordering::Relaxed);
+                        }
+                        oauth2::RecordInspection::Missing => {}
+                    });
+                })
+                .await
+                .is_err()
                 {
                     tracing::error!(
                         event = "broker_credential_record_inspection_failed",
@@ -397,6 +502,35 @@ impl ScheduledCatalog {
                     );
                 }
             }
+        }
+    }
+
+    pub(crate) fn mark_record_invalid(&self, drn: &SecretDrn) {
+        if let Some(entry) = self.entry(drn) {
+            entry
+                .record_invalid
+                .get_or_init(Arc::default)
+                .store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn log_chatgpt_loads(&self, previous: Option<&Self>) {
+        let Some(resolver) = &self.resolver else {
+            return;
+        };
+        for (drn, entry) in &resolver.entries {
+            let Some(Minted::Chatgpt(source)) = entry.minted.as_deref() else {
+                continue;
+            };
+            let before = previous
+                .and_then(|catalog| catalog.entry(drn))
+                .and_then(|entry| entry.minted.as_deref());
+            if let Some(Minted::Chatgpt(before)) = before
+                && source.same_generation(before)
+            {
+                continue;
+            }
+            source.log_loaded();
         }
     }
 
@@ -1577,7 +1711,7 @@ pub(crate) struct LoadedMap {
     pub(crate) bytes: Vec<u8>,
     pub(crate) scheduled: ScheduledCatalog,
     pub(crate) chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
-    pub(crate) key_digest: [u8; 32],
+    pub(crate) minted_digest: [u8; 32],
 }
 
 pub(crate) async fn load_with_bytes(
@@ -1591,7 +1725,7 @@ pub(crate) async fn load_with_bytes(
         bytes,
         scheduled: validated.scheduled,
         chatgpt: validated.chatgpt,
-        key_digest: validated.key_digest,
+        minted_digest: validated.minted_digest,
     })
 }
 
@@ -1892,11 +2026,14 @@ async fn validate_map(
         .map_err(|_join| SecretMapError::Validation {
             problems: vec!["minted secret sources could not be opened".to_owned()],
         })??;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .build()
-        .map_err(|source| SecretMapError::Client { source })?;
+    let client = client_builder(
+        reqwest::Client::builder(),
+        Timeout::Request(Duration::from_millis(MAX_TIMEOUT_MS)),
+        crate::EGRESS_USER_AGENT,
+        [],
+    )
+    .build()
+    .map_err(|source| SecretMapError::Client { source })?;
     let mut resolved_entries = BTreeMap::new();
     for (drn, (source, projection)) in entries {
         let minted_source = minted.sources.remove(&drn);
@@ -1904,8 +2041,9 @@ async fn validate_map(
             SecretSource::KubernetesTokenRequest {
                 bootstrap_root,
                 ca_key,
+                timeout_ms,
                 ..
-            } => kubernetes_client(bootstrap_root, ca_key)
+            } => kubernetes_client(bootstrap_root, ca_key, Duration::from_millis(*timeout_ms))
                 .await
                 .map_err(|source| SecretMapError::Source { source })?,
             _ => client.clone(),
@@ -1917,6 +2055,7 @@ async fn validate_map(
                 projection,
                 client,
                 minted: minted_source,
+                record_invalid: OnceLock::new(),
             },
         );
     }
@@ -1934,7 +2073,7 @@ async fn validate_map(
             resolver: Some(resolver),
         },
         chatgpt: minted.chatgpt,
-        key_digest: minted.key_digest,
+        minted_digest: minted.minted_digest,
     })
 }
 
@@ -1942,13 +2081,13 @@ struct ValidatedMap {
     catalog: SecretCatalog,
     scheduled: ScheduledCatalog,
     chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
-    key_digest: [u8; 32],
+    minted_digest: [u8; 32],
 }
 
 struct MintedSources {
     sources: BTreeMap<SecretDrn, Arc<Minted>>,
     chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
-    key_digest: [u8; 32],
+    minted_digest: [u8; 32],
 }
 
 fn mint_sources(
@@ -1958,11 +2097,13 @@ fn mint_sources(
     let mut problems = Vec::new();
     let mut sources = BTreeMap::new();
     let mut chatgpt = Vec::new();
-    let mut keys = Sha256::new();
+    let mut minted_digest = Sha256::new();
     for (drn, source) in minting {
         let opened = match source {
             SecretSource::ChatgptSubscription { auth_file } => {
                 chatgpt::ChatGptSubscription::open(&drn, &auth_file, expected_uid).map(|source| {
+                    minted_digest.update([1]);
+                    minted_digest.update(source.auth_digest());
                     chatgpt.push(source.file());
                     Minted::Chatgpt(source)
                 })
@@ -1977,7 +2118,7 @@ fn mint_sources(
                 &drn,
                 &private_key,
                 expected_uid,
-                &mut keys,
+                &mut minted_digest,
                 Installation {
                     app_id,
                     installation_id,
@@ -2016,7 +2157,7 @@ fn mint_sources(
     Ok(MintedSources {
         sources,
         chatgpt,
-        key_digest: keys.finalize().into(),
+        minted_digest: minted_digest.finalize().into(),
     })
 }
 
@@ -2024,7 +2165,7 @@ fn open_github_app(
     drn: &SecretDrn,
     private_key: &Path,
     expected_uid: u32,
-    keys: &mut Sha256,
+    minted_digest: &mut Sha256,
     installation: Installation,
 ) -> Result<GithubAppCredential, String> {
     let pem = read_trusted_file(
@@ -2043,36 +2184,45 @@ fn open_github_app(
             dekopon_core::error_chain(&source)
         )
     })?;
-    keys.update(pem.len().to_le_bytes());
-    keys.update(&pem);
+    minted_digest.update([0]);
+    minted_digest.update(pem.len().to_le_bytes());
+    minted_digest.update(&pem);
     let key = GithubAppKey::from_pem(&pem)
         .map_err(|source| format!("{drn} privateKey {}: {source}", private_key.display()))?;
-    GithubAppCredential::new(drn.to_string(), installation, key)
-        .map_err(|source| format!("{drn} could not be built: {source}"))
+    GithubAppCredential::new(drn.to_string(), installation, key).map_err(|source| {
+        format!(
+            "{drn} could not be built: {}",
+            dekopon_core::error_chain(&source)
+        )
+    })
 }
 
-async fn kubernetes_client(root: &Path, ca_key: &str) -> Result<reqwest::Client, SourceError> {
+async fn kubernetes_client(
+    root: &Path,
+    ca_key: &str,
+    timeout: Duration,
+) -> Result<reqwest::Client, SourceError> {
     let pem = read_kubernetes_projection(root, ca_key).await?;
     let certificates = reqwest::Certificate::from_pem_bundle(&pem)
         .map_err(|source| classified(SourceError::Config, &source))?;
     if certificates.is_empty() {
         return Err(SourceError::Config);
     }
-    let mut builder = reqwest::Client::builder()
-        .https_only(true)
-        .tls_built_in_root_certs(false)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy();
-    for certificate in certificates {
-        builder = builder.add_root_certificate(certificate);
-    }
-    builder
-        .build()
-        .map_err(|source| classified(SourceError::Config, &source))
+    client_builder(
+        reqwest::Client::builder()
+            .https_only(true)
+            .tls_built_in_root_certs(false),
+        Timeout::Request(timeout),
+        crate::EGRESS_USER_AGENT,
+        certificates,
+    )
+    .build()
+    .map_err(|source| classified(SourceError::Config, &source))
 }
 
 fn validate_timeout(value: u64) -> Result<(), &'static str> {
-    (value > 0 && value <= 120_000)
+    (1..=MAX_TIMEOUT_MS)
+        .contains(&value)
         .then_some(())
         .ok_or("timeout must be between 1 and 120000 milliseconds")
 }
@@ -2299,7 +2449,7 @@ async fn bounded_json(
     let response = timeout_at(deadline, request.send())
         .await
         .map_err(|source| classified(SourceError::Timeout, &source))?
-        .map_err(|source| classified(SourceError::Transport, &source))?;
+        .map_err(|source| classify_http_failure(&source))?;
     if !response.status().is_success() {
         tracing::debug!(
             event = "secret_source_cause_classified",
@@ -2329,7 +2479,7 @@ async fn bounded_json(
         .await
         .map_err(|source| classified(SourceError::Timeout, &source))?
     {
-        let chunk = chunk.map_err(|source| classified(SourceError::Transport, &source))?;
+        let chunk = chunk.map_err(|source| classify_http_failure(&source))?;
         if bytes.len().saturating_add(chunk.len()) > HARD_MAX_SOURCE_RESPONSE_BYTES {
             return Err(SourceError::TooLarge);
         }
@@ -2698,6 +2848,15 @@ fn io_cause<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a std:
         source = current.source();
     }
     None
+}
+
+fn classify_http_failure(source: &reqwest::Error) -> SourceError {
+    let error = if source.is_timeout() {
+        SourceError::Timeout
+    } else {
+        SourceError::Transport
+    };
+    classified(error, source)
 }
 
 fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> SourceError {
@@ -3319,6 +3478,102 @@ secrets:
                 .any(|problem| problem.contains("is also a backend bootstrap credential")),
             "{problems:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn chatgpt_credential_load_is_reported_only_at_boot_and_when_a_change_commits() {
+        use crate::tests::{ManagedBroker, candidate_or_refusal, write_config, write_owner_only};
+        use dekopon_broker_protocol::GenerationOutcome;
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::prelude::*;
+
+        let broker = ManagedBroker::gateway();
+        broker.publish_lock('1');
+        let directory = broker.directory.path().canonicalize().unwrap();
+        let auth = directory.join("auth.json");
+        let before = chatgpt_auth_document();
+        write_owner_only(&auth, before.as_bytes());
+        const ROTATED: &str = "rotated-fixture-refresh-token";
+        const BEFORE_EXPIRY: &str = "4102444800000";
+        const AFTER_EXPIRY: &str = "4102444800001";
+        let rotated = before
+            .replace("fixture-refresh-token", ROTATED)
+            .replace(BEFORE_EXPIRY, AFTER_EXPIRY);
+        let replacement = directory.join("replacement.json");
+        write_owner_only(&replacement, rotated.as_bytes());
+        let reads = crate::private_read_witness::TrackedRead::new(&auth);
+        reads.replace_after_next_read(replacement);
+
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(broker.config()).unwrap()).unwrap();
+        config["secretMapPath"] = serde_json::json!("map.yaml");
+        config["capabilities"]["cli-probe"]["constraints"]["http"] = serde_json::json!({
+            "allowedHosts": ["chatgpt.com"], "allowedMethods": ["POST"], "maxRequests": 1,
+            "maxRequestBytes": 1024, "maxResponseBytes": 1024
+        });
+        write_config(&broker.config(), &config);
+        let entry = format!(
+            "  - drn: drn:secret:chatgpt/image\n    destinations: [chatgpt.com]\n    source: {{ kind: chatgptSubscription, authFile: {} }}\n",
+            auth.display()
+        );
+        let map = minted_map(&entry).replace("http-probe.fetch", "cli-probe.upper");
+        write_owner_only(&directory.join("map.yaml"), map.as_bytes());
+
+        let capture = dekopon_test_support::CaptureLayer::new();
+        let loaded = || {
+            capture.events_where(
+                "dekopon_brokerd",
+                &[("event", "broker_chatgpt_credential_loaded")],
+            )
+        };
+        async {
+            let (candidate, report) =
+                candidate_or_refusal(&broker.config(), crate::Mode::Boot).await;
+            assert!(report.problems.is_empty(), "{report:?}");
+            let owner = crate::Coordination::new(broker.config(), candidate.unwrap());
+            let digest = owner.active().digest.clone();
+            assert_eq!(loaded().len(), 1);
+            assert_eq!(loaded()[0].field("expires_at"), Some(BEFORE_EXPIRY));
+            assert_eq!(std::fs::read(&auth).unwrap(), rotated.as_bytes());
+            assert_eq!(
+                owner.prepare(&digest, uid()).await,
+                (digest.clone(), GenerationOutcome::Prepared)
+            );
+            assert_eq!(loaded().len(), 1);
+            assert_eq!(owner.abort(&digest, uid()), GenerationOutcome::Aborted);
+            assert_eq!(loaded().len(), 1);
+            assert_eq!(
+                owner.prepare(&digest, uid()).await,
+                (digest.clone(), GenerationOutcome::Prepared)
+            );
+            assert_eq!(owner.commit(&digest, uid()), GenerationOutcome::Applied);
+            for _ in 0..10 {
+                assert_eq!(
+                    owner.prepare(&digest, uid()).await,
+                    (digest.clone(), GenerationOutcome::Active)
+                );
+            }
+        }
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+
+        assert_eq!(reads.count(), 13);
+        let events = loaded();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].field("expires_at"), Some(AFTER_EXPIRY));
+        for event in events {
+            assert_eq!(event.field("credential"), Some("drn:secret:chatgpt/image"));
+            assert_eq!(event.field("path"), auth.to_str());
+        }
+        let captured = capture.text();
+        let fixture: serde_json::Value = serde_json::from_str(&before).unwrap();
+        for secret in [
+            "fixture-refresh-token",
+            ROTATED,
+            fixture["access"].as_str().unwrap(),
+        ] {
+            assert!(!captured.contains(secret));
+        }
     }
 
     #[tokio::test]

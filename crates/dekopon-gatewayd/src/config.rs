@@ -73,8 +73,8 @@ pub enum LivenessMode {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum SlackExperience {
-    #[default]
     Classic,
+    #[default]
     Agent,
 }
 
@@ -1493,6 +1493,10 @@ impl RawCandidate {
             }
         }
         Self(hasher.finalize().into())
+    }
+
+    pub(crate) fn digest(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     pub(crate) fn refusing(self, refusal: &str) -> Self {
@@ -4487,6 +4491,28 @@ routes:
                 }
             )));
         }
+    }
+
+    #[test]
+    fn a_slack_transport_defaults_to_agent_and_only_classic_takes_a_stop_button() {
+        let slack = "transports:\n  - name: slack\n    kind: slackSocketMode\n    appTokenEnv: A\n    botTokenEnv: B\n";
+        let route =
+            "routes:\n  - transport: slack\n    conversation: { kind: any }\n    agent: reviewer\n";
+        let stop = "    indicators: { mode: native, cancelButton: true }\n";
+        assert!(matches!(
+            resolved(&format!("{slack}{route}")).unwrap().transports[0],
+            super::TransportConfig::SlackSocketMode {
+                experience: super::SlackExperience::Agent,
+                ..
+            }
+        ));
+        assert!(matches!(
+            resolved(&format!("{slack}{stop}{route}")),
+            Err(ConfigError::Invalid { problems, .. })
+            if problems.iter().any(|p| matches!(p, super::ConfigProblem::UnsupportedRouteIndicator { route: 0, surface: "cancelButton", .. }))
+        ));
+        resolved(&format!("{slack}    experience: classic\n{stop}{route}"))
+            .expect("classic renders a message-backed Stop button");
     }
 
     #[test]

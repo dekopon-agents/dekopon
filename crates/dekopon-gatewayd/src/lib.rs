@@ -87,6 +87,7 @@ use crate::{
 
 pub const OTEL_TRACE_FILTER: &str = "dekopon_gatewayd=trace,dekopon_agent=trace,dekopon_process=trace,dekopon_shell=trace,dekopon_model=trace,gateway=debug,prompt=debug,model=debug,asset=debug,shell=debug,job=debug,broker=debug,provider=debug,http=debug,credential=debug,memory=debug,telemetry=debug,hyper=off,h2=off,reqwest=off,tungstenite=off,tokio_tungstenite=off";
 
+const EGRESS_USER_AGENT: &str = concat!("dekopon-gatewayd/", env!("CARGO_PKG_VERSION"));
 const INBOUND_BUFFER: usize = 64;
 const ONE_SHOT_ASSET_IDLE: Duration = Duration::from_secs(60 * 60);
 

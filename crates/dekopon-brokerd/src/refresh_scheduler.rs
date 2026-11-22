@@ -80,6 +80,7 @@ where
                 }
                 Ok(Err(error)) => {
                     if unreadable.insert(path.clone()) && !new_generation {
+                        current.mark_record_invalid(&drn);
                         tracing::error!(event = "broker_credential_record_invalid", credential = %drn, category = error.category(), instruction = "delete the record and provide a new seed", "broker.credential.record.invalid");
                     }
                     false
