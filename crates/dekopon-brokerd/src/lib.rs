@@ -291,6 +291,13 @@ where
         tracing::info!(event = "broker_stopped", "broker.stopped");
     }
     reload_stop?;
+    let drained = match drained {
+        self_reload::Drained::Failed(cause) => return Err(cause),
+        self_reload::Drained::Clean => Ok(()),
+        self_reload::Drained::Elapsed => Err(BrokerdError::ReloadTask(
+            dekopon_core::TaskOutcome::Cancelled,
+        )),
+    };
     result?;
     cleanup?;
     drained

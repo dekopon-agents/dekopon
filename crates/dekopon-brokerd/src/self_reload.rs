@@ -30,15 +30,23 @@ pub(crate) async fn reload_ended(task: &mut JoinSet<BrokerStop>) -> Result<(), B
     }
 }
 
+pub(crate) enum Drained {
+    Clean,
+    Failed(BrokerdError),
+    Elapsed,
+}
+
 pub(crate) async fn drain_bounded(
     deadline: &ShutdownDeadline,
     grace: Duration,
     task: &mut JoinSet<BrokerStop>,
-) -> Result<(), BrokerdError> {
+) -> Drained {
     let until = deadline.start(grace);
-    timeout_at(until, drain_reload(task))
-        .await
-        .unwrap_or(Err(BrokerdError::ReloadTask(TaskOutcome::Cancelled)))
+    match timeout_at(until, drain_reload(task)).await {
+        Ok(Ok(())) => Drained::Clean,
+        Ok(Err(cause)) => Drained::Failed(cause),
+        Err(_) => Drained::Elapsed,
+    }
 }
 
 async fn drain_reload(task: &mut JoinSet<BrokerStop>) -> Result<(), BrokerdError> {

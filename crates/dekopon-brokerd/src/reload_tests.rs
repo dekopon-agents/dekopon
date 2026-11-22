@@ -131,6 +131,33 @@ async fn a_reload_panic_that_races_shutdown_still_stops_the_broker_with_its_caus
     ));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_reload_panic_that_races_shutdown_outranks_a_drain_that_outlives_the_grace() {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let deadline = ShutdownDeadline::default();
+    deadline.start(Duration::ZERO);
+    let (panicking, panicked) = oneshot::channel::<()>();
+    let task = tokio::spawn(crate::serve_with_reload(
+        broker.config(),
+        async {
+            drop(panicked.await);
+        },
+        deadline,
+        |_, _| {
+            Some(async move {
+                panicking.send(()).expect("shutdown is waiting");
+                panics().await
+            })
+        },
+    ));
+
+    assert!(matches!(
+        stopped_within(task).await,
+        Err(BrokerdError::ReloadTask(TaskOutcome::Panicked))
+    ));
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn the_broker_reload_drain_gets_no_fresh_grace() {
     let grace = Duration::from_secs(5);
@@ -143,9 +170,6 @@ async fn the_broker_reload_drain_gets_no_fresh_grace() {
 
     let drained = self_reload::drain_bounded(&deadline, grace, &mut reload).await;
 
-    assert!(matches!(
-        drained,
-        Err(BrokerdError::ReloadTask(TaskOutcome::Cancelled))
-    ));
+    assert!(matches!(drained, self_reload::Drained::Elapsed));
     assert_eq!(tokio::time::Instant::now(), drained_at);
 }
