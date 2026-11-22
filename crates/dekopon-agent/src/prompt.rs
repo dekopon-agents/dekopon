@@ -294,22 +294,21 @@ pub struct PromptOutcome {
     pub suggestions: Vec<ImprovementSuggestion>,
 }
 
-pub fn run_prompt<M, R>(
-    model: &M,
+pub fn run_prompt<R>(
+    model: &dyn ChatModel,
     runtime: &R,
     prompt: &str,
     system: Option<&str>,
     limits: PromptLimits,
 ) -> Result<PromptOutcome, PromptError>
 where
-    M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
     run_prompt_with_history(model, runtime, prompt, system, limits, &[]).0
 }
 
-pub fn run_prompt_with_history<M, R>(
-    model: &M,
+pub fn run_prompt_with_history<R>(
+    model: &dyn ChatModel,
     runtime: &R,
     prompt: &str,
     system: Option<&str>,
@@ -317,7 +316,6 @@ pub fn run_prompt_with_history<M, R>(
     prior: &[ModelMessage],
 ) -> (Result<PromptOutcome, PromptError>, Option<CapturedTurn>)
 where
-    M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
     run_prompt_with_history_and_options(
@@ -335,8 +333,8 @@ where
     clippy::too_many_arguments,
     reason = "reshaped by the unit that next rewrites this"
 )]
-pub fn run_prompt_with_history_and_options<M, R>(
-    model: &M,
+pub fn run_prompt_with_history_and_options<R>(
+    model: &dyn ChatModel,
     runtime: &R,
     prompt: &str,
     system: Option<&str>,
@@ -345,7 +343,6 @@ pub fn run_prompt_with_history_and_options<M, R>(
     options: &CompletionOptions,
 ) -> (Result<PromptOutcome, PromptError>, Option<CapturedTurn>)
 where
-    M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
     run_prompt_session(
@@ -617,14 +614,13 @@ struct SessionExtensions<'a> {
     native_asset_bytes: usize,
 }
 
-pub fn run_prompt_session<M, R>(
-    model: &M,
+pub fn run_prompt_session<R>(
+    model: &dyn ChatModel,
     runtime: &R,
     inputs: SessionInputs<'_>,
     prior: &[ModelMessage],
 ) -> (Result<PromptOutcome, PromptError>, Option<CapturedTurn>)
 where
-    M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
     let SessionInputs {
@@ -717,15 +713,14 @@ where
     (result, Some(record.finish()))
 }
 
-fn run_session<M, R>(
-    model: &M,
+fn run_session<R>(
+    model: &dyn ChatModel,
     runtime: &R,
     messages: Vec<ModelMessage>,
     limits: PromptLimits,
     extensions: SessionExtensions<'_>,
 ) -> Result<PromptOutcome, PromptError>
 where
-    M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
     let progress = extensions.progress;
@@ -765,8 +760,8 @@ fn emit(progress: Option<&dyn ProgressSink>, event: ProgressEvent) {
     }
 }
 
-fn run_turns<M, R>(
-    model: &M,
+fn run_turns<R>(
+    model: &dyn ChatModel,
     runtime: &R,
     messages: Vec<ModelMessage>,
     limits: PromptLimits,
@@ -774,7 +769,6 @@ fn run_turns<M, R>(
     mut lease: MailboxLease<'_>,
 ) -> Result<PromptOutcome, PromptError>
 where
-    M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
     let result = turns(model, runtime, messages, limits, extensions, &mut lease);
@@ -788,8 +782,8 @@ where
     clippy::too_many_lines,
     reason = "reshaped by the unit that next rewrites this"
 )]
-fn turns<M, R>(
-    model: &M,
+fn turns<R>(
+    model: &dyn ChatModel,
     runtime: &R,
     mut messages: Vec<ModelMessage>,
     limits: PromptLimits,
@@ -797,7 +791,6 @@ fn turns<M, R>(
     lease: &mut MailboxLease<'_>,
 ) -> Result<PromptOutcome, PromptError>
 where
-    M: ChatModel + ?Sized,
     R: ScriptRuntime + ?Sized,
 {
     let SessionExtensions {
