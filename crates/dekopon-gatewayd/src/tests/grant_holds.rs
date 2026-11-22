@@ -1,11 +1,13 @@
 use super::*;
 use dekopon_agent::BrokerLeg;
-use dekopon_agent::grant::{GrantRefusal, SessionGrants};
+use dekopon_agent::grant::{
+    GrantLedger, GrantLedgerFailed, GrantRefusal, GrantRelease, SessionGrants,
+};
 use dekopon_core::VmSession;
 use dekopon_model_token_governor::{
     Budget, Call, Estimate, MeterSpec, Metering, Tokens, UnixMillis, Via,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const AGENT: &str = "astra";
 const MODEL: &str = "claude-ultra";
@@ -188,5 +190,84 @@ async fn a_carve_the_budget_cannot_cover_is_refused_before_the_vm_runs() {
     );
     let refused = vm.exec(&leg, session("01937b2e-7d1a-7c3e-8f00-000000000003"), 1);
     assert!(matches!(refused, Err(GrantRefusal::Budget(refusal)) if refusal.remaining == 0));
+    leg.grants().unwrap().release_all();
+    let zero = vm.exec(&leg, session(SESSION_A), 0);
+    assert!(matches!(zero, Err(GrantRefusal::Budget(_))));
     assert_eq!(vm.runs(), 2);
+}
+
+struct PausedLedger {
+    entered: std::sync::mpsc::SyncSender<()>,
+    verdicts: Mutex<std::sync::mpsc::Receiver<Result<(), GrantLedgerFailed>>>,
+}
+
+impl GrantLedger for PausedLedger {
+    fn carved(
+        &self,
+        _: &dekopon_core::AgentId,
+        _: &VmSession,
+        _: &str,
+        _: Tokens,
+    ) -> Result<(), GrantLedgerFailed> {
+        self.entered.send(()).unwrap();
+        self.verdicts.lock().recv().unwrap()
+    }
+
+    fn tallied(&self, _: &VmSession, _: Tokens) -> Result<(), GrantLedgerFailed> {
+        Ok(())
+    }
+
+    fn released(&self, _: &VmSession, _: GrantRelease) -> Result<(), GrantLedgerFailed> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_same_session_carve_waits_for_the_ledger_and_cannot_reuse_a_refused_hold() {
+    let directory = temporary();
+    let metering = metering(100);
+    let (entered, carving) = std::sync::mpsc::sync_channel(0);
+    let (verdict, verdicts) = std::sync::mpsc::sync_channel(0);
+    let grants = Arc::new(
+        SessionGrants::new(Arc::clone(&metering), AGENT.parse().unwrap()).with_ledger(Arc::new(
+            PausedLedger {
+                entered,
+                verdicts: Mutex::new(verdicts),
+            },
+        )),
+    );
+    let leg = leg_with(&grants, directory.path()).await;
+    let vm = FakeVm::default();
+    let second_done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| vm.exec(&leg, session(SESSION_A), 60));
+        carving.recv().unwrap();
+        let second = scope.spawn(|| {
+            let carved = vm.exec(&leg, session(SESSION_A), 60);
+            second_done.store(true, Ordering::SeqCst);
+            carved
+        });
+        for _ in 0..10_000 {
+            std::thread::yield_now();
+        }
+        assert!(
+            !second_done.load(Ordering::SeqCst),
+            "the second carve returned before the first one's ledger write"
+        );
+        verdict.send(Err(GrantLedgerFailed)).unwrap();
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(GrantRefusal::Ledger(GrantLedgerFailed))
+        ));
+        carving.recv().unwrap();
+        verdict.send(Ok(())).unwrap();
+        second.join().unwrap().unwrap();
+    });
+    assert_eq!(vm.runs(), 1);
+    grants.release_all();
+    assert_eq!(
+        used(&metering),
+        60,
+        "the surviving grant is charged in full"
+    );
 }

@@ -242,6 +242,8 @@ fn an_up_to_reservation_clamps_to_what_other_reservations_leave_and_refuses_at_z
         budget.reserve_up_to(at(0), Tokens(80)).unwrap().tokens(),
         Tokens(50)
     );
+    let zero = budget.reserve_up_to(at(0), Tokens(0)).unwrap_err();
+    assert_eq!(zero.retry, Retry::Never);
 }
 
 #[test]

@@ -75,42 +75,38 @@ impl SessionGrants {
         model: &str,
         estimate: Tokens,
     ) -> Result<(), GrantRefusal> {
-        let held = {
-            let mut open = self.open.lock();
-            if open.iter().any(|(open, _)| *open == session) {
-                return Ok(());
-            }
-            if open.len() >= MAX_OPEN_GRANTS {
-                return Err(GrantRefusal::Full);
-            }
-            let admission = self
-                .metering
-                .admit_up_to(
-                    Call {
-                        agent: self.agent.clone(),
-                        model: model.to_owned(),
-                        backend: GRANT_BACKEND,
-                        via: Via::Proxy {
-                            session: Some(session),
-                        },
-                    },
-                    estimate,
-                )
-                .map_err(GrantRefusal::Budget)?;
-            let held = admission.estimate().input;
-            open.push((session, admission));
-            held
-        };
-        let Some(ledger) = &self.ledger else {
+        // The lock is held through the ledger write so a same-session carve cannot reuse a hold
+        // that a failed write is about to refund.
+        let mut open = self.open.lock();
+        if open.iter().any(|(open, _)| *open == session) {
             return Ok(());
-        };
-        ledger
-            .carved(&self.agent, &session, model, held)
-            .inspect_err(|_| {
-                if let Some(admission) = self.take(&session) {
-                    admission.settle(Outcome::NotSent);
-                }
-            })?;
+        }
+        if open.len() >= MAX_OPEN_GRANTS {
+            return Err(GrantRefusal::Full);
+        }
+        let admission = self
+            .metering
+            .admit_up_to(
+                Call {
+                    agent: self.agent.clone(),
+                    model: model.to_owned(),
+                    backend: GRANT_BACKEND,
+                    via: Via::Proxy {
+                        session: Some(session),
+                    },
+                },
+                estimate,
+            )
+            .map_err(GrantRefusal::Budget)?;
+        if let Some(ledger) = &self.ledger
+            && let Err(failed) =
+                ledger.carved(&self.agent, &session, model, admission.estimate().input)
+        {
+            drop(open);
+            admission.settle(Outcome::NotSent);
+            return Err(GrantRefusal::Ledger(failed));
+        }
+        open.push((session, admission));
         Ok(())
     }
 
