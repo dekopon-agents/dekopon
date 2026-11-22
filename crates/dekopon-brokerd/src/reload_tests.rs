@@ -69,6 +69,34 @@ async fn the_broker_reload_task_is_joined_at_shutdown() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_reload_panic_outranks_a_drain_that_outlives_the_grace() {
+    let broker = ManagedBroker::new();
+    broker.publish_lock('1');
+    let deadline = ShutdownDeadline::default();
+    let (expired, panic_now) = oneshot::channel::<()>();
+    let task = tokio::spawn(crate::serve_with_reload(
+        broker.config(),
+        std::future::pending(),
+        deadline.clone(),
+        |_, _| {
+            Some(async move {
+                drop(panic_now.await);
+                panics().await
+            })
+        },
+    ));
+    broker.ready(&task).await;
+    let until = deadline.start(Duration::ZERO);
+    tokio::time::sleep_until(until + Duration::from_millis(1)).await;
+    expired.send(()).expect("reload task is waiting");
+
+    assert!(matches!(
+        stopped_within(task).await,
+        Err(BrokerdError::ReloadTask(TaskOutcome::Panicked))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_lock_change_through_the_reload_task_ends_the_broker_cleanly() {
     let broker = ManagedBroker::new();
     broker.publish_lock('1');

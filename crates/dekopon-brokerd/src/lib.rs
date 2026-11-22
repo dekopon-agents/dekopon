@@ -287,10 +287,13 @@ where
         );
     }
 
+    if result.is_ok() {
+        tracing::info!(event = "broker_stopped", "broker.stopped");
+    }
+    reload_stop?;
     result?;
-    tracing::info!(event = "broker_stopped", "broker.stopped");
     cleanup?;
-    reload_stop.and(drained)
+    drained
 }
 
 #[derive(Debug)]
