@@ -14,6 +14,7 @@ categories = ["web-programming::http-server"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+arc-swap.workspace = true
 axum.workspace = true
 bytes.workspace = true
 dekopon-core.workspace = true
@@ -35,7 +36,6 @@ tracing.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
-arc-swap.workspace = true
 dekopon-telemetry = { workspace = true, features = ["exporter"] }
 dekopon-test-support = { path = "../dekopon-test-support" }
 opentelemetry.workspace = true

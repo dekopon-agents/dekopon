@@ -18,6 +18,7 @@ native = ["dep:base64"]
 cli = ["dep:clap"]
 tokio-task = ["dep:tokio"]
 offload-tracing = ["tokio-task", "dep:tracing"]
+reload = ["tokio-task", "tokio/signal", "dep:notify"]
 
 [dependencies]
 base64 = { workspace = true, optional = true }
@@ -32,6 +33,7 @@ tracing = { workspace = true, optional = true }
 # wasm guest never listens, so the dependency stays off every non-Unix build of this crate.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+notify = { workspace = true, optional = true }
 serde_yaml.workspace = true
 tempfile.workspace = true
 

@@ -29,6 +29,25 @@ where
     serve_with_clock(server, catalog, deadline, Arc::new(oauth2::now_seconds)).await
 }
 
+#[expect(
+    clippy::todo,
+    unused_variables,
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload"
+)]
+pub(crate) async fn serve_on_commits<F, C>(
+    server: F,
+    catalog: C,
+    commits: dekopon_core::reload::CommitReceiver,
+    deadline: ShutdownDeadline,
+) -> Result<(), BrokerdError>
+where
+    F: Future<Output = Result<(), BrokerdError>>,
+    C: Fn() -> secrets::ScheduledCatalog,
+{
+    todo!()
+}
+
 pub(crate) async fn serve_with_clock<F, C>(
     server: F,
     catalog: C,

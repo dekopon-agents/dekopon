@@ -24,7 +24,9 @@ mod provider_manager;
 mod reaper;
 mod refresh_scheduler;
 mod secrets;
+mod self_reload;
 mod server;
+mod signer_reload;
 mod socket;
 mod workflows;
 
@@ -267,6 +269,31 @@ where
         None | Some(lock_watch::LockStop::Changed) => Ok(()),
         Some(lock_watch::LockStop::Unsettled) => Err(BrokerdError::ProviderLockUnsettled),
     }
+}
+
+#[expect(
+    clippy::todo,
+    unused_variables,
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload"
+)]
+async fn serve_with_watcher<F, W>(
+    config_path: &Path,
+    shutdown: F,
+    deadline: ShutdownDeadline,
+    watcher: W,
+) -> Result<(), BrokerdError>
+where
+    F: Future<Output = ()> + Send,
+    W: FnOnce(
+        dekopon_core::reload::ReloadSettings,
+        Vec<self_reload::BrokerGroup>,
+    ) -> Result<
+        dekopon_core::reload::Watcher<self_reload::BrokerGroup>,
+        dekopon_core::reload::ReloadError,
+    >,
+{
+    todo!()
 }
 
 async fn stopped<F>(
@@ -1773,6 +1800,10 @@ pub enum BrokerdError {
         "the provider lock never read as one stable file; the broker drained so a restart rereads it"
     )]
     ProviderLockUnsettled,
+    #[error("configuration reload stopped")]
+    Reload(#[from] dekopon_core::reload::ReloadError),
+    #[error("configuration reload task failed")]
+    ReloadTask(#[source] dekopon_core::TaskOutcome),
     #[error("check could not prepare its private directory {path}")]
     CheckDirectory {
         path: PathBuf,
@@ -1826,6 +1857,8 @@ fn render_errors(problems: &[BrokerdError]) -> String {
         .join("; ")
 }
 
+#[cfg(test)]
+mod reload_tests;
 #[cfg(test)]
 mod tests;
 

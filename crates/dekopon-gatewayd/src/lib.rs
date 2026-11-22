@@ -443,6 +443,22 @@ where
             );
             Err(GatewaydError::TransportsLost)
         }
+        ServeOutcome::ReloadStopped(cause) => {
+            tracing::error!(
+                event = "gateway_stopped",
+                reason = "reload-stopped",
+                "gateway.stopped"
+            );
+            Err(*cause)
+        }
+        ServeOutcome::ReloadPanicked(failure) => {
+            tracing::error!(
+                event = "gateway_stopped",
+                reason = "reload-task-failed",
+                "gateway.stopped"
+            );
+            Err(GatewaydError::ReloadTask(failure))
+        }
     }
 }
 
@@ -892,10 +908,14 @@ fn transport_credential_variables(spec: &TransportConfig) -> Vec<&str> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 enum ServeOutcome {
     Shutdown,
     TransportsLost,
+    #[expect(dead_code, reason = "skeleton: daemon/supervisor")]
+    ReloadStopped(Box<GatewaydError>),
+    #[expect(dead_code, reason = "skeleton: daemon/supervisor")]
+    ReloadPanicked(dekopon_core::TaskOutcome),
 }
 
 #[cfg(test)]
@@ -1411,6 +1431,10 @@ pub enum GatewaydError {
     Probe(Box<ProbeProblem>),
     #[error("{}", render_problems(.problems))]
     Problems { problems: Vec<GatewaydError> },
+    #[error("configuration reload stopped")]
+    Reload(#[from] dekopon_core::reload::ReloadError),
+    #[error("configuration reload task failed")]
+    ReloadTask(#[source] dekopon_core::TaskOutcome),
 }
 
 impl GatewaydError {

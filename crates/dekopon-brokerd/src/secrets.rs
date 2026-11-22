@@ -1714,6 +1714,17 @@ pub(crate) struct LoadedMap {
     pub(crate) minted_digest: [u8; 32],
 }
 
+impl LoadedMap {
+    #[expect(
+        clippy::todo,
+        dead_code,
+        reason = "skeleton: daemon/broker-self-reload"
+    )]
+    pub(crate) fn key_paths(&self) -> Vec<PathBuf> {
+        todo!()
+    }
+}
+
 pub(crate) async fn load_with_bytes(
     path: &Path,
     expected_uid: u32,
