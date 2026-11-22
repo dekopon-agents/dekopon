@@ -155,6 +155,7 @@ impl SelfSignedIssuer {
         if !errors.is_empty() {
             return Err(errors);
         }
+        digest.update([2]);
         digest.update(pem.len().to_le_bytes());
         digest.update(&pem);
         Ok(Self { key, config })

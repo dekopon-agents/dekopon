@@ -551,7 +551,7 @@ impl Directory {
         result
     }
 
-    fn unique_temporary_name(&self) -> Result<String, StorageHostError> {
+    pub(crate) fn unique_temporary_name(&self) -> Result<String, StorageHostError> {
         for _ in 0..16 {
             let bytes = random_bytes(16)?;
             let mut name = String::from("tmp-");

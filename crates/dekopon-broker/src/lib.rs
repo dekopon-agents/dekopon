@@ -723,9 +723,9 @@ impl ConstraintCatalog {
             let Some(storage) = &set.constraints.storage else {
                 continue;
             };
-            if storage.scope != StorageScope::Agent {
+            if !matches!(storage.scope, StorageScope::Agent | StorageScope::Instance) {
                 if let Some(namespace) = &storage.namespace {
-                    conflicts.push(NamespaceConflict::NotAgentScope {
+                    conflicts.push(NamespaceConflict::UnsupportedScope {
                         capability: capability.clone(),
                         namespace: namespace.clone(),
                         scope: storage.scope,
@@ -741,6 +741,19 @@ impl ConstraintCatalog {
         for (namespace, sets) in members {
             if sets.iter().all(|(_, storage)| storage.namespace.is_none()) {
                 continue;
+            }
+            let scopes = sets
+                .iter()
+                .map(|(_, storage)| storage.scope)
+                .collect::<BTreeSet<_>>();
+            if scopes.len() > 1 {
+                conflicts.push(NamespaceConflict::ScopeMismatch {
+                    namespace: namespace.clone(),
+                    capabilities: sets
+                        .iter()
+                        .map(|(capability, storage)| ((*capability).clone(), storage.scope))
+                        .collect(),
+                });
             }
             let interfaces = sets
                 .iter()
@@ -1517,7 +1530,7 @@ pub enum RouteConflict {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NamespaceConflict {
-    NotAgentScope {
+    UnsupportedScope {
         capability: CapabilityId,
         namespace: ProviderId,
         scope: StorageScope,
@@ -1526,19 +1539,23 @@ pub enum NamespaceConflict {
         namespace: ProviderId,
         capabilities: Vec<(CapabilityId, StorageInterface)>,
     },
+    ScopeMismatch {
+        namespace: ProviderId,
+        capabilities: Vec<(CapabilityId, StorageScope)>,
+    },
 }
 
 impl fmt::Display for NamespaceConflict {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotAgentScope {
+            Self::UnsupportedScope {
                 capability,
                 namespace,
                 scope,
             } => write!(
                 formatter,
                 "capability {capability} names storage namespace {namespace} at scope {scope:?}; \
-                 only agent scope may name a namespace"
+                 agent or instance scope may name a namespace"
             ),
             Self::Mismatch {
                 namespace,
@@ -1550,7 +1567,20 @@ impl fmt::Display for NamespaceConflict {
                 }
                 write!(
                     formatter,
-                    "; every agent-scope capability in one namespace declares one interface"
+                    "; capabilities sharing a namespace must declare the same interface"
+                )
+            }
+            Self::ScopeMismatch {
+                namespace,
+                capabilities,
+            } => {
+                write!(formatter, "storage namespace {namespace} is shared by")?;
+                for (capability, scope) in capabilities {
+                    write!(formatter, " {capability} ({scope:?})")?;
+                }
+                write!(
+                    formatter,
+                    "; capabilities sharing a namespace must declare the same scope"
                 )
             }
         }
@@ -3348,10 +3378,12 @@ where
             };
             (ContinuityPolicy::Paranoid, Vec::new(), Some(memory))
         } else {
-            let policy = if storage.scope == StorageScope::PrivateConversation {
-                ContinuityPolicy::Paranoid
-            } else {
-                ContinuityPolicy::Relaxed
+            let policy = match storage.scope {
+                StorageScope::PrivateConversation => ContinuityPolicy::Paranoid,
+                StorageScope::SharedConversation
+                | StorageScope::Agent
+                | StorageScope::Space
+                | StorageScope::Instance => ContinuityPolicy::Relaxed,
             };
             let authority = self.authority_surface_v1(
                 context,
@@ -3382,6 +3414,7 @@ where
             authority,
         )
         .with_shared_namespace(storage.namespace.clone())
+        .with_principal(context.principal().clone())
         .with_space_key(context.space_binding().map(|binding| binding.key));
         let grant_request = match memory {
             Some(memory) => grant_request.with_memory_continuity(memory),
@@ -4595,6 +4628,7 @@ fn encode_storage_constraints(
                 StorageScope::SharedConversation => 1,
                 StorageScope::Agent => 2,
                 StorageScope::Space => 3,
+                StorageScope::Instance => 4,
             },
         );
         if let Some(namespace) = &storage.namespace {
@@ -5791,7 +5825,7 @@ fn storage_scope_permits(context: &AuthenticatedContext, set: &ConstraintSet) ->
         .map(|storage| storage.scope)
     {
         Some(StorageScope::Space) => context.space.is_some(),
-        Some(StorageScope::Agent) => context.space.is_none(),
+        Some(StorageScope::Agent | StorageScope::Instance) => context.space.is_none(),
         Some(StorageScope::PrivateConversation | StorageScope::SharedConversation) | None => true,
     }
 }

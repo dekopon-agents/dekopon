@@ -15,10 +15,9 @@ A declarative policy language suits "who may do what" and is the wrong place for
 Constraint sets are checked at startup against what Cedar never sees: the loaded provider manifests,
 the host's own ceilings and the credential store.
 
-Three broker rules sit outside both layers, and no policy overrides them. A capability with no
-constraint set is denied before Cedar runs. A watch probe, and any job it starts, may only read,
-because it runs unattended on every tick. A storage capability needs a chat scope; agent-scoped
-storage runs only outside a mapped channel, and space-scoped storage only inside one.
+A capability without a constraint set is denied before Cedar runs. A watch probe and its jobs may
+only read because they run unattended. Storage needs a chat scope. Space storage requires a mapped
+channel. Agent and instance storage are unavailable in mapped channels and their wakes.
 
 Cedar validates types, not instances, so the broker refuses a policy naming a principal, group or
 secret it didn't declare. Agents aren't declared (the catalog belongs to the gateway), so a

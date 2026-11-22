@@ -32,6 +32,7 @@ pub mod private_file;
 mod redaction;
 mod skill;
 mod space;
+pub mod standin;
 mod subject;
 mod task;
 mod trace;

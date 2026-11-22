@@ -3449,6 +3449,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn check_loads_cached_components_and_compiles_only_when_needed() {
+        use crate::tests::write_owner_only;
+
+        for (seeded, compile_on_load, expected) in
+            [(2, false, [0, 0]), (1, false, [0, 1]), (2, true, [1, 1])]
+        {
+            let directory = tempfile::tempdir().expect("candidate store");
+            let (_, paths) =
+                local_precompile_fixture(directory.path(), &["cli-probe", "clock-probe"]).await;
+            let uid = socket::current_uid();
+            let lock = load_lock(&paths.lock_file, uid)
+                .await
+                .expect("fixture lock");
+            let provider_set = directory.path().join("providers.yaml");
+            write_set(
+                &provider_set,
+                &lock
+                    .providers
+                    .into_iter()
+                    .map(|provider| provider.source)
+                    .collect::<Vec<_>>(),
+            );
+            let sources = load_locked_sources(&paths.lock_file, &paths.store, uid)
+                .await
+                .expect("candidate sources");
+            dekopon_broker_host::precompile(sources[..seeded].to_vec(), paths.store.join("cwasm"))
+                .await
+                .expect("seed compiled cache");
+
+            let config = directory.path().join("broker.yaml");
+            write_owner_only(
+                &config,
+                &serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": crate::config::CONFIG_API_VERSION,
+                    "socketPath": "broker.sock",
+                    "providerSet": {"lockPath": "runtime.lock.yaml", "storePath": "runtime-store"},
+                    "compileOnLoad": compile_on_load,
+                }))
+                .expect("encode broker config"),
+            );
+            let probe = sync_compile_probe();
+            for source in &sources {
+                probe.lock().stages.insert(source.path().to_owned(), 0);
+            }
+            let report = crate::check(
+                &config,
+                Some(crate::CheckProviders {
+                    provider_set,
+                    store: directory.path().to_owned(),
+                }),
+                None,
+            )
+            .await;
+            let counts = sources
+                .iter()
+                .map(|source| {
+                    probe
+                        .lock()
+                        .stages
+                        .remove(source.path())
+                        .expect("tracked source")
+                })
+                .collect::<Vec<_>>();
+            assert!(report.problems.is_empty(), "{report:?}");
+            assert_eq!(
+                counts, expected,
+                "seeded: {seeded}, compileOnLoad: {compile_on_load}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn precompile_repairs_a_truncated_object_and_a_dangling_index() {
         let directory = tempfile::tempdir().expect("fixture");

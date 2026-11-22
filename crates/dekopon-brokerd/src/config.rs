@@ -576,6 +576,7 @@ pub struct ResolvedConfig {
     pub policies: String,
     pub capabilities: BTreeMap<ProviderId, ProviderCapabilities>,
     pub host_limits: BrokerHostLimits,
+    pub(crate) compile_on_load: bool,
     pub host_options: BrokerHostOptions,
     pub plaintext_hosts: PlaintextHosts,
     pub broker_limits: BrokerLimits,
@@ -1311,6 +1312,7 @@ async fn resolve(
         policies: String::new(),
         capabilities: config.capabilities,
         host_limits,
+        compile_on_load: config.compile_on_load,
         host_options: BrokerHostOptions {
             cwasm_dir: managed_provider_paths
                 .as_ref()

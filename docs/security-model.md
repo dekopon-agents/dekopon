@@ -68,10 +68,10 @@ probe can only read.
 
 Memory never grants authority ([memory](memory.md)). What it widens is time and audience.
 
-- **Time.** On a one-shot route an injected instruction dies with its session. With history it stays
-  in every later prompt until the window, the idle timeout or retention drops it. Anything an agent
-  writes to agent-scoped storage and reads back lasts until deleted, across sessions and people: the
-  longest-lived injection surface.
+- **Time.** On a one-shot route an injected instruction dies with its session. History keeps it in
+  prompts until the window, idle timeout or retention drops it. Agent storage carries it across
+  people and sessions. Instance storage carries it across one person's transports and sessions
+  with the same agent.
 - **Audience.** Shared scope replays each participant's text and the agent's answers into prompts
   others start. The chat service decides how wide a conversation is: a Discord message outside a
   thread shares the whole channel.
@@ -123,8 +123,8 @@ API offers on a granted model. The budget bounds the spend.
 - Whoever reads the telemetry store reads every conversation.
 - If something hostile already runs as root or as the broker's user, you've lost.
 - Gateway history in memory can reach swap and core dumps; the daemon controls neither.
-- Chat memory with `continuityPolicy: relaxed`, and shared, agent and space storage always, stay
-  readable after the authority that wrote them changes. A secret reference cannot prove its upstream
+- For calls the broker still authorizes, grant changes preserve relaxed chat memory and shared,
+  agent, instance and space storage. A secret reference cannot prove its upstream
   account unchanged; only broker memory rotates, not the journal or model context. To reset one
   `paranoid` conversation, stop the broker, move its namespace's `current` file out of the storage
   root and restart; the next turn starts empty, keeping the old generation.

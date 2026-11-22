@@ -263,7 +263,7 @@ async fn inspecting_a_loaded_map_reports_all_sealed_and_malformed_records_withou
             super::super::super::load_with_bytes(&map_path, rustix::process::geteuid().as_raw())
                 .await
                 .expect("load valid map with unavailable records");
-        loaded.scheduled.inspect_records().await;
+        loaded.scheduled.inspect_records(None).await;
         loaded.catalog
     }
     .with_subscriber(subscriber)

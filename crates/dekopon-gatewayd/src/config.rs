@@ -1495,6 +1495,10 @@ impl RawCandidate {
         Self(hasher.finalize().into())
     }
 
+    pub(crate) fn digest(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     pub(crate) fn refusing(self, refusal: &str) -> Self {
         use sha2::{Digest as _, Sha256};
         Self(

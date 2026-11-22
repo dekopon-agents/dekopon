@@ -495,6 +495,7 @@ pub enum StorageScope {
     SharedConversation,
     Agent,
     Space,
+    Instance,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -585,6 +586,14 @@ mod storage_retention_tests {
             serde_json::from_str(r#"{"interface":"jsonl","access":"read-only","scope":"space"}"#)
                 .expect("space scope");
         assert_eq!(space.scope, StorageScope::Space);
+        let instance: StorageConstraints =
+            serde_json::from_str(&configured.replace("\"agent\"", "\"instance\""))
+                .expect("instance scope");
+        assert_eq!(instance.scope, StorageScope::Instance);
+        assert_eq!(
+            serde_json::to_value(instance.scope).expect("encode scope"),
+            "instance"
+        );
         assert_eq!(parsed.retention, StorageRetention::Keep);
         let ttl = r#"{"interface":"durable-files","access":"read-only","scope":"shared-conversation","retention":{"mode":"idle-ttl","idleTtlMs":60000}}"#;
         let parsed: StorageConstraints = serde_json::from_str(ttl).expect("idle TTL");

@@ -324,6 +324,14 @@ pub async fn check(
     report
 }
 
+pub async fn load_storage_config(path: &Path) -> Result<Option<StorageConfig>, ConfigError> {
+    let (config, refusal) = config::load_in(path, current_uid(), config::LoadMode::Check).await?;
+    match refusal {
+        Some(error) => Err(error),
+        None => Ok(config.storage),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {
     ProviderSet,
@@ -387,13 +395,35 @@ struct Coordination {
 struct GenerationState {
     active: Arc<Candidate>,
     prepared: Option<(u32, Arc<Candidate>, Arc<Candidate>)>,
+    discarded_record_markers: secrets::DiscardedRecordMarkers,
     reported: Option<RawCandidate>,
+    rejected: Option<RawCandidate>,
     retired_credentials: Vec<std::sync::Weak<dekopon_model::chatgpt::CredentialFile>>,
 }
 
 impl GenerationState {
+    fn discard_prepared(&mut self) {
+        if let Some((_, _, previous)) = self.prepared.take() {
+            previous
+                .ready
+                .scheduled
+                .retain_discarded_record_markers(&mut self.discarded_record_markers);
+        }
+    }
+
     fn unreported(&mut self, raw: RawCandidate) -> bool {
         self.reported.replace(raw) != Some(raw)
+    }
+
+    fn record_recovery(&mut self) {
+        if let Some(rejected) = self.rejected.take() {
+            tracing::info!(
+                event = "broker_reload_recovered",
+                generation.digest = %self.active.digest,
+                rejected_generation.digest = %rejected.digest(),
+                "broker.reload.recovered"
+            );
+        }
     }
 
     fn owned_by(&self, uid: u32) -> bool {
@@ -407,13 +437,16 @@ impl GenerationState {
 
 impl Coordination {
     fn new(config_path: PathBuf, active: Candidate) -> Self {
+        active.ready.scheduled.log_chatgpt_loads(None);
         Self {
             config_path,
             loading: tokio::sync::Semaphore::new(1),
             state: parking_lot::Mutex::new(GenerationState {
                 active: Arc::new(active),
                 prepared: None,
+                discarded_record_markers: secrets::DiscardedRecordMarkers::default(),
                 reported: None,
+                rejected: None,
                 retired_credentials: Vec::new(),
             }),
         }
@@ -475,31 +508,41 @@ impl Coordination {
                 .collect::<Vec<_>>();
             let count = entries.len();
             let error = bounded_problems(entries.into_iter());
-            let raw = RawCandidate::of(
+            let (raw, refusal) = RawCandidate::of(
                 self.config_path.clone(),
                 report.private_sources,
                 error.clone(),
             )
             .await;
-            let unreported = self.state.lock().unreported(raw);
             let unreadable = report.problems.iter().any(|problem| {
                 matches!(
                     problem,
                     BrokerdError::Config(config::ConfigError::Read { .. })
                 )
             });
-            match (unreported, unreadable) {
-                (false, _) => {}
-                (true, true) => {
-                    tracing::warn!(event = "broker_reload_monitor_failed", applied = false, error = %error, "broker.reload.monitor.failed");
+            let mut state = self.state.lock();
+            if state.unreported(refusal) {
+                if unreadable {
+                    tracing::warn!(
+                        event = "broker_reload_monitor_failed",
+                        applied = false,
+                        active_generation.digest = %state.active.digest,
+                        rejected_generation.digest = %raw.digest(),
+                        error = %error,
+                        "broker.reload.monitor.failed"
+                    );
+                } else {
+                    state.rejected = Some(raw);
+                    tracing::warn!(
+                        event = "broker_reload_refused",
+                        applied = false,
+                        active_generation.digest = %state.active.digest,
+                        rejected_generation.digest = %raw.digest(),
+                        problems = count,
+                        error = %error,
+                        "broker.reload.refused"
+                    );
                 }
-                (true, false) => tracing::warn!(
-                    event = "broker_reload_refused",
-                    applied = false,
-                    problems = count,
-                    error = %error,
-                    "broker.reload.refused"
-                ),
             }
             return (active.digest.clone(), GenerationOutcome::Refused);
         };
@@ -515,19 +558,27 @@ impl Coordination {
                 return (state.active.digest.clone(), GenerationOutcome::Refused);
             }
             state.reported = None;
+            state.discard_prepared();
             match loaded {
                 Loaded::Unchanged => {
-                    state.prepared = None;
+                    state.record_recovery();
                     return (active.digest.clone(), GenerationOutcome::Active);
                 }
                 Loaded::Candidate(next) => {
+                    next.ready.scheduled.inherit_record_markers(
+                        &active.ready.scheduled,
+                        &state.discarded_record_markers,
+                    );
                     let next = Arc::<Candidate>::from(next);
                     state.prepared = Some((uid, active, Arc::clone(&next)));
                     next
                 }
             }
         };
-        next.ready.scheduled.inspect_records().await;
+        next.ready
+            .scheduled
+            .inspect_records(Some(&next.digest))
+            .await;
         (next.digest.clone(), GenerationOutcome::Prepared)
     }
 
@@ -557,6 +608,11 @@ impl Coordination {
             .collect();
         state.retired_credentials.extend(retired);
         state.active = next;
+        state
+            .active
+            .ready
+            .scheduled
+            .log_chatgpt_loads(Some(&base.ready.scheduled));
         state.active.ready.policy_loaded();
         tracing::info!(
             event = "broker_reload_applied",
@@ -565,6 +621,7 @@ impl Coordination {
             categories = %categories.join(","),
             "broker.reload.applied"
         );
+        state.record_recovery();
         GenerationOutcome::Applied
     }
 
@@ -577,7 +634,7 @@ impl Coordination {
                 .as_ref()
                 .is_some_and(|(owner, _, next)| *owner == uid && next.digest == digest)
         {
-            state.prepared = None;
+            state.discard_prepared();
             GenerationOutcome::Aborted
         } else {
             GenerationOutcome::Refused
@@ -671,7 +728,9 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                 (true, Some(providers)) => {
                     provider_lock_file = Some(providers.store.join(PROVIDER_LOCK_FILE));
                     match resolve_provider_set(providers, uid).await {
-                        Ok(sources) => {
+                        Ok((sources, cwasm_dir)) => {
+                            config.host_options.cwasm_dir =
+                                (!config.compile_on_load).then_some(cwasm_dir);
                             config.providers = sources
                                 .iter()
                                 .map(|source| source.path().to_path_buf())
@@ -862,7 +921,7 @@ async fn boot_runtime(
 ) -> Option<Runtime> {
     let private = private_inputs(config, uid, problems).await;
     if let Some(private) = &private {
-        private.scheduled.inspect_records().await;
+        private.scheduled.inspect_records(None).await;
     }
     let storage = keep(
         problems,
@@ -1002,7 +1061,7 @@ async fn private_inputs(
     let fingerprint = PrivateFingerprint::of(
         secrets
             .as_ref()
-            .map(|loaded| (loaded.bytes.as_slice(), &loaded.key_digest)),
+            .map(|loaded| (loaded.bytes.as_slice(), &loaded.minted_digest)),
     );
     Some(match secrets {
         Some(loaded) => PrivateInputs {
@@ -1052,11 +1111,15 @@ const MAX_RAW_SOURCE_BYTES: u64 = 16 << 20;
 struct RawCandidate([u8; 32]);
 
 impl RawCandidate {
-    async fn of(config: PathBuf, private: Vec<PathBuf>, refusal: String) -> Self {
+    fn digest(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    async fn of(config: PathBuf, private: Vec<PathBuf>, refusal: String) -> (Self, Self) {
         use std::io::Read as _;
 
         use sha2::{Digest as _, Sha256};
-        let digest = offload(move || {
+        let digests = offload(move || {
             let mut paths = std::fs::read_dir(&config).map_or_else(
                 |_| vec![config.clone()],
                 |entries| {
@@ -1086,11 +1149,13 @@ impl RawCandidate {
                     hasher.update(part);
                 }
             }
+            let source = hasher.clone().finalize().into();
             hasher.update(refusal.as_bytes());
-            hasher.finalize().into()
+            (source, hasher.finalize().into())
         })
         .await;
-        Self(digest.unwrap_or_default())
+        let (source, refusal) = digests.unwrap_or_default();
+        (Self(source), Self(refusal))
     }
 }
 
@@ -1099,7 +1164,7 @@ const PROVIDER_LOCK_FILE: &str = "providers.lock.yaml";
 async fn resolve_provider_set(
     providers: CheckProviders,
     uid: u32,
-) -> Result<Vec<dekopon_broker_host::LockedProviderSource>, BrokerdError> {
+) -> Result<(Vec<dekopon_broker_host::LockedProviderSource>, PathBuf), BrokerdError> {
     let mut directory = tokio::fs::DirBuilder::new();
     directory.mode(0o700);
     match directory.create(&providers.store).await {
@@ -1129,9 +1194,10 @@ async fn resolve_provider_set(
         .precompile()
         .await
         .map_err(BrokerdError::ProviderSet)?;
-    provider_manager::load_locked_sources(&lock_file, &store, uid)
+    let sources = provider_manager::load_locked_sources(&lock_file, &store, uid)
         .await
-        .map_err(BrokerdError::ProviderSet)
+        .map_err(BrokerdError::ProviderSet)?;
+    Ok((sources, store.join("cwasm")))
 }
 
 fn scratch_host(

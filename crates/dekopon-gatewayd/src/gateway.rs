@@ -131,6 +131,7 @@ struct ReloadState {
     metering: Arc<Metering>,
     pending: Option<(String, String)>,
     unsettled: Option<config::RawCandidate>,
+    rejected: Option<config::RawCandidate>,
 }
 
 enum Unsettled {
@@ -306,6 +307,7 @@ impl Gateway {
             metering: owners.metering,
             pending: None,
             unsettled: None,
+            rejected: None,
         });
         Ok(self)
     }
@@ -1295,6 +1297,7 @@ impl ReloadState {
                 .collect::<Vec<_>>();
             let error = bounded_problems(entries.iter().map(|(_, reason)| reason.clone()));
             if self.unreported(report.raw.refusing(&error)) {
+                self.rejected = Some(report.raw);
                 let categories = entries
                     .iter()
                     .take(MAX_RENDERED_PROBLEMS)
@@ -1303,6 +1306,8 @@ impl ReloadState {
                 tracing::warn!(
                     event = "gateway_reload_refused",
                     applied = false,
+                    active_generation.digest = %self.gateway_digest,
+                    rejected_generation.digest = %report.raw.digest(),
                     problems = entries.len(),
                     categories = %categories.join(","),
                     error = %error,
@@ -1327,20 +1332,28 @@ impl ReloadState {
                     "gateway.reload.monitor.failed"
                 ),
                 Unsettled::Refused(reason) => {
+                    self.rejected = Some(raw);
                     tracing::warn!(
                         event = "gateway_reload_refused",
                         applied = false,
+                        active_generation.digest = %self.gateway_digest,
+                        rejected_generation.digest = %raw.digest(),
                         reason,
                         "gateway.reload.refused"
                     );
                 }
-                Unsettled::Proxy(error) => tracing::warn!(
-                    event = "gateway_reload_refused",
-                    applied = false,
-                    reason = "proxy-model",
-                    error = %reload_problem(&GatewaydError::Proxy(error)),
-                    "gateway.reload.refused"
-                ),
+                Unsettled::Proxy(error) => {
+                    self.rejected = Some(raw);
+                    tracing::warn!(
+                        event = "gateway_reload_refused",
+                        applied = false,
+                        active_generation.digest = %self.gateway_digest,
+                        rejected_generation.digest = %raw.digest(),
+                        reason = "proxy-model",
+                        error = %reload_problem(&GatewaydError::Proxy(error)),
+                        "gateway.reload.refused"
+                    );
+                }
             }
         }
     }
@@ -1451,6 +1464,7 @@ impl ReloadState {
                     "gateway.reload.applied"
                 );
             }
+            self.record_recovery(&digest);
             return;
         }
         let categories = self
@@ -1480,8 +1494,20 @@ impl ReloadState {
             categories = %categories.join(","),
             "gateway.reload.applied"
         );
+        self.record_recovery(&digest);
         self.gateway_digest = digest;
         self.credentials.retire();
+    }
+
+    fn record_recovery(&mut self, digest: &str) {
+        if let Some(rejected) = self.rejected.take() {
+            tracing::info!(
+                event = "gateway_reload_recovered",
+                generation.digest = digest,
+                rejected_generation.digest = %rejected.digest(),
+                "gateway.reload.recovered"
+            );
+        }
     }
 }
 
