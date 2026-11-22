@@ -323,6 +323,14 @@ pub async fn check(
     report
 }
 
+pub async fn load_storage_config(path: &Path) -> Result<Option<StorageConfig>, ConfigError> {
+    let (config, refusal) = config::load_in(path, current_uid(), config::LoadMode::Check).await?;
+    match refusal {
+        Some(error) => Err(error),
+        None => Ok(config.storage),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {
     ProviderSet,
