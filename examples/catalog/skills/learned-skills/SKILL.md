@@ -1,6 +1,6 @@
 ---
 name: learned-skills
-description: Use when a task looks like one you have done before, when someone refers to how it was done last time, or after working out a procedure worth reusing. Your own skills are rows in your turso database; list them with `turso 'SELECT name, description FROM agent_skill'`, read the one that fits, and save new ones there.
+description: Use when a task looks like one you have done before, when someone refers to how it was done last time, or after working out a procedure worth reusing. Use this skill only in direct messages. Your own skills are rows in your turso database; list them with `turso 'SELECT name, description FROM agent_skill'`, read the one that fits, and save new ones there.
 license: MIT OR Apache-2.0
 metadata:
   author: dekopon
@@ -8,6 +8,9 @@ metadata:
 ---
 
 # Skills you write yourself
+
+Instance memory is available only in direct messages. Skip this skill in every group chat,
+including mapped group chats.
 
 You keep skills you wrote in the `agent_skill` table of your `turso` database. That database
 persists across conversations and is private to you and the person you are serving. Other people

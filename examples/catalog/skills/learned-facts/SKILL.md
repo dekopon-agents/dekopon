@@ -1,6 +1,6 @@
 ---
 name: learned-facts
-description: Use when a request depends on something about the person you are serving, or when they give you a durable fact or correct one. Read and save facts in your turso database.
+description: Use when a request depends on something about the person you are serving, or when they give you a durable fact or correct one. Use this skill only in direct messages. Read and save facts in your turso database.
 license: MIT OR Apache-2.0
 metadata:
   author: dekopon
@@ -8,6 +8,9 @@ metadata:
 ---
 
 # Facts about the person you are serving
+
+Instance memory is available only in direct messages. Skip this skill in every group chat,
+including mapped group chats.
 
 Keep durable facts about the person in the `agent_fact` table of your `turso` database. The database
 persists across conversations and is private to you and the person you are serving. Other people
