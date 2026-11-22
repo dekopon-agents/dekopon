@@ -7,6 +7,22 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.94.0] - 2026-11-22
+
+### Added
+
+- provider SDK enables clap suggestions so a mistyped flag gets a tip.
+
+### Fixed
+
+- A panicked configuration reload task now stops the gateway or broker with a non-zero exit that names the cause, instead of the gateway serving on without reloads.
+
+## [dekopon-chart-0.81.0] - 2026-11-22
+
+### Changed
+
+- Chart 0.81.0 targets core v0.94.0 and renders the `v0.94.0` image tag.
+
 ## [0.93.0] - 2026-11-22
 
 ### Added
