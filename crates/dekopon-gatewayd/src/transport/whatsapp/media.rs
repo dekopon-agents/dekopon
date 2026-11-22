@@ -11,7 +11,10 @@ use super::*;
 pub(crate) const MAX_IMAGE_BYTES: usize = 5_000_000;
 pub(super) const MAX_CAPTION_CHARS: usize = 1024;
 const MAX_DOCUMENT_NAME_BYTES: usize = 128;
+const PNG: &str = "image/png";
+const JPEG: &str = "image/jpeg";
 const PDF: &str = "application/pdf";
+const HEIC: &str = "image/heic";
 const DOWNLOAD_HOST: &str = "lookaside.fbsbx.com";
 const DOWNLOAD_PATH: &str = "/whatsapp_business/attachments/";
 
@@ -19,18 +22,37 @@ fn media_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn photo(image: &Value) -> Option<PendingAsset> {
-    let id = image.get("id")?.as_str()?;
-    let mime = image.get("mime_type")?.as_str()?;
-    let extension = match mime {
-        "image/png" => "png",
-        "image/jpeg" => "jpg",
-        _ => return None,
-    };
-    if !media_id(id) {
-        return None;
+fn declared_media_id(media: &Value) -> Result<&str, ReceiveRefusal> {
+    media
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| media_id(id))
+        .ok_or(ReceiveRefusal::InvalidMediaId)
+}
+
+fn mime_type(media: &Value) -> Option<&str> {
+    media.get("mime_type").and_then(Value::as_str)
+}
+
+pub(super) fn declared_mime(media: &Value) -> &'static str {
+    match mime_type(media) {
+        Some(PNG) => PNG,
+        Some(JPEG) => JPEG,
+        Some(PDF) => PDF,
+        Some(HEIC) => HEIC,
+        _ => UNKNOWN,
     }
-    Some(PendingAsset {
+}
+
+fn photo(image: &Value) -> Result<PendingAsset, ReceiveRefusal> {
+    let id = declared_media_id(image)?;
+    let mime = mime_type(image).ok_or(ReceiveRefusal::UnsupportedMime)?;
+    let extension = match mime {
+        PNG => "png",
+        JPEG => "jpg",
+        _ => return Err(ReceiveRefusal::UnsupportedMime),
+    };
+    Ok(PendingAsset {
         name: format!("photo.{extension}"),
         mime: mime.to_owned(),
         size: None,
@@ -41,41 +63,37 @@ fn photo(image: &Value) -> Option<PendingAsset> {
     })
 }
 
-pub(super) fn inbound_image(image: &Value) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+pub(super) fn inbound_image(image: &Value) -> Admission<'_> {
     captioned(image, photo(image))
 }
 
-pub(super) fn inbound_document(
-    document: &Value,
-) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+pub(super) fn inbound_document(document: &Value) -> Admission<'_> {
     captioned(document, pdf(document))
 }
 
-fn captioned(
-    media: &Value,
-    asset: Option<PendingAsset>,
-) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
-    let caption = match media.get("caption") {
-        None => Some(""),
-        Some(Value::String(caption)) => Some(caption.as_str()),
-        Some(_) => None,
+fn captioned(media: &Value, asset: Result<PendingAsset, ReceiveRefusal>) -> Admission<'_> {
+    let text = match media.get("caption") {
+        None => "",
+        Some(Value::String(caption)) => caption.as_str(),
+        Some(_) => {
+            return Admission {
+                text: "",
+                asset: Err(ReceiveRefusal::InvalidCaption),
+            };
+        }
     };
-    match (caption, asset) {
-        (Some(caption), Some(asset)) => (caption, vec![asset], None),
-        (caption, _) => (
-            caption.unwrap_or_default(),
-            Vec::new(),
-            Some(InputRefusal::Unsupported),
-        ),
+    Admission {
+        text,
+        asset: asset.map(Some),
     }
 }
 
-fn pdf(document: &Value) -> Option<PendingAsset> {
-    let id = document.get("id")?.as_str()?;
-    if document.get("mime_type")?.as_str()? != PDF || !media_id(id) {
-        return None;
+fn pdf(document: &Value) -> Result<PendingAsset, ReceiveRefusal> {
+    let id = declared_media_id(document)?;
+    if mime_type(document) != Some(PDF) {
+        return Err(ReceiveRefusal::UnsupportedMime);
     }
-    Some(PendingAsset {
+    Ok(PendingAsset {
         name: document_name(document.get("filename").and_then(Value::as_str)),
         mime: PDF.to_owned(),
         size: None,
@@ -115,8 +133,8 @@ enum Media {
 impl Media {
     fn of(mime: &str) -> Option<Self> {
         match mime {
-            "image/png" => Some(Self::Png),
-            "image/jpeg" => Some(Self::Jpeg),
+            PNG => Some(Self::Png),
+            JPEG => Some(Self::Jpeg),
             PDF => Some(Self::Pdf),
             _ => None,
         }

@@ -153,6 +153,85 @@ pub(crate) fn document_webhook(document: Value) -> Value {
 }
 
 #[tokio::test]
+async fn signed_webhooks_record_only_allowlisted_receive_dispositions() {
+    use dekopon_test_support::{CaptureLayer, Record};
+    use tracing_subscriber::prelude::*;
+
+    const CAPTION: &str = "synthetic caption";
+    const FILENAME: &str = "synthetic.heic";
+    const URL: &str = "https://media.invalid/download?sig=synthetic";
+    const BODY: &str = "synthetic media body";
+
+    let document = json!({
+        "id":"789", "mime_type":"image/heic", "caption":CAPTION,
+        "filename":FILENAME, "url":URL, "body":BODY,
+    });
+    let heic = document_webhook(document.clone());
+    let mut off_list = document.clone();
+    off_list["mime_type"] = json!(URL);
+    let cases = [
+        (
+            photo_webhook("image/jpeg", Some(CAPTION)),
+            ["image", "image/jpeg", "admitted"],
+        ),
+        (heic, ["document", "image/heic", "unsupported-mime"]),
+        (
+            message_webhook("future-type", document),
+            ["unknown", "unknown", "unsupported-message"],
+        ),
+        (
+            document_webhook(off_list),
+            ["document", "unknown", "unsupported-mime"],
+        ),
+    ];
+
+    for (body, expected) in cases {
+        let capture = CaptureLayer::workspace();
+        let _subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let (state, _receiver) = super::tests::state_and_receiver();
+        let body = body.to_string();
+        let response =
+            receive_webhook(State(state), super::tests::signed_request(body.as_bytes())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let records = capture.records();
+        let new_fields = [
+            "whatsapp.message.type",
+            "whatsapp.message.declared_mime",
+            "whatsapp.message.disposition_reason",
+        ];
+        for (field, expected) in new_fields.into_iter().zip(expected) {
+            let values = records
+                .iter()
+                .filter_map(|record| match record {
+                    Record::Span {
+                        name: "transport.receive",
+                        ..
+                    } => record.field(field),
+                    Record::Span { .. } | Record::Event { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(values, [expected], "{field}");
+            for value in values {
+                for sentinel in [
+                    "15550000001",
+                    "789",
+                    CAPTION,
+                    FILENAME,
+                    URL,
+                    "https://evil.invalid/ignored",
+                    BODY,
+                ] {
+                    assert!(!value.contains(sentinel), "{field} contains fixture data");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn signed_png_and_jpeg_captions_are_lazy_and_optional() {
     for mime in ["image/png", "image/jpeg"] {
         for caption in [None, Some(""), Some("Edit the sky 🟣")] {
