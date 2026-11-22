@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dekopon_broker::{
-    AssetInvocationResult, Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerError,
-    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, DefaultSecretSink,
-    DefaultSecretUse, IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld,
-    SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding,
-    TraceOnlyAuditLog,
+    AssetInvocationResult, Attestation, AttestorGrant, AuditSink, AuthenticatedContext, Broker,
+    BrokerError, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
+    DefaultSecretSink, DefaultSecretUse, IdentityDirectory, InvocationRequest, PolicyEngine,
+    PolicyWorld, SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver,
+    SecretUseBinding, TraceOnlyAuditLog,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{
@@ -56,7 +56,7 @@ fn principal(name: &str) -> PrincipalId {
 }
 
 async fn invoke_as_caller(
-    broker: &Broker<TraceOnlyAuditLog>,
+    broker: &Broker,
     request: InvocationRequest,
 ) -> Result<AssetInvocationResult, BrokerError> {
     let gateway = AuthenticatedContext::new(
@@ -246,7 +246,7 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
             principal("caller"),
         )])
         .expect("one mapping builds a directory"),
-        Arc::new(TraceOnlyAuditLog),
+        Arc::new(AuditSink::TraceOnly(TraceOnlyAuditLog)),
         BrokerLimits::default(),
     )
     .expect("the defaulted constraint set builds")

@@ -2,10 +2,10 @@
 #![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
-    ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation,
-    ConversationKind, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
-    PolicyWorld, Trigger,
+    Attestation, AttestorGrant, AuditSink, AuthenticatedContext, Broker, BrokerLimits,
+    CapabilityRoute, ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
+    Conversation, ConversationKind, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
+    PolicyEngine, PolicyWorld, Trigger,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{
@@ -22,10 +22,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-async fn build_broker(
-    root: &std::path::Path,
-    permit_bob: bool,
-) -> (Broker<InMemoryAuditLog>, StorageHost) {
+async fn build_broker(root: &std::path::Path, permit_bob: bool) -> (Broker, StorageHost) {
     build_scoped_broker(root, permit_bob, StorageScope::Agent).await
 }
 
@@ -33,7 +30,7 @@ async fn build_scoped_broker(
     root: &std::path::Path,
     permit_bob: bool,
     scope: StorageScope,
-) -> (Broker<InMemoryAuditLog>, StorageHost) {
+) -> (Broker, StorageHost) {
     let storage = StorageHost::open(root, StorageLimits::default()).unwrap();
     let registry = BrokerProviderRegistry::load_with_storage(
         [provider_fixture("storage-probe-provider.wasm")],
@@ -126,7 +123,9 @@ when { context.via == "gateway" && context.agent == "reviewer" };
             ),
         ])
         .unwrap(),
-        Arc::new(InMemoryAuditLog::new(12).unwrap()),
+        Arc::new(AuditSink::InMemory(Arc::new(
+            InMemoryAuditLog::new(12).unwrap(),
+        ))),
         BrokerLimits::default(),
     )
     .unwrap();

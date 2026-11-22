@@ -266,7 +266,7 @@ where
     }
 }
 
-impl BrokerServer<dekopon_broker::TraceOnlyAuditLog> {
+impl BrokerServer<dekopon_broker::AuditSink> {
     pub(crate) fn for_generations(
         coordination: Arc<Coordination>,
         limits: ServerLimits,

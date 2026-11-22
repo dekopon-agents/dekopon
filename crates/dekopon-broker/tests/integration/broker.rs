@@ -4,11 +4,11 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dekopon_broker::{
-    AssetInvocationResult, Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker,
-    BrokerBuildError, BrokerError, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
-    IdentityDirectory, InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld,
-    SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding,
-    StartupWarning,
+    AssetInvocationResult, Attestation, AttestorGrant, AuditEvent, AuditSink, AuthenticatedContext,
+    Broker, BrokerBuildError, BrokerError, BrokerLimits, CapabilityRoute, ConstraintCatalog,
+    ConstraintSet, IdentityDirectory, InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine,
+    PolicyWorld, SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver,
+    SecretUseBinding, StartupWarning,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule};
@@ -79,7 +79,7 @@ fn direct_peer(name: &str, agent_name: &str) -> AuthenticatedContext {
 }
 
 async fn invoke_as(
-    broker: &Broker<InMemoryAuditLog>,
+    broker: &Broker,
     name: &str,
     agent_name: &str,
     request: InvocationRequest,
@@ -403,39 +403,33 @@ impl TestBroker {
         self
     }
 
-    fn build(self) -> Result<Broker<InMemoryAuditLog>, BrokerBuildError> {
+    fn build(self) -> Result<Broker, BrokerBuildError> {
         Broker::new(
             self.registry,
             principal("broker-test"),
             self.policy,
             self.constraints,
             self.identities,
-            self.audit,
+            Arc::new(AuditSink::InMemory(self.audit)),
             BrokerLimits::default(),
         )
     }
 
-    fn start(
-        self,
-        leniency: Leniency,
-    ) -> Result<(Broker<InMemoryAuditLog>, Vec<StartupWarning>), BrokerBuildError> {
+    fn start(self, leniency: Leniency) -> Result<(Broker, Vec<StartupWarning>), BrokerBuildError> {
         Broker::start(
             self.registry,
             principal("broker-test"),
             self.policy,
             self.constraints,
             self.identities,
-            self.audit,
+            Arc::new(AuditSink::InMemory(self.audit)),
             BrokerLimits::default(),
             leniency,
         )
     }
 }
 
-async fn attested_broker(
-    identities: IdentityDirectory,
-    audit: Arc<InMemoryAuditLog>,
-) -> Broker<InMemoryAuditLog> {
+async fn attested_broker(identities: IdentityDirectory, audit: Arc<InMemoryAuditLog>) -> Broker {
     TestBroker::new(
         probe_registry(BrokerHostLimits::default()).await,
         probe_engine(
@@ -2387,7 +2381,7 @@ fn basic_secret_broker(
     authority: &str,
     username: &str,
     audit: &Arc<InMemoryAuditLog>,
-) -> Broker<InMemoryAuditLog> {
+) -> Broker {
     let policy = format!(
         "{}\n{}",
         http_policy("caller", "provider-test", "http-probe.fetch"),

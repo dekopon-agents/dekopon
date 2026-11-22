@@ -12,7 +12,7 @@ use dekopon_core::{
 };
 
 use super::{
-    AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuthenticatedContext,
+    AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuditSink, AuthenticatedContext,
     AuthorityEncoder, Broker, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ConstraintCatalog,
     ConstraintSet, ContextError, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
     encode_capability_authority, encode_execution_constraints, encode_host_limits,
@@ -117,7 +117,7 @@ async fn desired_pin_without_a_loaded_artifact_is_not_an_execution_digest() {
 
 #[tokio::test]
 async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
-    async fn broker() -> Broker<InMemoryAuditLog> {
+    async fn broker() -> Broker {
         let registry = dekopon_broker_host::BrokerProviderRegistry::load(
             [dekopon_test_support::provider_fixture(
                 "cli-probe-provider.wasm",
@@ -139,7 +139,9 @@ async fn smoke_digest_is_boot_via_subject_and_agent_bound() {
             PolicyEngine::new("", &world).expect("policy"),
             ConstraintCatalog::new([]).expect("constraints"),
             IdentityDirectory::empty(),
-            Arc::new(InMemoryAuditLog::new(4).expect("audit")),
+            Arc::new(AuditSink::InMemory(Arc::new(
+                InMemoryAuditLog::new(4).expect("audit"),
+            ))),
             BrokerLimits::default(),
         )
         .expect("broker")
@@ -1333,7 +1335,9 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
         )])
         .unwrap(),
         IdentityDirectory::empty(),
-        Arc::new(InMemoryAuditLog::new(4).unwrap()),
+        Arc::new(AuditSink::InMemory(Arc::new(
+            InMemoryAuditLog::new(4).unwrap(),
+        ))),
         BrokerLimits::default(),
     )
     .unwrap();
@@ -2624,11 +2628,11 @@ impl<'a> SurfaceBroker<'a> {
         self
     }
 
-    async fn build(self) -> Broker<InMemoryAuditLog> {
+    async fn build(self) -> Broker {
         self.try_build().await.expect("broker")
     }
 
-    async fn try_build(self) -> Result<Broker<InMemoryAuditLog>, super::BrokerBuildError> {
+    async fn try_build(self) -> Result<Broker, super::BrokerBuildError> {
         let _memoization = dekopon_broker_host::enable_test_component_memoization();
         let storage = self.storage.then(|| {
             dekopon_storage_host::StorageHost::open(
@@ -2679,7 +2683,9 @@ impl<'a> SurfaceBroker<'a> {
                 )
             }))
             .expect("identities"),
-            Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+            Arc::new(AuditSink::InMemory(Arc::new(
+                InMemoryAuditLog::new(8).expect("audit"),
+            ))),
             BrokerLimits::default(),
         )?;
         if self.memory {
@@ -2700,7 +2706,7 @@ impl<'a> SurfaceBroker<'a> {
     }
 }
 
-fn surface(broker: &Broker<InMemoryAuditLog>, memory_route: bool) -> Vec<u8> {
+fn surface(broker: &Broker, memory_route: bool) -> Vec<u8> {
     use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
 
     let context = attested_agent_context(
@@ -3726,10 +3732,8 @@ async fn an_authorized_failure_before_the_provider_names_the_loaded_artifact() {
         .find(|metadata| metadata.manifest.id == provider)
         .map(|metadata| metadata.artifact_sha256)
         .expect("the cli-probe artifact is loaded");
-    let artifacts = |broker: &Broker<InMemoryAuditLog>| {
-        broker
-            .audit
-            .records()
+    let artifacts = |broker: &Broker| {
+        records(broker)
             .into_iter()
             .filter_map(|event| match event {
                 AuditEvent::Execution {
@@ -3814,7 +3818,9 @@ async fn a_successful_provider_that_wrote_stderr_carries_it_as_detail() {
         )])
         .unwrap(),
         IdentityDirectory::empty(),
-        Arc::new(InMemoryAuditLog::new(4).unwrap()),
+        Arc::new(AuditSink::InMemory(Arc::new(
+            InMemoryAuditLog::new(4).unwrap(),
+        ))),
         BrokerLimits::default(),
     )
     .unwrap();
@@ -3936,9 +3942,7 @@ async fn an_http_request_decision_digests_its_own_verdict_and_denial_reason() {
         captured.join().expect("stdout reader");
     }
 
-    let decisions = broker
-        .audit
-        .records()
+    let decisions = records(&broker)
         .into_iter()
         .filter_map(|event| match event {
             AuditEvent::Decision {
@@ -4063,7 +4067,9 @@ async fn with_chat_memory_refuses_routes_whose_matching_risk_is_not_the_fixed_ri
         PolicyEngine::new("", &world).expect("policy"),
         ConstraintCatalog::new(routes).expect("constraints"),
         IdentityDirectory::empty(),
-        Arc::new(InMemoryAuditLog::new(4).expect("audit")),
+        Arc::new(AuditSink::InMemory(Arc::new(
+            InMemoryAuditLog::new(4).expect("audit"),
+        ))),
         BrokerLimits::default(),
     )
     .expect("constraints that match the declared risk start");
@@ -4095,21 +4101,21 @@ fn memory_broker(root: &std::path::Path) -> SurfaceBroker<'_> {
         .with_identities([(MEMBER, "maintainer")])
 }
 
-fn paranoid_surface(broker: &Broker<InMemoryAuditLog>) -> Vec<u8> {
+fn paranoid_surface(broker: &Broker) -> Vec<u8> {
     broker
         .memory_surface_v2(&member_context())
         .expect("paranoid surface")
 }
 
 fn memory_handle(
-    broker: &Broker<InMemoryAuditLog>,
+    broker: &Broker,
     capability: &str,
 ) -> Result<dekopon_storage_host::StorageHandle, super::BrokerError> {
     memory_handle_in(broker, &member_context(), capability)
 }
 
 fn memory_handle_in(
-    broker: &Broker<InMemoryAuditLog>,
+    broker: &Broker,
     context: &AuthenticatedContext,
     capability: &str,
 ) -> Result<dekopon_storage_host::StorageHandle, super::BrokerError> {
@@ -4135,14 +4141,14 @@ fn memory_handle_in(
         .expect("transaction"))
 }
 
-fn remembered_bytes(broker: &Broker<InMemoryAuditLog>) -> Result<u64, super::BrokerError> {
+fn remembered_bytes(broker: &Broker) -> Result<u64, super::BrokerError> {
     let mut handle = memory_handle(broker, "memory.chat.recent")?;
     let size = handle.jsonl_size("turns.jsonl").unwrap_or(0);
     handle.finish_read().expect("finish read");
     Ok(size)
 }
 
-fn remember(broker: &Broker<InMemoryAuditLog>, line: &[u8]) {
+fn remember(broker: &Broker, line: &[u8]) {
     let mut handle = memory_handle(broker, "memory.chat.record").expect("record grant");
     let offset = handle.jsonl_size("turns.jsonl").unwrap_or(0);
     handle
@@ -4151,7 +4157,7 @@ fn remember(broker: &Broker<InMemoryAuditLog>, line: &[u8]) {
     handle.commit().expect("commit");
 }
 
-fn remember_as_released_broker(broker: &Broker<InMemoryAuditLog>, line: &[u8]) {
+fn remember_as_released_broker(broker: &Broker, line: &[u8]) {
     let context = member_context();
     let capability: CapabilityId = "memory.chat.record".parse().expect("capability");
     let set = broker.constraints.get(&capability).expect("record route");
@@ -4217,7 +4223,7 @@ fn migration(
     }
 }
 
-fn report(broker: &Broker<InMemoryAuditLog>) -> super::ContinuityReport {
+fn report(broker: &Broker) -> super::ContinuityReport {
     broker.continuity_report().expect("memory report").clone()
 }
 
@@ -4502,7 +4508,7 @@ async fn legacy_proof_refuses_space_routing_and_id_only_contexts() {
     use dekopon_broker_protocol::{ChatTransportKind, ConversationKind, Trigger};
     use dekopon_storage_host::{ContinuityCheck, LegacyContinuity};
 
-    let digest = |broker: &Broker<InMemoryAuditLog>| {
+    let digest = |broker: &Broker| {
         let attested = report(broker);
         migration(
             &attested.legacy_authority_digest,
@@ -4510,7 +4516,7 @@ async fn legacy_proof_refuses_space_routing_and_id_only_contexts() {
             super::OperationalOverrides::default(),
         )
     };
-    let check = |broker: &Broker<InMemoryAuditLog>, context: &AuthenticatedContext| match broker
+    let check = |broker: &Broker, context: &AuthenticatedContext| match broker
         .legacy_continuity(context)
         .expect("legacy proof")
     {
@@ -4877,4 +4883,11 @@ async fn an_http_method_case_change_rotates_paranoid_memory() {
     let lowercase = paranoid_surface(&spelled(0, "get").build().await);
     let uppercase = paranoid_surface(&spelled(1, "GET").build().await);
     assert_ne!(lowercase, uppercase);
+}
+
+fn records(broker: &Broker) -> Vec<AuditEvent> {
+    match &*broker.audit {
+        AuditSink::InMemory(log) => log.records(),
+        AuditSink::TraceOnly(_) => Vec::new(),
+    }
 }

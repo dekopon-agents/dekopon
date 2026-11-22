@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use dekopon_broker::{
-    AssetInvocationResult, Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerError,
-    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, IdentityDirectory,
-    InvocationRequest, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
+    AssetInvocationResult, Attestation, AttestorGrant, AuditSink, AuthenticatedContext, Broker,
+    BrokerError, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
+    IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints};
@@ -30,7 +30,7 @@ pub(crate) fn principal(name: &str) -> PrincipalId {
 }
 
 pub(crate) async fn invoke_as_caller(
-    broker: &Broker<TraceOnlyAuditLog>,
+    broker: &Broker,
     request: InvocationRequest,
 ) -> Result<AssetInvocationResult, BrokerError> {
     let gateway = AuthenticatedContext::new(
@@ -107,7 +107,7 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     }
 }
 
-pub(crate) async fn http_probe_broker(authority: &str) -> Broker<TraceOnlyAuditLog> {
+pub(crate) async fn http_probe_broker(authority: &str) -> Broker {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -140,7 +140,7 @@ pub(crate) async fn http_probe_broker(authority: &str) -> Broker<TraceOnlyAuditL
         .expect("catalog"),
         IdentityDirectory::new([(SUBJECT.parse().expect("subject"), principal("caller"))])
             .expect("directory"),
-        Arc::new(TraceOnlyAuditLog),
+        Arc::new(AuditSink::TraceOnly(TraceOnlyAuditLog)),
         BrokerLimits::default(),
     )
     .expect("broker")

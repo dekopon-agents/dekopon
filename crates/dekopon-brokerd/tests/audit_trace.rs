@@ -14,8 +14,9 @@ use std::{
 };
 
 use dekopon_broker::{
-    AttestorGrant, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
-    IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
+    AttestorGrant, AuditSink, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog,
+    ConstraintSet, IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld,
+    TraceOnlyAuditLog,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
@@ -314,7 +315,7 @@ fn bind_fixture(path: &Path) -> UnixListener {
     listener
 }
 
-async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
+async fn broker() -> Arc<Broker> {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -357,7 +358,7 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
                 principal("cpetersen"),
             )])
             .expect("one mapping builds a directory"),
-            Arc::new(TraceOnlyAuditLog),
+            Arc::new(AuditSink::TraceOnly(TraceOnlyAuditLog)),
             BrokerLimits::default(),
         )
         .expect("broker starts"),

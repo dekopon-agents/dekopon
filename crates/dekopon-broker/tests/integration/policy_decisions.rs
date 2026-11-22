@@ -48,7 +48,7 @@ fn policy_engine() -> PolicyEngine {
     PolicyEngine::new(POLICIES, &world).expect("the workflow policy set validates")
 }
 
-async fn broker() -> Broker<InMemoryAuditLog> {
+async fn broker() -> Broker {
     configured_broker(
         policy_engine(),
         IdentityDirectory::new([(subject(), principal("cpetersen"))]).expect("directory"),
@@ -256,7 +256,7 @@ async fn a_conversation_the_senders_service_cannot_produce_is_refused() {
 async fn space_broker(
     space_prompt: &str,
     space_capability: &str,
-) -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
+) -> (Broker, Arc<InMemoryAuditLog>) {
     let mappings = [
         (SLACK_SUBJECT, "asker"),
         ("drn:discord:user::123", "asker"),

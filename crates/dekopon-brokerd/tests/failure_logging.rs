@@ -11,9 +11,9 @@ use std::{
 };
 
 use dekopon_broker::{
-    AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog,
-    ConstraintSet, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
-    PolicyWorld,
+    AttestorGrant, AuditSink, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
+    ConstraintCatalog, ConstraintSet, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
+    PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
@@ -95,7 +95,7 @@ fn limits() -> ServerLimits {
     }
 }
 
-async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
+async fn broker(audit_bound: usize) -> Arc<Broker> {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -140,7 +140,9 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
                 "cpetersen".parse::<PrincipalId>().expect("valid principal"),
             )])
             .expect("one mapping builds a directory"),
-            Arc::new(InMemoryAuditLog::new(audit_bound).expect("valid audit bound")),
+            Arc::new(AuditSink::InMemory(Arc::new(
+                InMemoryAuditLog::new(audit_bound).expect("valid audit bound"),
+            ))),
             BrokerLimits::default(),
         )
         .expect("broker starts"),

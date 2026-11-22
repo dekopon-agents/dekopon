@@ -15,9 +15,9 @@ use std::{
 };
 
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
-    ConstraintCatalog, ConstraintSet, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
-    PolicyEngine, PolicyWorld, SecretResolver as _,
+    Attestation, AttestorGrant, AuditSink, AuthenticatedContext, Broker, BrokerLimits,
+    CapabilityRoute, ConstraintCatalog, ConstraintSet, IdentityDirectory, InMemoryAuditLog,
+    InvocationRequest, PolicyEngine, PolicyWorld, SecretResolver as _,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{
@@ -740,7 +740,9 @@ async fn two_invocations_of_one_record_share_one_refresh() {
                 "caller".parse().unwrap(),
             )])
             .unwrap(),
-            Arc::new(InMemoryAuditLog::new(16).unwrap()),
+            Arc::new(AuditSink::InMemory(Arc::new(
+                InMemoryAuditLog::new(16).unwrap(),
+            ))),
             BrokerLimits::default(),
         )
         .unwrap()

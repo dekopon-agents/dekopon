@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits,
+    Attestation, AttestorGrant, AuditEvent, AuditSink, AuthenticatedContext, Broker, BrokerLimits,
     CapabilityRoute, ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
     Conversation, ConversationKind, DeliveryIdentity, IdentityDirectory, InMemoryAuditLog,
     InvocationRequest, PolicyEngine, PolicyWorld, Trigger,
@@ -26,7 +26,7 @@ fn only(captured: &CaptureLayer, id: &str) -> Record {
     record
 }
 
-async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
+async fn broker_fixture() -> (Broker, Arc<InMemoryAuditLog>) {
     let mappings = [
         ("drn:fauxlack:user:team:uasker", "asker"),
         ("drn:fauxlack:channel:team:cchannel", "space"),
@@ -79,7 +79,7 @@ async fn broker_fixture() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
         )])
         .expect("catalog"),
         IdentityDirectory::new(mappings).expect("directory"),
-        Arc::clone(&audit),
+        Arc::new(AuditSink::InMemory(Arc::clone(&audit))),
         BrokerLimits::default(),
     )
     .expect("broker");
@@ -124,7 +124,7 @@ fn fauxlack_scope() -> ChatScopeClaim {
 }
 
 async fn assert_refused(
-    broker: &Broker<InMemoryAuditLog>,
+    broker: &Broker,
     audit: &InMemoryAuditLog,
     id: &str,
     claim: Attestation,

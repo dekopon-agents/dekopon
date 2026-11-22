@@ -12,7 +12,7 @@ use std::{
 
 use dekopon_agent::BrokerLeg;
 use dekopon_broker::{
-    AttestorGrant, AuditError, AuditEvent, AuditLog, AuthenticatedContext, Broker,
+    AttestorGrant, AuditError, AuditEvent, AuditLog, AuditSink, AuthenticatedContext, Broker,
     BrokerBuildError, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
     IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
 };
@@ -193,16 +193,16 @@ fn bind_fixture(path: &Path) -> UnixListener {
     listener
 }
 
-async fn broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
+async fn broker() -> (Arc<Broker>, Arc<InMemoryAuditLog>) {
     broker_with(POLICY, 8).await
 }
 
-async fn broker_with(
-    policies: &str,
-    maximum: usize,
-) -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
+async fn broker_with(policies: &str, maximum: usize) -> (Arc<Broker>, Arc<InMemoryAuditLog>) {
     let audit = Arc::new(InMemoryAuditLog::new(maximum).expect("valid audit bound"));
-    (broker_over(policies, Arc::clone(&audit)).await, audit)
+    (
+        broker_over(policies, Arc::new(AuditSink::InMemory(Arc::clone(&audit)))).await,
+        audit,
+    )
 }
 
 async fn broker_over<A: AuditLog>(policies: &str, audit: Arc<A>) -> Arc<Broker<A>> {
@@ -2401,7 +2401,7 @@ impl RunHarness {
                 probe_engine(POLICY, ["caller", "cpetersen"]),
                 ConstraintCatalog::new([("cli-probe.upper".parse().unwrap(), set)]).unwrap(),
                 identities(),
-                Arc::clone(&audit),
+                Arc::new(AuditSink::InMemory(Arc::clone(&audit))),
                 BrokerLimits::default(),
             )
             .unwrap();
