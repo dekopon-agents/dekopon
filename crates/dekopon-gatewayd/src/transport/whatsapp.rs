@@ -402,6 +402,79 @@ async fn process_webhook(
     content_free(StatusCode::OK)
 }
 
+const UNKNOWN: &str = "unknown";
+
+enum ReceiveRefusal {
+    Message(InputRefusal),
+    UnsupportedMime,
+    InvalidMediaId,
+    InvalidCaption,
+}
+
+impl ReceiveRefusal {
+    fn trace_reason(self) -> &'static str {
+        match self {
+            Self::Message(refusal) => match refusal.reason() {
+                reason @ "unsupported-message" => reason,
+                _ => UNKNOWN,
+            },
+            Self::UnsupportedMime => "unsupported-mime",
+            Self::InvalidMediaId => "invalid-media-id",
+            Self::InvalidCaption => "invalid-caption",
+        }
+    }
+}
+
+struct Admission<'a> {
+    text: &'a str,
+    asset: Result<Option<PendingAsset>, ReceiveRefusal>,
+}
+
+fn parse_message_content(message: &Value) -> Option<(&'static str, &'static str, Admission<'_>)> {
+    let content = match message.get("type").and_then(Value::as_str)? {
+        "text" => {
+            let text = message.pointer("/text/body").and_then(Value::as_str)?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            (
+                "text",
+                UNKNOWN,
+                Admission {
+                    text,
+                    asset: Ok(None),
+                },
+            )
+        }
+        "image" => {
+            let image = &message["image"];
+            (
+                "image",
+                media::declared_mime(image),
+                media::inbound_image(image),
+            )
+        }
+        "document" => {
+            let document = &message["document"];
+            (
+                "document",
+                media::declared_mime(document),
+                media::inbound_document(document),
+            )
+        }
+        "reaction" | "system" => return None,
+        _ => (
+            UNKNOWN,
+            UNKNOWN,
+            Admission {
+                text: "",
+                asset: Err(ReceiveRefusal::Message(InputRefusal::Unsupported)),
+            },
+        ),
+    };
+    Some(content)
+}
+
 fn parse_delivery(
     state: &WebhookState,
     root: &Value,
@@ -450,21 +523,9 @@ fn parse_delivery(
                 ) else {
                     continue;
                 };
-                let (text, assets, refusal) = match message.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        let Some(text) = message.pointer("/text/body").and_then(Value::as_str)
-                        else {
-                            continue;
-                        };
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        (text, Vec::new(), None)
-                    }
-                    Some("image") => media::inbound_image(&message["image"]),
-                    Some("document") => media::inbound_document(&message["document"]),
-                    None | Some("reaction" | "system") => continue,
-                    Some(_) => ("", Vec::new(), Some(InputRefusal::Unsupported)),
+                let Some((message_type, declared_mime, admission)) = parse_message_content(message)
+                else {
+                    continue;
                 };
                 let individual = contacts.is_some_and(|contacts| {
                     contacts
@@ -509,6 +570,17 @@ fn parse_delivery(
                 let receipt = received.in_scope(|| receive_span(ChatTransportKind::Whatsapp));
                 receipt.record("message.id", id);
                 record_conversation(&receipt, &conversation);
+                let (assets, refusal, reason) = match admission.asset {
+                    Ok(asset) => (asset.into_iter().collect(), None, "admitted"),
+                    Err(reason) => (
+                        Vec::new(),
+                        Some(InputRefusal::Unsupported),
+                        reason.trace_reason(),
+                    ),
+                };
+                receipt.record("whatsapp.message.type", message_type);
+                receipt.record("whatsapp.message.declared_mime", declared_mime);
+                receipt.record("whatsapp.message.disposition_reason", reason);
                 accepted.push(InboundMessage {
                     control_text: None,
                     pull_request_links: None,
@@ -517,7 +589,7 @@ fn parse_delivery(
                     subject,
                     conversation,
                     message_id: MessageId::Native(id.to_owned()),
-                    text: bound_inbound(text),
+                    text: bound_inbound(admission.text),
                     assets,
                     addressed: None,
                     thread_continuation: None,

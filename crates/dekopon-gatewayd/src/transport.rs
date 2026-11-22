@@ -171,6 +171,9 @@ pub(crate) fn receive_span(kind: ChatTransportKind) -> tracing::Span {
         slack.attachments.msg_unfurl = tracing::field::Empty,
         slack.attachments.is_share_present = tracing::field::Empty,
         slack.attachments.quotes_message = tracing::field::Empty,
+        whatsapp.message.type = tracing::field::Empty,
+        whatsapp.message.declared_mime = tracing::field::Empty,
+        whatsapp.message.disposition_reason = tracing::field::Empty,
     )
 }
 
