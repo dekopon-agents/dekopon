@@ -19,6 +19,13 @@ pub struct Reservation {
     tokens: Tokens,
 }
 
+impl Reservation {
+    #[must_use]
+    pub const fn tokens(&self) -> Tokens {
+        self.tokens
+    }
+}
+
 impl Budget {
     #[must_use]
     pub fn new(
@@ -54,6 +61,20 @@ impl Budget {
         }
         self.reserved = self.reserved.saturating_add(estimate);
         Ok(Reservation { tokens: estimate })
+    }
+
+    pub fn reserve_up_to(&mut self, now: UnixMillis, want: Tokens) -> Result<Reservation, Refusal> {
+        let reserved = i64::try_from(self.reserved.0).unwrap_or(i64::MAX);
+        let headroom = self
+            .meters
+            .iter()
+            .map(|meter| meter.status(now).remaining.saturating_sub(reserved))
+            .min()
+            .map_or(want.0, |headroom| u64::try_from(headroom).unwrap_or(0));
+        match want.0.min(headroom) {
+            0 => self.reserve(now, want),
+            size => self.reserve(now, Tokens(size)),
+        }
     }
 
     pub fn settle(&mut self, reservation: Reservation, at: UnixMillis, actual: Tokens) {

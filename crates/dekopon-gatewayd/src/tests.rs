@@ -23764,6 +23764,9 @@ async fn a_journal_initializes_follow_state_before_the_first_route_is_enabled() 
     ));
 }
 
+#[path = "tests/grant_holds.rs"]
+mod grant_holds;
+
 #[path = "tests/thread_budget.rs"]
 mod thread_budget;
 

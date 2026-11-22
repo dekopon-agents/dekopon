@@ -2944,7 +2944,13 @@ async fn session_turn(
     let session_attachments = Arc::clone(&attachments);
     let progress_sink = Arc::clone(&sink) as Arc<dyn ProgressSink>;
     let calls = CallBudget::new(limits.max_capability_calls);
-    let mut leg = leg.with_progress(Arc::clone(&progress_sink), calls.clone());
+    let grants = Arc::new(dekopon_agent::grant::SessionGrants::new(
+        Arc::clone(&runner.metering),
+        route.agent.clone(),
+    ));
+    let mut leg = leg
+        .with_progress(Arc::clone(&progress_sink), calls.clone())
+        .with_grants(Arc::clone(&grants));
     if progress_notes {
         leg = leg.with_progress_notes();
     }
@@ -3401,6 +3407,7 @@ async fn session_turn(
         .await;
 
     participant_worker.finish().await;
+    grants.release_all();
     deferred.follows = std::mem::take(&mut *pending_follows.lock());
     let Turn {
         outcome,

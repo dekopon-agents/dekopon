@@ -229,6 +229,22 @@ fn a_refusal_counts_reservations_in_flight_as_spent() {
 }
 
 #[test]
+fn an_up_to_reservation_clamps_to_what_other_reservations_leave_and_refuses_at_zero() {
+    let mut budget = budget(&specs()[1..2]);
+    let first = budget.reserve_up_to(at(0), Tokens(60)).unwrap();
+    assert_eq!(first.tokens(), Tokens(60));
+    let second = budget.reserve_up_to(at(0), Tokens(60)).unwrap();
+    assert_eq!(second.tokens(), Tokens(40));
+    let refusal = budget.reserve_up_to(at(0), Tokens(1)).unwrap_err();
+    assert_eq!(refusal.remaining, 0);
+    budget.settle(first, at(0), Tokens(10));
+    assert_eq!(
+        budget.reserve_up_to(at(0), Tokens(80)).unwrap().tokens(),
+        Tokens(50)
+    );
+}
+
+#[test]
 fn settling_under_the_estimate_frees_the_difference() {
     let mut budget = budget(&specs()[1..2]);
     let reservation = budget.reserve(at(0), Tokens(90)).unwrap();
