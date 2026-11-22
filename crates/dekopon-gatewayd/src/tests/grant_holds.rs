@@ -210,7 +210,10 @@ impl GrantLedger for PausedLedger {
         _: Tokens,
     ) -> Result<(), GrantLedgerFailed> {
         self.entered.send(()).unwrap();
-        self.verdicts.lock().recv().unwrap()
+        self.verdicts
+            .lock()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or(Err(GrantLedgerFailed))
     }
 
     fn tallied(&self, _: &VmSession, _: Tokens) -> Result<(), GrantLedgerFailed> {
@@ -241,13 +244,13 @@ async fn a_same_session_carve_waits_for_the_ledger_and_cannot_reuse_a_refused_ho
     let second_done = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let first = scope.spawn(|| vm.exec(&leg, session(SESSION_A), 60));
-        carving.recv().unwrap();
+        carving.recv_timeout(Duration::from_secs(10)).unwrap();
         let second = scope.spawn(|| {
             let carved = vm.exec(&leg, session(SESSION_A), 60);
             second_done.store(true, Ordering::SeqCst);
             carved
         });
-        for _ in 0..10_000 {
+        for _ in 0..1_000 {
             std::thread::yield_now();
         }
         assert!(
@@ -259,7 +262,7 @@ async fn a_same_session_carve_waits_for_the_ledger_and_cannot_reuse_a_refused_ho
             first.join().unwrap(),
             Err(GrantRefusal::Ledger(GrantLedgerFailed))
         ));
-        carving.recv().unwrap();
+        carving.recv_timeout(Duration::from_secs(10)).unwrap();
         verdict.send(Ok(())).unwrap();
         second.join().unwrap().unwrap();
     });

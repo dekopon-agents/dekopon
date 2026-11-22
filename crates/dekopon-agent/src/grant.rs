@@ -102,7 +102,6 @@ impl SessionGrants {
             && let Err(failed) =
                 ledger.carved(&self.agent, &session, model, admission.estimate().input)
         {
-            drop(open);
             admission.settle(Outcome::NotSent);
             return Err(GrantRefusal::Ledger(failed));
         }

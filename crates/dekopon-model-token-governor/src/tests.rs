@@ -231,6 +231,8 @@ fn a_refusal_counts_reservations_in_flight_as_spent() {
 #[test]
 fn an_up_to_reservation_clamps_to_what_other_reservations_leave_and_refuses_at_zero() {
     let mut budget = budget(&specs()[1..2]);
+    let empty = budget.reserve_up_to(at(0), Tokens(0)).unwrap_err();
+    assert_eq!(empty.remaining, 100);
     let first = budget.reserve_up_to(at(0), Tokens(60)).unwrap();
     assert_eq!(first.tokens(), Tokens(60));
     let second = budget.reserve_up_to(at(0), Tokens(60)).unwrap();
