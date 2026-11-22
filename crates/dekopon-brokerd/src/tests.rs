@@ -4024,7 +4024,10 @@ impl ManagedBroker {
         fs::rename(staged, self.lock()).expect("atomic lock replacement");
     }
 
-    fn serve<F>(&self, shutdown: F) -> tokio::task::JoinHandle<Result<(), super::BrokerdError>>
+    pub(super) fn serve<F>(
+        &self,
+        shutdown: F,
+    ) -> tokio::task::JoinHandle<Result<(), super::BrokerdError>>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -4036,7 +4039,10 @@ impl ManagedBroker {
         ))
     }
 
-    async fn ready(&self, task: &tokio::task::JoinHandle<Result<(), super::BrokerdError>>) {
+    pub(super) async fn ready(
+        &self,
+        task: &tokio::task::JoinHandle<Result<(), super::BrokerdError>>,
+    ) {
         tokio::time::timeout(std::time::Duration::from_secs(120), async {
             let parent = fs::symlink_metadata(self.directory.path()).unwrap();
             loop {
@@ -4252,7 +4258,7 @@ async fn socket_generation_handshake_observes_only_confirmed_activation() {
 
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-async fn stopped_within(
+pub(super) async fn stopped_within(
     task: tokio::task::JoinHandle<Result<(), super::BrokerdError>>,
 ) -> Result<(), super::BrokerdError> {
     tokio::time::timeout(std::time::Duration::from_secs(10), task)

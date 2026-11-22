@@ -24,6 +24,7 @@ mod provider_manager;
 mod reaper;
 mod refresh_scheduler;
 mod secrets;
+mod self_reload;
 mod server;
 mod socket;
 mod workflows;
@@ -175,6 +176,23 @@ async fn serve<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    serve_with_reload(config_path, shutdown, deadline, |lock, uid| {
+        lock.map(|lock| self_reload::watch_lock(lock, uid, lock_poll))
+    })
+    .await
+}
+
+async fn serve_with_reload<F, S, R>(
+    config_path: impl AsRef<Path>,
+    shutdown: F,
+    deadline: ShutdownDeadline,
+    seed: S,
+) -> Result<(), BrokerdError>
+where
+    F: Future<Output = ()> + Send,
+    S: FnOnce(Option<lock_watch::LoadedLock>, u32) -> Option<R>,
+    R: Future<Output = self_reload::BrokerStop> + Send + 'static,
+{
     let fd_limits = raise_nofile_limit();
     let (candidate, report) = load_candidate(config_path.as_ref(), Mode::Boot).await;
     for warning in &report.warnings {
@@ -210,9 +228,17 @@ where
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
     coordination.active().ready.policy_loaded();
     tracing::info!(event = "broker_started", "broker.started");
-    let mut lock_stop = None;
+    let mut reload = tokio::task::JoinSet::new();
+    if let Some(task) = seed(provider_lock, uid) {
+        reload.spawn(task);
+    }
+    let mut reload_stop = Ok(());
     let stop = async {
-        lock_stop = stopped(shutdown, provider_lock.as_ref(), uid, lock_poll).await;
+        tokio::select! {
+            biased;
+            () = shutdown => {}
+            ended = self_reload::reload_ended(&mut reload) => reload_stop = ended,
+        }
         deadline.start(limits.shutdown_grace);
         // Unlinking at admission close sends a new connect to NotFound, which clients retry,
         // instead of into a listener that will never accept it.
@@ -246,6 +272,7 @@ where
         deadline.clone(),
     )
     .await;
+    let drained = self_reload::drain_bounded(&deadline, limits.shutdown_grace, &mut reload).await;
 
     coordination.drain_credentials().await;
 
@@ -263,29 +290,7 @@ where
     result?;
     tracing::info!(event = "broker_stopped", "broker.stopped");
     cleanup?;
-    match lock_stop {
-        None | Some(lock_watch::LockStop::Changed) => Ok(()),
-        Some(lock_watch::LockStop::Unsettled) => Err(BrokerdError::ProviderLockUnsettled),
-    }
-}
-
-async fn stopped<F>(
-    shutdown: F,
-    lock: Option<&lock_watch::LoadedLock>,
-    uid: u32,
-    poll: Duration,
-) -> Option<lock_watch::LockStop>
-where
-    F: Future<Output = ()>,
-{
-    let Some(lock) = lock else {
-        shutdown.await;
-        return None;
-    };
-    tokio::select! {
-        () = shutdown => None,
-        stop = lock_watch::watch(lock, uid, poll) => Some(stop),
-    }
+    reload_stop.and(drained)
 }
 
 #[derive(Debug)]
@@ -1773,6 +1778,8 @@ pub enum BrokerdError {
         "the provider lock never read as one stable file; the broker drained so a restart rereads it"
     )]
     ProviderLockUnsettled,
+    #[error("configuration reload task failed")]
+    ReloadTask(#[source] dekopon_core::TaskOutcome),
     #[error("check could not prepare its private directory {path}")]
     CheckDirectory {
         path: PathBuf,
@@ -1826,6 +1833,8 @@ fn render_errors(problems: &[BrokerdError]) -> String {
         .join("; ")
 }
 
+#[cfg(test)]
+mod reload_tests;
 #[cfg(test)]
 mod tests;
 
