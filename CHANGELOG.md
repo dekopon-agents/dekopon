@@ -7,6 +7,24 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.92.0] - 2026-11-22
+
+### Added
+
+- The learned-facts skill remembers durable facts and corrections about the person you are serving.
+- Instance-scoped provider storage follows a person across conversations and transports with the same agent.
+- Copy an agent database into a person’s instance with an offline broker command.
+
+### Changed
+
+- The learned-skills skill describes memory private to the agent and the person it serves.
+
+## [dekopon-chart-0.79.0] - 2026-11-22
+
+### Changed
+
+- Chart 0.79.0 targets core v0.92.0 and renders the `v0.92.0` image tag.
+
 ## [0.91.0] - 2026-11-22
 
 ### Added
