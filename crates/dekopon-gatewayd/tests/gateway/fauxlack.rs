@@ -438,6 +438,7 @@ fn config_problems(
             | dekopon_gatewayd::GatewaydError::Journal { .. }
             | dekopon_gatewayd::GatewaydError::CacheKeySecret(_)
             | dekopon_gatewayd::GatewaydError::WakeStore(_)
+            | dekopon_gatewayd::GatewaydError::Store(_)
             | dekopon_gatewayd::GatewaydError::Proxy(_)
             | dekopon_gatewayd::GatewaydError::Probe(_) => Vec::new(),
         })

@@ -213,7 +213,12 @@ pub(crate) struct CancelRequest {
     pub via: dekopon_agent::CancelVia,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum ThreadClaim {
     Slack {
         team_id: String,
