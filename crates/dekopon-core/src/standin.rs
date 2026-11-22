@@ -1,6 +1,10 @@
 // These streaks stand in for Alertmanager or OpenObserve silences.
 
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    fmt,
+    marker::PhantomData,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
@@ -24,6 +28,7 @@ pub struct Notice;
 #[serde(deny_unknown_fields)]
 pub struct Recovery {
     pub failures: u64,
+    #[serde(deserialize_with = "deserialize_causes")]
     pub causes: Vec<String>,
 }
 
@@ -72,22 +77,83 @@ where
     D: Deserializer<'de>,
     K: Ord + Deserialize<'de>,
 {
-    let active = BTreeMap::<K, Recovery>::deserialize(deserializer)?;
-    if active.len() > MAX_SUBJECTS {
-        return Err(de::Error::custom("too many active streaks"));
+    struct Visitor<K>(PhantomData<K>);
+
+    impl<'de, K: Ord + Deserialize<'de>> de::Visitor<'de> for Visitor<K> {
+        type Value = BTreeMap<K, Recovery>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a map of up to {MAX_SUBJECTS} active streaks")
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(
+            self,
+            mut subjects: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut active = BTreeMap::new();
+            for _ in 0..MAX_SUBJECTS {
+                let Some((subject, streak)) = subjects.next_entry()? else {
+                    return Ok(active);
+                };
+                active.insert(subject, streak);
+            }
+            subjects
+                .next_key_seed(RejectExcess("too many active streaks"))
+                .map(|_| active)
+        }
     }
-    if active
-        .values()
-        .any(|streak| streak.causes.len() > MAX_CAUSES)
-    {
-        return Err(de::Error::custom("too many causes in an active streak"));
+
+    deserializer.deserialize_map(Visitor(PhantomData))
+}
+
+fn deserialize_causes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    struct Visitor;
+
+    impl<'de> de::Visitor<'de> for Visitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a sequence of up to {MAX_CAUSES} causes")
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut causes = Vec::new();
+            for _ in 0..MAX_CAUSES {
+                let Some(cause) = sequence.next_element()? else {
+                    return Ok(causes);
+                };
+                causes.push(cause);
+            }
+            sequence
+                .next_element_seed(RejectExcess("too many causes in an active streak"))
+                .map(|_| causes)
+        }
     }
-    Ok(active)
+
+    deserializer.deserialize_seq(Visitor)
+}
+
+struct RejectExcess(&'static str);
+
+impl<'de> de::DeserializeSeed<'de> for RejectExcess {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, _deserializer: D) -> Result<Self::Value, D::Error> {
+        Err(de::Error::custom(self.0))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CAUSES, MAX_SUBJECTS, Notice, Recovery, Streaks};
+    use serde::{
+        Deserialize,
+        de::value::{Error, MapDeserializer, SeqDeserializer},
+    };
+
+    use super::{MAX_CAUSES, MAX_SUBJECTS, Notice, Recovery, Streaks, deserialize_causes};
 
     #[test]
     fn opening_a_streak_returns_a_notice() {
@@ -222,5 +288,27 @@ mod tests {
         streaks.active.append(&mut extra.active);
         let encoded = serde_json::to_string(&streaks).expect("serialize oversized subject map");
         assert!(serde_json::from_str::<Streaks<usize>>(&encoded).is_err());
+    }
+
+    #[test]
+    fn deserialization_stops_at_the_first_excess_subject() {
+        let mut subjects_read = 0;
+        let subjects = (0..1_000).map(|subject| {
+            subjects_read += 1;
+            (
+                subject,
+                serde_json::json!({ "failures": 1, "causes": ["timeout"] }),
+            )
+        });
+        assert!(Streaks::<usize>::deserialize(MapDeserializer::new(subjects)).is_err());
+        assert_eq!(subjects_read, MAX_SUBJECTS + 1);
+    }
+
+    #[test]
+    fn deserialization_stops_at_the_first_excess_cause() {
+        let mut causes_read = 0;
+        let causes = std::iter::repeat_n("timeout", 1_000).inspect(|_| causes_read += 1);
+        assert!(deserialize_causes(SeqDeserializer::<_, Error>::new(causes)).is_err());
+        assert_eq!(causes_read, MAX_CAUSES + 1);
     }
 }
