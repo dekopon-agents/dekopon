@@ -309,6 +309,23 @@ pub struct CheckProviders {
     pub provider_set: PathBuf,
     pub store: PathBuf,
     pub download_concurrency: NonZeroUsize,
+    pub verification: ProviderVerification,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub enum ProviderVerification {
+    #[default]
+    Strict,
+    Relaxed,
+}
+
+impl ProviderVerification {
+    pub const fn message(self) -> Option<&'static str> {
+        match self {
+            Self::Strict => None,
+            Self::Relaxed => Some("relaxed verification"),
+        }
+    }
 }
 
 pub const DEFAULT_DOWNLOAD_CONCURRENCY: NonZeroUsize =
@@ -337,6 +354,8 @@ pub struct CheckTimings {
     pub prepare_load: Option<CheckPhase>,
     pub policy: Option<CheckPhase>,
     pub workflows: Option<CheckPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<CheckPhase>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -735,11 +754,23 @@ impl Coordination {
     reason = "independent validation stages aggregate failures before preparing a candidate"
 )]
 async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, CheckReport) {
-    let mut report = CheckReport {
-        timings: matches!(mode, Mode::Check { .. }).then(CheckTimings::default),
-        ..CheckReport::default()
-    };
+    let mut report = CheckReport::default();
     let uid = current_uid();
+    let relaxed = match &mode {
+        Mode::Check { providers, .. } => {
+            report.timings = Some(CheckTimings::default());
+            providers
+                .as_ref()
+                .is_some_and(|providers| providers.verification == ProviderVerification::Relaxed)
+        }
+        Mode::Boot | Mode::Reload(_) => false,
+    };
+    if relaxed {
+        report.warnings.extend(
+            [Stage::Providers, Stage::Workflows]
+                .map(|stage| StartupWarning::RelaxedVerification { stage }),
+        );
+    }
     let load_mode = match mode {
         Mode::Boot => LoadMode::Boot,
         Mode::Reload(active) => LoadMode::Reload {
@@ -752,18 +783,14 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
         Mode::Check {
             workflows: Some(directory),
             ..
-        } => match workflows::load(directory, uid).await {
+        } if !relaxed => match workflows::load(directory, uid).await {
             Ok(files) => Some(files),
             Err(error) => {
                 report.problems.push(error.into());
                 None
             }
         },
-        Mode::Boot
-        | Mode::Reload(_)
-        | Mode::Check {
-            workflows: None, ..
-        } => None,
+        Mode::Boot | Mode::Reload(_) | Mode::Check { .. } => None,
     };
     let mut provider_lock_file = None;
     let Some(mut config) = (match config::load_in(config_path, uid, load_mode).await {
@@ -782,13 +809,11 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             None
         }
     }) else {
-        for stage in [
-            Stage::ProviderSet,
-            Stage::FrameLimits,
-            Stage::Runtime,
-            Stage::Providers,
-        ] {
+        for stage in [Stage::ProviderSet, Stage::FrameLimits, Stage::Runtime] {
             report.skipped(stage);
+        }
+        if !relaxed {
+            report.skipped(Stage::Providers);
         }
         if essential.is_some() {
             report.skipped(Stage::Workflows);
@@ -816,6 +841,16 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             );
             // A Check load leaves a providerSet's providers for this function to resolve.
             let resolved = match (config.providers.is_empty(), providers) {
+                (true, Some(providers)) if relaxed => {
+                    let result = provider_manager::probe_provider_set(
+                        &providers.provider_set,
+                        providers.download_concurrency,
+                        report.timings.as_mut(),
+                    )
+                    .await
+                    .map_err(BrokerdError::ProviderSet);
+                    keep(&mut report.problems, result).is_some()
+                }
                 (true, Some(providers)) => {
                     provider_lock_file = Some(providers.store.join(PROVIDER_LOCK_FILE));
                     match resolve_provider_set(providers, uid, report.timings.as_mut()).await {
@@ -899,6 +934,9 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                 })
         }
     };
+    if relaxed {
+        return (None, report);
+    }
     let (Some(frame_limits), Some(mut runtime), true) = (frame_limits, runtime, providers_resolved)
     else {
         report.skipped(Stage::Providers);
@@ -1728,6 +1766,8 @@ pub enum StartupWarning {
     IdentitiesRequired,
     #[error("{stage} not checked: a stage it needs failed")]
     Skipped { stage: Stage },
+    #[error("{stage} skipped under relaxed verification")]
+    RelaxedVerification { stage: Stage },
     #[error("attestor scope {scope} covers the kinds {}", kinds.join(", "))]
     ScopeKinds { scope: String, kinds: Vec<String> },
 }
@@ -1759,7 +1799,7 @@ impl StartupWarning {
                 },
                 "{warning}"
             ),
-            Self::Skipped { .. } => tracing::warn!(
+            Self::Skipped { .. } | Self::RelaxedVerification { .. } => tracing::warn!(
                 target: "dekopon_brokerd::audit",
                 { audit.event = "config.startup.warning", reason = "skipped-stage" },
                 "{self}"

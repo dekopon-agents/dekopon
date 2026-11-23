@@ -3641,6 +3641,7 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
                 provider_set: provider_set.clone(),
                 store: store.clone(),
                 download_concurrency: super::DEFAULT_DOWNLOAD_CONCURRENCY,
+                verification: super::ProviderVerification::Strict,
             }),
             None,
         )
@@ -4457,6 +4458,112 @@ impl WorkflowFixture {
             })
             .collect()
     }
+}
+
+#[tokio::test]
+async fn strict_check_rejects_corrupt_wasm() {
+    let fixture = WorkflowFixture::new();
+    write_owner_only(
+        &fixture._root.path().join("cli-probe.wasm"),
+        b"corrupt wasm",
+    );
+
+    let report = super::check(&fixture.config, None, None).await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::Host(
+                dekopon_broker_host::BrokerHostError::Compile { .. }
+            )]
+        ),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn strict_check_rejects_conflicting_provider_routes() {
+    let fixture = WorkflowFixture::new();
+    let component = fs::read(fixture._root.path().join("cli-probe.wasm")).unwrap();
+    write_owner_only(&fixture._root.path().join("http-probe.wasm"), &component);
+
+    let report = super::check(&fixture.config, None, None).await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::Host(
+                dekopon_broker_host::BrokerHostError::ConflictingProviders { report }
+            )] if report.capabilities.iter().any(|capability| capability.as_str() == "cli-probe.upper")
+        ),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn strict_check_rejects_workflow_arguments_that_propose_the_wrong_capability() {
+    use super::workflows::{ParseFailure, Refused};
+
+    let fixture = WorkflowFixture::new();
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: wrong, argv: [probe, upper, --text, hi], capability: http-probe.fetch}\n",
+    );
+    let refusals = fixture.refusals().await;
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        matches!(
+            &refusals[0].refused,
+            Refused::Parse(parse) if matches!(
+                &parse.failure,
+                ParseFailure::Proposed { capability } if capability.as_str() == "cli-probe.upper"
+            )
+        ),
+        "{refusals:?}"
+    );
+}
+
+#[tokio::test]
+async fn relaxed_check_skips_workflow_loading_and_leaves_the_store_unopened() {
+    let fixture = WorkflowFixture::new();
+    let mut document = attested_document(current_uid());
+    document.as_object_mut().unwrap().remove("providers");
+    document["providerSet"] = json!({"lockPath": "providers.lock.yaml", "storePath": "store"});
+    write_config(&fixture.config, &document);
+    let store = fixture._root.path().join("store");
+    let missing_set = fixture._root.path().join("providers.yaml");
+    let report = super::check(
+        &fixture.config,
+        Some(super::CheckProviders {
+            provider_set: missing_set,
+            store: store.clone(),
+            download_concurrency: super::DEFAULT_DOWNLOAD_CONCURRENCY,
+            verification: super::ProviderVerification::Relaxed,
+        }),
+        Some(&fixture.workflows.join("missing")),
+    )
+    .await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::ProviderSet(_)]
+        ),
+        "{report:?}"
+    );
+    assert!(
+        matches!(
+            report.warnings.as_slice(),
+            [
+                super::StartupWarning::RelaxedVerification {
+                    stage: super::Stage::Providers
+                },
+                super::StartupWarning::RelaxedVerification {
+                    stage: super::Stage::Workflows
+                },
+                ..
+            ]
+        ),
+        "{report:?}"
+    );
+    assert!(!store.exists());
 }
 
 const MAPPED_SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";

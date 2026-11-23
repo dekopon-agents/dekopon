@@ -28,7 +28,7 @@ use dekopon_core::{
 use futures_util::{StreamExt as _, stream};
 use http_auth::parser::ChallengeParser;
 use reqwest::{
-    StatusCode, Url,
+    Method, StatusCode, Url,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, WWW_AUTHENTICATE},
 };
 use semver::Version;
@@ -196,12 +196,8 @@ pub struct ProviderManager {
 
 impl ProviderManager {
     pub async fn new(options: ProviderManagerOptions) -> Result<Self, ProviderManagerError> {
-        let bundle = load_registry_ca_bundle(
-            std::env::var_os(REGISTRY_CA_BUNDLE_ENV).as_deref(),
-            socket::current_uid(),
-        )
-        .await?;
-        let registry = RegistryClient::new(options.plaintext_loopback_registries, bundle)?;
+        let registry =
+            RegistryClient::with_operator_ca(options.plaintext_loopback_registries).await?;
         Ok(Self {
             paths: options.paths,
             registry,
@@ -467,6 +463,15 @@ impl ProviderManager {
             providers: lock.providers.len(),
         })
     }
+}
+
+pub(crate) async fn probe_provider_set(
+    path: &Path,
+    concurrency: NonZeroUsize,
+    timings: Option<&mut CheckTimings>,
+) -> Result<(), ProviderManagerError> {
+    let registry = RegistryClient::with_operator_ca(Vec::new()).await?;
+    registry.probe_set(path, concurrency, timings).await
 }
 
 fn export_skills(
@@ -1221,6 +1226,91 @@ struct RegistryClient {
 struct RegistryToken(String);
 
 impl RegistryClient {
+    async fn with_operator_ca(plaintext: Vec<String>) -> Result<Self, ProviderManagerError> {
+        let bundle = load_registry_ca_bundle(
+            std::env::var_os(REGISTRY_CA_BUNDLE_ENV).as_deref(),
+            socket::current_uid(),
+        )
+        .await?;
+        Self::new(plaintext, bundle)
+    }
+
+    async fn probe_set(
+        &self,
+        path: &Path,
+        concurrency: NonZeroUsize,
+        timings: Option<&mut CheckTimings>,
+    ) -> Result<(), ProviderManagerError> {
+        let desired = load_provider_set(path, socket::current_uid()).await?;
+        let count = desired.providers.len();
+        let started = std::time::Instant::now();
+        let mut failures = stream::iter(desired.providers.into_iter().enumerate())
+            .map(|(index, provider)| async move {
+                self.probe(&provider.source)
+                    .await
+                    .err()
+                    .map(|error| (index, (provider.source, error.for_probe())))
+            })
+            .buffer_unordered(concurrency.get())
+            .filter_map(std::future::ready)
+            .collect::<Vec<_>>()
+            .await;
+        if let Some(timings) = timings {
+            let concurrency = concurrency.get().min(count);
+            timings.download_concurrency = Some(concurrency);
+            timings.probe = Some(CheckPhase::record(
+                "relaxed_probe",
+                started,
+                count,
+                None,
+                failures.is_empty(),
+                Some(concurrency),
+            ));
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        failures.sort_unstable_by_key(|(index, _)| *index);
+        Err(ProviderManagerError::ProbeFailed {
+            failures: failures.into_iter().map(|(_, failure)| failure).collect(),
+        })
+    }
+
+    async fn probe(&self, source: &str) -> Result<(), ProviderManagerError> {
+        let resolved = self.resolve(source).await?;
+        let parsed = ParsedSource::parse(&resolved.source)?;
+        let url = self.registry_url(
+            &parsed.reference,
+            &format!("blobs/{}", resolved.layer.digest),
+        )?;
+        let response = self
+            .request_authorized(
+                &parsed.reference,
+                Method::HEAD,
+                url,
+                None,
+                RegistryOperation::Blob,
+            )
+            .await?;
+        if let Some(header) = response.headers().get(CONTENT_LENGTH) {
+            let length = header
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    ProviderManagerError::registry("OCI blob Content-Length is invalid")
+                })?;
+            if length != resolved.layer.size {
+                return Err(ProviderManagerError::digest_mismatch(
+                    BLOB_SIZE_MISMATCH,
+                    resolved.layer.size.to_string(),
+                    length.to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn new(
         plaintext: Vec<String>,
         bundle: Option<RegistryCaBundle>,
@@ -1268,11 +1358,12 @@ impl RegistryClient {
             .ok_or_else(|| ProviderManagerError::config_detail(MISSING_SELECTOR, source))?;
         let url = self.registry_url(&parsed.reference, &format!("manifests/{selector}"))?;
         let response = self
-            .get_authorized(
+            .request_authorized(
                 &parsed.reference,
+                Method::GET,
                 url,
                 Some(OCI_MANIFEST_MEDIA_TYPE),
-                "manifest",
+                RegistryOperation::Manifest,
             )
             .await?;
         let headers = response.headers().clone();
@@ -1352,7 +1443,13 @@ impl RegistryClient {
         let parsed = ParsedSource::parse(source)?;
         let url = self.registry_url(&parsed.reference, &format!("blobs/{}", descriptor.digest))?;
         let response = self
-            .get_authorized(&parsed.reference, url, None, "blob")
+            .request_authorized(
+                &parsed.reference,
+                Method::GET,
+                url,
+                None,
+                RegistryOperation::Blob,
+            )
             .await?;
         if let Some(length) = response.content_length()
             && length != descriptor.size
@@ -1430,57 +1527,103 @@ impl RegistryClient {
         })
     }
 
-    async fn get_authorized(
+    async fn request_authorized(
         &self,
         reference: &OciReference,
+        method: Method,
         url: Url,
         accept: Option<&str>,
-        operation: &'static str,
+        operation: RegistryOperation,
     ) -> Result<reqwest::Response, ProviderManagerError> {
         let key = format!("{}/{}", reference.registry(), reference.repository());
         let cached = self.tokens.lock().get(&key).cloned();
+        let mut authentication = if cached.is_some() {
+            RegistryAuthentication::Bearer
+        } else {
+            RegistryAuthentication::Anonymous
+        };
         let mut response = self
-            .send_get(url.clone(), accept, cached.as_ref(), operation)
+            .send_request(
+                method.clone(),
+                url.clone(),
+                accept,
+                cached.as_ref(),
+                operation,
+            )
             .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
-            let challenge = response
-                .headers()
-                .get(WWW_AUTHENTICATE)
-                .ok_or_else(|| ProviderManagerError::registry(MISSING_CHALLENGE))?
-                .to_str()
-                .map_err(|source| {
-                    ProviderManagerError::registry_source(
-                        "OCI registry authentication challenge header is invalid",
-                        source,
-                    )
-                })?
-                .to_owned();
+            let challenge = Self::bearer_challenge(response.headers()).map_err(|error| {
+                ProviderManagerError::RegistryStatus {
+                    status: StatusCode::UNAUTHORIZED,
+                    operation,
+                    authentication,
+                    source: Some(Box::new(error)),
+                }
+            })?;
             // Registry response text is untrusted and must never reach the surfaced error or
             // ordinary logs.
-            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation).await?;
+            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation.label())
+                .await?;
             let token = self.fetch_token(reference, &challenge).await?;
             self.tokens.lock().insert(key, token.clone());
-            response = self.send_get(url, accept, Some(&token), operation).await?;
+            authentication = RegistryAuthentication::Bearer;
+            response = self
+                .send_request(method, url, accept, Some(&token), operation)
+                .await?;
         }
-        if !response.status().is_success() {
-            let status = response.status();
-            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation).await?;
-            return Err(ProviderManagerError::registry_detail(
-                REGISTRY_STATUS,
-                format!("{operation}: HTTP {status}"),
-            ));
-        }
-        Ok(response)
+        Self::require_success(response, operation, authentication).await
     }
 
-    async fn send_get(
+    fn bearer_challenge(
+        headers: &reqwest::header::HeaderMap,
+    ) -> Result<String, ProviderManagerError> {
+        headers
+            .get(WWW_AUTHENTICATE)
+            .ok_or_else(|| ProviderManagerError::registry(MISSING_CHALLENGE))?
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|source| {
+                ProviderManagerError::registry_source(
+                    "OCI registry authentication challenge header is invalid",
+                    source,
+                )
+            })
+    }
+
+    async fn require_success(
+        response: reqwest::Response,
+        operation: RegistryOperation,
+        authentication: RegistryAuthentication,
+    ) -> Result<reqwest::Response, ProviderManagerError> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let source =
+            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation.label())
+                .await
+                .err()
+                .map(Box::new);
+        Err(ProviderManagerError::RegistryStatus {
+            status,
+            operation,
+            authentication,
+            source,
+        })
+    }
+
+    async fn send_request(
         &self,
+        method: Method,
         url: Url,
         accept: Option<&str>,
         token: Option<&RegistryToken>,
-        operation: &'static str,
+        operation: RegistryOperation,
     ) -> Result<reqwest::Response, ProviderManagerError> {
-        let mut request = self.client.get(url).timeout(REGISTRY_OPERATION_TIMEOUT);
+        let mut request = self
+            .client
+            .request(method, url)
+            .timeout(REGISTRY_OPERATION_TIMEOUT);
         if let Some(accept) = accept {
             request = request.header(ACCEPT, accept);
         }
@@ -1497,7 +1640,7 @@ impl RegistryClient {
         request.send().await.map_err(|source| {
             ProviderManagerError::registry_transport(
                 REGISTRY_REQUEST_FAILED,
-                operation,
+                operation.label(),
                 source.without_url(),
             )
         })
@@ -1537,26 +1680,14 @@ impl RegistryClient {
             );
         }
         let response = self
-            .client
-            .get(realm)
-            .timeout(REGISTRY_OPERATION_TIMEOUT)
-            .send()
-            .await
-            .map_err(|source| {
-                ProviderManagerError::registry_transport(
-                    REGISTRY_REQUEST_FAILED,
-                    "token",
-                    source.without_url(),
-                )
-            })?;
-        if !response.status().is_success() {
-            let status = response.status();
-            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, "token").await?;
-            return Err(ProviderManagerError::registry_detail(
-                REGISTRY_STATUS,
-                format!("token: HTTP {status}"),
-            ));
-        }
+            .send_request(Method::GET, realm, None, None, RegistryOperation::Token)
+            .await?;
+        let response = Self::require_success(
+            response,
+            RegistryOperation::Token,
+            RegistryAuthentication::Anonymous,
+        )
+        .await?;
         let bytes = bounded_response_bytes(response, HARD_MAX_TOKEN_BYTES, "token").await?;
         let document = serde_json::from_slice::<TokenDocument>(&bytes).map_err(|source| {
             ProviderManagerError::registry_source("OCI registry token response is invalid", source)
@@ -2419,7 +2550,6 @@ const RESOLVED_VERSION_MISMATCH: &str =
     "provider lock resolvedVersion does not match its exact tag";
 const REGISTRY_REQUEST_FAILED: &str = "OCI registry request failed";
 const REGISTRY_STREAM_FAILED: &str = "OCI registry response failed while streaming";
-const REGISTRY_STATUS: &str = "OCI registry returned an unsuccessful HTTP status";
 const RESPONSE_TOO_LARGE: &str = "OCI registry response exceeds its byte ceiling";
 const MISSING_CHALLENGE: &str =
     "OCI registry required authentication without a WWW-Authenticate challenge";
@@ -2447,6 +2577,14 @@ pub enum RegistryCaBundleCause {
 pub enum ProviderManagerError {
     #[error("provider sync failed: {}", render_provider_failures(.failures))]
     SyncFailed { failures: Vec<(String, Self)> },
+    #[error("relaxed verification failed: {}", render_provider_failures(.failures))]
+    ProbeFailed { failures: Vec<(String, Self)> },
+    #[error("pinned artifact {outcome}")]
+    Probe {
+        outcome: ProbeOutcome,
+        #[source]
+        source: Box<Self>,
+    },
     #[error("{REGISTRY_CA_BUNDLE_ENV} names {}, which cannot be used", path.display())]
     RegistryCaBundle {
         path: PathBuf,
@@ -2496,6 +2634,21 @@ pub enum ProviderManagerError {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
+    #[error("OCI registry returned an unsuccessful HTTP status: {}: HTTP {status}", operation.label())]
+    RegistryStatus {
+        operation: RegistryOperation,
+        status: StatusCode,
+        authentication: RegistryAuthentication,
+        #[source]
+        source: Option<Box<Self>>,
+    },
+    #[error("{reason}: {operation}")]
+    RegistryTransport {
+        reason: &'static str,
+        operation: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("{reason}: expected {expected}, got {actual}")]
     DigestMismatch {
         reason: &'static str,
@@ -2530,6 +2683,46 @@ pub enum ProviderManagerError {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistryOperation {
+    Manifest,
+    Blob,
+    Token,
+}
+
+impl RegistryOperation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Blob => "blob",
+            Self::Token => "token",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistryAuthentication {
+    Anonymous,
+    Bearer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeOutcome {
+    Missing,
+    Inconclusive,
+    Invalid,
+}
+
+impl std::fmt::Display for ProbeOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "is missing",
+            Self::Inconclusive => "availability is inconclusive",
+            Self::Invalid => "is invalid",
+        })
+    }
+}
+
 fn render_provider_failures(failures: &[(String, ProviderManagerError)]) -> String {
     failures
         .iter()
@@ -2539,6 +2732,43 @@ fn render_provider_failures(failures: &[(String, ProviderManagerError)]) -> Stri
 }
 
 impl ProviderManagerError {
+    fn for_probe(self) -> Self {
+        let outcome = match &self {
+            Self::RegistryStatus {
+                status: StatusCode::NOT_FOUND,
+                operation: RegistryOperation::Manifest | RegistryOperation::Blob,
+                authentication: RegistryAuthentication::Bearer,
+                source: None,
+            } => ProbeOutcome::Missing,
+            Self::RegistryStatus { .. } | Self::RegistryTransport { .. } => {
+                ProbeOutcome::Inconclusive
+            }
+            Self::RegistryCaBundle { .. }
+            | Self::SkillExportTask { .. }
+            | Self::SkillRead { .. }
+            | Self::SkillOutputNotDirectory { .. }
+            | Self::SkillOutputNotEmpty { .. }
+            | Self::DuplicateSkill { .. }
+            | Self::Configuration { .. }
+            | Self::StateConflicts { .. }
+            | Self::FileSecurity { .. }
+            | Self::Registry { .. }
+            | Self::DigestMismatch { .. }
+            | Self::LockMismatch { .. }
+            | Self::StoreFull { .. }
+            | Self::OperationInProgress { .. }
+            | Self::Host(_)
+            | Self::Io { .. }
+            | Self::SyncFailed { .. }
+            | Self::ProbeFailed { .. }
+            | Self::Probe { .. } => ProbeOutcome::Invalid,
+        };
+        Self::Probe {
+            outcome,
+            source: Box::new(self),
+        }
+    }
+
     fn config(reason: &'static str) -> Self {
         Self::Configuration {
             reason,
@@ -2598,10 +2828,10 @@ impl ProviderManagerError {
         operation: &'static str,
         source: reqwest::Error,
     ) -> Self {
-        Self::Registry {
+        Self::RegistryTransport {
             reason,
-            detail: Some(operation.to_owned()),
-            source: Some(Box::new(source)),
+            operation,
+            source,
         }
     }
 
@@ -2709,11 +2939,12 @@ mod tests {
         let client = RegistryClient::new(Vec::new(), None).expect("client");
         assert!(
             client
-                .send_get(
+                .send_request(
+                    Method::GET,
                     Url::parse(&format!("{}{path}", refused.endpoint)).expect("URL"),
                     None,
                     None,
-                    "manifest"
+                    RegistryOperation::Manifest,
                 )
                 .await
                 .is_err()
@@ -2734,11 +2965,12 @@ mod tests {
             .expect("bundle");
         let client = RegistryClient::new(Vec::new(), bundle).expect("client");
         client
-            .send_get(
+            .send_request(
+                Method::GET,
                 Url::parse(&format!("{}{path}", reached.endpoint)).expect("URL"),
                 None,
                 None,
-                "manifest",
+                RegistryOperation::Manifest,
             )
             .await
             .expect("trusted registry");
@@ -2919,8 +3151,11 @@ mod tests {
         component: Arc<Vec<u8>>,
         manifests: Arc<AtomicUsize>,
         blobs: Arc<AtomicUsize>,
+        heads: Arc<AtomicUsize>,
         competing_blob: Option<PathBuf>,
         manifest_failures: Arc<parking_lot::Mutex<BTreeMap<String, (StatusCode, Duration)>>>,
+        blob_head: Arc<parking_lot::Mutex<Option<(StatusCode, u64)>>>,
+        token_status: Arc<parking_lot::Mutex<Option<StatusCode>>>,
     }
 
     #[derive(Clone)]
@@ -2985,11 +3220,15 @@ mod tests {
                 component: Arc::new(component),
                 manifests: Arc::new(AtomicUsize::new(0)),
                 blobs: Arc::new(AtomicUsize::new(0)),
+                heads: Arc::new(AtomicUsize::new(0)),
                 competing_blob,
                 manifest_failures: Arc::default(),
+                blob_head: Arc::default(),
+                token_status: Arc::default(),
             };
             let app = Router::new()
                 .route("/v2/{*path}", get(registry_response))
+                .route("/token", get(registry_token_response))
                 .with_state(state.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -3023,7 +3262,28 @@ mod tests {
     async fn registry_response(
         AxumPath(path): AxumPath<String>,
         State(state): State<RegistryState>,
+        method: Method,
+        headers: AxumHeaderMap,
     ) -> Response<Body> {
+        if state.token_status.lock().is_some()
+            && headers
+                .get(AUTHORIZATION)
+                .is_none_or(|value| value != "Bearer fixture")
+        {
+            let host = headers
+                .get(reqwest::header::HOST)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(
+                    WWW_AUTHENTICATE,
+                    format!("Bearer realm=\"http://{host}/token\""),
+                )
+                .body(Body::empty())
+                .unwrap();
+        }
         if path.contains("/manifests/") {
             state.manifests.fetch_add(1, Ordering::Relaxed);
             let failure = state.manifest_failures.lock().get(&path).copied();
@@ -3046,6 +3306,18 @@ mod tests {
             return response;
         }
         if path.contains("/blobs/") {
+            if method == Method::HEAD {
+                state.heads.fetch_add(1, Ordering::Relaxed);
+                let (status, length) = state
+                    .blob_head
+                    .lock()
+                    .unwrap_or((StatusCode::OK, state.component.len() as u64));
+                return Response::builder()
+                    .status(status)
+                    .header(CONTENT_LENGTH, length)
+                    .body(Body::empty())
+                    .unwrap();
+            }
             let previous = state.blobs.fetch_add(1, Ordering::Relaxed);
             if previous == 0
                 && let Some(path) = &state.competing_blob
@@ -3065,6 +3337,17 @@ mod tests {
             .status(StatusCode::NOT_FOUND)
             .body(Body::empty())
             .expect("404 fixture")
+    }
+
+    async fn registry_token_response(State(state): State<RegistryState>) -> Response<Body> {
+        let status = state
+            .token_status
+            .lock()
+            .unwrap_or(StatusCode::UNAUTHORIZED);
+        Response::builder()
+            .status(status)
+            .body(Body::from(r#"{"token":"fixture"}"#))
+            .unwrap()
     }
 
     fn cli_probe_component() -> Vec<u8> {
@@ -3204,6 +3487,120 @@ mod tests {
         assert_eq!(registry.state.manifests.load(Ordering::Relaxed), 2);
         assert!(!paths.lock_file.exists());
         registry.stop().await;
+    }
+
+    #[tokio::test]
+    async fn relaxed_probe_uses_head_and_refuses_a_size_mismatch() {
+        let registry = TestRegistry::start(cli_probe_component()).await;
+        let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
+        let source = format!("{}/test/provider:1.0.0", registry.authority);
+        client.probe(&source).await.unwrap();
+        *registry.state.blob_head.lock() = Some((StatusCode::OK, 1));
+        assert!(matches!(
+            client.probe(&source).await,
+            Err(ProviderManagerError::DigestMismatch {
+                reason: BLOB_SIZE_MISMATCH,
+                ..
+            })
+        ));
+        assert_eq!(registry.state.heads.load(Ordering::Relaxed), 2);
+        assert_eq!(registry.state.blobs.load(Ordering::Relaxed), 0);
+        registry.stop().await;
+    }
+
+    #[tokio::test]
+    async fn relaxed_probe_distinguishes_authenticated_missing_from_inconclusive_responses() {
+        let registry = TestRegistry::start(cli_probe_component()).await;
+        let source = format!("{}/test/provider:1.0.0", registry.authority);
+        let manifest = "test/provider/manifests/1.0.0".to_owned();
+        for (token, failure, operation, authentication, outcome) in [
+            (
+                None,
+                StatusCode::NOT_FOUND,
+                RegistryOperation::Manifest,
+                RegistryAuthentication::Anonymous,
+                ProbeOutcome::Inconclusive,
+            ),
+            (
+                Some(StatusCode::UNAUTHORIZED),
+                StatusCode::UNAUTHORIZED,
+                RegistryOperation::Token,
+                RegistryAuthentication::Anonymous,
+                ProbeOutcome::Inconclusive,
+            ),
+            (
+                Some(StatusCode::FORBIDDEN),
+                StatusCode::FORBIDDEN,
+                RegistryOperation::Token,
+                RegistryAuthentication::Anonymous,
+                ProbeOutcome::Inconclusive,
+            ),
+            (
+                Some(StatusCode::OK),
+                StatusCode::NOT_FOUND,
+                RegistryOperation::Manifest,
+                RegistryAuthentication::Bearer,
+                ProbeOutcome::Missing,
+            ),
+            (
+                Some(StatusCode::OK),
+                StatusCode::NOT_FOUND,
+                RegistryOperation::Blob,
+                RegistryAuthentication::Bearer,
+                ProbeOutcome::Missing,
+            ),
+            (
+                Some(StatusCode::OK),
+                StatusCode::TOO_MANY_REQUESTS,
+                RegistryOperation::Blob,
+                RegistryAuthentication::Bearer,
+                ProbeOutcome::Inconclusive,
+            ),
+            (
+                Some(StatusCode::OK),
+                StatusCode::SERVICE_UNAVAILABLE,
+                RegistryOperation::Manifest,
+                RegistryAuthentication::Bearer,
+                ProbeOutcome::Inconclusive,
+            ),
+        ] {
+            *registry.state.token_status.lock() = token;
+            registry.state.manifest_failures.lock().clear();
+            *registry.state.blob_head.lock() = None;
+            match operation {
+                RegistryOperation::Manifest => {
+                    registry
+                        .state
+                        .manifest_failures
+                        .lock()
+                        .insert(manifest.clone(), (failure, Duration::ZERO));
+                }
+                RegistryOperation::Blob => *registry.state.blob_head.lock() = Some((failure, 0)),
+                RegistryOperation::Token => {}
+            }
+            let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
+            let error = client.probe(&source).await.unwrap_err().for_probe();
+            assert!(
+                matches!(
+                    &error,
+                    ProviderManagerError::Probe { outcome: result, source }
+                        if *result == outcome && matches!(
+                            &**source,
+                            ProviderManagerError::RegistryStatus {
+                                operation: actual_operation, status, authentication: actual_authentication, ..
+                            } if *actual_operation == operation && *status == failure && *actual_authentication == authentication
+                        )
+                ),
+                "{error:?}"
+            );
+        }
+        let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
+        registry.stop().await;
+        assert!(matches!(
+            client.probe(&source).await.unwrap_err().for_probe(),
+            ProviderManagerError::Probe { outcome: ProbeOutcome::Inconclusive, source }
+                if matches!(*source, ProviderManagerError::RegistryTransport { .. })
+        ));
     }
 
     #[test]
@@ -3690,6 +4087,7 @@ mod tests {
                     provider_set,
                     store: directory.path().to_owned(),
                     download_concurrency: crate::DEFAULT_DOWNLOAD_CONCURRENCY,
+                    verification: crate::ProviderVerification::Strict,
                 }),
                 None,
             )
@@ -3901,7 +4299,7 @@ mod tests {
         let url = Url::parse(&format!("http://{authority}/{sentinel}?token={sentinel}"))
             .expect("request URL");
         let error = registry
-            .send_get(url, None, None, "manifest")
+            .send_request(Method::GET, url, None, None, RegistryOperation::Manifest)
             .await
             .expect_err("closed port refuses request");
         let mut rendered = error.to_string();
@@ -3974,11 +4372,12 @@ mod tests {
         )
         .expect("redirect client");
         let response = client
-            .send_get(
+            .send_request(
+                Method::GET,
                 Url::parse(&format!("http://{source_authority}/source")).expect("source URL"),
                 None,
                 Some(&RegistryToken("bearer-secret-sentinel".to_owned())),
-                "blob",
+                RegistryOperation::Blob,
             )
             .await
             .expect("approved cross-authority redirect follows");
@@ -4021,15 +4420,19 @@ mod tests {
         let client =
             RegistryClient::new(vec![loop_authority.to_string()], None).expect("loop client");
         let error = client
-            .send_get(
+            .send_request(
+                Method::GET,
                 Url::parse(&format!("http://{loop_authority}/loop")).expect("loop URL"),
                 None,
                 None,
-                "manifest",
+                RegistryOperation::Manifest,
             )
             .await
             .expect_err("redirect loop reaches the hard hop ceiling");
-        assert!(matches!(error, ProviderManagerError::Registry { .. }));
+        assert!(matches!(
+            error,
+            ProviderManagerError::RegistryTransport { .. }
+        ));
         loop_task.abort();
         assert!(
             loop_task

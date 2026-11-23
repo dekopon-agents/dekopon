@@ -137,9 +137,17 @@ struct CheckArgs {
         long,
         value_name = "N",
         default_value_t = dekopon_brokerd::DEFAULT_DOWNLOAD_CONCURRENCY,
-        help = "Maximum number of concurrent provider downloads (positive)"
+        help = "Maximum number of concurrent provider downloads or availability probes (positive)"
     )]
     download_concurrency: NonZeroUsize,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        requires_if("relaxed", "provider_set"),
+        help = "Run full validation (strict) or check pinned artifact availability only (relaxed)"
+    )]
+    provider_verification: dekopon_brokerd::ProviderVerification,
     /// Render problems and warnings as a table or JSON.
     #[arg(long, value_enum, default_value_t)]
     output: OutputFormat,
@@ -671,6 +679,8 @@ struct CheckOutput {
     peak_rss_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timings: Option<dekopon_brokerd::CheckTimings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<&'static str>,
 }
 
 #[cfg(unix)]
@@ -719,6 +729,7 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
             provider_set,
             store,
             download_concurrency: check.download_concurrency,
+            verification: check.provider_verification,
         });
     let report = dekopon_brokerd::check(&check.config, providers, check.workflows.as_deref()).await;
     let output = CheckOutput {
@@ -734,6 +745,7 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
         warnings: report.warnings.iter().map(ToString::to_string).collect(),
         peak_rss_bytes: report.peak_rss_bytes,
         timings: report.timings,
+        verification: check.provider_verification.message(),
     };
     render(check.output, &output, || {
         let lines = output
@@ -780,7 +792,12 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
                     )
                 }))
             }))
-            .chain(output.ok.then(|| "ok".to_owned()))
+            .chain(
+                output
+                    .verification
+                    .map(|message| format!("verification\t{message}")),
+            )
+            .chain((output.ok && output.verification.is_none()).then(|| "ok".to_owned()))
             .collect::<Vec<_>>();
         lines.join("\n")
     })?;
@@ -1097,6 +1114,7 @@ mod tests {
                 warnings: Vec::new(),
                 peak_rss_bytes: peak,
                 timings: None,
+                verification: None,
             };
             assert_eq!(
                 serde_json::to_value(output).expect("JSON output"),
@@ -1128,6 +1146,28 @@ mod tests {
                 "broker.yaml",
                 "--download-concurrency",
                 "0"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn check_defaults_to_strict_and_relaxed_requires_a_provider_set() {
+        let cli = Cli::try_parse_from(["dekopon-brokerd", "check", "broker.yaml"]).unwrap();
+        let Some(Command::Check(check)) = cli.command else {
+            panic!("check command");
+        };
+        assert_eq!(
+            check.provider_verification,
+            dekopon_brokerd::ProviderVerification::Strict
+        );
+        assert!(
+            Cli::try_parse_from([
+                "dekopon-brokerd",
+                "check",
+                "broker.yaml",
+                "--provider-verification",
+                "relaxed",
             ])
             .is_err()
         );
