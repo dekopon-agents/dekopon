@@ -46,7 +46,8 @@ use tokio::{
 use tracing::Instrument as _;
 
 use crate::github_app::{
-    Downscope, GithubAppCredential, GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES, Installation,
+    Downscope, GithubAppCredential, GithubAppError, GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES,
+    Installation,
 };
 
 pub(crate) mod chatgpt;
@@ -301,6 +302,22 @@ struct Projection {
     pointer: Option<String>,
     #[serde(default)]
     decode_base64: bool,
+}
+
+impl Projection {
+    fn pointer_problems(&self) -> impl Iterator<Item = &'static str> {
+        let non_document = matches!(self.format, DocumentFormat::Raw | DocumentFormat::Utf8);
+        [
+            (non_document && self.pointer.is_some())
+                .then_some("uses a pointer with a non-document projection"),
+            self.pointer
+                .as_deref()
+                .is_some_and(|pointer| !valid_json_pointer(pointer))
+                .then_some("uses an invalid RFC 6901 pointer"),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -1732,18 +1749,98 @@ pub(crate) async fn load_with_bytes(
 pub(crate) async fn load_shapes(
     path: &Path,
     expected_uid: u32,
+    mut material_problems: Option<&mut Vec<SecretMapError>>,
 ) -> Result<SecretCatalog, SecretMapError> {
     let (file, _) = read_map::<SecretMapFile>(path, expected_uid).await?;
     let mut problems = Vec::new();
-    let bindings = file
-        .secrets
-        .into_iter()
-        .flat_map(|entry| entry_bindings(entry, &mut problems).1)
-        .collect();
+    let mut bindings = Vec::new();
+    for entry in file.secrets {
+        let ((drn, source, projection), entry_bindings) = entry_bindings(entry, &mut problems);
+        bindings.extend(entry_bindings);
+        if let Some(problems) = material_problems.as_deref_mut()
+            && let Err(error) = check_material(drn, source, &projection, expected_uid).await
+        {
+            problems.push(error);
+        }
+    }
     if !problems.is_empty() {
         return Err(SecretMapError::Validation { problems });
     }
     SecretCatalog::unresolved(bindings).map_err(|source| SecretMapError::Catalog { source })
+}
+
+async fn check_material(
+    drn: SecretDrn,
+    source: SecretSource,
+    projection: &Projection,
+    uid: u32,
+) -> Result<(), SecretMapError> {
+    let failure = |field, path, reason: MaterialError| SecretMapError::Material {
+        drn,
+        field,
+        path,
+        reason: dekopon_core::error_chain(&reason),
+    };
+    match source {
+        SecretSource::SecureFile { path } => check_secure_file(&path, projection, uid)
+            .await
+            .map_err(|reason| failure("secureFile", path, reason)),
+        SecretSource::GithubApp { private_key, .. } => check_github_app_key(&private_key, uid)
+            .await
+            .map_err(|reason| failure("privateKey", private_key, reason)),
+        SecretSource::KubernetesProjection { .. }
+        | SecretSource::OnePasswordConnect { .. }
+        | SecretSource::VaultKv1 { .. }
+        | SecretSource::VaultKv2 { .. }
+        | SecretSource::AwsSecretsManager { .. }
+        | SecretSource::AwsSsmParameter { .. }
+        | SecretSource::GcpSecretManager { .. }
+        | SecretSource::AzureKeyVault { .. }
+        | SecretSource::KubernetesApi { .. }
+        | SecretSource::KubernetesTokenRequest { .. }
+        | SecretSource::OAuth2Refresh { .. }
+        | SecretSource::ChatgptSubscription { .. } => Ok(()),
+    }
+}
+
+#[derive(Debug, Error)]
+enum MaterialError {
+    #[error("{0}")]
+    Config(&'static str),
+    #[error(transparent)]
+    Source(#[from] SourceError),
+    #[error(transparent)]
+    File(#[from] FileHygieneError),
+    #[error(transparent)]
+    Key(#[from] GithubAppError),
+    #[error("private key validation {0}")]
+    Task(#[from] dekopon_core::TaskOutcome),
+}
+
+async fn check_secure_file(
+    path: &Path,
+    projection: &Projection,
+    uid: u32,
+) -> Result<(), MaterialError> {
+    validate_absolute(path).map_err(MaterialError::Config)?;
+    let bytes = read_private_file(path, uid, HARD_MAX_SOURCE_RESPONSE_BYTES).await?;
+    if let Some(problem) = projection.pointer_problems().next() {
+        return Err(MaterialError::Config(problem));
+    }
+    project(bytes, projection)?;
+    Ok(())
+}
+
+async fn check_github_app_key(path: &Path, uid: u32) -> Result<(), MaterialError> {
+    validate_absolute(path).map_err(MaterialError::Config)?;
+    let path = path.to_path_buf();
+    offload(move || {
+        let pem = read_github_app_pem(&path, uid)?;
+        GithubAppKey::from_pem(&pem)?;
+        Ok(())
+    })
+    .await
+    .map_err(dekopon_core::TaskOutcome::from)?
 }
 
 fn entry_bindings(
@@ -1880,24 +1977,12 @@ async fn validate_map(
         if entry.bindings.is_empty() || entry.bindings.len() > MAX_BINDINGS_PER_SECRET {
             problems.push(format!("{} has an invalid binding count", entry.drn));
         }
-        if matches!(
-            entry.projection.format,
-            DocumentFormat::Raw | DocumentFormat::Utf8
-        ) && entry.projection.pointer.is_some()
-        {
-            problems.push(format!(
-                "{} uses a pointer with a non-document projection",
-                entry.drn
-            ));
-        }
-        if entry
-            .projection
-            .pointer
-            .as_deref()
-            .is_some_and(|pointer| !valid_json_pointer(pointer))
-        {
-            problems.push(format!("{} uses an invalid RFC 6901 pointer", entry.drn));
-        }
+        problems.extend(
+            entry
+                .projection
+                .pointer_problems()
+                .map(|problem| format!("{} {problem}", entry.drn)),
+        );
         if matches!(
             entry.source,
             SecretSource::ChatgptSubscription { .. } | SecretSource::GithubApp { .. }
@@ -2161,6 +2246,13 @@ fn mint_sources(
     })
 }
 
+fn read_github_app_pem(path: &Path, uid: u32) -> Result<Vec<u8>, FileHygieneError> {
+    let pem = read_trusted_file(path, uid, FileTier::Private, HARD_MAX_GITHUB_APP_KEY_BYTES);
+    #[cfg(test)]
+    crate::private_read_witness::record(path, &pem);
+    pem
+}
+
 fn open_github_app(
     drn: &SecretDrn,
     private_key: &Path,
@@ -2168,15 +2260,7 @@ fn open_github_app(
     minted_digest: &mut Sha256,
     installation: Installation,
 ) -> Result<GithubAppCredential, String> {
-    let pem = read_trusted_file(
-        private_key,
-        expected_uid,
-        FileTier::Private,
-        HARD_MAX_GITHUB_APP_KEY_BYTES,
-    );
-    #[cfg(test)]
-    crate::private_read_witness::record(private_key, &pem);
-    let pem = pem.map_err(|source| {
+    let pem = read_github_app_pem(private_key, expected_uid).map_err(|source| {
         format!(
             "{drn} privateKey {} is not trusted input ({}): {}",
             private_key.display(),
@@ -2948,6 +3032,13 @@ pub enum SecretMapError {
     },
     #[error("private secret map is not strict valid YAML or JSON: {diagnostic}")]
     Decode { diagnostic: String },
+    #[error("{drn} {field} {path}: {reason}")]
+    Material {
+        drn: SecretDrn,
+        field: &'static str,
+        path: PathBuf,
+        reason: String,
+    },
     #[error("private secret map has conflicts: {}", problems.join("; "))]
     Validation { problems: Vec<String> },
     #[error("private secret map HTTP client could not be built")]

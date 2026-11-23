@@ -32,9 +32,7 @@ or a file another UID owns (on a read-only mount the gateway also takes root's f
 projection). Configuration and policy must not be group- or world-writable;
 the secret map, credential files and `--env-file` must be `0600`. Directories above the socket,
 providers and storage must not be group- or world-writable unless sticky, and above `--env-file`
-and `--log-file` must belong to root or the daemon. `dekopon-brokerd check` skips credential files
-and an unreadable secret map: the map's owner and mode fail at start, a `secureFile`'s at first use. macOS refuses a socket
-path of 104 bytes or more.
+and `--log-file` must belong to root or the daemon. macOS refuses a socket path of 104 bytes or more.
 
 ## Kubernetes
 
@@ -152,7 +150,8 @@ administrator:
 Upgrade both daemons together from one release; their protocol has no cross-release negotiation.
 
 1. Run the new release's `dekopon-brokerd check` and `dekopon-gatewayd check` on the configuration
-   each will serve; start nothing until both pass.
+   each will serve. For a broker tree with its credential files mounted or copied into place,
+   pass `--materialized` to the broker check. Start both daemons after the checks pass.
 2. Stop the gateway, then the broker.
 3. Replace both binaries; with a managed provider set, run the new broker's `provider precompile`.
 4. Start the broker, wait for its `probe`, then start the gateway.
