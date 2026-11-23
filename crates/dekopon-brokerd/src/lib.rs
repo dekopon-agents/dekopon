@@ -790,10 +790,17 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
         Mode::Boot | Mode::Reload(_) => false,
     };
     if relaxed {
-        report.warnings.extend(
-            [Stage::Providers, Stage::Workflows]
-                .map(|stage| StartupWarning::RelaxedVerification { stage }),
-        );
+        for stage in [Stage::Providers, Stage::Workflows] {
+            if report.materialized {
+                report
+                    .problems
+                    .push(BrokerdError::RelaxedVerificationSkipped { stage });
+            } else {
+                report
+                    .warnings
+                    .push(StartupWarning::RelaxedVerification { stage });
+            }
+        }
     }
     let load_mode = match mode {
         Mode::Boot => LoadMode::Boot,
@@ -2007,6 +2014,8 @@ pub enum BrokerdError {
     ReloadTask(#[source] dekopon_core::TaskOutcome),
     #[error("{stage} not checked: a stage it needs failed")]
     CheckSkipped { stage: Stage },
+    #[error("{stage} skipped under relaxed verification")]
+    RelaxedVerificationSkipped { stage: Stage },
     #[error("{DEFAULT_SECRETS_UNCHECKED}")]
     DefaultSecretsUnchecked,
     #[error("check could not prepare its private directory {path}")]
