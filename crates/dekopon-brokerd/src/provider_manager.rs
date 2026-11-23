@@ -1998,11 +1998,10 @@ impl ProviderStore {
             )
         })?;
         let mut file = tokio::fs::File::from_std(std_file);
-        registry
-            .download_blob(source, descriptor, &mut file)
-            .await?;
-        file.flush()
-            .await
+        let downloaded = registry.download_blob(source, descriptor, &mut file).await;
+        let flushed = file.flush().await;
+        downloaded?;
+        flushed
             .map_err(|source| ProviderManagerError::io("could not write provider blob", source))?;
         file.sync_all().await.map_err(|source| {
             ProviderManagerError::io("could not synchronize provider blob", source)
@@ -2738,8 +2737,14 @@ impl ProviderManagerError {
                 status: StatusCode::NOT_FOUND,
                 operation: RegistryOperation::Manifest | RegistryOperation::Blob,
                 authentication: RegistryAuthentication::Bearer,
-                source: None,
-            } => ProbeOutcome::Missing,
+                source,
+            } => {
+                if let Some(Self::RegistryTransport { .. }) = source.as_deref() {
+                    ProbeOutcome::Inconclusive
+                } else {
+                    ProbeOutcome::Missing
+                }
+            }
             Self::RegistryStatus { .. } | Self::RegistryTransport { .. } => {
                 ProbeOutcome::Inconclusive
             }
@@ -3154,6 +3159,7 @@ mod tests {
         heads: Arc<AtomicUsize>,
         competing_blob: Option<PathBuf>,
         manifest_failures: Arc<parking_lot::Mutex<BTreeMap<String, (StatusCode, Duration)>>>,
+        manifest_failure_bytes: Arc<AtomicUsize>,
         blob_head: Arc<parking_lot::Mutex<Option<(StatusCode, u64)>>>,
         token_status: Arc<parking_lot::Mutex<Option<StatusCode>>>,
     }
@@ -3223,6 +3229,7 @@ mod tests {
                 heads: Arc::new(AtomicUsize::new(0)),
                 competing_blob,
                 manifest_failures: Arc::default(),
+                manifest_failure_bytes: Arc::default(),
                 blob_head: Arc::default(),
                 token_status: Arc::default(),
             };
@@ -3291,7 +3298,12 @@ mod tests {
                 tokio::time::sleep(delay).await;
                 return Response::builder()
                     .status(status)
-                    .body(Body::empty())
+                    .body(Body::from(vec![
+                        0;
+                        state
+                            .manifest_failure_bytes
+                            .load(Ordering::Relaxed)
+                    ]))
                     .unwrap();
             }
             let mut response = Response::new(Body::from(state.manifest.as_ref().clone()));
@@ -3451,6 +3463,62 @@ mod tests {
         registry.stop().await;
     }
 
+    #[test]
+    fn rejected_blob_holds_its_slot_until_pending_writes_are_drained() {
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let directory = tempfile::tempdir().unwrap();
+                let store = ProviderStore::open(
+                    &directory.path().join("store"),
+                    socket::current_uid(),
+                    true,
+                )
+                .unwrap();
+                let _operation = store.lock().unwrap();
+                store.usage.lock().occupied = Some((HARD_MAX_PROVIDER_STORE_BLOBS - 1, 0));
+                let registry = TestRegistry::start(vec![0]).await;
+                let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
+                let source = format!("{}/test/provider:1.0.0", registry.authority);
+                let descriptor = LayerDescriptor {
+                    digest: prefixed_sha256(&[1]),
+                    size: 1,
+                };
+                let (started, wait_until_started) = oneshot::channel();
+                let (unblock, wait_until_unblocked) = oneshot::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    wait_until_unblocked.blocking_recv()
+                });
+                wait_until_started.await.unwrap();
+
+                let mut download =
+                    std::pin::pin!(store.install_blob(&client, &source, &descriptor));
+                let completion =
+                    tokio::time::timeout(Duration::from_secs(1), download.as_mut()).await;
+                let slot_reserved = store.ensure_capacity(1).unwrap().is_none();
+                unblock.send(()).unwrap();
+                blocker.await.unwrap().unwrap();
+
+                assert_eq!(registry.state.blobs.load(Ordering::Relaxed), 1);
+                assert!(completion.is_err(), "{completion:?}");
+                assert!(slot_reserved);
+                assert!(matches!(
+                    download.await,
+                    Err(ProviderManagerError::DigestMismatch {
+                        reason: BLOB_DIGEST_MISMATCH,
+                        ..
+                    })
+                ));
+                assert_eq!(fs::read_dir(&store.sha256).unwrap().count(), 0);
+                assert!(store.ensure_capacity(1).unwrap().is_some());
+                registry.stop().await;
+            });
+    }
+
     #[tokio::test]
     async fn sync_reports_all_fetch_failures_in_provider_set_order() {
         let directory = tempfile::tempdir().expect("manager fixture");
@@ -3513,6 +3581,11 @@ mod tests {
         let registry = TestRegistry::start(cli_probe_component()).await;
         let source = format!("{}/test/provider:1.0.0", registry.authority);
         let manifest = "test/provider/manifests/1.0.0".to_owned();
+        let oversized = HARD_MAX_REGISTRY_ERROR_BYTES + 1;
+        registry
+            .state
+            .manifest_failure_bytes
+            .store(oversized, Ordering::Relaxed);
         for (token, failure, operation, authentication, outcome) in [
             (
                 None,
@@ -3575,7 +3648,9 @@ mod tests {
                         .lock()
                         .insert(manifest.clone(), (failure, Duration::ZERO));
                 }
-                RegistryOperation::Blob => *registry.state.blob_head.lock() = Some((failure, 0)),
+                RegistryOperation::Blob => {
+                    *registry.state.blob_head.lock() = Some((failure, oversized as u64))
+                }
                 RegistryOperation::Token => {}
             }
             let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
@@ -3596,10 +3671,30 @@ mod tests {
         }
         let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
         registry.stop().await;
+        let probe = client.probe(&source).await.unwrap_err().for_probe();
+        let ProviderManagerError::Probe {
+            outcome: ProbeOutcome::Inconclusive,
+            source: transport,
+        } = probe
+        else {
+            panic!("expected an inconclusive transport failure, got {probe:?}");
+        };
         assert!(matches!(
-            client.probe(&source).await.unwrap_err().for_probe(),
-            ProviderManagerError::Probe { outcome: ProbeOutcome::Inconclusive, source }
-                if matches!(*source, ProviderManagerError::RegistryTransport { .. })
+            *transport,
+            ProviderManagerError::RegistryTransport { .. }
+        ));
+        let interrupted_404 = ProviderManagerError::RegistryStatus {
+            operation: RegistryOperation::Manifest,
+            status: StatusCode::NOT_FOUND,
+            authentication: RegistryAuthentication::Bearer,
+            source: Some(transport),
+        };
+        assert!(matches!(
+            interrupted_404.for_probe(),
+            ProviderManagerError::Probe {
+                outcome: ProbeOutcome::Inconclusive,
+                ..
+            }
         ));
     }
 
