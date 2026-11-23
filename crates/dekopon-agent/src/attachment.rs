@@ -391,6 +391,8 @@ pub enum ChatAssetRefusal {
         MAX_INVOCATION_ASSET_BYTES / (1024 * 1024)
     )]
     ByteBudget,
+    #[error("chat-asset:{asset} exceeds the {} MiB asset cap. Ask the user for a smaller file.", limit / (1024 * 1024))]
+    AssetTooLarge { asset: u64, limit: u64 },
     #[error("the attachment's bytes could not be read")]
     Unavailable,
     #[error("data URLs are refused; use chat-asset:<N> instead")]
@@ -408,6 +410,7 @@ impl ChatAssetRefusal {
             Self::UnsupportedMedia => "unsupported-media",
             Self::PerInvocationLimit => "per-invocation-limit",
             Self::ByteBudget => "byte-budget",
+            Self::AssetTooLarge { .. } => "asset-too-large",
             Self::Unavailable => "unavailable",
             Self::DataUrl => "data-url",
         }

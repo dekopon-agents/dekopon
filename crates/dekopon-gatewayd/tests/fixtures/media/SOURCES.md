@@ -1,0 +1,10 @@
+# Multimedia fixtures
+
+| File | Real type (bytes) | Extension says | Source | Author | License | sha256 | Derivation |
+|---|---|---|---|---|---|---|---|
+| `cat-meow-opus.ogg` | Ogg Opus (`OggS` + `OpusHead`), mono, 48 kHz, 24 kbps, 1.17 s: a voice note's shape | ogg (match) | as `cat-meow-vorbis.ogg` | George Miquilena | CC0 1.0 | `cf097b2f8f568f9fed00614fc5e3bb1515bbeafc48010a363720b74047827a1c` | `ffmpeg -i cat-meow-vorbis.ogg -ac 1 -ar 48000 -c:a libopus -b:a 24k -application voip -map_metadata -1`, the PoC's voice-note recipe |
+| `cat-meow.m4a` | MP4 audio, `ftyp` brand `M4A `, AAC-LC mono 44.1 kHz, 1.16 s | m4a (match) | as `cat-meow-vorbis.ogg` | George Miquilena | CC0 1.0 | `d50806ce6f946311bc960606b87725bc453c9d1133999c9ff5511f4c02f6cf26` | `ffmpeg -i cat-meow-vorbis.ogg -ac 1 -c:a aac -b:a 64k -map_metadata -1 -f ipod`. The audio half of the mp4/m4a near-miss. |
+| `cat-gallop.mp4` | MP4, `ftyp` brand `isom`, silent H.264 baseline, 320×144, 5 s | mp4 (match) | as `cat-gallop-animated.gif` | Eadweard Muybridge | Public domain | `cc5b7f2827a416801943a2052940ecea8be1d74681fb6d4bc376c2f158551a27` | `ffmpeg -i cat-gallop-animated.gif -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" -c:v libx264 -pix_fmt yuv420p -profile:v baseline -movflags +faststart -an -map_metadata -1`. The video half of the mp4/m4a near-miss; also Telegram's silent-MP4 animation shape. |
+| `cat-gallop-animated.gif` | GIF89a, 320×143, 20 frames at 250 ms, loops | gif (match) | [Cat trotting, changing to a gallop.gif](https://commons.wikimedia.org/wiki/File:Cat_trotting,_changing_to_a_gallop.gif) | Eadweard Muybridge (Animal Locomotion, plate 717, 1887) | Public domain (PD-US) | `01d4cb37e6c382e83e410399056166725abb4c9a49e0f5746bbad76e21b9e9aa` | Scaled from 1231×551 (6.2 MB): `ffmpeg -i orig.gif -vf "scale=320:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=64[p];[b][p]paletteuse=dither=bayer:bayer_scale=4" -loop 0`. Same frames and timing. |
+
+[Original source and derivation manifest](https://github.com/dekopon-agents/campaign-trail/blob/863781733a13f1bca5589ffe555d3d810b0c5d72/store/designs/multimedia-design/fixtures/SOURCES.md)
