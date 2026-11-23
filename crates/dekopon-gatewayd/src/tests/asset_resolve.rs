@@ -1588,7 +1588,7 @@ fn every_image_type_keeps_the_image_ceiling_and_other_media_get_the_document_cei
         "Image/JPEG; quality=high",
         " image/webp",
     ] {
-        assert_eq!(byte_limit(mime), image, "{mime}");
+        assert_eq!(byte_limit(mime, None), image, "{mime}");
     }
     for mime in [
         "application/pdf",
@@ -1596,6 +1596,6 @@ fn every_image_type_keeps_the_image_ceiling_and_other_media_get_the_document_cei
         "video/mp4",
         "imagefile",
     ] {
-        assert_eq!(byte_limit(mime), document, "{mime}");
+        assert_eq!(byte_limit(mime, None), document, "{mime}");
     }
 }

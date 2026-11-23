@@ -462,6 +462,22 @@ fn parse_message_content(message: &Value) -> Option<(&'static str, &'static str,
                 media::inbound_document(document),
             )
         }
+        "audio" => {
+            let audio = &message["audio"];
+            (
+                "audio",
+                media::declared_mime(audio),
+                media::inbound_audio(audio),
+            )
+        }
+        "video" => {
+            let video = &message["video"];
+            (
+                "video",
+                media::declared_mime(video),
+                media::inbound_video(video),
+            )
+        }
         "reaction" | "system" => return None,
         _ => (
             UNKNOWN,

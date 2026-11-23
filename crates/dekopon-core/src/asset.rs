@@ -9,6 +9,8 @@ pub enum AssetKind {
     Image,
     TextDocument,
     BinaryDocument,
+    Audio,
+    Video,
     Other,
 }
 
@@ -18,6 +20,8 @@ impl AssetKind {
             Self::Image => "image",
             Self::TextDocument => "text-document",
             Self::BinaryDocument => "binary-document",
+            Self::Audio => "audio",
+            Self::Video => "video",
             Self::Other => "other",
         }
     }
@@ -33,6 +37,8 @@ impl AssetKind {
             | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             | "application/rtf" => Self::BinaryDocument,
+            mime if mime.starts_with("audio/") => Self::Audio,
+            mime if mime.starts_with("video/") => Self::Video,
             _ => Self::Other,
         }
     }

@@ -35,7 +35,9 @@ impl Row {
     fn ladder(&self) -> Vec<Rung> {
         let native = match self.kind {
             AssetKind::Image | AssetKind::BinaryDocument => true,
-            AssetKind::TextDocument | AssetKind::Other => false,
+            AssetKind::TextDocument | AssetKind::Audio | AssetKind::Video | AssetKind::Other => {
+                false
+            }
         };
         let mut rungs = asset_available(&self.slots, false);
         rungs.pop();
@@ -117,7 +119,9 @@ impl Row {
         let showable = match self.kind {
             AssetKind::Image => access.is_some_and(|access| access.images_supported),
             AssetKind::BinaryDocument => true,
-            AssetKind::TextDocument | AssetKind::Other => false,
+            AssetKind::TextDocument | AssetKind::Audio | AssetKind::Video | AssetKind::Other => {
+                false
+            }
         };
         if !showable {
             self.unshowable = true;

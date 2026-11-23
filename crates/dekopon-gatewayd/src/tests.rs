@@ -13989,6 +13989,87 @@ async fn telegram_photos_and_documents_are_routed_as_assets() {
     assert_eq!(document.assets[0].mime, "application/pdf");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_voice_audio_video_and_animation_become_assets() {
+    let cases: [(&str, &str, &str, &[u8]); 4] = [
+        (
+            "voice",
+            "Audio/Ogg; codecs=opus",
+            "audio/ogg",
+            include_bytes!("../tests/fixtures/media/cat-meow-opus.ogg"),
+        ),
+        (
+            "audio",
+            "audio/mp4",
+            "audio/mp4",
+            include_bytes!("../tests/fixtures/media/cat-meow.m4a"),
+        ),
+        (
+            "video",
+            "video/mp4",
+            "video/mp4",
+            include_bytes!("../tests/fixtures/media/cat-gallop.mp4"),
+        ),
+        (
+            "animation",
+            "image/gif",
+            "image/gif",
+            include_bytes!("../tests/fixtures/media/cat-gallop-animated.gif"),
+        ),
+    ];
+    let updates = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (field, raw, _, bytes))| {
+            let mut message = json!({
+                "message_id": 20 + index, "from": {"id": 16034700182_i64, "is_bot": false},
+                "chat": {"id": 4242, "type": "private"}
+            });
+            message[*field] = json!({"file_id": field, "mime_type": raw, "file_size": bytes.len()});
+            if *field == "animation" {
+                message["document"] =
+                    json!({"file_id":"duplicate", "mime_type":"application/octet-stream"});
+            }
+            json!({"update_id": 300 + index, "message": message})
+        })
+        .collect();
+    let handler = telegram_handler(updates);
+    let http = spawn_raw_http_mock(move |path| {
+        if path.starts_with("/file/") {
+            let field = path.rsplit('/').next().unwrap();
+            let (_, _, mime, bytes) = cases.iter().find(|(key, _, _, _)| *key == field).unwrap();
+            return (200, *mime, bytes.to_vec());
+        }
+        let body = if let Some(file_id) = path.split("file_id=").nth(1) {
+            json!({"ok":true, "result":{"file_path":format!("media/{file_id}")}})
+        } else {
+            handler(path, "")
+        };
+        (200, "application/json", serde_json::to_vec(&body).unwrap())
+    });
+    let mut transport = telegram(&http.base);
+    transport.connect().await.expect("telegram connects");
+    let fetcher = transport.asset_fetcher().unwrap();
+
+    for (field, _, mime, bytes) in cases {
+        let message = next_message(&mut transport).await;
+        let [asset] = message.assets.as_slice() else {
+            panic!("one {field} asset");
+        };
+        assert_eq!(asset.mime, mime);
+        assert_eq!(asset.size, Some(bytes.len() as u64));
+        let source = AssetSourceRef::Telegram {
+            file_id: field.to_owned(),
+        };
+        assert_eq!(asset.source, Some(source.clone()));
+        let fetched = fetcher
+            .fetch(&source, dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64)
+            .await
+            .expect("getFile and download return the fixture");
+        assert_eq!(fetched, bytes);
+    }
+}
+
 #[test]
 fn an_asset_note_numbers_what_the_model_cannot_fetch() {
     let pdf = PendingAsset {
@@ -14017,7 +14098,7 @@ fn an_asset_note_numbers_what_the_model_cannot_fetch() {
             vec![pending("clip.mp4", "video/mp4", 1024)],
             true,
             false,
-            &["clip.mp4", "chat-asset:"][..],
+            &["video (video/mp4, 1 KB)", "chat-asset:"][..],
             &["fetch_chat_asset"][..],
         ),
     ] {
@@ -16985,14 +17066,6 @@ async fn an_unsupported_whatsapp_message_gets_one_refusal_only_when_routed() {
         (
             "document",
             json!({"id":"789", "mime_type":"application/msword", "caption":"read"}),
-        ),
-        (
-            "audio",
-            json!({"id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true}),
-        ),
-        (
-            "video",
-            json!({"id":"789", "mime_type":"video/mp4", "caption":"watch"}),
         ),
         (
             "sticker",
