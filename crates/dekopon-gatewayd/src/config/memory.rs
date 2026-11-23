@@ -162,7 +162,7 @@ impl AttachmentSummaries {
         match match kind {
             AssetKind::Image => self.images,
             AssetKind::TextDocument | AssetKind::BinaryDocument => self.documents,
-            AssetKind::Other => Toggle::Off,
+            AssetKind::Audio | AssetKind::Video | AssetKind::Other => Toggle::Off,
         } {
             Toggle::Off => false,
             Toggle::Summarize => true,

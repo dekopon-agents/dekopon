@@ -344,22 +344,29 @@ impl TelegramTransport {
                 }),
             }];
         }
-        let document = &message["document"];
-        if let Some(file_id) = document["file_id"].as_str() {
-            let name = document["file_name"].as_str().unwrap_or("attachment");
-            return vec![PendingAsset {
+        [
+            ("voice", crate::asset::VOICE_NOTE_NAME),
+            ("audio", "audio"),
+            ("video", "video"),
+            ("animation", "animation"),
+            ("document", "attachment"),
+        ]
+        .into_iter()
+        .find_map(|(field, default_name)| {
+            let media = &message[field];
+            let file_id = media["file_id"].as_str()?;
+            let name = media["file_name"].as_str().unwrap_or(default_name);
+            Some(PendingAsset {
                 name: name[..floor_boundary(name, MAX_ATTACHMENT_NAME_BYTES)].to_owned(),
-                mime: document["mime_type"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-                size: document["file_size"].as_u64(),
+                mime: crate::asset::platform_mime(media["mime_type"].as_str().unwrap_or_default()),
+                size: media["file_size"].as_u64(),
                 source: Some(AssetSourceRef::Telegram {
                     file_id: file_id.to_owned(),
                 }),
-            }];
-        }
-        Vec::new()
+            })
+        })
+        .into_iter()
+        .collect()
     }
 }
 
@@ -448,12 +455,16 @@ impl AssetFetcher for TelegramDriver {
                 });
             }
             let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            if let Some(size) = response.content_length()
+                && size > max_bytes
+            {
+                return Err(TransportError::AssetTooLarge { size });
+            }
             let mut body = asset_buffer(response.content_length(), limit);
             while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
-                if body.len().saturating_add(chunk.len()) as u64 > max_bytes {
-                    return Err(TransportError::Service {
-                        code: "asset-too-large".to_owned(),
-                    });
+                let size = body.len().saturating_add(chunk.len()) as u64;
+                if size > max_bytes {
+                    return Err(TransportError::AssetTooLarge { size });
                 }
                 reserve_for_chunk(&mut body, chunk.len(), limit);
                 body.extend_from_slice(&chunk);

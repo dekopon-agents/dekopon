@@ -947,11 +947,6 @@ async fn an_unsigned_or_group_document_enqueues_nothing() {
 async fn an_unhandled_message_kind_or_refused_image_is_marked_for_refusal_and_never_fetched() {
     for (kind, body) in [
         (
-            "audio",
-            json!({"id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true}),
-        ),
-        ("video", json!({"id":"789", "mime_type":"video/mp4"})),
-        (
             "sticker",
             json!({"id":"789", "mime_type":"image/webp", "animated":false}),
         ),
