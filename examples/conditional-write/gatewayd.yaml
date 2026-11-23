@@ -52,11 +52,7 @@ routes:
     agent: conditional-writer
     # Asset references resolve automatically; attaching retains a file, while sending requires
     # a separately broker-authorized asset.send invocation.
-    limits:
-      # One review is a handful of steps: view the pull request, read the files, approve, answer.
-      # A budget that cannot finish the job is a bug; a budget that can loop is a bill.
-      maxSteps: 8
-      maxCapabilityCalls: 16
+    # To size route and model limits, see https://github.com/dekopon-agents/dekopon/blob/main/docs/deploy.md#route-and-model-limits
     memory:
       # Remembered, so "and the second one?" is a question this bot can answer. Omit this block
       # entirely for `mode: oneShot`, where every message starts from an empty prompt. The window
