@@ -813,11 +813,15 @@ impl SteerAck for WhatsappDriver {
 #[async_trait]
 impl ChatDriver for WhatsappDriver {
     fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
-        // Each image is its own message, so the count bounds how many messages one reply posts.
+        // Each attachment is its own message, so the count bounds how many messages one reply posts.
         dekopon_agent::attachment::AttachmentLimit::new(
             4,
             dekopon_agent::attachment::Holding::OneAtATime,
         )
+    }
+
+    fn attachment_preflight(&self) -> Option<dekopon_agent::attachment::AttachmentPreflight> {
+        Some(media::Upload::preflight)
     }
 
     async fn reply(
@@ -831,20 +835,16 @@ impl ChatDriver for WhatsappDriver {
             footer,
         } = reply;
         let suffix = footer.as_ref().map(|footer| format!("_{}_", footer.line()));
-        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Photos)?;
+        let media = super::hydration::classify_media(&images, media::Upload::classify)?;
         let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::WhatsApp { recipient } = target else {
             return Err(TransportError::Response);
         };
-        if images
-            .decoded_lengths()
-            .await?
-            .into_iter()
-            .any(|length| length > media::MAX_IMAGE_BYTES)
-        {
-            return Err(media::failure("image-too-large"));
+        for (upload, length) in media.iter().zip(images.decoded_lengths().await?) {
+            upload.check_size(length)?;
         }
-        let caption_fits = !images.is_empty() && text.chars().count() <= media::MAX_CAPTION_CHARS;
+        let caption_fits = media.first().is_some_and(media::Upload::accepts_caption)
+            && text.chars().count() <= media::MAX_CAPTION_CHARS;
         let caption = suffix.as_deref().and_then(|suffix| {
             crate::progress::Footer::caption(
                 &text,
@@ -856,14 +856,15 @@ impl ChatDriver for WhatsappDriver {
         let caption_text = caption.as_deref().unwrap_or(&text);
         let total = images.len();
         let mut accepted = 0_usize;
-        while let Some(read) = images.next().await {
+        for upload in media {
+            let read = images.next().await.ok_or(TransportError::Response)?;
             let (index, image) = match read {
                 Ok(read) => read,
                 Err(error) => return Err(self.reply_failure(error, accepted, accepted..total)),
             };
             let caption =
                 (caption_fits && index == 0 && !caption_text.is_empty()).then_some(caption_text);
-            if let Err(error) = self.send_image(recipient, caption, image).await {
+            if let Err(error) = self.send_media(recipient, caption, image, upload).await {
                 return Err(self.reply_failure(error, accepted, accepted..total));
             }
             accepted += 1;
