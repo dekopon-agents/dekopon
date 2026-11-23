@@ -662,6 +662,8 @@ struct CheckOutput {
     warnings: Vec<String>,
     #[serde(rename = "peakRssBytes")]
     peak_rss_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timings: Option<dekopon_brokerd::CheckTimings>,
 }
 
 #[cfg(unix)]
@@ -723,6 +725,7 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
             .collect(),
         warnings: report.warnings.iter().map(ToString::to_string).collect(),
         peak_rss_bytes: report.peak_rss_bytes,
+        timings: report.timings,
     };
     render(check.output, &output, || {
         let lines = output
@@ -1085,6 +1088,7 @@ mod tests {
                 problems: Vec::new(),
                 warnings: Vec::new(),
                 peak_rss_bytes: peak,
+                timings: None,
             };
             assert_eq!(
                 serde_json::to_value(output).expect("JSON output"),

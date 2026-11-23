@@ -3648,6 +3648,17 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
     assert!(report.problems.is_empty(), "{report:?}");
     #[cfg(target_os = "linux")]
     assert!(report.peak_rss_bytes.expect("process peak RSS") > 0);
+    let timings = report.timings.expect("check timings");
+    let validate = timings.validate_load.expect("validate load timing");
+    assert_eq!(
+        (validate.compiled_cache_hits, validate.compiled_cache_misses),
+        (Some(0), Some(1))
+    );
+    let prepare = timings.prepare_load.expect("prepare load timing");
+    assert_eq!(
+        (prepare.compiled_cache_hits, prepare.compiled_cache_misses),
+        (Some(1), Some(0))
+    );
     let cache = store.join("store/cwasm/v1");
     let objects = cache.join("sha256");
     let current_object = fs::read_dir(&objects)
@@ -3663,6 +3674,15 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
     write_owner_only(&unreferenced, b"unreferenced");
     let report = check().await;
     assert!(report.problems.is_empty(), "{report:?}");
+    let validate = report
+        .timings
+        .expect("check timings")
+        .validate_load
+        .expect("validate load timing");
+    assert_eq!(
+        (validate.compiled_cache_hits, validate.compiled_cache_misses),
+        (Some(1), Some(0))
+    );
     assert!(!old_generation.exists());
     assert!(!unreferenced.exists());
     assert!(current_object.is_file());

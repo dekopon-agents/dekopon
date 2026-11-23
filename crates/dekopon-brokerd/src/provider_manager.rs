@@ -37,7 +37,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::Instrument as _;
 
-use crate::{HARD_MAX_PROVIDERS, socket};
+use crate::{CheckPhase, CheckTimings, HARD_MAX_PROVIDERS, socket};
 
 pub const PROVIDER_ARTIFACT_TYPE: &str = "application/vnd.dekopon.provider.v1+wasm";
 pub const PROVIDER_LAYER_MEDIA_TYPE: &str = "application/wasm";
@@ -208,6 +208,13 @@ impl ProviderManager {
     }
 
     pub async fn sync(&self) -> Result<ProviderSyncReport, ProviderManagerError> {
+        self.sync_with_timings(None).await
+    }
+
+    pub(crate) async fn sync_with_timings(
+        &self,
+        mut timings: Option<&mut CheckTimings>,
+    ) -> Result<ProviderSyncReport, ProviderManagerError> {
         let uid = socket::current_uid();
         let _activation_operation = lock_activation(&self.paths.lock_file, uid)?;
         let desired = load_provider_set(
@@ -230,24 +237,53 @@ impl ProviderManager {
             })
             .unwrap_or_default();
 
-        let mut candidates = Vec::with_capacity(desired.providers.len());
-        let mut fetched = 0_usize;
-        for provider in desired.providers {
-            if let Some(locked) = old_by_source.get(&provider.source) {
-                if store.ensure_locked_blob(&self.registry, locked).await? {
-                    fetched += 1;
+        let provider_count = desired.providers.len();
+        let started = std::time::Instant::now();
+        let synced = async {
+            let mut candidates = Vec::with_capacity(provider_count);
+            let mut fetched = 0_usize;
+            for provider in desired.providers {
+                if let Some(locked) = old_by_source.get(&provider.source) {
+                    if store.ensure_locked_blob(&self.registry, locked).await? {
+                        fetched += 1;
+                    }
+                    candidates.push(CandidateProvider::from_locked(locked.clone()));
+                } else {
+                    let resolved = self.registry.resolve(&provider.source).await?;
+                    if store.install_resolved(&self.registry, &resolved).await? {
+                        fetched += 1;
+                    }
+                    candidates.push(CandidateProvider::from_resolved(resolved));
                 }
-                candidates.push(CandidateProvider::from_locked(locked.clone()));
-            } else {
-                let resolved = self.registry.resolve(&provider.source).await?;
-                if store.install_resolved(&self.registry, &resolved).await? {
-                    fetched += 1;
-                }
-                candidates.push(CandidateProvider::from_resolved(resolved));
             }
+            Ok::<_, ProviderManagerError>((candidates, fetched))
         }
-
-        let lock = validate_candidates(candidates, &store).await?;
+        .await;
+        if let Some(timings) = &mut timings {
+            timings.download_concurrency = Some(1);
+            timings.sync = Some(CheckPhase::record(
+                "sync",
+                started,
+                provider_count,
+                None,
+                synced.is_ok(),
+                Some(1),
+            ));
+        }
+        let (candidates, fetched) = synced?;
+        let started = std::time::Instant::now();
+        let validated = validate_candidates(candidates, &store).await;
+        if let Some(timings) = timings {
+            timings.validate_load = Some(CheckPhase::record(
+                "validate_load",
+                started,
+                provider_count,
+                validated.as_ref().ok().map(|(_, cache)| *cache),
+                validated.is_ok(),
+                None,
+            ));
+        }
+        let (lock, _) = validated?;
         let encoded = encode_lock(&lock)?;
         let previous = old_lock.as_ref().map(encode_lock).transpose()?;
         let lock_changed = previous.as_deref() != Some(encoded.as_slice());
@@ -597,7 +633,7 @@ impl CandidateProvider {
 async fn validate_candidates(
     candidates: Vec<CandidateProvider>,
     store: &ProviderStore,
-) -> Result<ProviderLock, ProviderManagerError> {
+) -> Result<(ProviderLock, dekopon_broker_host::CompiledCacheCounts), ProviderManagerError> {
     let paths = candidates
         .iter()
         .map(|candidate| store.blob_path(&candidate.component_digest))
@@ -665,7 +701,7 @@ async fn validate_candidates(
         providers,
     };
     validate_lock_shape(&lock)?;
-    Ok(lock)
+    Ok((lock, registry.compiled_cache_counts()))
 }
 
 async fn validate_lock(
