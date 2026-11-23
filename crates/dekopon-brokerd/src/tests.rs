@@ -3476,6 +3476,97 @@ async fn check_and_boot_have_equal_digests_for_private_map_names_absent_from_pol
 }
 
 #[tokio::test]
+async fn materialized_check_reports_each_failed_secret_without_exposing_material() {
+    use super::{BrokerdError, SecretMapError};
+
+    let mut fixture = ResidentFixture::boot_with(|_, document| {
+        document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+            "allowedHosts": ["api.example.test"], "allowedMethods": ["GET"],
+            "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
+        });
+    })
+    .await;
+    let missing = fixture.root.path().join("missing-token");
+    let projected = fixture.root.path().join("token.json");
+    let key = fixture.root.path().join("app.pem");
+    let map = fixture.root.path().join("secret-map.yaml");
+    let sentinel = "fixture-secret-material";
+    write_owner_only(&projected, sentinel.as_bytes());
+    write_owner_only(&key, sentinel.as_bytes());
+
+    let binding = |id| {
+        json!({
+            "id": id,
+            "capabilities": ["cli-probe.upper"],
+            "sink": "httpBearer",
+            "allowedHosts": ["api.example.test"],
+            "allowedMethods": ["GET"],
+            "allowedPaths": [{"match": "exact", "path": "/v1/thing"}]
+        })
+    };
+    write_config(
+        &map,
+        &json!({
+            "apiVersion": "dekopon.dev/secret-map/v1alpha1",
+            "mapRevision": "test",
+            "secrets": [
+                {
+                    "drn": "drn:secret:api/missing",
+                    "source": {"kind": "secureFile", "path": missing},
+                    "destinations": ["api.example.test"],
+                    "bindings": [binding("missing")]
+                },
+                {
+                    "drn": "drn:secret:api/projected",
+                    "source": {"kind": "secureFile", "path": projected},
+                    "projection": {"format": "json", "pointer": "/token"},
+                    "destinations": ["api.example.test"],
+                    "bindings": [binding("projected")]
+                },
+                {
+                    "drn": "drn:secret:github/app",
+                    "source": {
+                        "kind": "githubApp", "appId": 1, "installationId": 2, "privateKey": key
+                    },
+                    "destinations": ["api.example.test"],
+                    "bindings": [binding("app")]
+                }
+            ]
+        }),
+    );
+    fixture.document["secretMapPath"] = json!(map);
+    write_config(&fixture.path, &fixture.document);
+
+    let flagless = super::check(&fixture.path, None, None).await;
+    assert!(flagless.problems.is_empty(), "{flagless:?}");
+
+    let report = super::check(super::CheckConfig::Materialized(&fixture.path), None, None).await;
+    let expected = [
+        ("drn:secret:api/missing", "secureFile", &missing),
+        ("drn:secret:api/projected", "secureFile", &projected),
+        ("drn:secret:github/app", "privateKey", &key),
+    ];
+    assert_eq!(report.problems.len(), expected.len(), "{report:?}");
+    for (problem, (expected_drn, expected_field, expected_path)) in
+        report.problems.iter().zip(expected)
+    {
+        let BrokerdError::Secrets(SecretMapError::Material {
+            drn, field, path, ..
+        }) = problem
+        else {
+            panic!("expected a material problem, got {problem:?}");
+        };
+        assert_eq!(
+            (drn.as_str(), *field, path),
+            (expected_drn, expected_field, expected_path)
+        );
+        assert!(!dekopon_core::error_chain(problem).contains(sentinel));
+        assert!(!format!("{problem:?}").contains(sentinel));
+    }
+    assert!(report.policy_digest.is_some());
+}
+
+#[tokio::test]
 async fn check_reads_binding_shapes_and_refuses_a_swap_target_without_one_binding() {
     use super::{BrokerdError, Mode};
     let root = tempfile::tempdir().unwrap();
@@ -3861,6 +3952,26 @@ async fn check_keeps_going_past_a_collision_and_names_the_stage_it_could_not_run
             stage: Stage::Providers
         }
     )));
+
+    let materialized = super::check(super::CheckConfig::Materialized(&directory), None, None).await;
+    assert!(matches!(
+        materialized.problems.as_slice(),
+        [
+            BrokerdError::Config(config::ConfigError::Fragments(
+                FragmentError::Conflicts { .. }
+            )),
+            BrokerdError::ProviderSetRequired,
+            BrokerdError::CheckSkipped {
+                stage: Stage::Providers
+            },
+        ]
+    ));
+    assert!(
+        !materialized
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, StartupWarning::Skipped { .. }))
+    );
 }
 
 #[tokio::test]
@@ -3898,6 +4009,21 @@ async fn check_binds_no_socket_and_reports_the_digests_boot_serves() {
             .iter()
             .any(|warning| matches!(warning, StartupWarning::DefaultSecretsUnchecked))
     );
+    let materialized = super::check(super::CheckConfig::Materialized(&path), None, None).await;
+    assert!(matches!(
+        materialized.problems.as_slice(),
+        [
+            super::BrokerdError::Secrets(super::SecretMapError::Read { path, .. }),
+            super::BrokerdError::CheckSkipped { stage: super::Stage::Providers },
+        ] if path == &secret_map
+    ));
+    assert!(
+        !materialized
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, StartupWarning::DefaultSecretsUnchecked))
+    );
+
     write_owner_only(
         &secret_map,
         fs::read_to_string(example.join("secret-map.yaml.example"))

@@ -339,6 +339,7 @@ pub struct CheckReport {
     pub identity_digest: Option<String>,
     pub continuity: Option<dekopon_broker::ContinuityReport>,
     private_sources: Vec<PathBuf>,
+    materialized: bool,
     pub peak_rss_bytes: Option<u64>,
     pub timings: Option<CheckTimings>,
 }
@@ -401,17 +402,33 @@ impl CheckPhase {
     }
 }
 
-pub async fn check(
-    config_path: impl AsRef<Path>,
+pub enum CheckConfig<P> {
+    Shapes(P),
+    Materialized(P),
+}
+
+impl<P: AsRef<Path>> From<P> for CheckConfig<P> {
+    fn from(path: P) -> Self {
+        Self::Shapes(path)
+    }
+}
+
+pub async fn check<P: AsRef<Path>>(
+    config: impl Into<CheckConfig<P>>,
     providers: Option<CheckProviders>,
     workflows: Option<&Path>,
 ) -> CheckReport {
     let started = Instant::now();
+    let (config_path, materialized) = match config.into() {
+        CheckConfig::Shapes(path) => (path, false),
+        CheckConfig::Materialized(path) => (path, true),
+    };
     let mut report = load_candidate(
         config_path.as_ref(),
         Mode::Check {
             providers,
             workflows,
+            materialized,
         },
     )
     .await
@@ -466,6 +483,7 @@ enum Mode<'a> {
     Check {
         providers: Option<CheckProviders>,
         workflows: Option<&'a Path>,
+        materialized: bool,
     },
 }
 
@@ -754,7 +772,13 @@ impl Coordination {
     reason = "independent validation stages aggregate failures before preparing a candidate"
 )]
 async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, CheckReport) {
-    let mut report = CheckReport::default();
+    let mut report = CheckReport {
+        materialized: match &mode {
+            Mode::Check { materialized, .. } => *materialized,
+            Mode::Boot | Mode::Reload(_) => false,
+        },
+        ..CheckReport::default()
+    };
     let uid = current_uid();
     let relaxed = match &mode {
         Mode::Check { providers, .. } => {
@@ -766,10 +790,17 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
         Mode::Boot | Mode::Reload(_) => false,
     };
     if relaxed {
-        report.warnings.extend(
-            [Stage::Providers, Stage::Workflows]
-                .map(|stage| StartupWarning::RelaxedVerification { stage }),
-        );
+        for stage in [Stage::Providers, Stage::Workflows] {
+            if report.materialized {
+                report
+                    .problems
+                    .push(BrokerdError::RelaxedVerificationSkipped { stage });
+            } else {
+                report
+                    .warnings
+                    .push(StartupWarning::RelaxedVerification { stage });
+            }
+        }
     }
     let load_mode = match mode {
         Mode::Boot => LoadMode::Boot,
@@ -906,23 +937,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             reload_runtime(&mut config, uid, active, &mut scratch, &mut report.problems).await
         }
         Residents::Scratch => {
-            let secrets = match config.secret_map_path.as_deref() {
-                Some(path) => match secrets::load_shapes(path, uid).await {
-                    Ok(catalog) => Some(Secrets::Shapes(catalog)),
-                    Err(secrets::SecretMapError::Read { .. }) => Some(Secrets::Unchecked),
-                    Err(
-                        error @ (secrets::SecretMapError::Decode { .. }
-                        | secrets::SecretMapError::Validation { .. }
-                        | secrets::SecretMapError::Client { .. }
-                        | secrets::SecretMapError::Source { .. }
-                        | secrets::SecretMapError::Catalog { .. }),
-                    ) => {
-                        report.problems.push(error.into());
-                        None
-                    }
-                },
-                None => Some(Secrets::Shapes(dekopon_broker::SecretCatalog::empty())),
-            };
+            let secrets = check_secrets(config.secret_map_path.as_deref(), uid, &mut report).await;
             keep(&mut report.problems, scratch_host(&config, &mut scratch))
                 .zip(secrets)
                 .map(|(storage, secrets)| Runtime {
@@ -1048,7 +1063,43 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
 
 impl CheckReport {
     fn skipped(&mut self, stage: Stage) {
-        self.warnings.push(StartupWarning::Skipped { stage });
+        if self.materialized {
+            self.problems.push(BrokerdError::CheckSkipped { stage });
+        } else {
+            self.warnings.push(StartupWarning::Skipped { stage });
+        }
+    }
+
+    fn default_secrets_unchecked(&mut self) {
+        if self.materialized {
+            self.problems.push(BrokerdError::DefaultSecretsUnchecked);
+        } else {
+            self.warnings.push(StartupWarning::DefaultSecretsUnchecked);
+        }
+    }
+}
+
+async fn check_secrets(path: Option<&Path>, uid: u32, report: &mut CheckReport) -> Option<Secrets> {
+    let Some(path) = path else {
+        return Some(Secrets::Shapes(dekopon_broker::SecretCatalog::empty()));
+    };
+    let mut material_problems = Vec::new();
+    let shapes = secrets::load_shapes(
+        path,
+        uid,
+        report.materialized.then_some(&mut material_problems),
+    )
+    .await;
+    report
+        .problems
+        .extend(material_problems.into_iter().map(BrokerdError::from));
+    match shapes {
+        Ok(catalog) => Some(Secrets::Shapes(catalog)),
+        Err(SecretMapError::Read { .. }) if !report.materialized => Some(Secrets::Unchecked),
+        Err(error) => {
+            report.problems.push(error.into());
+            None
+        }
     }
 }
 
@@ -1448,7 +1499,6 @@ async fn prepare(
 ) -> Result<Ready, Vec<BrokerdError>> {
     #[cfg(test)]
     let _hook_ran = BEFORE_BROKER_PREPARE.try_with(|hook| hook()).is_ok();
-    let warnings = &mut report.warnings;
     let started = Instant::now();
     let provider_count = config.providers.len();
     validate_unmanaged_providers(&config, resident_registry.as_ref(), current_uid())
@@ -1571,7 +1621,7 @@ async fn prepare(
                 world,
                 config.strict,
                 secrets_unchecked,
-                warnings,
+                &mut report.warnings,
             ),
         )
     });
@@ -1599,7 +1649,7 @@ async fn prepare(
     if !fatal.is_empty() {
         problems.push(BrokerdError::Capabilities { problems: fatal });
     }
-    warnings.extend(
+    report.warnings.extend(
         tolerable
             .into_iter()
             .map(StartupWarning::UnloadedCapability),
@@ -1624,7 +1674,7 @@ async fn prepare(
             .values()
             .any(|set| set.default_secret_use.is_some())
     {
-        warnings.push(StartupWarning::DefaultSecretsUnchecked);
+        report.default_secrets_unchecked();
     }
     let constraints = ConstraintCatalog::new(constraint_sets)
         .map_err(|error| vec![BrokerdError::Broker(error)])?
@@ -1654,7 +1704,9 @@ async fn prepare(
         leniency,
     )
     .map_err(|error| vec![BrokerdError::Broker(error)])?;
-    warnings.extend(broker_warnings.into_iter().map(StartupWarning::Broker));
+    report
+        .warnings
+        .extend(broker_warnings.into_iter().map(StartupWarning::Broker));
     let broker = match secret_catalog {
         Some(catalog) => broker
             .with_secret_catalog(catalog)
@@ -1741,6 +1793,8 @@ fn build_policy(
     }
 }
 
+const DEFAULT_SECRETS_UNCHECKED: &str = "the secret map is unreadable here, so no default secret was checked against its bindings; boot refuses a default without exactly one";
+
 #[derive(Debug, Error)]
 pub enum StartupWarning {
     #[error(
@@ -1755,10 +1809,7 @@ pub enum StartupWarning {
     UnloadedCapability(capabilities::CapabilityProblem),
     #[error("{0}")]
     Broker(dekopon_broker::StartupWarning),
-    #[error(
-        "the secret map is unreadable here, so no default secret was checked against its bindings; \
-         boot refuses a default without exactly one"
-    )]
+    #[error("{DEFAULT_SECRETS_UNCHECKED}")]
     DefaultSecretsUnchecked,
     #[error("policy {policy} names secret {secret}; boot requires it in secretMapPath")]
     SecretRequired { policy: String, secret: String },
@@ -1961,6 +2012,12 @@ pub enum BrokerdError {
     ProviderLockUnsettled,
     #[error("configuration reload task failed")]
     ReloadTask(#[source] dekopon_core::TaskOutcome),
+    #[error("{stage} not checked: a stage it needs failed")]
+    CheckSkipped { stage: Stage },
+    #[error("{stage} skipped under relaxed verification")]
+    RelaxedVerificationSkipped { stage: Stage },
+    #[error("{DEFAULT_SECRETS_UNCHECKED}")]
+    DefaultSecretsUnchecked,
     #[error("check could not prepare its private directory {path}")]
     CheckDirectory {
         path: PathBuf,

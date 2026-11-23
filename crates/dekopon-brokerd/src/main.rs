@@ -133,6 +133,9 @@ struct CheckArgs {
     /// and policy.
     #[arg(long, value_name = "DIR", requires = "provider_set")]
     workflows: Option<PathBuf>,
+    /// Validate local secret material and fail when a check cannot run.
+    #[arg(long)]
+    materialized: bool,
     #[arg(
         long,
         value_name = "N",
@@ -731,7 +734,12 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
             download_concurrency: check.download_concurrency,
             verification: check.provider_verification,
         });
-    let report = dekopon_brokerd::check(&check.config, providers, check.workflows.as_deref()).await;
+    let config = if check.materialized {
+        dekopon_brokerd::CheckConfig::Materialized(&check.config)
+    } else {
+        dekopon_brokerd::CheckConfig::Shapes(&check.config)
+    };
+    let report = dekopon_brokerd::check(config, providers, check.workflows.as_deref()).await;
     let output = CheckOutput {
         policy_digest: report.policy_digest,
         identity_digest: report.identity_digest,
@@ -1250,6 +1258,17 @@ mod tests {
         let daemon = Cli::try_parse_from(["dekopon-brokerd", "--config=x", "check", "broker.d"])
             .expect("shape parses before validation");
         assert!(validate_cli(&daemon).is_err());
+    }
+
+    #[test]
+    fn materialized_check_needs_only_the_configuration_path() {
+        let cli = Cli::try_parse_from(["dekopon-brokerd", "check", "broker.d", "--materialized"])
+            .expect("materialized check parses");
+        assert!(validate_cli(&cli).is_ok());
+        let Some(Command::Check(check)) = cli.command else {
+            panic!("check command");
+        };
+        assert!(check.materialized);
     }
 
     #[test]
