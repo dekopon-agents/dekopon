@@ -635,6 +635,7 @@ struct CompiledComponent {
     artifact_bytes: u64,
     artifact_sha256: String,
     compile_ms: u64,
+    publication: Option<cwasm::Publication>,
     pre: bindings::ProviderPre<StoreState>,
     command_export: CommandExport,
 }
@@ -722,7 +723,7 @@ fn prepare_component(
     );
     let expected_provider_id = source.expected.map(|expected| expected.provider_id);
     let source = source.path;
-    let component = match &runtime.cwasm {
+    let (component, publication) = match &runtime.cwasm {
         Some(cache) => match runtime.compiled_cache_mode {
             CompiledCacheMode::Reader => match cache
                 .load(&runtime.engine, &artifact.sha256)
@@ -730,7 +731,7 @@ fn prepare_component(
                     path: source.clone(),
                     source: error,
                 })? {
-                cwasm::Lookup::Mapped(component) => component,
+                cwasm::Lookup::Mapped(component) => (component, Some(cwasm::Publication::Hit)),
                 cwasm::Lookup::Missing => {
                     return Err(BrokerHostError::CompiledArtifactMissing {
                         path: source,
@@ -740,6 +741,7 @@ fn prepare_component(
             },
             CompiledCacheMode::Publisher => cache
                 .publish_component(&runtime.engine, &bytes, &artifact.sha256)
+                .map(|(component, publication)| (component, Some(publication)))
                 .map_err(|error| BrokerHostError::CompiledArtifact {
                     path: source.clone(),
                     source: error,
@@ -753,6 +755,7 @@ fn prepare_component(
                 &bytes,
             )
         })
+        .map(|component| (component, None))
         .map_err(|error| BrokerHostError::Compile {
             path: source.clone(),
             source: error,
@@ -774,6 +777,7 @@ fn prepare_component(
         artifact_bytes: artifact.bytes,
         artifact_sha256: artifact.sha256,
         compile_ms: 0,
+        publication,
         pre,
         command_export,
     })
@@ -862,6 +866,7 @@ impl BrokerWasmProvider {
         compiled: CompiledComponent,
     ) -> Result<Self, BrokerHostError> {
         let CompiledComponent {
+            publication: _,
             source,
             expected_provider_id,
             artifact_bytes,
@@ -1408,6 +1413,13 @@ pub struct BrokerProviderRegistry {
     routes: BTreeMap<CapabilityId, usize>,
     storage_host: Option<StorageHost>,
     assets: Option<dekopon_http_host::asset::AssetDirectory>,
+    compiled_cache: CompiledCacheCounts,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompiledCacheCounts {
+    pub hits: usize,
+    pub misses: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1556,6 +1568,7 @@ impl BrokerProviderRegistry {
             outcome = tracing::field::Empty
         );
         let started = Instant::now();
+        let mut compiled_cache = CompiledCacheCounts::default();
         let result = async {
             if sources.is_empty() {
                 return Err(BrokerHostError::NoProviders);
@@ -1574,6 +1587,13 @@ impl BrokerProviderRegistry {
                     path: source.path,
                     source: wasmtime::Error::new(dekopon_core::TaskOutcome::from(join)),
                 })??;
+                match compiled.publication {
+                    Some(cwasm::Publication::Hit) => compiled_cache.hits += 1,
+                    Some(cwasm::Publication::Compiled | cwasm::Publication::Repaired) => {
+                        compiled_cache.misses += 1;
+                    }
+                    None => {}
+                }
                 let provider = BrokerWasmProvider::load(Arc::clone(&runtime), compiled).await?;
                 scan.record(&provider.manifest, providers.len());
                 providers.push(provider);
@@ -1589,6 +1609,7 @@ impl BrokerProviderRegistry {
                 routes,
                 storage_host,
                 assets: None,
+                compiled_cache,
             })
         }
         .instrument(span.clone())
@@ -1601,8 +1622,21 @@ impl BrokerProviderRegistry {
         };
         span.record("elapsed_us", elapsed_us);
         span.record("outcome", outcome);
-        span.in_scope(|| tracing::info!(elapsed_us, outcome, "provider.registry.loaded"));
+        span.in_scope(|| {
+            tracing::info!(
+                elapsed_us,
+                outcome,
+                compiled_cache_hits = compiled_cache.hits,
+                compiled_cache_misses = compiled_cache.misses,
+                "provider.registry.loaded"
+            );
+        });
         result
+    }
+
+    #[must_use]
+    pub const fn compiled_cache_counts(&self) -> CompiledCacheCounts {
+        self.compiled_cache
     }
 
     #[must_use]
