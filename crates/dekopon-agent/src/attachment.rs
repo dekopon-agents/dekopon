@@ -14,6 +14,7 @@ pub struct GeneratedImage {
     data: DiskBlob,
     content_type: String,
     encoding: AssetEncoding,
+    chat_asset: Option<u64>,
 }
 impl GeneratedImage {
     pub fn new(data: DiskBlob, content_type: String, encoding: AssetEncoding) -> Self {
@@ -21,6 +22,7 @@ impl GeneratedImage {
             data,
             content_type,
             encoding,
+            chat_asset: None,
         }
     }
     pub fn from_png(data: Vec<u8>) -> Result<Self, BlobError> {
@@ -32,6 +34,12 @@ impl GeneratedImage {
     }
     pub fn media_type(&self) -> &str {
         &self.content_type
+    }
+    pub fn attachment_reference(&self, index: usize) -> AttachmentReference {
+        match self.chat_asset {
+            Some(id) => AttachmentReference::ChatAsset(id),
+            None => AttachmentReference::ReplyAttachment(index + 1),
+        }
     }
     pub fn filename(&self, index: usize) -> String {
         let content_type = self
@@ -47,6 +55,11 @@ impl GeneratedImage {
             "image/webp" => "webp",
             "image/gif" => "gif",
             "video/mp4" => "mp4",
+            "audio/ogg" => "ogg",
+            "audio/mpeg" => "mp3",
+            "audio/mp4" => "m4a",
+            "audio/aac" => "aac",
+            "audio/amr" => "amr",
             "text/plain" => "txt",
             "application/pdf" => "pdf",
             "text/markdown" => "md",
@@ -206,7 +219,46 @@ impl AttachmentLimit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentReference {
+    ChatAsset(u64),
+    ReplyAttachment(usize),
+}
+
+impl fmt::Display for AttachmentReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChatAsset(id) => write!(f, "chat-asset:{id}"),
+            Self::ReplyAttachment(number) => write!(f, "attachment {number}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum MediaSendRefusal {
+    #[error("WhatsApp has no GIF type. Ask the user for an MP4 copy of {asset}.")]
+    WhatsappGif { asset: AttachmentReference },
+    #[error("WhatsApp cannot send WebP replies. Ask the user for an MP4 copy of {asset}.")]
+    WhatsappWebp { asset: AttachmentReference },
+    #[error(
+        "{platform} cannot send {asset} with this MIME type. Ask the user for a copy in one of these formats ({accepted})."
+    )]
+    UnsupportedType {
+        asset: AttachmentReference,
+        platform: &'static str,
+        accepted: String,
+    },
+    #[error("WhatsApp caps {media} at {megabytes} MB. Ask the user for a smaller copy of {asset}.")]
+    WhatsappSize {
+        asset: AttachmentReference,
+        media: &'static str,
+        megabytes: usize,
+    },
+}
+
+pub type AttachmentPreflight = fn(AttachmentReference, &GeneratedImage) -> Result<(), SendRefusal>;
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SendRefusal {
     #[error("this reply already carries its limit of {limit} attachments")]
     Allowance { limit: u8 },
@@ -214,6 +266,8 @@ pub enum SendRefusal {
     ByteBudget { bytes: usize },
     #[error("{0}")]
     Storage(BlobError),
+    #[error(transparent)]
+    Media(#[from] MediaSendRefusal),
 }
 
 struct Queued {
@@ -228,6 +282,7 @@ pub struct ReplyAttachments {
     queued: Mutex<Queued>,
     registrar: Arc<dyn GeneratedAssetStore>,
     transport: String,
+    preflight: Option<AttachmentPreflight>,
 }
 impl ReplyAttachments {
     pub fn new(
@@ -239,6 +294,7 @@ impl ReplyAttachments {
             limit,
             registrar,
             transport,
+            preflight: None,
             queued: Mutex::new(Queued {
                 images: Vec::new(),
                 ids: Vec::new(),
@@ -247,6 +303,10 @@ impl ReplyAttachments {
                 finished: false,
             }),
         }
+    }
+    pub fn with_preflight(mut self, preflight: Option<AttachmentPreflight>) -> Self {
+        self.preflight = preflight;
+        self
     }
     pub fn remaining(&self) -> u8 {
         self.limit.count.saturating_sub(self.queued.lock().spent)
@@ -257,7 +317,10 @@ impl ReplyAttachments {
     pub fn take(&self) -> Vec<GeneratedImage> {
         std::mem::take(&mut self.queued.lock().images)
     }
-    fn admit(&self, id: u64, image: GeneratedImage) -> Result<usize, SendRefusal> {
+    fn admit(&self, id: u64, mut image: GeneratedImage) -> Result<usize, SendRefusal> {
+        let verified = self.preflight.map_or(Ok(()), |verify| {
+            verify(AttachmentReference::ChatAsset(id), &image)
+        });
         let decoded = match self.limit.holding {
             Holding::OneAtATime => Ok(0),
             Holding::AllAtOnce { .. } => image.decoded_len().map_err(SendRefusal::Storage),
@@ -270,6 +333,7 @@ impl ReplyAttachments {
         }
         // The broker already spent this send's allowance, so a refusal below still costs a slot.
         queued.spent += 1;
+        verified?;
         let bytes = match self.limit.holding {
             Holding::OneAtATime => queued.bytes,
             Holding::AllAtOnce { bytes } => decoded?
@@ -279,6 +343,7 @@ impl ReplyAttachments {
         };
         queued.bytes = bytes;
         queued.ids.push(id);
+        image.chat_asset = Some(id);
         queued.images.push(image);
         Ok(queued.ids.len())
     }

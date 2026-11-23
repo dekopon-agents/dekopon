@@ -1,5 +1,8 @@
 use std::{net::IpAddr, time::Instant};
 
+use dekopon_agent::attachment::{
+    AttachmentReference, GeneratedImage, MediaSendRefusal, SendRefusal,
+};
 use tracing::Instrument as _;
 
 use crate::transport::{asset_buffer, floor_boundary, hydration::HydratedImage, reserve_for_chunk};
@@ -9,6 +12,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use super::*;
 
 pub(crate) const MAX_IMAGE_BYTES: usize = 5_000_000;
+const MAX_MEDIA_BYTES: usize = 16_000_000;
 pub(super) const MAX_CAPTION_CHARS: usize = 1024;
 const MAX_DOCUMENT_NAME_BYTES: usize = 128;
 const PNG: &str = "image/png";
@@ -287,6 +291,91 @@ async fn json_response(response: reqwest::Response) -> Result<Value, TransportEr
     })
 }
 
+#[derive(Clone, Copy)]
+enum UploadKind {
+    Image,
+    Audio,
+    Video,
+}
+
+impl UploadKind {
+    const TYPES: [(&'static str, Self); 8] = [
+        (PNG, Self::Image),
+        (JPEG, Self::Image),
+        ("audio/ogg", Self::Audio),
+        ("audio/mpeg", Self::Audio),
+        ("audio/mp4", Self::Audio),
+        ("audio/aac", Self::Audio),
+        ("audio/amr", Self::Audio),
+        ("video/mp4", Self::Video),
+    ];
+
+    fn field(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+pub(super) struct Upload {
+    asset: AttachmentReference,
+    kind: UploadKind,
+}
+
+impl Upload {
+    pub(super) fn classify(
+        asset: AttachmentReference,
+        image: &GeneratedImage,
+    ) -> Result<Self, MediaSendRefusal> {
+        let kind = match image.media_type() {
+            "image/gif" => return Err(MediaSendRefusal::WhatsappGif { asset }),
+            "image/webp" => return Err(MediaSendRefusal::WhatsappWebp { asset }),
+            mime => UploadKind::TYPES
+                .iter()
+                .find_map(|(allowed, kind)| (*allowed == mime).then_some(*kind))
+                .ok_or_else(|| MediaSendRefusal::UnsupportedType {
+                    asset,
+                    platform: "WhatsApp",
+                    accepted: UploadKind::TYPES.map(|(mime, _)| mime).join(", "),
+                })?,
+        };
+        Ok(Self { asset, kind })
+    }
+
+    pub(super) fn check_size(&self, bytes: usize) -> Result<(), MediaSendRefusal> {
+        let (limit, media) = match self.kind {
+            UploadKind::Image => (MAX_IMAGE_BYTES, "images"),
+            UploadKind::Audio | UploadKind::Video => (MAX_MEDIA_BYTES, "audio and video"),
+        };
+        if bytes > limit {
+            return Err(MediaSendRefusal::WhatsappSize {
+                asset: self.asset,
+                media,
+                megabytes: limit / 1_000_000,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn preflight(
+        asset: AttachmentReference,
+        image: &GeneratedImage,
+    ) -> Result<(), SendRefusal> {
+        let upload = Self::classify(asset, image)?;
+        upload.check_size(image.decoded_len().map_err(SendRefusal::Storage)?)?;
+        Ok(())
+    }
+
+    pub(super) fn accepts_caption(&self) -> bool {
+        match self.kind {
+            UploadKind::Image | UploadKind::Video => true,
+            UploadKind::Audio => false,
+        }
+    }
+}
+
 impl WhatsappDriver {
     fn download_url(&self, value: &str) -> Result<reqwest::Url, TransportError> {
         let url = reqwest::Url::parse(value).map_err(|source| {
@@ -334,15 +423,18 @@ impl WhatsappDriver {
         }
     }
 
-    pub(super) async fn send_image(
+    pub(super) async fn send_media(
         &self,
         recipient: &str,
         caption: Option<&str>,
         image: HydratedImage,
+        upload_plan: Upload,
     ) -> Result<(), TransportError> {
         let bytes = image.bytes.len();
+        let kind = upload_plan.kind.field();
         let upload = tracing::info_span!(
             "whatsapp.image_upload",
+            media = kind,
             bytes,
             duration_ms = tracing::field::Empty,
             outcome = tracing::field::Empty,
@@ -383,6 +475,7 @@ impl WhatsappDriver {
         let id = result?;
         let send = tracing::info_span!(
             "whatsapp.image_send",
+            media = kind,
             bytes,
             duration_ms = tracing::field::Empty,
             outcome = tracing::field::Empty,
@@ -392,10 +485,11 @@ impl WhatsappDriver {
         let result = async {
             let mut payload = json!({
                 "messaging_product": "whatsapp", "recipient_type": "individual", "to": recipient,
-                "type": "image", "image": {"id": id}
+                "type": kind,
             });
+            payload[kind] = json!({"id": id});
             if let Some(caption) = caption {
-                payload["image"]["caption"] = json!(caption);
+                payload[kind]["caption"] = json!(caption);
             }
             let response = self
                 .http

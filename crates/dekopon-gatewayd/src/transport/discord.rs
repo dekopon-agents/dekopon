@@ -1111,7 +1111,7 @@ impl ChatDriver for DiscordDriver {
         let suffix = footer
             .as_ref()
             .map(|footer| format!("-# {}", footer.line()));
-        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
+        super::hydration::validate_file_types(&images)?;
         let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Discord {
             channel_id,

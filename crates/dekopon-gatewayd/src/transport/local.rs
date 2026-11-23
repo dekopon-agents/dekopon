@@ -495,7 +495,7 @@ impl ChatDriver for LocalDriver {
             images,
             footer: _,
         } = reply;
-        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
+        super::hydration::validate_file_types(&images)?;
         let images = super::hydration::hydrate_images(images).await?;
         let &ReplyTarget::Local { connection } = target else {
             return Err(TransportError::Response);

@@ -14302,6 +14302,124 @@ async fn telegram_sends_a_png_or_declared_jpeg_as_a_photo_in_the_authenticated_t
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn telegram_selects_the_bot_api_method_and_multipart_field_for_each_media_label() {
+    let cases: [(&str, &str, &str, &str, &[u8]); 4] = [
+        (
+            "image/gif",
+            "sendAnimation",
+            "animation",
+            "gif",
+            include_bytes!("../tests/fixtures/media/cat-gallop-animated.gif"),
+        ),
+        (
+            "audio/ogg",
+            "sendVoice",
+            "voice",
+            "ogg",
+            include_bytes!("../tests/fixtures/media/cat-meow-opus.ogg"),
+        ),
+        (
+            "audio/mp4",
+            "sendAudio",
+            "audio",
+            "m4a",
+            include_bytes!("../tests/fixtures/media/cat-meow.m4a"),
+        ),
+        (
+            "video/mp4",
+            "sendVideo",
+            "video",
+            "mp4",
+            include_bytes!("../tests/fixtures/media/cat-gallop.mp4"),
+        ),
+    ];
+    for (label, method, field, extension, bytes) in cases {
+        let http = spawn_http_mock(move |path, _| {
+            assert!(path.ends_with(&format!("/{method}")));
+            let mut result = json!({"message_id":12, "message_thread_id":77, "chat":{"id":-1001}});
+            result[field] = json!({"file_id":"media"});
+            json!({"ok":true, "result":result})
+        });
+        let image = GeneratedImage::new(
+            dekopon_model::asset::DiskBlob::from_bytes(bytes).unwrap(),
+            label.to_owned(),
+            dekopon_broker_protocol::AssetEncoding::Identity,
+        );
+        telegram(&http.base)
+            .driver()
+            .reply(
+                &ReplyTarget::Telegram {
+                    chat_id: -1001,
+                    reply_to: Some(3),
+                    message_thread_id: Some(77),
+                },
+                OutboundReply::with_images("Cat media", vec![image]),
+            )
+            .await
+            .expect("Bot API accepted the attachment");
+        let calls = http.calls();
+        let [(path, multipart)] = calls.as_slice() else {
+            panic!("expected one Bot API call for {label}");
+        };
+        assert!(path.ends_with(&format!("/{method}")));
+        for expected in [
+            format!("name=\"{field}\""),
+            format!("filename=\"asset-1.{extension}\""),
+            format!("Content-Type: {label}"),
+            "name=\"reply_parameters\"".to_owned(),
+            "name=\"message_thread_id\"".to_owned(),
+            "Cat media".to_owned(),
+            String::from_utf8_lossy(bytes).into_owned(),
+        ] {
+            assert!(
+                multipart.contains(&expected),
+                "expected multipart part for {label}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_refuses_unsupported_media_with_the_supported_formats_before_calling_the_bot_api()
+{
+    use dekopon_agent::attachment::{AttachmentReference, MediaSendRefusal};
+    let http = spawn_http_mock(|_, _| panic!("no Bot API calls for refused media"));
+    let image = GeneratedImage::new(
+        dekopon_model::asset::DiskBlob::from_bytes(include_bytes!(
+            "../tests/fixtures/media/cat-gallop-animated.webp"
+        ))
+        .unwrap(),
+        "image/webp".into(),
+        dekopon_broker_protocol::AssetEncoding::Identity,
+    );
+    let error = telegram(&http.base)
+        .driver()
+        .reply(
+            &ReplyTarget::Telegram {
+                chat_id: 42,
+                reply_to: None,
+                message_thread_id: None,
+            },
+            OutboundReply::with_images("Cat media", vec![image]),
+        )
+        .await
+        .expect_err("Telegram refuses WebP");
+    assert!(matches!(
+        error,
+        TransportError::MediaSend(MediaSendRefusal::UnsupportedType {
+            asset: AttachmentReference::ReplyAttachment(1),
+            platform: "Telegram",
+            ..
+        }),
+    ));
+    assert_eq!(
+        error.to_string(),
+        "Telegram cannot send attachment 1 with this MIME type. Ask the user for a copy in one of these formats (image/png, image/jpeg, image/gif, audio/ogg, audio/mpeg, audio/mp4, video/mp4)."
+    );
+    assert!(http.calls().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn telegram_sends_one_photo_per_attachment_and_captions_the_first() {
     let http = spawn_http_mock(|path, _body| {
         assert!(path.contains("sendPhoto"));
@@ -17717,6 +17835,81 @@ async fn queued_mp4_delivers_on_empty_text_but_not_when_the_model_fails_before_r
             driver.image_bytes(),
             if fail { vec![vec![]] } else { vec![vec![10]] }
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn whatsapp_gif_and_webp_refusals_reach_the_agent_before_the_final_reply() {
+    use crate::transport::whatsapp::tests_media::{MediaPeer, accepted, admitted, message_webhook};
+    for (mime, bytes, refusal) in [
+        (
+            "image/gif",
+            &include_bytes!("../tests/fixtures/media/cat-gallop-animated.gif")[..],
+            "WhatsApp has no GIF type. Ask the user for an MP4 copy of chat-asset:1.",
+        ),
+        (
+            "image/webp",
+            &include_bytes!("../tests/fixtures/media/cat-gallop-animated.webp")[..],
+            "WhatsApp cannot send WebP replies. Ask the user for an MP4 copy of chat-asset:1.",
+        ),
+    ] {
+        let peer = MediaPeer::new(|_, index| {
+            assert_eq!(index, 0, "only the agent's text reply is posted");
+            accepted()
+        })
+        .await;
+        let (transport, message) = admitted(
+            &peer.origin,
+            &message_webhook("text", json!({"body":"Send the cat"})),
+        )
+        .await;
+        let directory = temporary();
+        let (broker, _observed) = stub_broker_assets(
+            directory.path(),
+            vec![
+                plain_response(probe_listing()),
+                plain_response(upper_proposal("create")),
+                asset_response(bytes, mime),
+                plain_response(upper_proposal("send")),
+                queued_response(1),
+            ],
+        )
+        .await;
+        let models = ModelScript::new([
+            script_call("probe upper --text create"),
+            script_call("probe upper --text send"),
+            answer("Please send an MP4 copy."),
+        ]);
+        let mut route = route(model_config());
+        route.transport = "wa".to_owned();
+        run_session(
+            runner(broker, Arc::clone(&models), 4),
+            route,
+            message,
+            transport.driver(),
+        )
+        .await;
+        assert!(
+            tool_message(&models, 2)
+                .lines()
+                .any(|line| line == format!("[gateway: chat-asset:1 was not queued: {refusal}]"))
+        );
+        {
+            let requests = peer.requests.lock();
+            let [request] = requests.as_slice() else {
+                panic!("only the text reply should reach WhatsApp");
+            };
+            assert_eq!(request.path, "/v25.0/456/messages");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["type"], "text");
+            assert_eq!(
+                body["text"]["body"]
+                    .as_str()
+                    .and_then(|text| text.lines().next()),
+                Some("Please send an MP4 copy.")
+            );
+        }
+        peer.finish().await;
     }
 }
 

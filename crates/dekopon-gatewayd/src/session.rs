@@ -2891,15 +2891,18 @@ async fn session_turn(
         .unwrap_or_default();
     let leg = leg.with_cancel_signal(cancellation.signal());
     // A digest reply is posted as text alone, so its turn offers no attachment sends.
-    let attachments = Arc::new(ReplyAttachments::new(
-        if is_digest {
-            dekopon_agent::attachment::AttachmentLimit::NONE
-        } else {
-            driver.attachments_per_reply()
-        },
-        Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::GeneratedAssetStore>,
-        message.transport.to_string(),
-    ));
+    let attachments = Arc::new(
+        ReplyAttachments::new(
+            if is_digest {
+                dekopon_agent::attachment::AttachmentLimit::NONE
+            } else {
+                driver.attachments_per_reply()
+            },
+            Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::GeneratedAssetStore>,
+            message.transport.to_string(),
+        )
+        .with_preflight(driver.attachment_preflight()),
+    );
     let leg = leg
         .with_provider_attachments(Arc::clone(&attachments))
         .with_chat_asset_inputs(ChatAssetInputs::new(

@@ -26,7 +26,7 @@ use crate::{
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
 const MAX_MESSAGE_CHARS: usize = 4_096;
 const MAX_STREAM_CHARS: usize = 4_000;
-const MAX_PHOTO_CAPTION_CHARS: usize = 1_024;
+const MAX_MEDIA_CAPTION_CHARS: usize = 1_024;
 
 const POLL_SECONDS: u64 = 50;
 const POLL_TIMEOUT: Duration = Duration::from_secs(POLL_SECONDS + 20);
@@ -845,14 +845,90 @@ fn bounded(text: &str) -> String {
         .unwrap_or_default()
 }
 
+#[derive(Clone, Copy)]
+enum TelegramMedia {
+    Photo,
+    Animation,
+    Voice,
+    Audio,
+    Video,
+}
+
+impl TelegramMedia {
+    const TYPES: [(&'static str, Self); 7] = [
+        ("image/png", Self::Photo),
+        ("image/jpeg", Self::Photo),
+        ("image/gif", Self::Animation),
+        ("audio/ogg", Self::Voice),
+        ("audio/mpeg", Self::Audio),
+        ("audio/mp4", Self::Audio),
+        ("video/mp4", Self::Video),
+    ];
+
+    fn classify(
+        asset: dekopon_agent::attachment::AttachmentReference,
+        image: &dekopon_agent::attachment::GeneratedImage,
+    ) -> Result<Self, dekopon_agent::attachment::MediaSendRefusal> {
+        Self::TYPES
+            .iter()
+            .find_map(|(mime, method)| (*mime == image.media_type()).then_some(*method))
+            .ok_or_else(
+                || dekopon_agent::attachment::MediaSendRefusal::UnsupportedType {
+                    asset,
+                    platform: "Telegram",
+                    accepted: Self::TYPES.map(|(mime, _)| mime).join(", "),
+                },
+            )
+    }
+
+    fn method(self) -> &'static str {
+        match self {
+            Self::Photo => "sendPhoto",
+            Self::Animation => "sendAnimation",
+            Self::Voice => "sendVoice",
+            Self::Audio => "sendAudio",
+            Self::Video => "sendVideo",
+        }
+    }
+
+    fn field(self) -> &'static str {
+        match self {
+            Self::Photo => "photo",
+            Self::Animation => "animation",
+            Self::Voice => "voice",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+
+    fn accepted(self, value: Option<&Value>) -> bool {
+        match self {
+            Self::Photo => value
+                .and_then(Value::as_array)
+                .is_some_and(|photo| !photo.is_empty()),
+            Self::Animation | Self::Voice | Self::Audio | Self::Video => value
+                .and_then(|file| file["file_id"].as_str())
+                .is_some_and(|id| !id.is_empty()),
+        }
+    }
+}
+
 #[async_trait]
 impl ChatDriver for TelegramDriver {
     fn attachments_per_reply(&self) -> dekopon_agent::attachment::AttachmentLimit {
-        // Each photo is its own message, so the count bounds how many messages one reply posts.
+        // Each attachment is its own message, so the count bounds how many messages one reply posts.
         dekopon_agent::attachment::AttachmentLimit::new(
             4,
             dekopon_agent::attachment::Holding::OneAtATime,
         )
+    }
+
+    fn attachment_preflight(&self) -> Option<dekopon_agent::attachment::AttachmentPreflight> {
+        Some(|asset, image| {
+            TelegramMedia::classify(asset, image)
+                .map(drop)
+                .map_err(Into::into)
+        })
     }
 
     async fn reply(
@@ -861,7 +937,7 @@ impl ChatDriver for TelegramDriver {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let mut reply = reply;
-        super::hydration::validate_types(&reply.images, super::hydration::AcceptedTypes::Photos)?;
+        let media = super::hydration::classify_media(&reply.images, TelegramMedia::classify)?;
         let mut images = super::hydration::ImageQueue::new(std::mem::take(&mut reply.images));
         let text = &reply.text;
         let footer = reply.footer.as_ref();
@@ -879,19 +955,19 @@ impl ChatDriver for TelegramDriver {
             let unsent = |sent: usize| TransportError::PartialDelivery {
                 failed_attachments: (sent..total).collect(),
             };
-            let caption_fits = text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
+            let caption_fits = text.encode_utf16().count() <= MAX_MEDIA_CAPTION_CHARS;
             let caption = footer.and_then(|footer| {
                 crate::progress::Footer::caption(
                     text,
                     footer.line(),
-                    MAX_PHOTO_CAPTION_CHARS,
+                    MAX_MEDIA_CAPTION_CHARS,
                     TextUnit::Utf16,
                 )
             });
             let caption_footer = caption.as_ref().and(footer);
             let mut sent = 0;
-            while let Some(read) = images.next().await {
-                let (index, image) = match read {
+            for kind in media {
+                let (index, image) = match images.next().await.ok_or(TransportError::Response)? {
                     Ok(read) => read,
                     Err(_) if sent > 0 => return Err(unsent(sent)),
                     Err(error) => return Err(error),
@@ -899,7 +975,7 @@ impl ChatDriver for TelegramDriver {
                 let caption = (index == 0 && caption_fits)
                     .then_some((caption.as_deref().unwrap_or(text), caption_footer));
                 match self
-                    .send_photo(chat_id, reply_to, message_thread_id, caption, image)
+                    .send_media(chat_id, reply_to, message_thread_id, caption, (kind, image))
                     .await
                 {
                     Ok(()) => sent += 1,
@@ -1044,13 +1120,13 @@ impl TelegramDriver {
         Ok(())
     }
 
-    async fn send_photo(
+    async fn send_media(
         &self,
         chat_id: i64,
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
         caption: Option<(&str, Option<&crate::progress::Footer>)>,
-        image: super::hydration::HydratedImage,
+        (kind, image): (TelegramMedia, super::hydration::HydratedImage),
     ) -> Result<(), TransportError> {
         let filename = image.filename;
         #[allow(
@@ -1064,7 +1140,7 @@ impl TelegramDriver {
             .map_err(|_| TransportError::Response)?;
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
-            .part("photo", part);
+            .part(kind.field(), part);
         if let Some((caption, footer)) = caption {
             form = form.text("caption", caption.to_owned());
             if let Some(entities) = footer_entities(caption, footer) {
@@ -1082,7 +1158,7 @@ impl TelegramDriver {
         }
         let response = self
             .http
-            .post(self.url("sendPhoto"))
+            .post(self.url(kind.method()))
             .multipart(form)
             .send()
             .await
@@ -1102,14 +1178,10 @@ impl TelegramDriver {
             .and_then(Value::as_i64)
             .ok_or(TransportError::Response)?;
         let response_thread = result.get("message_thread_id").and_then(Value::as_i64);
-        let accepted_photo = result
-            .get("photo")
-            .and_then(Value::as_array)
-            .is_some_and(|photo| !photo.is_empty());
         if !posted
             || response_chat != chat_id
             || response_thread != message_thread_id
-            || !accepted_photo
+            || !kind.accepted(result.get(kind.field()))
         {
             return Err(TransportError::Response);
         }

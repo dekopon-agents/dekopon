@@ -854,6 +854,7 @@ impl ChannelKindLookupError {
             | Self::Flags
             | Self::Response(
                 TransportError::AssetType { .. }
+                | TransportError::MediaSend(_)
                 | TransportError::Attachment(_)
                 | TransportError::AttachmentTask { .. }
                 | TransportError::MissingCredential { .. }
@@ -1052,7 +1053,7 @@ impl ChatDriver for SlackReplier {
             images,
             footer,
         } = reply;
-        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
+        super::hydration::validate_file_types(&images)?;
         let images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Slack { channel, thread_ts } = target else {
             return Err(TransportError::Response);
@@ -2109,6 +2110,7 @@ impl PermanentReactionError {
                 _ => None,
             },
             TransportError::AssetType { .. }
+            | TransportError::MediaSend(_)
             | TransportError::AssetTooLarge { .. }
             | TransportError::AssetRefused { .. }
             | TransportError::Attachment(_)

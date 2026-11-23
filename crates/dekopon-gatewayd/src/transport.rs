@@ -590,6 +590,10 @@ pub(crate) trait ChatDriver: Send + Sync {
 
     fn attachments_per_reply(&self) -> AttachmentLimit;
 
+    fn attachment_preflight(&self) -> Option<dekopon_agent::attachment::AttachmentPreflight> {
+        None
+    }
+
     fn typing(&self) -> Option<&dyn TypingLease> {
         None
     }
@@ -703,6 +707,8 @@ pub(crate) fn reserve_for_chunk(buffer: &mut Vec<u8>, chunk: usize, limit: usize
 pub enum TransportError {
     #[error("unsupported asset content type; this transport accepts {accepted}")]
     AssetType { accepted: &'static str },
+    #[error(transparent)]
+    MediaSend(#[from] dekopon_agent::attachment::MediaSendRefusal),
     #[error("{0}")]
     Attachment(#[from] dekopon_model::asset::BlobError),
     #[error("attachment hydration task failed ({outcome}); provider already executed")]
@@ -762,6 +768,7 @@ impl TransportError {
             Self::Attachment(_) => "attachment-storage",
             Self::AttachmentTask { .. } => "attachment-task",
             Self::AssetType { .. } => "asset-type",
+            Self::MediaSend(_) => "media-send-refused",
             Self::MissingCredential { .. } => "missing-credential",
             Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",
