@@ -32,6 +32,7 @@ mod workflows;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -307,7 +308,11 @@ where
 pub struct CheckProviders {
     pub provider_set: PathBuf,
     pub store: PathBuf,
+    pub download_concurrency: NonZeroUsize,
 }
+
+pub const DEFAULT_DOWNLOAD_CONCURRENCY: NonZeroUsize =
+    NonZeroUsize::new(8).expect("default download concurrency is positive");
 
 #[derive(Debug, Default)]
 pub struct CheckReport {
@@ -1286,7 +1291,7 @@ async fn resolve_provider_set(
     .await
     .map_err(BrokerdError::ProviderSet)?;
     manager
-        .sync_with_timings(timings.as_deref_mut())
+        .sync_for_check(providers.download_concurrency, timings.as_deref_mut())
         .await
         .map_err(BrokerdError::ProviderSet)?;
     let started = Instant::now();

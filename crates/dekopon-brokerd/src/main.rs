@@ -13,7 +13,7 @@ mod observed;
 use observed::observed;
 
 #[cfg(unix)]
-use std::{io, path::PathBuf, process::ExitCode};
+use std::{io, num::NonZeroUsize, path::PathBuf, process::ExitCode};
 
 #[cfg(unix)]
 use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum, error::ErrorKind};
@@ -133,6 +133,13 @@ struct CheckArgs {
     /// and policy.
     #[arg(long, value_name = "DIR", requires = "provider_set")]
     workflows: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = dekopon_brokerd::DEFAULT_DOWNLOAD_CONCURRENCY,
+        help = "Maximum number of concurrent provider downloads (positive)"
+    )]
+    download_concurrency: NonZeroUsize,
     /// Render problems and warnings as a table or JSON.
     #[arg(long, value_enum, default_value_t)]
     output: OutputFormat,
@@ -711,6 +718,7 @@ async fn execute_check(check: CheckArgs) -> Result<(), AppError> {
         .map(|(provider_set, store)| dekopon_brokerd::CheckProviders {
             provider_set,
             store,
+            download_concurrency: check.download_concurrency,
         });
     let report = dekopon_brokerd::check(&check.config, providers, check.workflows.as_deref()).await;
     let output = CheckOutput {
@@ -1097,6 +1105,32 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn check_requires_positive_download_concurrency() {
+        let cli = Cli::try_parse_from([
+            "dekopon-brokerd",
+            "check",
+            "broker.yaml",
+            "--download-concurrency",
+            "40",
+        ])
+        .unwrap();
+        let Some(Command::Check(check)) = cli.command else {
+            panic!("check command");
+        };
+        assert_eq!(check.download_concurrency.get(), 40);
+        assert!(
+            Cli::try_parse_from([
+                "dekopon-brokerd",
+                "check",
+                "broker.yaml",
+                "--download-concurrency",
+                "0"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

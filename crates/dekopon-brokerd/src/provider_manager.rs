@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Write as _},
+    num::NonZeroUsize,
     os::unix::fs::{
         DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     },
@@ -24,7 +25,7 @@ use dekopon_core::{
     },
     read_trusted_file,
 };
-use futures_util::StreamExt as _;
+use futures_util::{StreamExt as _, stream};
 use http_auth::parser::ChallengeParser;
 use reqwest::{
     StatusCode, Url,
@@ -208,11 +209,12 @@ impl ProviderManager {
     }
 
     pub async fn sync(&self) -> Result<ProviderSyncReport, ProviderManagerError> {
-        self.sync_with_timings(None).await
+        self.sync_for_check(NonZeroUsize::MIN, None).await
     }
 
-    pub(crate) async fn sync_with_timings(
+    pub(crate) async fn sync_for_check(
         &self,
+        concurrency: NonZeroUsize,
         mut timings: Option<&mut CheckTimings>,
     ) -> Result<ProviderSyncReport, ProviderManagerError> {
         let uid = socket::current_uid();
@@ -239,38 +241,57 @@ impl ProviderManager {
 
         let provider_count = desired.providers.len();
         let started = std::time::Instant::now();
-        let synced = async {
-            let mut candidates = Vec::with_capacity(provider_count);
-            let mut fetched = 0_usize;
-            for provider in desired.providers {
-                if let Some(locked) = old_by_source.get(&provider.source) {
-                    if store.ensure_locked_blob(&self.registry, locked).await? {
-                        fetched += 1;
+        let mut results = stream::iter(desired.providers.into_iter().enumerate())
+            .map(|(index, provider)| {
+                let store = &store;
+                let old_by_source = &old_by_source;
+                async move {
+                    let source = provider.source;
+                    let result = async {
+                        if let Some(locked) = old_by_source.get(&source) {
+                            let fetched = store.ensure_locked_blob(&self.registry, locked).await?;
+                            Ok((CandidateProvider::from_locked(locked.clone()), fetched))
+                        } else {
+                            let resolved = self.registry.resolve(&source).await?;
+                            let fetched = store.install_resolved(&self.registry, &resolved).await?;
+                            Ok((CandidateProvider::from_resolved(resolved), fetched))
+                        }
                     }
-                    candidates.push(CandidateProvider::from_locked(locked.clone()));
-                } else {
-                    let resolved = self.registry.resolve(&provider.source).await?;
-                    if store.install_resolved(&self.registry, &resolved).await? {
-                        fetched += 1;
-                    }
-                    candidates.push(CandidateProvider::from_resolved(resolved));
+                    .await;
+                    (index, source, result)
                 }
+            })
+            .buffer_unordered(concurrency.get())
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_unstable_by_key(|(index, _, _)| *index);
+        let mut candidates = Vec::with_capacity(provider_count);
+        let mut fetched = 0;
+        let mut failures = Vec::new();
+        for (_, source, result) in results {
+            match result {
+                Ok((candidate, downloaded)) => {
+                    candidates.push(candidate);
+                    fetched += usize::from(downloaded);
+                }
+                Err(error) => failures.push((source, error)),
             }
-            Ok::<_, ProviderManagerError>((candidates, fetched))
         }
-        .await;
         if let Some(timings) = &mut timings {
-            timings.download_concurrency = Some(1);
+            let concurrency = concurrency.get().min(provider_count);
+            timings.download_concurrency = Some(concurrency);
             timings.sync = Some(CheckPhase::record(
                 "sync",
                 started,
                 provider_count,
                 None,
-                synced.is_ok(),
-                Some(1),
+                failures.is_empty(),
+                Some(concurrency),
             ));
         }
-        let (candidates, fetched) = synced?;
+        if !failures.is_empty() {
+            return Err(ProviderManagerError::SyncFailed { failures });
+        }
         let started = std::time::Instant::now();
         let validated = validate_candidates(candidates, &store).await;
         if let Some(timings) = timings {
@@ -631,9 +652,10 @@ impl CandidateProvider {
 }
 
 async fn validate_candidates(
-    candidates: Vec<CandidateProvider>,
+    mut candidates: Vec<CandidateProvider>,
     store: &ProviderStore,
 ) -> Result<(ProviderLock, dekopon_broker_host::CompiledCacheCounts), ProviderManagerError> {
+    candidates.sort_by(|left, right| left.source.cmp(&right.source));
     let paths = candidates
         .iter()
         .map(|candidate| store.blob_path(&candidate.component_digest))
@@ -785,8 +807,6 @@ async fn load_provider_set(
             problems: conflicts.into_iter().collect(),
         });
     }
-    set.providers
-        .sort_by(|left, right| left.source.cmp(&right.source));
     Ok(set)
 }
 
@@ -1707,6 +1727,38 @@ struct ProviderStore {
     root: PathBuf,
     sha256: PathBuf,
     uid: u32,
+    usage: parking_lot::Mutex<StoreUsage>,
+    capacity_changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct StoreUsage {
+    occupied: Option<(usize, u64)>,
+    pending: usize,
+}
+
+struct BlobReservation<'a> {
+    store: &'a ProviderStore,
+    bytes: Option<u64>,
+}
+
+impl BlobReservation<'_> {
+    fn published(mut self) {
+        self.bytes = None;
+    }
+}
+
+impl Drop for BlobReservation<'_> {
+    fn drop(&mut self) {
+        let mut usage = self.store.usage.lock();
+        usage.pending -= 1;
+        if let (Some((blobs, occupied)), Some(bytes)) = (&mut usage.occupied, self.bytes) {
+            *blobs -= 1;
+            *occupied -= bytes;
+        }
+        drop(usage);
+        self.store.capacity_changed.notify_waiters();
+    }
 }
 
 impl ProviderStore {
@@ -1728,6 +1780,8 @@ impl ProviderStore {
             root,
             sha256,
             uid: expected_uid,
+            usage: parking_lot::Mutex::default(),
+            capacity_changed: tokio::sync::Notify::new(),
         })
     }
 
@@ -1783,12 +1837,18 @@ impl ProviderStore {
         descriptor: &LayerDescriptor,
     ) -> Result<bool, ProviderManagerError> {
         let destination = self.blob_path(&descriptor.digest)?;
-        if destination.exists() {
-            verify_component_file(&destination, &descriptor.digest, descriptor.size, self.uid)
-                .await?;
-            return Ok(false);
-        }
-        self.ensure_capacity(descriptor.size)?;
+        let reservation = loop {
+            let capacity_changed = self.capacity_changed.notified();
+            if destination.exists() {
+                verify_component_file(&destination, &descriptor.digest, descriptor.size, self.uid)
+                    .await?;
+                return Ok(false);
+            }
+            if let Some(reservation) = self.ensure_capacity(descriptor.size)? {
+                break reservation;
+            }
+            capacity_changed.await;
+        };
         let temporary = tempfile::Builder::new()
             .prefix(BLOB_TEMPORARY_PREFIX)
             .tempfile_in(&self.sha256)
@@ -1817,22 +1877,70 @@ impl ProviderStore {
             ProviderManagerError::io("could not synchronize provider blob", source)
         })?;
         drop(file);
-        replace_private_file_noclobber(&destination, temporary.into_temp_path()).map_err(
-            |error| {
-                let reason = if error.path == self.sha256 {
-                    SYNC_PROVIDER_DIRECTORY
-                } else {
-                    "could not atomically publish provider blob"
-                };
-                ProviderManagerError::io_at(reason, error.path, error.source)
-            },
-        )?;
+        match replace_private_file_noclobber(&destination, temporary.into_temp_path()) {
+            Ok(()) => reservation.published(),
+            Err(error) if error.path == self.sha256 => {
+                reservation.published();
+                return Err(ProviderManagerError::io_at(
+                    SYNC_PROVIDER_DIRECTORY,
+                    error.path,
+                    error.source,
+                ));
+            }
+            Err(error) if error.source.kind() == io::ErrorKind::AlreadyExists => {
+                drop(reservation);
+                verify_component_file(&destination, &descriptor.digest, descriptor.size, self.uid)
+                    .await?;
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(ProviderManagerError::io_at(
+                    "could not atomically publish provider blob",
+                    error.path,
+                    error.source,
+                ));
+            }
+        }
         socket::validate_owned_file(&destination, self.uid)
             .map_err(|error| ProviderManagerError::file_security(&destination, error))?;
         Ok(true)
     }
 
-    fn ensure_capacity(&self, requested: u64) -> Result<(), ProviderManagerError> {
+    fn ensure_capacity(
+        &self,
+        requested: u64,
+    ) -> Result<Option<BlobReservation<'_>>, ProviderManagerError> {
+        let mut usage = self.usage.lock();
+        let (blobs, bytes) = match usage.occupied {
+            Some(occupied) => occupied,
+            None => self.scan_usage(requested)?,
+        };
+        usage.occupied = Some((blobs, bytes));
+        if blobs >= HARD_MAX_PROVIDER_STORE_BLOBS
+            || bytes
+                .checked_add(requested)
+                .is_none_or(|total| total > HARD_MAX_PROVIDER_STORE_BYTES)
+        {
+            if usage.pending > 0 {
+                return Ok(None);
+            }
+            return Err(ProviderManagerError::StoreFull {
+                blobs,
+                bytes,
+                requested,
+                maximum_blobs: HARD_MAX_PROVIDER_STORE_BLOBS,
+                maximum_bytes: HARD_MAX_PROVIDER_STORE_BYTES,
+            });
+        }
+        usage.occupied = Some((blobs + 1, bytes + requested));
+        usage.pending += 1;
+        Ok(Some(BlobReservation {
+            store: self,
+            bytes: Some(requested),
+        }))
+    }
+
+    fn scan_usage(&self, requested: u64) -> Result<(usize, u64), ProviderManagerError> {
         let mut blobs = 0_usize;
         let mut bytes = 0_u64;
         let entries = fs::read_dir(&self.sha256).map_err(|source| {
@@ -1873,20 +1981,7 @@ impl ProviderStore {
                     maximum_bytes: HARD_MAX_PROVIDER_STORE_BYTES,
                 })?;
         }
-        if blobs >= HARD_MAX_PROVIDER_STORE_BLOBS
-            || bytes
-                .checked_add(requested)
-                .is_none_or(|total| total > HARD_MAX_PROVIDER_STORE_BYTES)
-        {
-            return Err(ProviderManagerError::StoreFull {
-                blobs,
-                bytes,
-                requested,
-                maximum_blobs: HARD_MAX_PROVIDER_STORE_BLOBS,
-                maximum_bytes: HARD_MAX_PROVIDER_STORE_BYTES,
-            });
-        }
-        Ok(())
+        Ok((blobs, bytes))
     }
 }
 
@@ -2350,6 +2445,8 @@ pub enum RegistryCaBundleCause {
 
 #[derive(Debug, Error)]
 pub enum ProviderManagerError {
+    #[error("provider sync failed: {}", render_provider_failures(.failures))]
+    SyncFailed { failures: Vec<(String, Self)> },
     #[error("{REGISTRY_CA_BUNDLE_ENV} names {}, which cannot be used", path.display())]
     RegistryCaBundle {
         path: PathBuf,
@@ -2431,6 +2528,14 @@ pub enum ProviderManagerError {
         #[source]
         source: io::Error,
     },
+}
+
+fn render_provider_failures(failures: &[(String, ProviderManagerError)]) -> String {
+    failures
+        .iter()
+        .map(|(source, error)| format!("{source}: {}", dekopon_core::error_chain(error)))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl ProviderManagerError {
@@ -2815,6 +2920,7 @@ mod tests {
         manifests: Arc<AtomicUsize>,
         blobs: Arc<AtomicUsize>,
         competing_blob: Option<PathBuf>,
+        manifest_failures: Arc<parking_lot::Mutex<BTreeMap<String, (StatusCode, Duration)>>>,
     }
 
     #[derive(Clone)]
@@ -2880,6 +2986,7 @@ mod tests {
                 manifests: Arc::new(AtomicUsize::new(0)),
                 blobs: Arc::new(AtomicUsize::new(0)),
                 competing_blob,
+                manifest_failures: Arc::default(),
             };
             let app = Router::new()
                 .route("/v2/{*path}", get(registry_response))
@@ -2919,6 +3026,14 @@ mod tests {
     ) -> Response<Body> {
         if path.contains("/manifests/") {
             state.manifests.fetch_add(1, Ordering::Relaxed);
+            let failure = state.manifest_failures.lock().get(&path).copied();
+            if let Some((status, delay)) = failure {
+                tokio::time::sleep(delay).await;
+                return Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .unwrap();
+            }
             let mut response = Response::new(Body::from(state.manifest.as_ref().clone()));
             response.headers_mut().insert(
                 reqwest::header::CONTENT_TYPE,
@@ -3003,7 +3118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_download_clears_abandoned_staging_and_refuses_a_competing_blob() {
+    async fn blob_download_clears_abandoned_staging_and_verifies_a_competing_blob() {
         let directory = tempfile::tempdir().expect("manager fixture");
         let store =
             ProviderStore::open(&directory.path().join("store"), socket::current_uid(), true)
@@ -3025,11 +3140,12 @@ mod tests {
         let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
         let source = format!("{}/test/provider:1.0.0", registry.authority);
 
-        assert!(matches!(
-            store.install_blob(&client, &source, &descriptor).await,
-            Err(ProviderManagerError::Io { path: Some(path), source, .. })
-                if path == destination && source.kind() == io::ErrorKind::AlreadyExists
-        ));
+        assert!(
+            !store
+                .install_blob(&client, &source, &descriptor)
+                .await
+                .unwrap()
+        );
         assert!(!abandoned.exists());
         assert_eq!(fs::read(&destination).unwrap(), component);
         assert!(
@@ -3049,6 +3165,44 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), component);
         assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o7777, 0o600);
         assert_eq!(fs::read_dir(&store.sha256).unwrap().count(), 1);
+        registry.stop().await;
+    }
+
+    #[tokio::test]
+    async fn sync_reports_all_fetch_failures_in_provider_set_order() {
+        let directory = tempfile::tempdir().expect("manager fixture");
+        let registry = TestRegistry::start(cli_probe_component()).await;
+        let sources = [
+            format!("{}/test/throttled:1.0.0", registry.authority),
+            format!("{}/test/missing:1.0.0", registry.authority),
+        ];
+        registry.state.manifest_failures.lock().extend([
+            (
+                "test/throttled/manifests/1.0.0".to_owned(),
+                (StatusCode::TOO_MANY_REQUESTS, Duration::from_millis(40)),
+            ),
+            (
+                "test/missing/manifests/1.0.0".to_owned(),
+                (StatusCode::NOT_FOUND, Duration::ZERO),
+            ),
+        ]);
+        let (manager, paths) = test_manager(directory.path(), &registry.authority, &sources).await;
+        let err = manager
+            .sync_for_check(NonZeroUsize::new(2).unwrap(), None)
+            .await
+            .unwrap_err();
+        let ProviderManagerError::SyncFailed { failures } = err else {
+            panic!("expected provider failures, got {err:?}");
+        };
+        assert_eq!(
+            failures
+                .iter()
+                .map(|(source, _)| source)
+                .collect::<Vec<_>>(),
+            sources.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(registry.state.manifests.load(Ordering::Relaxed), 2);
+        assert!(!paths.lock_file.exists());
         registry.stop().await;
     }
 
@@ -3535,6 +3689,7 @@ mod tests {
                 Some(crate::CheckProviders {
                     provider_set,
                     store: directory.path().to_owned(),
+                    download_concurrency: crate::DEFAULT_DOWNLOAD_CONCURRENCY,
                 }),
                 None,
             )
@@ -4210,6 +4365,29 @@ providers:
             store.ensure_capacity(1),
             Err(ProviderManagerError::StoreFull { .. })
         ));
+    }
+
+    #[test]
+    fn store_reserves_bytes_and_slots_until_downloads_publish_or_drop() {
+        let directory = tempfile::tempdir().expect("store fixture");
+        let store =
+            ProviderStore::open(&directory.path().join("store"), socket::current_uid(), true)
+                .expect("store opens");
+        let _operation = store.lock().unwrap();
+        for occupied in [
+            (0, HARD_MAX_PROVIDER_STORE_BYTES - 1),
+            (HARD_MAX_PROVIDER_STORE_BLOBS - 1, 0),
+        ] {
+            store.usage.lock().occupied = Some(occupied);
+            let first = store.ensure_capacity(1).unwrap().unwrap();
+            assert!(store.ensure_capacity(1).unwrap().is_none());
+            drop(first);
+            store.ensure_capacity(1).unwrap().unwrap().published();
+            assert!(matches!(
+                store.ensure_capacity(1),
+                Err(ProviderManagerError::StoreFull { .. })
+            ));
+        }
     }
 
     #[test]

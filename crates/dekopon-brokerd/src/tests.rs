@@ -3640,6 +3640,7 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
             Some(super::CheckProviders {
                 provider_set: provider_set.clone(),
                 store: store.clone(),
+                download_concurrency: super::DEFAULT_DOWNLOAD_CONCURRENCY,
             }),
             None,
         )
