@@ -3479,7 +3479,13 @@ async fn check_and_boot_have_equal_digests_for_private_map_names_absent_from_pol
 async fn materialized_check_reports_each_failed_secret_without_exposing_material() {
     use super::{BrokerdError, SecretMapError};
 
-    let mut fixture = ResidentFixture::boot().await;
+    let mut fixture = ResidentFixture::boot_with(|_, document| {
+        document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+            "allowedHosts": ["api.example.test"], "allowedMethods": ["GET"],
+            "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
+        });
+    })
+    .await;
     let missing = fixture.root.path().join("missing-token");
     let projected = fixture.root.path().join("token.json");
     let key = fixture.root.path().join("app.pem");
