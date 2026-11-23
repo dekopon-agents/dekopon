@@ -409,19 +409,16 @@ impl ModelConfig {
 
     pub(crate) fn output_reserve(&self) -> Tokens {
         let max_output = match self {
-            Self::Openrouter {
-                generation: Some(generation),
-                ..
-            } => generation
-                .max_output_tokens
-                .map(|tokens| u64::from(tokens.get())),
-            Self::Openrouter { .. }
-            | Self::OpenaiCompatible { .. }
-            | Self::ChatgptSubscription { .. }
-            | Self::Anthropic { .. } => None,
+            Self::Openrouter { generation, .. } => Some(
+                dekopon_model::openrouter::settings::Generation::output_limit(generation.as_ref()),
+            ),
+            Self::OpenaiCompatible { generation, .. } => {
+                Some(generation.unwrap_or_default().output_limit())
+            }
+            Self::ChatgptSubscription { .. } | Self::Anthropic { .. } => None,
         };
         Estimate::output_reserve(
-            max_output,
+            max_output.map(|tokens| u64::from(tokens.get())),
             self.classes().iter().any(|class| class == "reasoning"),
         )
     }

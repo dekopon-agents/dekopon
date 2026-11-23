@@ -859,8 +859,6 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
     assert_eq!(resolved.routes.len(), 1);
     assert_eq!(resolved.sessions.max_concurrent, 4);
     assert!(resolved.sessions.reply_on_busy);
-    assert_eq!(resolved.routes[0].limits.max_steps, 8);
-    assert_eq!(resolved.routes[0].limits.max_capability_calls, 16);
     assert_eq!(resolved.shutdown_grace, Duration::from_secs(120));
     assert_eq!(resolved.broker.server_uid, 501);
     assert!(resolved.telemetry.is_none());
@@ -869,6 +867,42 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
         resolved.routes[0].memory,
         MemoryPolicy::Persistent(_)
     ));
+}
+
+async fn route_without_limits() -> crate::routes::BoundRoute {
+    let directory = temporary();
+    let config = resolved(directory.path(), &document(directory.path())).await;
+    let table = RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap();
+    table.routes()[0].clone()
+}
+
+#[tokio::test]
+async fn a_route_without_limits_allows_one_hundred_steps() {
+    assert_eq!(route_without_limits().await.limits.max_steps, 100);
+}
+
+#[tokio::test]
+async fn a_route_without_limits_allows_two_hundred_fifty_six_capability_calls() {
+    assert_eq!(
+        route_without_limits().await.limits.max_capability_calls,
+        256
+    );
+}
+
+#[tokio::test]
+async fn a_route_without_limits_allows_five_and_a_half_minutes_per_script() {
+    assert_eq!(
+        route_without_limits().await.script_timeout,
+        Duration::from_secs(330)
+    );
+}
+
+#[tokio::test]
+async fn a_route_without_limits_allows_thirty_minutes_per_turn() {
+    assert_eq!(
+        route_without_limits().await.max_duration,
+        Some(Duration::from_secs(1800))
+    );
 }
 
 #[tokio::test]
@@ -1366,6 +1400,7 @@ fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
         api_key_env: api_key_env.map(ToOwned::to_owned),
         timeout_ms: 60_000,
         stream: true,
+        generation: None,
         classes: vec!["fast".to_owned()],
         modalities: Vec::new(),
     };
@@ -2434,6 +2469,33 @@ async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
 }
 
 #[tokio::test]
+async fn a_wake_interval_can_be_shorter_than_the_default_script_timeout() {
+    let directory = temporary();
+    let mut config = document(directory.path());
+    config["routes"][0]["wakes"] = json!(true);
+    config["sessions"]["wakes"] = json!({"path": "wakes.jsonl", "minIntervalMs": 1000});
+    load(directory.path(), &config).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_wake_interval_shorter_than_an_explicit_script_timeout_is_refused() {
+    let directory = temporary();
+    let mut config = document(directory.path());
+    config["routes"][0]["wakes"] = json!(true);
+    config["routes"][0]["limits"] = json!({"scriptTimeoutMs": 330_000});
+    config["sessions"]["wakes"] = json!({"path": "wakes.jsonl", "minIntervalMs": 300_000});
+    let error = load(directory.path(), &config).await.unwrap_err();
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::WakeIntervalWithinScriptTimeout {
+            route: 0,
+            min_interval_ms: 300_000,
+            script_timeout_ms: 330_000
+        }
+    )));
+}
+
+#[tokio::test]
 async fn a_wake_store_interval_must_exceed_the_routed_script_timeout() {
     let directory = temporary();
     let mut config = document(directory.path());
@@ -2636,7 +2698,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
         ),
         (
             json!({"/sessions": {"wakes": {"path": "wakes.jsonl", "minIntervalMs": 1000}},
-            "/routes/0/wakes": true}),
+            "/routes/0/wakes": true, "/routes/0/limits": {"scriptTimeoutMs": 30_000}}),
             |problem| {
                 matches!(
                     problem,
@@ -4742,6 +4804,7 @@ fn model_config() -> ModelConfig {
         api_key_env: None,
         timeout_ms: 1_000,
         stream: true,
+        generation: None,
         classes: vec!["reasoning".to_owned()],
         modalities: Vec::new(),
     }

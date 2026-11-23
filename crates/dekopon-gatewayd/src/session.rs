@@ -270,8 +270,10 @@ impl ConfiguredModels {
                 api_key_env,
                 timeout_ms,
                 stream,
+                generation,
                 ..
             } => {
+                let generation = generation.unwrap_or_default();
                 let bearer_token = api_key_env
                     .as_deref()
                     .map(|variable| model_credential(model, variable, resolve(variable)))
@@ -285,6 +287,7 @@ impl ConfiguredModels {
                         ca_bundles,
                     )?
                     .with_streaming(*stream)
+                    .with_output_limit(generation.output_limit(), generation.token_param)
                     .with_name(name),
                 )))
             }
@@ -4369,6 +4372,90 @@ mod model_factory_tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(gate.clone().stranger_reply());
         assert!(!gate.stranger_reply());
+    }
+
+    #[tokio::test]
+    async fn configured_chat_models_send_the_same_output_limit_the_governor_reserves() {
+        use dekopon_model::{
+            control::TurnControl,
+            inference::{GenerateRequest, InferenceModel},
+        };
+        use dekopon_test_support::LoopbackServer;
+        use serde_json::{Value, json};
+        use std::ops::ControlFlow;
+
+        let factory = ConfiguredModels::default();
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+            sse.len()
+        );
+
+        for (kind, generation, field, limit) in [
+            ("openrouter", None, "max_tokens", 32_768),
+            ("openaiCompatible", None, "max_tokens", 32_768),
+            (
+                "openaiCompatible",
+                Some(json!({"tokenParam": "maxCompletionTokens"})),
+                "max_completion_tokens",
+                32_768,
+            ),
+            (
+                "openaiCompatible",
+                Some(json!({"tokenParam": "maxTokens", "maxOutputTokens": 4096})),
+                "max_tokens",
+                4096,
+            ),
+        ] {
+            let peer = LoopbackServer::once(response.as_bytes());
+            let endpoint = peer.url();
+            let mut document = json!({
+                "kind": kind, "name": "fixture", "model": "vendor/model", "timeoutMs": 3000,
+            });
+            if kind == "openrouter" {
+                document["apiKeyEnv"] = json!("OPENROUTER_API_KEY");
+            } else {
+                document["endpoint"] = json!(endpoint);
+            }
+            if let Some(generation) = generation {
+                document["generation"] = generation;
+            }
+
+            let model: ModelConfig = serde_json::from_value(document).unwrap();
+            let built = factory
+                .construct_with(&model, |_| Some("synthetic-key".into()))
+                .unwrap();
+            let client = match Arc::into_inner(built).unwrap() {
+                ModelClient::OpenRouter(client) => {
+                    ModelClient::OpenRouter(client.with_loopback_endpoint(&endpoint).unwrap())
+                }
+                client @ (ModelClient::OpenAiCompatible(_) | ModelClient::Codex(_)) => client,
+            };
+            client
+                .generate(
+                    GenerateRequest {
+                        messages: &[],
+                        tools: &[],
+                        options: &CompletionOptions::default(),
+                    },
+                    &mut |_| ControlFlow::Continue(()),
+                    &TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(3))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let request = peer.request_text();
+            let body: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body[field], limit);
+            assert_eq!(model.output_reserve().0, limit);
+            assert_eq!(body.get("max_tokens").is_some(), field == "max_tokens");
+            assert_eq!(
+                body.get("max_completion_tokens").is_some(),
+                field == "max_completion_tokens"
+            );
+        }
     }
 
     #[test]

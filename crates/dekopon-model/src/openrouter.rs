@@ -189,10 +189,11 @@ impl OpenRouterClient {
 
     fn record_settings(&self, secrets: DiagnosticSecrets<'_>) {
         let span = tracing::Span::current();
+        span.record(
+            "generation.max_output_tokens",
+            settings::Generation::output_limit(self.settings.generation.as_ref()),
+        );
         if let Some(generation) = &self.settings.generation {
-            if let Some(value) = generation.max_output_tokens {
-                span.record("generation.max_output_tokens", value);
-            }
             if let Some(value) = generation.temperature {
                 span.record("generation.temperature", value);
             }
