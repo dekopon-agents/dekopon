@@ -50,6 +50,7 @@ use crate::attachment::{ChatAssetInputs, ChatAssetRefusal, ReplyAttachments};
 use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
 
 pub mod attachment;
+pub mod grant;
 pub mod improvement;
 pub mod memory;
 pub mod memory_tools;
@@ -329,6 +330,7 @@ pub struct BrokerLeg {
     notes: AtomicU32,
     calls: CallBudget,
     jobs: Option<Arc<dyn JobControl>>,
+    grants: Option<Arc<grant::SessionGrants>>,
 }
 
 #[cfg(unix)]
@@ -376,6 +378,7 @@ impl BrokerLeg {
             notes: AtomicU32::new(0),
             calls: CallBudget::new(0),
             jobs: None,
+            grants: None,
         })
     }
 
@@ -431,6 +434,17 @@ impl BrokerLeg {
     pub fn with_progress_notes(mut self) -> Self {
         self.notes_enabled = true;
         self
+    }
+
+    #[must_use]
+    pub fn with_grants(mut self, grants: Arc<grant::SessionGrants>) -> Self {
+        self.grants = Some(grants);
+        self
+    }
+
+    #[must_use]
+    pub fn grants(&self) -> Option<&grant::SessionGrants> {
+        self.grants.as_deref()
     }
 
     fn emit(&self, event: ProgressEvent) {
@@ -2128,6 +2142,7 @@ mod tests {
                 notes: AtomicU32::new(0),
                 calls: dekopon_process::CallBudget::new(0),
                 jobs: None,
+                grants: None,
             }
         }
 

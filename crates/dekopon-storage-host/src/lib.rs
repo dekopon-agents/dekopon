@@ -44,7 +44,7 @@ use std::{
 };
 
 use dekopon_capability::{StorageAccess, StorageInterface, StorageScope};
-use dekopon_core::{AgentId, CapabilityId, InvocationId, ProviderId, Subject};
+use dekopon_core::{AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, Subject};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -61,6 +61,7 @@ mod vfs;
 pub use config::{StorageConfigError, StorageLimits};
 pub use handle::StorageHandle;
 pub use jsonl::JsonlChunk;
+pub use namespace::{StorageCopyError, copy_agent_database};
 pub use sweep::{RetentionPolicies, SweepSummary};
 pub use vfs::{Durability, FileStat, OpenOptions};
 
@@ -71,6 +72,27 @@ use key::{
 use layout::{Layout, scan_root_usage, scan_usage, usage_with_directory_entry};
 use namespace::{ContinuityOutcome, Namespace, NamespacePlan, Reset, deadline_after};
 use quota::QuotaLedger;
+
+const AGENT_SCOPE_VERSION: &str = "agent-v1";
+const INSTANCE_SCOPE_VERSION: &str = "instance-v1";
+
+fn agent_values(provider: String, agent: String) -> Vec<String> {
+    vec![AGENT_SCOPE_VERSION.to_owned(), provider, agent]
+}
+
+fn instance_values(provider: String, agent: String, principal: String) -> Vec<String> {
+    vec![
+        INSTANCE_SCOPE_VERSION.to_owned(),
+        provider,
+        agent,
+        principal,
+    ]
+}
+
+fn namespace_token(values: &[String]) -> String {
+    let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
+    token(DOMAIN_NAMESPACE_PATH, &fields)
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -178,6 +200,7 @@ pub struct StorageGrantRequest {
     comparison: Comparison,
     shared_namespace: Option<ProviderId>,
     space_key: Option<dekopon_core::SpaceKey>,
+    principal: Option<PrincipalId>,
 }
 
 impl fmt::Debug for StorageGrantRequest {
@@ -226,6 +249,7 @@ impl StorageGrantRequest {
             },
             shared_namespace: None,
             space_key: None,
+            principal: None,
         }
     }
 
@@ -244,6 +268,12 @@ impl StorageGrantRequest {
     #[must_use]
     pub fn with_space_key(mut self, key: Option<dekopon_core::SpaceKey>) -> Self {
         self.space_key = key;
+        self
+    }
+
+    #[must_use]
+    pub fn with_principal(mut self, principal: PrincipalId) -> Self {
+        self.principal = Some(principal);
         self
     }
 
@@ -273,7 +303,14 @@ impl StorageGrantRequest {
                 self.channel.clone(),
                 self.conversation.clone(),
             ],
-            StorageScope::Agent => vec!["agent-v1".to_owned(), provider, agent],
+            StorageScope::Agent => agent_values(provider, agent),
+            StorageScope::Instance => instance_values(
+                provider,
+                agent,
+                self.principal
+                    .as_ref()
+                    .map_or_else(String::new, ToString::to_string),
+            ),
             StorageScope::Space => vec![
                 "space-v1".to_owned(),
                 provider,
@@ -507,11 +544,14 @@ impl StorageHost {
         {
             return Err(StorageHostError::InvalidArgument);
         }
+        if request.scope == StorageScope::Instance && request.principal.is_none() {
+            return Err(StorageHostError::InvalidArgument);
+        }
         let values = request.scope_values();
         let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
         Ok(StorageGrantPreparation {
             host: self.clone(),
-            base_token: token(DOMAIN_NAMESPACE_PATH, &fields),
+            base_token: namespace_token(&values),
             scope_commitment: StorageScopeCommitment(commitment(DOMAIN_AUDIT_SCOPE, &fields)),
             request,
         })
@@ -526,17 +566,7 @@ impl StorageHost {
         request: StorageGrantRequest,
         base: String,
     ) -> Result<StorageGrant, StorageHostError> {
-        debug_assert_eq!(
-            base,
-            token(
-                DOMAIN_NAMESPACE_PATH,
-                &request
-                    .scope_values()
-                    .iter()
-                    .map(String::as_bytes)
-                    .collect::<Vec<_>>()
-            )
-        );
+        debug_assert_eq!(base, namespace_token(&request.scope_values()));
         // One deadline covers all of a grant's waits; per-wait timeouts would let the k-th
         // contender behind the lease wait k times as long.
         let deadline = deadline_after(self.inner.limits.lock_timeout_ms)?;

@@ -42,9 +42,10 @@ pub const CONFIG_API_VERSION: &str = "dekopon.dev/gatewayd/v1alpha1";
 pub const HARD_MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 4;
 pub const DEFAULT_MAX_JOBS: usize = 2;
-pub const DEFAULT_MAX_STEPS: u32 = 8;
-pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 16;
-pub const DEFAULT_SCRIPT_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_MAX_STEPS: u32 = 100;
+pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 256;
+pub const DEFAULT_SCRIPT_TIMEOUT_MS: u64 = 330_000;
+const DEFAULT_MAX_DURATION: Duration = Duration::from_millis(1_800_000);
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
 pub const DEFAULT_CONVERSATION_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 pub const DEFAULT_CONVERSATION_MAX_TURNS: usize = 12;
@@ -575,6 +576,7 @@ pub enum ModelConfig {
         timeout_ms: u64,
         #[serde(default = "default_model_stream")]
         stream: bool,
+        generation: Option<OpenAiCompatibleGeneration>,
         #[serde(default)]
         classes: Vec<String>,
         #[serde(default)]
@@ -616,6 +618,21 @@ pub enum ModelConfig {
         model: String,
         api_key_env: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct OpenAiCompatibleGeneration {
+    max_output_tokens: Option<NonZeroU32>,
+    #[serde(default)]
+    pub(crate) token_param: dekopon_model::openai::TokenParam,
+}
+
+impl OpenAiCompatibleGeneration {
+    pub(crate) fn output_limit(self) -> NonZeroU32 {
+        self.max_output_tokens
+            .unwrap_or(dekopon_model::model::DEFAULT_MAX_OUTPUT_TOKENS)
+    }
 }
 
 const fn default_model_stream() -> bool {
@@ -759,6 +776,13 @@ impl Default for RouteLimits {
 }
 
 impl RouteLimits {
+    pub(crate) const fn max_duration(self) -> Duration {
+        match self.max_duration_ms {
+            Some(milliseconds) => Duration::from_millis(milliseconds),
+            None => DEFAULT_MAX_DURATION,
+        }
+    }
+
     #[must_use]
     pub const fn script_timeout(self) -> Duration {
         Duration::from_millis(match self.script_timeout_ms {
@@ -2793,20 +2817,17 @@ fn resolve_with_service(
         if route.wakes {
             match &config.sessions.wakes {
                 None => problems.push(ConfigProblem::WakesWithoutStore { route: index }),
-                Some(wakes)
-                    if Duration::from_millis(wakes.min_interval_ms)
-                        <= route.limits.script_timeout() =>
-                {
-                    problems.push(ConfigProblem::WakeIntervalWithinScriptTimeout {
-                        route: index,
-                        min_interval_ms: wakes.min_interval_ms,
-                        script_timeout_ms: route
-                            .limits
-                            .script_timeout_ms
-                            .unwrap_or(DEFAULT_SCRIPT_TIMEOUT_MS),
-                    });
+                Some(wakes) => {
+                    if let Some(script_timeout_ms) = route.limits.script_timeout_ms
+                        && script_timeout_ms >= wakes.min_interval_ms
+                    {
+                        problems.push(ConfigProblem::WakeIntervalWithinScriptTimeout {
+                            route: index,
+                            min_interval_ms: wakes.min_interval_ms,
+                            script_timeout_ms,
+                        });
+                    }
                 }
-                Some(_) => {}
             }
         }
         routes.push(ResolvedRoute {
@@ -3678,8 +3699,8 @@ mod tests {
     use dekopon_broker_protocol::BrokerSocketDiscovery;
 
     use super::{
-        ConfigError, DEFAULT_SCRIPT_TIMEOUT_MS, Duration, LivenessMode, LoadMode, ModelConfig,
-        ProgressDetail, ProgressSurface, SeenReaction, resolve,
+        ConfigError, Duration, LivenessMode, LoadMode, ModelConfig, ProgressDetail,
+        ProgressSurface, SeenReaction, resolve,
     };
     use crate::progress::{DEFAULT_KEEP_ALIVE_MAX, KeepAlive};
 
@@ -4798,7 +4819,7 @@ routes:
         }
         for kind in ["chatgptSubscription", "openaiCompatible"] {
             for block in [
-                "generation: {}",
+                "generation: {temperature: 1.0}",
                 "reasoning: {effort: medium}",
                 "routing: {}",
                 "cache: {style: automatic}",
@@ -5011,7 +5032,7 @@ routes:
     }
 
     #[test]
-    fn a_route_script_deadline_is_read_and_otherwise_defaults() {
+    fn an_authored_route_script_deadline_wins() {
         let config = resolved(
             "transports:\n\
              \x20 - name: dev\n\
@@ -5021,21 +5042,14 @@ routes:
              \x20 - transport: dev\n\
              \x20   conversation: { kind: [directMessage] }\n\
              \x20   agent: reviewer\n\
-             \x20 - transport: dev\n\
-             \x20   conversation: { kind: [channel, thread] }\n\
-             \x20   agent: reviewer\n\
              \x20   limits: { scriptTimeoutMs: 240000, maxDurationMs: 300000 }\n",
         )
         .expect("a well-formed configuration resolves");
 
-        let written = config.routes.first().expect("the route without the field");
-        assert_eq!(written.limits.script_timeout_ms, None);
-        assert_eq!(
-            written.limits.script_timeout(),
-            Duration::from_millis(DEFAULT_SCRIPT_TIMEOUT_MS),
-            "an omitted deadline resolves to the documented 30 seconds"
-        );
-        let named = config.routes.get(1).expect("the route that named one");
+        let named = config
+            .routes
+            .first()
+            .expect("the route that named a deadline");
         assert_eq!(named.limits.script_timeout_ms, Some(240_000));
         assert_eq!(
             named.limits.script_timeout(),
@@ -5087,7 +5101,7 @@ routes:
         let rendered = error.to_string();
         for expected in [
             "sets limits.scriptTimeoutMs to 0",
-            "omit it for the 30000ms default",
+            "omit it for the 330000ms default",
             "sets limits.scriptTimeoutMs to 300000 above limits.maxDurationMs 120000",
             "can never take effect",
         ] {

@@ -1247,7 +1247,11 @@ fn stdout_provider_exiting_eight() -> tempfile::NamedTempFile {
         manifest = hex(manifest.as_bytes()),
     );
     let mut provider = tempfile::NamedTempFile::new().unwrap();
-    std::io::Write::write_all(&mut provider, wat.as_bytes()).unwrap();
+    std::io::Write::write_all(
+        &mut provider,
+        &wat::parse_str(wat).expect("valid inline component"),
+    )
+    .unwrap();
     provider
 }
 
@@ -1290,7 +1294,11 @@ fn inline_provider_declaring(manifest: &str) -> tempfile::NamedTempFile {
         manifest = hex(manifest.as_bytes()),
     );
     let mut provider = tempfile::NamedTempFile::new().unwrap();
-    std::io::Write::write_all(&mut provider, wat.as_bytes()).unwrap();
+    std::io::Write::write_all(
+        &mut provider,
+        &wat::parse_str(wat).expect("valid inline component"),
+    )
+    .unwrap();
     provider
 }
 
@@ -1703,7 +1711,7 @@ fn a_shared_namespace_keys_retention_and_conflicting_retention_fails() {
 }
 
 #[test]
-fn a_named_namespace_outside_agent_scope_and_every_interface_mismatch_are_refused_together() {
+fn invalid_namespace_scopes_and_interface_mismatches_are_refused_together() {
     use super::{BrokerBuildError, ConstraintCatalog, NamespaceConflict};
     let keep = dekopon_capability::StorageRetention::Keep;
     let set = |provider, interface, scope, namespace| {
@@ -1757,6 +1765,15 @@ fn a_named_namespace_outside_agent_scope_and_every_interface_mismatch_are_refuse
             ),
         ),
         (
+            "python.sqlite-eval".parse().unwrap(),
+            set(
+                "python",
+                StorageInterface::DurableFiles,
+                StorageScope::Instance,
+                Some("turso"),
+            ),
+        ),
+        (
             "memory.recent".parse().unwrap(),
             set(
                 "memory",
@@ -1779,15 +1796,30 @@ fn a_named_namespace_outside_agent_scope_and_every_interface_mismatch_are_refuse
     assert_eq!(
         conflicts,
         vec![
-            NamespaceConflict::NotAgentScope {
+            NamespaceConflict::UnsupportedScope {
                 capability: "memory.recent".parse().unwrap(),
                 namespace: "chat".parse().unwrap(),
                 scope: StorageScope::Space,
+            },
+            NamespaceConflict::ScopeMismatch {
+                namespace: "turso".parse().unwrap(),
+                capabilities: vec![
+                    ("python.eval".parse().unwrap(), StorageScope::Agent),
+                    (
+                        "python.sqlite-eval".parse().unwrap(),
+                        StorageScope::Instance
+                    ),
+                    ("turso.exec".parse().unwrap(), StorageScope::Agent),
+                ],
             },
             NamespaceConflict::Mismatch {
                 namespace: "turso".parse().unwrap(),
                 capabilities: vec![
                     ("python.eval".parse().unwrap(), StorageInterface::Jsonl),
+                    (
+                        "python.sqlite-eval".parse().unwrap(),
+                        StorageInterface::DurableFiles
+                    ),
                     (
                         "turso.exec".parse().unwrap(),
                         StorageInterface::DurableFiles
@@ -1839,6 +1871,46 @@ fn naming_a_namespace_leaves_its_owners_conversation_scoped_sets_alone() {
     ])
     .unwrap();
     assert!(catalog.validate_storage_namespaces().is_ok());
+}
+
+#[test]
+fn instance_capabilities_can_share_an_explicit_namespace() {
+    use super::ConstraintCatalog;
+    use dekopon_capability::StorageRetention;
+
+    let catalog = ConstraintCatalog::new([
+        (
+            "turso.exec".parse().unwrap(),
+            storage_set(
+                "turso",
+                StorageInterface::DurableFiles,
+                StorageAccess::ReadWrite,
+                StorageScope::Instance,
+                StorageRetention::Keep,
+                None,
+            ),
+        ),
+        (
+            "python.sqlite-eval".parse().unwrap(),
+            storage_set(
+                "python",
+                StorageInterface::DurableFiles,
+                StorageAccess::ReadOnly,
+                StorageScope::Instance,
+                StorageRetention::Keep,
+                Some("turso"),
+            ),
+        ),
+    ])
+    .unwrap();
+    assert!(catalog.validate_storage_namespaces().is_ok());
+    assert_eq!(
+        catalog.retention_policies().unwrap(),
+        dekopon_storage_host::RetentionPolicies::from([(
+            ("turso".parse().unwrap(), StorageScope::Instance),
+            StorageRetention::Keep
+        ),])
+    );
 }
 
 #[test]
@@ -3538,6 +3610,7 @@ async fn a_private_conversation_namespace_rotates_with_authority_and_other_scope
     for (scope, rotates) in [
         (StorageScope::PrivateConversation, true),
         (StorageScope::Agent, false),
+        (StorageScope::Instance, false),
     ] {
         let root = tempfile::tempdir().expect("tempdir");
         let mut sizes = Vec::new();

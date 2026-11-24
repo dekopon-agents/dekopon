@@ -24,16 +24,19 @@ mod provider_manager;
 mod reaper;
 mod refresh_scheduler;
 mod secrets;
+mod self_reload;
 mod server;
 mod socket;
+mod token_issuer;
 mod workflows;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use config::{LoadMode, Resident};
@@ -41,8 +44,8 @@ use dekopon_broker::{
     AuditLog, AuditSink, Broker, ConstraintCatalog, IdentityDirectory, Leniency, PolicyBuildError,
     PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
-use dekopon_broker_host::BrokerProviderRegistry;
 pub use dekopon_broker_host::enable_test_component_memoization;
+use dekopon_broker_host::{BrokerProviderRegistry, CompiledCacheCounts};
 use dekopon_broker_protocol::ResponseEnvelope;
 use dekopon_capability::EffectKind;
 use dekopon_core::{SecretDrn, bounded_problems, error_chain, offload};
@@ -175,6 +178,23 @@ async fn serve<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    serve_with_reload(config_path, shutdown, deadline, |lock, uid| {
+        lock.map(|lock| self_reload::watch_lock(lock, uid, lock_poll))
+    })
+    .await
+}
+
+async fn serve_with_reload<F, S, R>(
+    config_path: impl AsRef<Path>,
+    shutdown: F,
+    deadline: ShutdownDeadline,
+    seed: S,
+) -> Result<(), BrokerdError>
+where
+    F: Future<Output = ()> + Send,
+    S: FnOnce(Option<lock_watch::LoadedLock>, u32) -> Option<R>,
+    R: Future<Output = self_reload::BrokerStop> + Send + 'static,
+{
     let fd_limits = raise_nofile_limit();
     let (candidate, report) = load_candidate(config_path.as_ref(), Mode::Boot).await;
     for warning in &report.warnings {
@@ -210,9 +230,17 @@ where
     let (listener, mut socket_guard) = socket::bind(&socket_path, uid).await?;
     coordination.active().ready.policy_loaded();
     tracing::info!(event = "broker_started", "broker.started");
-    let mut lock_stop = None;
+    let mut reload = tokio::task::JoinSet::new();
+    if let Some(task) = seed(provider_lock, uid) {
+        reload.spawn(task);
+    }
+    let mut reload_stop = Ok(());
     let stop = async {
-        lock_stop = stopped(shutdown, provider_lock.as_ref(), uid, lock_poll).await;
+        tokio::select! {
+            biased;
+            () = shutdown => {}
+            ended = self_reload::reload_ended(&mut reload) => reload_stop = ended,
+        }
         deadline.start(limits.shutdown_grace);
         // Unlinking at admission close sends a new connect to NotFound, which clients retry,
         // instead of into a listener that will never accept it.
@@ -246,6 +274,7 @@ where
         deadline.clone(),
     )
     .await;
+    let drained = self_reload::drain_bounded(&deadline, limits.shutdown_grace, &mut reload).await;
 
     coordination.drain_credentials().await;
 
@@ -260,39 +289,48 @@ where
         );
     }
 
-    result?;
-    tracing::info!(event = "broker_stopped", "broker.stopped");
-    cleanup?;
-    match lock_stop {
-        None | Some(lock_watch::LockStop::Changed) => Ok(()),
-        Some(lock_watch::LockStop::Unsettled) => Err(BrokerdError::ProviderLockUnsettled),
+    if result.is_ok() {
+        tracing::info!(event = "broker_stopped", "broker.stopped");
     }
-}
-
-async fn stopped<F>(
-    shutdown: F,
-    lock: Option<&lock_watch::LoadedLock>,
-    uid: u32,
-    poll: Duration,
-) -> Option<lock_watch::LockStop>
-where
-    F: Future<Output = ()>,
-{
-    let Some(lock) = lock else {
-        shutdown.await;
-        return None;
+    reload_stop?;
+    let drained = match drained {
+        self_reload::Drained::Failed(cause) => return Err(cause),
+        self_reload::Drained::Clean => Ok(()),
+        self_reload::Drained::Elapsed => Err(BrokerdError::ReloadTask(
+            dekopon_core::TaskOutcome::Cancelled,
+        )),
     };
-    tokio::select! {
-        () = shutdown => None,
-        stop = lock_watch::watch(lock, uid, poll) => Some(stop),
-    }
+    result?;
+    cleanup?;
+    drained
 }
 
 #[derive(Debug)]
 pub struct CheckProviders {
     pub provider_set: PathBuf,
     pub store: PathBuf,
+    pub download_concurrency: NonZeroUsize,
+    pub verification: ProviderVerification,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub enum ProviderVerification {
+    #[default]
+    Strict,
+    Relaxed,
+}
+
+impl ProviderVerification {
+    pub const fn message(self) -> Option<&'static str> {
+        match self {
+            Self::Strict => None,
+            Self::Relaxed => Some("relaxed verification"),
+        }
+    }
+}
+
+pub const DEFAULT_DOWNLOAD_CONCURRENCY: NonZeroUsize =
+    NonZeroUsize::new(8).expect("default download concurrency is positive");
 
 #[derive(Debug, Default)]
 pub struct CheckReport {
@@ -302,25 +340,121 @@ pub struct CheckReport {
     pub identity_digest: Option<String>,
     pub continuity: Option<dekopon_broker::ContinuityReport>,
     private_sources: Vec<PathBuf>,
+    materialized: bool,
     pub peak_rss_bytes: Option<u64>,
+    pub timings: Option<CheckTimings>,
 }
 
-pub async fn check(
-    config_path: impl AsRef<Path>,
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckTimings {
+    pub total_us: u64,
+    pub download_concurrency: Option<usize>,
+    pub sync: Option<CheckPhase>,
+    pub validate_load: Option<CheckPhase>,
+    pub precompile: Option<CheckPhase>,
+    pub prepare_load: Option<CheckPhase>,
+    pub policy: Option<CheckPhase>,
+    pub workflows: Option<CheckPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<CheckPhase>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckPhase {
+    pub elapsed_us: u64,
+    pub succeeded: bool,
+    pub providers: usize,
+    pub compiled_cache_hits: Option<usize>,
+    pub compiled_cache_misses: Option<usize>,
+}
+
+impl CheckPhase {
+    fn record(
+        phase: &'static str,
+        started: Instant,
+        providers: usize,
+        cache: Option<CompiledCacheCounts>,
+        succeeded: bool,
+        download_concurrency: Option<usize>,
+    ) -> Self {
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        let compiled_cache_hits = cache.map(|counts| counts.hits);
+        let compiled_cache_misses = cache.map(|counts| counts.misses);
+        tracing::info!(
+            name: "broker.check.phase",
+            phase,
+            elapsed_us,
+            succeeded,
+            providers,
+            compiled_cache_hits,
+            compiled_cache_misses,
+            download_concurrency,
+            "broker check phase finished"
+        );
+        Self {
+            elapsed_us,
+            succeeded,
+            providers,
+            compiled_cache_hits,
+            compiled_cache_misses,
+        }
+    }
+}
+
+pub enum CheckConfig<P> {
+    Shapes(P),
+    Materialized(P),
+}
+
+impl<P: AsRef<Path>> From<P> for CheckConfig<P> {
+    fn from(path: P) -> Self {
+        Self::Shapes(path)
+    }
+}
+
+pub async fn check<P: AsRef<Path>>(
+    config: impl Into<CheckConfig<P>>,
     providers: Option<CheckProviders>,
     workflows: Option<&Path>,
 ) -> CheckReport {
+    let started = Instant::now();
+    let (config_path, materialized) = match config.into() {
+        CheckConfig::Shapes(path) => (path, false),
+        CheckConfig::Materialized(path) => (path, true),
+    };
     let mut report = load_candidate(
         config_path.as_ref(),
         Mode::Check {
             providers,
             workflows,
+            materialized,
         },
     )
     .await
     .1;
     report.peak_rss_bytes = dekopon_broker_host::peak_rss_bytes();
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    if let Some(timings) = &mut report.timings {
+        timings.total_us = elapsed_us;
+    }
+    tracing::info!(
+        name: "broker.check.total",
+        elapsed_us,
+        succeeded = report.problems.is_empty(),
+        peak_rss_bytes = report.peak_rss_bytes,
+        "broker check finished"
+    );
     report
+}
+
+pub async fn load_storage_config(path: &Path) -> Result<Option<StorageConfig>, ConfigError> {
+    let (config, refusal) = config::load_in(path, current_uid(), config::LoadMode::Check).await?;
+    match refusal {
+        Some(error) => Err(error),
+        None => Ok(config.storage),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,6 +484,7 @@ enum Mode<'a> {
     Check {
         providers: Option<CheckProviders>,
         workflows: Option<&'a Path>,
+        materialized: bool,
     },
 }
 
@@ -638,8 +773,36 @@ impl Coordination {
     reason = "independent validation stages aggregate failures before preparing a candidate"
 )]
 async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, CheckReport) {
-    let mut report = CheckReport::default();
+    let mut report = CheckReport {
+        materialized: match &mode {
+            Mode::Check { materialized, .. } => *materialized,
+            Mode::Boot | Mode::Reload(_) => false,
+        },
+        ..CheckReport::default()
+    };
     let uid = current_uid();
+    let relaxed = match &mode {
+        Mode::Check { providers, .. } => {
+            report.timings = Some(CheckTimings::default());
+            providers
+                .as_ref()
+                .is_some_and(|providers| providers.verification == ProviderVerification::Relaxed)
+        }
+        Mode::Boot | Mode::Reload(_) => false,
+    };
+    if relaxed {
+        for stage in [Stage::Providers, Stage::Workflows] {
+            if report.materialized {
+                report
+                    .problems
+                    .push(BrokerdError::RelaxedVerificationSkipped { stage });
+            } else {
+                report
+                    .warnings
+                    .push(StartupWarning::RelaxedVerification { stage });
+            }
+        }
+    }
     let load_mode = match mode {
         Mode::Boot => LoadMode::Boot,
         Mode::Reload(active) => LoadMode::Reload {
@@ -652,18 +815,14 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
         Mode::Check {
             workflows: Some(directory),
             ..
-        } => match workflows::load(directory, uid).await {
+        } if !relaxed => match workflows::load(directory, uid).await {
             Ok(files) => Some(files),
             Err(error) => {
                 report.problems.push(error.into());
                 None
             }
         },
-        Mode::Boot
-        | Mode::Reload(_)
-        | Mode::Check {
-            workflows: None, ..
-        } => None,
+        Mode::Boot | Mode::Reload(_) | Mode::Check { .. } => None,
     };
     let mut provider_lock_file = None;
     let Some(mut config) = (match config::load_in(config_path, uid, load_mode).await {
@@ -682,13 +841,11 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             None
         }
     }) else {
-        for stage in [
-            Stage::ProviderSet,
-            Stage::FrameLimits,
-            Stage::Runtime,
-            Stage::Providers,
-        ] {
+        for stage in [Stage::ProviderSet, Stage::FrameLimits, Stage::Runtime] {
             report.skipped(stage);
+        }
+        if !relaxed {
+            report.skipped(Stage::Providers);
         }
         if essential.is_some() {
             report.skipped(Stage::Workflows);
@@ -716,10 +873,22 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             );
             // A Check load leaves a providerSet's providers for this function to resolve.
             let resolved = match (config.providers.is_empty(), providers) {
+                (true, Some(providers)) if relaxed => {
+                    let result = provider_manager::probe_provider_set(
+                        &providers.provider_set,
+                        providers.download_concurrency,
+                        report.timings.as_mut(),
+                    )
+                    .await
+                    .map_err(BrokerdError::ProviderSet);
+                    keep(&mut report.problems, result).is_some()
+                }
                 (true, Some(providers)) => {
                     provider_lock_file = Some(providers.store.join(PROVIDER_LOCK_FILE));
-                    match resolve_provider_set(providers, uid).await {
-                        Ok(sources) => {
+                    match resolve_provider_set(providers, uid, report.timings.as_mut()).await {
+                        Ok((sources, cwasm_dir)) => {
+                            config.host_options.cwasm_dir =
+                                (!config.compile_on_load).then_some(cwasm_dir);
                             config.providers = sources
                                 .iter()
                                 .map(|source| source.path().to_path_buf())
@@ -769,23 +938,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             reload_runtime(&mut config, uid, active, &mut scratch, &mut report.problems).await
         }
         Residents::Scratch => {
-            let secrets = match config.secret_map_path.as_deref() {
-                Some(path) => match secrets::load_shapes(path, uid).await {
-                    Ok(catalog) => Some(Secrets::Shapes(catalog)),
-                    Err(secrets::SecretMapError::Read { .. }) => Some(Secrets::Unchecked),
-                    Err(
-                        error @ (secrets::SecretMapError::Decode { .. }
-                        | secrets::SecretMapError::Validation { .. }
-                        | secrets::SecretMapError::Client { .. }
-                        | secrets::SecretMapError::Source { .. }
-                        | secrets::SecretMapError::Catalog { .. }),
-                    ) => {
-                        report.problems.push(error.into());
-                        None
-                    }
-                },
-                None => Some(Secrets::Shapes(dekopon_broker::SecretCatalog::empty())),
-            };
+            let secrets = check_secrets(config.secret_map_path.as_deref(), uid, &mut report).await;
             keep(&mut report.problems, scratch_host(&config, &mut scratch))
                 .zip(secrets)
                 .map(|(storage, secrets)| Runtime {
@@ -797,6 +950,9 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                 })
         }
     };
+    if relaxed {
+        return (None, report);
+    }
     let (Some(frame_limits), Some(mut runtime), true) = (frame_limits, runtime, providers_resolved)
     else {
         report.skipped(Stage::Providers);
@@ -837,6 +993,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     let assets = runtime.assets.clone();
     let fingerprint = runtime.fingerprint.take();
     let snapshot = config.snapshot.clone();
+    let provider_count = config.providers.len();
     let resident_registry = match residents {
         Residents::Borrow(active) if reuse_registry => Some(active.ready.registry.clone()),
         Residents::Open | Residents::Borrow(_) | Residents::Scratch => None,
@@ -852,13 +1009,22 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     drop(scratch);
     match (&prepared, &essential) {
         (Ok(ready), Some(files)) => {
+            let started = Instant::now();
             let versions = workflows::versions(provider_lock_file.as_deref(), uid).await;
-            report.problems.extend(
-                workflows::run(ready, files, &versions)
-                    .await
-                    .into_iter()
-                    .map(BrokerdError::Workflow),
-            );
+            let problems = workflows::run(ready, files, &versions).await;
+            if let Some(timings) = &mut report.timings {
+                timings.workflows = Some(CheckPhase::record(
+                    "workflows",
+                    started,
+                    provider_count,
+                    None,
+                    problems.is_empty(),
+                    None,
+                ));
+            }
+            report
+                .problems
+                .extend(problems.into_iter().map(BrokerdError::Workflow));
         }
         (Err(_), Some(_)) => report.skipped(Stage::Workflows),
         (Ok(_) | Err(_), None) => {}
@@ -898,7 +1064,43 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
 
 impl CheckReport {
     fn skipped(&mut self, stage: Stage) {
-        self.warnings.push(StartupWarning::Skipped { stage });
+        if self.materialized {
+            self.problems.push(BrokerdError::CheckSkipped { stage });
+        } else {
+            self.warnings.push(StartupWarning::Skipped { stage });
+        }
+    }
+
+    fn default_secrets_unchecked(&mut self) {
+        if self.materialized {
+            self.problems.push(BrokerdError::DefaultSecretsUnchecked);
+        } else {
+            self.warnings.push(StartupWarning::DefaultSecretsUnchecked);
+        }
+    }
+}
+
+async fn check_secrets(path: Option<&Path>, uid: u32, report: &mut CheckReport) -> Option<Secrets> {
+    let Some(path) = path else {
+        return Some(Secrets::Shapes(dekopon_broker::SecretCatalog::empty()));
+    };
+    let mut material_problems = Vec::new();
+    let shapes = secrets::load_shapes(
+        path,
+        uid,
+        report.materialized.then_some(&mut material_problems),
+    )
+    .await;
+    report
+        .problems
+        .extend(material_problems.into_iter().map(BrokerdError::from));
+    match shapes {
+        Ok(catalog) => Some(Secrets::Shapes(catalog)),
+        Err(SecretMapError::Read { .. }) if !report.materialized => Some(Secrets::Unchecked),
+        Err(error) => {
+            report.problems.push(error.into());
+            None
+        }
     }
 }
 
@@ -1152,7 +1354,8 @@ const PROVIDER_LOCK_FILE: &str = "providers.lock.yaml";
 async fn resolve_provider_set(
     providers: CheckProviders,
     uid: u32,
-) -> Result<Vec<dekopon_broker_host::LockedProviderSource>, BrokerdError> {
+    mut timings: Option<&mut CheckTimings>,
+) -> Result<(Vec<dekopon_broker_host::LockedProviderSource>, PathBuf), BrokerdError> {
     let mut directory = tokio::fs::DirBuilder::new();
     directory.mode(0o700);
     match directory.create(&providers.store).await {
@@ -1177,14 +1380,32 @@ async fn resolve_provider_set(
     })
     .await
     .map_err(BrokerdError::ProviderSet)?;
-    manager.sync().await.map_err(BrokerdError::ProviderSet)?;
     manager
-        .precompile()
+        .sync_for_check(providers.download_concurrency, timings.as_deref_mut())
         .await
         .map_err(BrokerdError::ProviderSet)?;
-    provider_manager::load_locked_sources(&lock_file, &store, uid)
+    let started = Instant::now();
+    let precompiled = manager.precompile().await;
+    if let Some(timings) = timings {
+        let cache = precompiled.as_ref().ok().map(|report| CompiledCacheCounts {
+            hits: report.providers - report.compiled,
+            misses: report.compiled,
+        });
+        let providers = timings.sync.as_ref().map_or(0, |phase| phase.providers);
+        timings.precompile = Some(CheckPhase::record(
+            "precompile",
+            started,
+            providers,
+            cache,
+            precompiled.is_ok(),
+            None,
+        ));
+    }
+    precompiled.map_err(BrokerdError::ProviderSet)?;
+    let sources = provider_manager::load_locked_sources(&lock_file, &store, uid)
         .await
-        .map_err(BrokerdError::ProviderSet)
+        .map_err(BrokerdError::ProviderSet)?;
+    Ok((sources, store.join("cwasm")))
 }
 
 fn scratch_host(
@@ -1279,10 +1500,11 @@ async fn prepare(
 ) -> Result<Ready, Vec<BrokerdError>> {
     #[cfg(test)]
     let _hook_ran = BEFORE_BROKER_PREPARE.try_with(|hook| hook()).is_ok();
-    let warnings = &mut report.warnings;
+    let started = Instant::now();
+    let provider_count = config.providers.len();
     validate_unmanaged_providers(&config, resident_registry.as_ref(), current_uid())
         .map_err(|error| vec![error])?;
-    let mut registry = if let Some(registry) = resident_registry {
+    let registry = if let Some(registry) = resident_registry {
         Ok(registry)
     } else {
         match config.locked_providers {
@@ -1305,8 +1527,22 @@ async fn prepare(
                 .await
             }
         }
+    };
+    if let Some(timings) = &mut report.timings {
+        timings.prepare_load = Some(CheckPhase::record(
+            "prepare_load",
+            started,
+            provider_count,
+            registry
+                .as_ref()
+                .ok()
+                .map(BrokerProviderRegistry::compiled_cache_counts),
+            registry.is_ok(),
+            None,
+        ));
     }
-    .map_err(|error| vec![BrokerdError::Host(error)])?;
+    let mut registry = registry.map_err(|error| vec![BrokerdError::Host(error)])?;
+    let policy_started = Instant::now();
     if let Some(directory) = runtime.assets {
         registry.set_assets(directory);
     }
@@ -1386,7 +1622,7 @@ async fn prepare(
                 world,
                 config.strict,
                 secrets_unchecked,
-                warnings,
+                &mut report.warnings,
             ),
         )
     });
@@ -1414,11 +1650,21 @@ async fn prepare(
     if !fatal.is_empty() {
         problems.push(BrokerdError::Capabilities { problems: fatal });
     }
-    warnings.extend(
+    report.warnings.extend(
         tolerable
             .into_iter()
             .map(StartupWarning::UnloadedCapability),
     );
+    if let Some(timings) = &mut report.timings {
+        timings.policy = Some(CheckPhase::record(
+            "policy",
+            policy_started,
+            provider_count,
+            None,
+            problems.is_empty(),
+            None,
+        ));
+    }
     let (Some(identity_directory), Some(policy), true) =
         (identity_directory, policy, problems.is_empty())
     else {
@@ -1429,7 +1675,7 @@ async fn prepare(
             .values()
             .any(|set| set.default_secret_use.is_some())
     {
-        warnings.push(StartupWarning::DefaultSecretsUnchecked);
+        report.default_secrets_unchecked();
     }
     let constraints = ConstraintCatalog::new(constraint_sets)
         .map_err(|error| vec![BrokerdError::Broker(error)])?
@@ -1459,7 +1705,9 @@ async fn prepare(
         leniency,
     )
     .map_err(|error| vec![BrokerdError::Broker(error)])?;
-    warnings.extend(broker_warnings.into_iter().map(StartupWarning::Broker));
+    report
+        .warnings
+        .extend(broker_warnings.into_iter().map(StartupWarning::Broker));
     let broker = match secret_catalog {
         Some(catalog) => broker
             .with_secret_catalog(catalog)
@@ -1546,6 +1794,8 @@ fn build_policy(
     }
 }
 
+const DEFAULT_SECRETS_UNCHECKED: &str = "the secret map is unreadable here, so no default secret was checked against its bindings; boot refuses a default without exactly one";
+
 #[derive(Debug, Error)]
 pub enum StartupWarning {
     #[error(
@@ -1560,10 +1810,7 @@ pub enum StartupWarning {
     UnloadedCapability(capabilities::CapabilityProblem),
     #[error("{0}")]
     Broker(dekopon_broker::StartupWarning),
-    #[error(
-        "the secret map is unreadable here, so no default secret was checked against its bindings; \
-         boot refuses a default without exactly one"
-    )]
+    #[error("{DEFAULT_SECRETS_UNCHECKED}")]
     DefaultSecretsUnchecked,
     #[error("policy {policy} names secret {secret}; boot requires it in secretMapPath")]
     SecretRequired { policy: String, secret: String },
@@ -1571,6 +1818,8 @@ pub enum StartupWarning {
     IdentitiesRequired,
     #[error("{stage} not checked: a stage it needs failed")]
     Skipped { stage: Stage },
+    #[error("{stage} skipped under relaxed verification")]
+    RelaxedVerification { stage: Stage },
     #[error("attestor scope {scope} covers the kinds {}", kinds.join(", "))]
     ScopeKinds { scope: String, kinds: Vec<String> },
 }
@@ -1602,7 +1851,7 @@ impl StartupWarning {
                 },
                 "{warning}"
             ),
-            Self::Skipped { .. } => tracing::warn!(
+            Self::Skipped { .. } | Self::RelaxedVerification { .. } => tracing::warn!(
                 target: "dekopon_brokerd::audit",
                 { audit.event = "config.startup.warning", reason = "skipped-stage" },
                 "{self}"
@@ -1762,6 +2011,14 @@ pub enum BrokerdError {
         "the provider lock never read as one stable file; the broker drained so a restart rereads it"
     )]
     ProviderLockUnsettled,
+    #[error("configuration reload task failed")]
+    ReloadTask(#[source] dekopon_core::TaskOutcome),
+    #[error("{stage} not checked: a stage it needs failed")]
+    CheckSkipped { stage: Stage },
+    #[error("{stage} skipped under relaxed verification")]
+    RelaxedVerificationSkipped { stage: Stage },
+    #[error("{DEFAULT_SECRETS_UNCHECKED}")]
+    DefaultSecretsUnchecked,
     #[error("check could not prepare its private directory {path}")]
     CheckDirectory {
         path: PathBuf,
@@ -1815,6 +2072,8 @@ fn render_errors(problems: &[BrokerdError]) -> String {
         .join("; ")
 }
 
+#[cfg(test)]
+mod reload_tests;
 #[cfg(test)]
 mod tests;
 

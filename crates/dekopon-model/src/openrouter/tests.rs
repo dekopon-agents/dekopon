@@ -281,7 +281,7 @@ fn indexed_merges_preserve_first_seen_order_and_unindexed_reasoning() {
 }
 
 #[tokio::test]
-async fn omitted_controls_stay_absent_and_authored_controls_map_exactly() {
+async fn omitted_optional_controls_stay_absent_and_authored_controls_map_exactly() {
     for settings in [
         Settings::default(),
         Settings {
@@ -328,13 +328,7 @@ async fn omitted_controls_stay_absent_and_authored_controls_map_exactly() {
                 json!({"allow_fallbacks":false,"require_parameters":true,"only":["alpha"]})
             );
         } else {
-            for absent in [
-                "max_tokens",
-                "temperature",
-                "top_p",
-                "reasoning",
-                "provider",
-            ] {
+            for absent in ["temperature", "top_p", "reasoning", "provider"] {
                 assert!(body.get(absent).is_none());
             }
         }

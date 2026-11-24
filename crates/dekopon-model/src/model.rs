@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt, ops::ControlFlow};
+use std::{borrow::Cow, fmt, num::NonZeroU32, ops::ControlFlow};
 
 use base64::{display::Base64Display, engine::general_purpose::STANDARD};
 
@@ -126,6 +126,8 @@ impl Serialize for DataUrl<'_> {
         serializer.collect_str(self)
     }
 }
+
+pub const DEFAULT_MAX_OUTPUT_TOKENS: NonZeroU32 = NonZeroU32::new(32_768).unwrap();
 
 pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 

@@ -4,6 +4,13 @@ use crate::StorageHostError;
 
 pub(crate) const DOMAIN_NAMESPACE_PATH: &str = "namespace-path-v1";
 pub(crate) const DOMAIN_LOGICAL_PATH: &str = "logical-name-path-v1";
+
+pub(crate) fn logical_path_token(base: &str, generation: &str, name: &str) -> String {
+    token(
+        DOMAIN_LOGICAL_PATH,
+        &[base.as_bytes(), generation.as_bytes(), name.as_bytes()],
+    )
+}
 pub(crate) const DOMAIN_AUTHORITY: &str = "authority-commitment-v1";
 pub(crate) const DOMAIN_GENERATION: &str = "generation-token-v1";
 pub(crate) const DOMAIN_AUDIT_SCOPE: &str = "audit-scope-commitment-v1";

@@ -510,7 +510,6 @@ async fn no_summary_fetches_and_nothing_off_the_allowlist_is_read() {
     let world = World::new();
     let disallowed = world.arrive(
         &[
-            "video/quicktime",
             "application/zip",
             "text/x-python",
             "application/yaml",
@@ -525,6 +524,15 @@ async fn no_summary_fetches_and_nothing_off_the_allowlist_is_read() {
             .arrived
             .iter()
             .all(|asset| asset.kind == AssetKind::Other && asset.summaries.is_empty())
+    );
+    let media = world.arrive(&["audio/ogg", "video/mp4"], Some(b"opaque"), 1);
+    assert_eq!(
+        media
+            .arrived
+            .iter()
+            .map(|asset| (asset.kind, asset.summaries.len()))
+            .collect::<Vec<_>>(),
+        [(AssetKind::Audio, 0), (AssetKind::Video, 0)]
     );
     let generated = world.arrive_pending(
         vec![PendingAsset {

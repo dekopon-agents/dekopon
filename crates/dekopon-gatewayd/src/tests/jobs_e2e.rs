@@ -1577,7 +1577,7 @@ fn serve_shutdown_cancels_a_sleeping_job_whose_thread_exits_within_two_seconds()
         .block_on(async { tokio::time::timeout(Duration::from_secs(5), service).await })
         .expect("serve returns within its grace")
         .expect("serve joins");
-    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
+    assert!(matches!(outcome, crate::ServeOutcome::Shutdown));
     let (joined, on_joined) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         drop(runtime);
@@ -1939,7 +1939,7 @@ async fn a_job_started_after_shutdown_began_is_refused_from_a_turn_and_a_probe()
         .await
         .expect("serve drains the turn within its grace")
         .expect("serve joins");
-    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
+    assert!(matches!(outcome, crate::ServeOutcome::Shutdown));
     assert_eq!(driver.replies(), ["drained"]);
     let output = tool_message(&models, 1);
     assert!(output.contains(dekopon_process::JOBS_OFF), "{output}");

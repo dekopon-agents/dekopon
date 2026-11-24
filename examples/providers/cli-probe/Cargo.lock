@@ -44,6 +44,7 @@ checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstyle",
  "clap_lex",
+ "strsim",
 ]
 
 [[package]]
@@ -66,7 +67,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "dekopon-capability"
-version = "0.90.0"
+version = "0.96.0"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -86,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.90.0"
+version = "0.96.0"
 dependencies = [
  "libc",
  "serde",
@@ -98,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.90.0"
+version = "0.96.0"
 dependencies = [
  "clap",
  "dekopon-capability",
@@ -411,6 +412,12 @@ dependencies = [
  "serde",
  "unsafe-libyaml",
 ]
+
+[[package]]
+name = "strsim"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "syn"

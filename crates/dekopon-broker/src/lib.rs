@@ -723,9 +723,9 @@ impl ConstraintCatalog {
             let Some(storage) = &set.constraints.storage else {
                 continue;
             };
-            if storage.scope != StorageScope::Agent {
+            if !matches!(storage.scope, StorageScope::Agent | StorageScope::Instance) {
                 if let Some(namespace) = &storage.namespace {
-                    conflicts.push(NamespaceConflict::NotAgentScope {
+                    conflicts.push(NamespaceConflict::UnsupportedScope {
                         capability: capability.clone(),
                         namespace: namespace.clone(),
                         scope: storage.scope,
@@ -741,6 +741,19 @@ impl ConstraintCatalog {
         for (namespace, sets) in members {
             if sets.iter().all(|(_, storage)| storage.namespace.is_none()) {
                 continue;
+            }
+            let scopes = sets
+                .iter()
+                .map(|(_, storage)| storage.scope)
+                .collect::<BTreeSet<_>>();
+            if scopes.len() > 1 {
+                conflicts.push(NamespaceConflict::ScopeMismatch {
+                    namespace: namespace.clone(),
+                    capabilities: sets
+                        .iter()
+                        .map(|(capability, storage)| ((*capability).clone(), storage.scope))
+                        .collect(),
+                });
             }
             let interfaces = sets
                 .iter()
@@ -864,6 +877,9 @@ impl SecretUseBinding {
             SecretSinkKind::HttpBot => SecretUseProposal::HttpBot {
                 secret: self.secret.clone(),
             },
+            SecretSinkKind::VmExecStdin => SecretUseProposal::VmExecStdin {
+                secret: self.secret.clone(),
+            },
         }
     }
 
@@ -879,6 +895,13 @@ impl SecretUseBinding {
 pub struct SecretMaterial {
     bytes: SecretBytes,
     chatgpt_account: Option<Redacted<String>>,
+    jwt: Option<IssuedJwt>,
+}
+
+#[derive(Clone)]
+struct IssuedJwt {
+    jti: String,
+    exp: u64,
 }
 
 impl SecretMaterial {
@@ -887,6 +910,16 @@ impl SecretMaterial {
         Self {
             bytes: SecretBytes::new(bytes),
             chatgpt_account: None,
+            jwt: None,
+        }
+    }
+
+    #[must_use]
+    pub fn issued_jwt(token: SecretBytes, jti: String, exp: u64) -> Self {
+        Self {
+            bytes: token,
+            chatgpt_account: None,
+            jwt: Some(IssuedJwt { jti, exp }),
         }
     }
 
@@ -930,6 +963,8 @@ pub struct SecretCatalog {
     bindings: Vec<SecretUseBinding>,
     resolver: Arc<dyn SecretResolver>,
     authority_revision: Option<String>,
+    jwt_runners: BTreeMap<SecretDrn, SecretDrn>,
+    reserved_runner_secrets: BTreeSet<SecretDrn>,
 }
 
 impl fmt::Debug for SecretCatalog {
@@ -949,6 +984,8 @@ impl Default for SecretCatalog {
             bindings: Vec::new(),
             resolver: Arc::new(EmptySecretResolver),
             authority_revision: None,
+            jwt_runners: BTreeMap::new(),
+            reserved_runner_secrets: BTreeSet::new(),
         }
     }
 }
@@ -1006,8 +1043,15 @@ impl SecretCatalog {
         Ok(Self {
             bindings,
             resolver,
-            authority_revision: None,
+            ..Self::default()
         })
+    }
+
+    #[must_use]
+    pub fn with_signed_jwt_runners(mut self, runners: BTreeMap<SecretDrn, SecretDrn>) -> Self {
+        self.reserved_runner_secrets = runners.values().cloned().collect();
+        self.jwt_runners = runners;
+        self
     }
 
     pub fn unresolved(bindings: Vec<SecretUseBinding>) -> Result<Self, BrokerBuildError> {
@@ -1085,7 +1129,8 @@ impl SecretCatalog {
                     .bindings
                     .iter()
                     .filter(|binding| {
-                        binding.capabilities.contains(capability)
+                        !self.reserved_runner_secrets.contains(secret)
+                            && binding.capabilities.contains(capability)
                             && &binding.secret == secret
                             && binding.sink == default.sink.sink()
                     })
@@ -1109,6 +1154,18 @@ impl SecretCatalog {
         secret: &SecretDrn,
         sink: SecretSinkKind,
     ) -> Option<&SecretUseBinding> {
+        if self.reserved_runner_secrets.contains(secret) {
+            return None;
+        }
+        self.binding_for_sink(capability, secret, sink)
+    }
+
+    fn binding_for_sink(
+        &self,
+        capability: &CapabilityId,
+        secret: &SecretDrn,
+        sink: SecretSinkKind,
+    ) -> Option<&SecretUseBinding> {
         self.bindings.iter().find(|binding| {
             binding.capabilities.contains(capability)
                 && &binding.secret == secret
@@ -1116,11 +1173,26 @@ impl SecretCatalog {
         })
     }
 
+    fn runner_binding(
+        &self,
+        capability: &CapabilityId,
+        persona: &SecretDrn,
+    ) -> Option<&SecretUseBinding> {
+        let runner = self.jwt_runners.get(persona)?;
+        self.binding_for_sink(capability, runner, SecretSinkKind::HttpBearer)
+    }
+
     fn binding(
         &self,
         capability: &CapabilityId,
         proposal: &SecretUseProposal,
     ) -> Option<&SecretUseBinding> {
+        if self.reserved_runner_secrets.contains(proposal.secret())
+            || matches!(proposal, SecretUseProposal::VmExecStdin { .. })
+                && self.runner_binding(capability, proposal.secret()).is_none()
+        {
+            return None;
+        }
         self.bindings
             .iter()
             .find(|binding| binding.matches(capability, proposal))
@@ -1458,7 +1530,7 @@ pub enum RouteConflict {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NamespaceConflict {
-    NotAgentScope {
+    UnsupportedScope {
         capability: CapabilityId,
         namespace: ProviderId,
         scope: StorageScope,
@@ -1467,19 +1539,23 @@ pub enum NamespaceConflict {
         namespace: ProviderId,
         capabilities: Vec<(CapabilityId, StorageInterface)>,
     },
+    ScopeMismatch {
+        namespace: ProviderId,
+        capabilities: Vec<(CapabilityId, StorageScope)>,
+    },
 }
 
 impl fmt::Display for NamespaceConflict {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotAgentScope {
+            Self::UnsupportedScope {
                 capability,
                 namespace,
                 scope,
             } => write!(
                 formatter,
                 "capability {capability} names storage namespace {namespace} at scope {scope:?}; \
-                 only agent scope may name a namespace"
+                 agent or instance scope may name a namespace"
             ),
             Self::Mismatch {
                 namespace,
@@ -1491,7 +1567,20 @@ impl fmt::Display for NamespaceConflict {
                 }
                 write!(
                     formatter,
-                    "; every agent-scope capability in one namespace declares one interface"
+                    "; capabilities sharing a namespace must declare the same interface"
+                )
+            }
+            Self::ScopeMismatch {
+                namespace,
+                capabilities,
+            } => {
+                write!(formatter, "storage namespace {namespace} is shared by")?;
+                for (capability, scope) in capabilities {
+                    write!(formatter, " {capability} ({scope:?})")?;
+                }
+                write!(
+                    formatter,
+                    "; capabilities sharing a namespace must declare the same scope"
                 )
             }
         }
@@ -2163,27 +2252,42 @@ where
         let span = tracing::Span::current();
         span.record("secret", secret_use.secret().as_str());
         span.record("secret.selection", selection.as_str());
-        let secret_decision =
-            self.authorize_secret_use(context, capability, &decision.set, secret_use, selection);
-        let secret_allowed = secret_decision.allowed;
-        let secret_errors = secret_decision.errors_present;
-        decision.errors_present |= secret_errors;
-        merge_space_decision(&mut decision.space, secret_decision.space);
-        decision
-            .policy_ids
-            .extend(secret_decision.policy.determining_policy_ids);
-        decision.policy_ids.sort();
-        decision.policy_ids.dedup();
-        if !secret_allowed {
-            return Err(Refusal {
-                evaluation: Some(Box::new(PolicyEvaluation {
-                    errors_present: secret_errors,
-                    cause: None,
-                    space: decision.space.clone(),
-                    github_denial: secret_decision.github_denial,
-                })),
-                ..determined_refusal("secret-denied", decision.policy_ids.clone())
-            });
+        let runner = match secret_use {
+            SecretUseProposal::VmExecStdin { secret } => self
+                .secrets
+                .runner_binding(capability, secret)
+                .map(SecretUseBinding::proposal),
+            SecretUseProposal::HttpBearer { .. }
+            | SecretUseProposal::HttpBasic { .. }
+            | SecretUseProposal::HttpBot { .. } => None,
+        };
+        for (proposal, selection) in std::iter::once((secret_use, selection)).chain(
+            runner
+                .as_ref()
+                .map(|proposal| (proposal, SecretSelection::Default)),
+        ) {
+            let secret_decision =
+                self.authorize_secret_use(context, capability, &decision.set, proposal, selection);
+            let secret_allowed = secret_decision.allowed;
+            let secret_errors = secret_decision.errors_present;
+            decision.errors_present |= secret_errors;
+            merge_space_decision(&mut decision.space, secret_decision.space);
+            decision
+                .policy_ids
+                .extend(secret_decision.policy.determining_policy_ids);
+            decision.policy_ids.sort();
+            decision.policy_ids.dedup();
+            if !secret_allowed {
+                return Err(Refusal {
+                    evaluation: Some(Box::new(PolicyEvaluation {
+                        errors_present: secret_errors,
+                        cause: None,
+                        space: decision.space.clone(),
+                        github_denial: secret_decision.github_denial,
+                    })),
+                    ..determined_refusal("secret-denied", decision.policy_ids.clone())
+                });
+            }
         }
         decision.set.constraints.secret_use = Some(self.secrets.grant(binding));
         Ok(())
@@ -2737,6 +2841,18 @@ where
                 refusal = Some(unevaluated_refusal("chat-scope-required"));
             }
         }
+        if refusal.is_none()
+            && matches!(
+                request.secret_use,
+                Some(SecretUseProposal::VmExecStdin { .. })
+            )
+            && assets
+                .streams
+                .as_ref()
+                .is_some_and(|streams| streams.stdin.is_some())
+        {
+            refusal = Some(unevaluated_refusal("secret-denied"));
+        }
         let mut outputs = dekopon_broker_host::asset::AssetOutputs::default();
         let result = self
             .invoke_inner(&context, request, refusal, assets, &mut outputs)
@@ -3277,10 +3393,12 @@ where
             };
             (ContinuityPolicy::Paranoid, Vec::new(), Some(memory))
         } else {
-            let policy = if storage.scope == StorageScope::PrivateConversation {
-                ContinuityPolicy::Paranoid
-            } else {
-                ContinuityPolicy::Relaxed
+            let policy = match storage.scope {
+                StorageScope::PrivateConversation => ContinuityPolicy::Paranoid,
+                StorageScope::SharedConversation
+                | StorageScope::Agent
+                | StorageScope::Space
+                | StorageScope::Instance => ContinuityPolicy::Relaxed,
             };
             let authority = self.authority_surface_v1(
                 context,
@@ -3311,6 +3429,7 @@ where
             authority,
         )
         .with_shared_namespace(storage.namespace.clone())
+        .with_principal(context.principal().clone())
         .with_space_key(context.space_binding().map(|binding| binding.key));
         let grant_request = match memory {
             Some(memory) => grant_request.with_memory_continuity(memory),
@@ -3635,6 +3754,43 @@ where
                 uri: None,
             }],
         })
+    }
+
+    async fn resolve_credential(
+        &self,
+        capability: &CapabilityId,
+        proposal: Option<&SecretUseProposal>,
+        grant: Option<&SecretUseGrant>,
+    ) -> Result<Option<BoundCredential>, CredentialFailure> {
+        let Some(proposal) = proposal else {
+            return Ok(None);
+        };
+        let grant = grant.ok_or(CredentialFailure::Binding)?;
+        let SecretMaterial {
+            bytes,
+            chatgpt_account,
+            jwt,
+        } = self.secrets.resolver.resolve(proposal.secret()).await?;
+        let credential = match proposal.sink() {
+            SecretSinkKind::HttpBearer => BoundCredential::secret_bearer(bytes, grant)?,
+            SecretSinkKind::HttpBasic => BoundCredential::secret_basic(bytes, grant)?,
+            SecretSinkKind::HttpBot => BoundCredential::secret_bot(bytes, grant)?,
+            SecretSinkKind::VmExecStdin => {
+                let jwt = jwt.ok_or(CredentialFailure::Binding)?;
+                let runner = self
+                    .secrets
+                    .runner_binding(capability, proposal.secret())
+                    .ok_or(CredentialFailure::Binding)?;
+                let bearer = self.secrets.resolver.resolve(&runner.secret).await?;
+                BoundCredential::secret_bearer(bearer.bytes, &self.secrets.grant(runner))?
+                    .with_vm_exec_stdin(bytes, jwt.jti, jwt.exp, grant)?
+            }
+        };
+        let credential = match chatgpt_account {
+            Some(account) => credential.with_chatgpt_account(account.expose())?,
+            None => credential,
+        };
+        Ok(Some(credential))
     }
 
     #[allow(
@@ -4059,34 +4215,38 @@ where
             }
         };
 
-        let proposed_secret = authorized.proposal().secret_use.clone();
-        let credential = if let Some(proposal) = proposed_secret {
-            let material = match self.secrets.resolver.resolve(proposal.secret()).await {
-                Ok(material) => material,
-                Err(source) => {
-                    tracing::warn!(
-                        event = "broker_secret_resolution_failed",
-                        invocation = %invocation_id,
-                        category = source.category,
-                        "broker.secret.resolution.failed"
-                    );
-                    return self
-                        .fail_authorized_before_provider(
-                            context,
-                            &invocation_id,
-                            trace,
-                            &capability,
-                            &decision_id,
-                            decision,
-                            &set,
-                            &policy_ids,
-                            policy_evidence,
-                            "secret-resolution",
-                        )
-                        .await;
-                }
-            };
-            let Some(grant) = authorized.constraints().secret_use.as_ref() else {
+        let credential = match self
+            .resolve_credential(
+                &capability,
+                authorized.proposal().secret_use.as_ref(),
+                authorized.constraints().secret_use.as_ref(),
+            )
+            .await
+        {
+            Ok(credential) => credential,
+            Err(error) => {
+                let code = match error {
+                    CredentialFailure::Resolution(source) => {
+                        tracing::warn!(
+                            event = "broker_secret_resolution_failed",
+                            invocation = %invocation_id,
+                            category = source.category,
+                            "broker.secret.resolution.failed"
+                        );
+                        "secret-resolution"
+                    }
+                    CredentialFailure::Binding => "secret-authorization",
+                    CredentialFailure::Material(source) => {
+                        tracing::warn!(
+                            event = "broker_secret_credential_failed",
+                            invocation = %invocation_id,
+                            category = "invalid-material",
+                            cause_type = std::any::type_name_of_val(&source),
+                            "broker.secret.credential.failed"
+                        );
+                        "secret-credential"
+                    }
+                };
                 return self
                     .fail_authorized_before_provider(
                         context,
@@ -4098,51 +4258,10 @@ where
                         &set,
                         &policy_ids,
                         policy_evidence,
-                        "secret-authorization",
+                        code,
                     )
                     .await;
-            };
-            let SecretMaterial {
-                bytes,
-                chatgpt_account,
-            } = material;
-            let built = match proposal.sink() {
-                SecretSinkKind::HttpBearer => BoundCredential::secret_bearer(bytes, grant),
-                SecretSinkKind::HttpBasic => BoundCredential::secret_basic(bytes, grant),
-                SecretSinkKind::HttpBot => BoundCredential::secret_bot(bytes, grant),
             }
-            .and_then(|credential| match &chatgpt_account {
-                Some(account) => credential.with_chatgpt_account(account.expose()),
-                None => Ok(credential),
-            });
-            match built {
-                Ok(credential) => Some(credential),
-                Err(source) => {
-                    tracing::warn!(
-                        event = "broker_secret_credential_failed",
-                        invocation = %invocation_id,
-                        category = "invalid-material",
-                        cause_type = std::any::type_name_of_val(&source),
-                        "broker.secret.credential.failed"
-                    );
-                    return self
-                        .fail_authorized_before_provider(
-                            context,
-                            &invocation_id,
-                            trace,
-                            &capability,
-                            &decision_id,
-                            decision,
-                            &set,
-                            &policy_ids,
-                            policy_evidence,
-                            "secret-credential",
-                        )
-                        .await;
-                }
-            }
-        } else {
-            None
         };
         let provider_artifact_sha256 = self
             .registry
@@ -4524,6 +4643,7 @@ fn encode_storage_constraints(
                 StorageScope::SharedConversation => 1,
                 StorageScope::Agent => 2,
                 StorageScope::Space => 3,
+                StorageScope::Instance => 4,
             },
         );
         if let Some(namespace) = &storage.namespace {
@@ -4921,6 +5041,16 @@ struct PolicyEvaluation {
     errors_present: bool,
     cause: Option<String>,
     space: Option<SpaceDecision>,
+}
+
+#[derive(Debug, Error)]
+enum CredentialFailure {
+    #[error("secret material resolution failed")]
+    Resolution(#[from] SecretResolutionError),
+    #[error("secret material is missing its authorization binding")]
+    Binding,
+    #[error("secret material could not be bound")]
+    Material(#[from] dekopon_broker_host::HttpConfigurationError),
 }
 
 pub struct CapabilityDecision {
@@ -5710,7 +5840,7 @@ fn storage_scope_permits(context: &AuthenticatedContext, set: &ConstraintSet) ->
         .map(|storage| storage.scope)
     {
         Some(StorageScope::Space) => context.space.is_some(),
-        Some(StorageScope::Agent) => context.space.is_none(),
+        Some(StorageScope::Agent | StorageScope::Instance) => context.space.is_none(),
         Some(StorageScope::PrivateConversation | StorageScope::SharedConversation) | None => true,
     }
 }

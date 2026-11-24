@@ -13,6 +13,7 @@ mod signed_download;
 mod stream;
 #[cfg(feature = "native-test")]
 pub mod test_transport;
+mod vm_exec_stdin;
 pub use signed_download::{Coverage, DownloadError, DownloadResponse, Window};
 pub use stream::{
     CHUNK_BYTES, FilePart, Part, Representation, StreamedRequest, StreamedResponse, read_decoded,
@@ -42,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::{Instant, timeout};
 use tracing::Instrument as _;
+use vm_exec_stdin::VmExecStdin;
 
 const DEFAULT_HTTPS_PORT: u16 = 443;
 const CHATGPT_ACCOUNT_HEADER: &str = "chatgpt-account-id";
@@ -436,6 +438,7 @@ pub struct BoundCredential {
     companion_header: Option<(HeaderName, Redacted<String>)>,
     destinations: Vec<String>,
     secret_binding: Option<SecretBindingIdentity>,
+    vm_exec_stdin: Option<VmExecStdin>,
     echo_values: Vec<SecretBytes>,
 }
 
@@ -505,6 +508,7 @@ impl BoundCredential {
             companion_header: None,
             destinations,
             secret_binding: None,
+            vm_exec_stdin: None,
             echo_values: vec![echo_value],
         })
     }
@@ -589,6 +593,7 @@ impl BoundCredential {
             header_value: Redacted::new(rendered),
             companion_header: None,
             destinations: grant.allowed_hosts.clone(),
+            vm_exec_stdin: None,
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
             }),
@@ -632,6 +637,7 @@ impl BoundCredential {
             header_value: Redacted::new(rendered),
             companion_header: None,
             destinations: grant.allowed_hosts.clone(),
+            vm_exec_stdin: None,
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
             }),
@@ -655,13 +661,46 @@ impl BoundCredential {
             .any(|destination| authority_matches(destination, host, port, scheme))
     }
 
+    pub fn with_vm_exec_stdin(
+        mut self,
+        token: SecretBytes,
+        jti: String,
+        exp: u64,
+        grant: &SecretUseGrant,
+    ) -> Result<Self, ConfigurationError> {
+        grant
+            .validate()
+            .map_err(|source| ConfigurationError::InvalidSecretGrant { source })?;
+        if grant.sink != SecretSinkKind::VmExecStdin
+            || grant.allow_query
+            || grant.max_injections != 1
+            || self
+                .secret_binding
+                .as_ref()
+                .is_none_or(|binding| binding.grant.sink != SecretSinkKind::HttpBearer)
+        {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "signed exec requires a one-shot stdin grant and a bound runner bearer",
+            });
+        }
+        self.vm_exec_stdin = Some(VmExecStdin::new(grant.clone(), token, jti, exp));
+        Ok(self)
+    }
+
     #[must_use]
     pub fn matches_secret_grant(&self, grant: Option<&SecretUseGrant>) -> bool {
-        match (&self.secret_binding, grant) {
-            (None, None) => true,
-            (Some(identity), Some(grant)) => &identity.grant == grant,
-            _ => false,
-        }
+        let bound = self
+            .vm_exec_stdin
+            .as_ref()
+            .map(|stdin| &stdin.grant)
+            .or_else(|| self.secret_binding.as_ref().map(|identity| &identity.grant));
+        bound == grant
+    }
+
+    fn echo_values(&self) -> impl Iterator<Item = &SecretBytes> {
+        self.echo_values
+            .iter()
+            .chain(self.vm_exec_stdin.as_ref().map(|stdin| &stdin.token))
     }
 
     fn scan_stream_chunk(
@@ -672,8 +711,7 @@ impl BoundCredential {
     ) -> Option<usize> {
         window.extend_from_slice(bytes);
         if self
-            .echo_values
-            .iter()
+            .echo_values()
             .any(|secret| !secret.expose().is_empty() && contains_bytes(window, secret.expose()))
         {
             return None;
@@ -682,15 +720,14 @@ impl BoundCredential {
     }
 
     fn echo_overlap(&self) -> usize {
-        self.echo_values
-            .iter()
+        self.echo_values()
             .map(|secret| secret.expose().len().saturating_sub(1))
             .max()
             .unwrap_or(0)
     }
 
     fn echoes_credential(&self, response: &Response) -> bool {
-        self.echo_values.iter().any(|secret| {
+        self.echo_values().any(|secret| {
             let secret = secret.expose();
             !secret.is_empty()
                 && (contains_bytes(&response.body, secret)
@@ -988,6 +1025,7 @@ impl BufferedHttpClient {
             "dekopon.http.byte_limit.key" = tracing::field::Empty,
             "dekopon.http.byte_limit.bytes" = tracing::field::Empty,
             "url.full" = tracing::field::Empty,
+            "secret.jti" = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
         span.record("url.full", request.uri.as_str());
@@ -1106,27 +1144,13 @@ impl BufferedHttpClient {
         // Credential injection happens strictly after every guest-facing check, and its binding is
         // narrower than the grant and fails closed: an allowed-but-unbound destination is refused
         // rather than sent unauthenticated.
-        if let Some(secret) = &self.secret_grant {
-            let path_allowed = secret
-                .allowed_paths
-                .iter()
-                .any(|rule| rule.matches(prepared.url.path()));
-            let method_allowed = secret
-                .allowed_methods
-                .iter()
-                .any(|method| method == prepared.method.as_str());
-            let port = prepared
-                .url
-                .port_or_known_default()
-                .unwrap_or(DEFAULT_HTTPS_PORT);
-            let host_allowed = secret.allowed_hosts.iter().any(|authority| {
-                authority_matches(authority, &prepared.host, port, prepared.url.scheme())
-            });
-            if !path_allowed
-                || !method_allowed
-                || !host_allowed
-                || (!secret.allow_query && prepared.url.query().is_some())
-            {
+        let transport_grant = self
+            .credential
+            .as_ref()
+            .and_then(|credential| credential.secret_binding.as_ref())
+            .map(|identity| &identity.grant);
+        if let Some(secret) = transport_grant {
+            if !secret_allows_request(secret, &prepared) {
                 return Err(http_error(
                     ErrorCode::Denied,
                     "request is outside this secret's authorized HTTP scope",
@@ -1138,6 +1162,13 @@ impl BufferedHttpClient {
                     "the authorized secret injection limit is exhausted",
                 ));
             }
+        }
+        if let Some(stdin) = self
+            .credential
+            .as_mut()
+            .and_then(|credential| credential.vm_exec_stdin.as_mut())
+        {
+            stdin.authorize(&mut prepared, streamed.is_some(), grant.max_request_bytes)?;
         }
 
         let credential_header = self.credential.as_ref().map(|credential| {
@@ -1224,6 +1255,13 @@ impl BufferedHttpClient {
             .is_some_and(|credential| credential.echoes_credential(&response))
         {
             return Err(stream::echoed());
+        }
+        if let Some(stdin) = self
+            .credential
+            .as_mut()
+            .and_then(|credential| credential.vm_exec_stdin.as_mut())
+        {
+            stdin.observe_response(&response);
         }
         Ok(response)
     }
@@ -1825,7 +1863,6 @@ fn validate_configuration(
     Ok(())
 }
 
-#[derive(Debug)]
 struct PreparedRequest {
     method: Method,
     url: Url,
@@ -1835,6 +1872,25 @@ struct PreparedRequest {
     authority: String,
     addresses: Vec<SocketAddr>,
     request_bytes: u64,
+}
+
+fn secret_allows_request(secret: &SecretUseGrant, request: &PreparedRequest) -> bool {
+    let port = request
+        .url
+        .port_or_known_default()
+        .unwrap_or(DEFAULT_HTTPS_PORT);
+    secret
+        .allowed_paths
+        .iter()
+        .any(|rule| rule.matches(request.url.path()))
+        && secret
+            .allowed_methods
+            .iter()
+            .any(|method| method == request.method.as_str())
+        && secret.allowed_hosts.iter().any(|authority| {
+            authority_matches(authority, &request.host, port, request.url.scheme())
+        })
+        && (secret.allow_query || request.url.query().is_none())
 }
 
 async fn resolve_destination(host: &str, port: u16) -> Result<Vec<SocketAddr>, HttpError> {

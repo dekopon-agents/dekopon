@@ -1,28 +1,34 @@
 use std::{
     fs::{File, FileTimes, TryLockError},
     io::Write as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
 };
 
+use dekopon_capability::StorageScope;
+use dekopon_core::{AgentId, PrincipalId, ProviderId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     Comparison, ContinuityCheck, ContinuityPolicy, LegacyContinuity, MemoryContinuity,
-    StorageGrantRequest, StorageHostError, UnprovenDisposition,
+    StorageGrantRequest, StorageHostError, StorageLimits, UnprovenDisposition, agent_values,
+    instance_values,
     key::{
-        DOMAIN_AUDIT_SCOPE, DOMAIN_AUTHORITY, DOMAIN_GENERATION, DOMAIN_NAMESPACE_PATH, commitment,
+        DOMAIN_AUDIT_SCOPE, DOMAIN_AUTHORITY, DOMAIN_GENERATION, commitment, logical_path_token,
         random_bytes, token,
     },
     layout::{
-        Directory, ENTRY_CHARGE, EntryKind, EntryMetadata, Usage, scan_usage,
-        usage_with_directory_entry,
+        Directory, ENTRY_CHARGE, EntryKind, EntryMetadata, Layout, Usage, scan_root_usage,
+        scan_usage, usage_with_directory_entry,
     },
+    namespace_token, resolve_storage_root_path,
 };
 
 const POINTER_V1: &str = "dekopon.dev/storage-authority-pointer/v1alpha1";
 const POINTER_V2: &str = "dekopon.dev/storage-authority-pointer/v1alpha2";
 const IDENTITY_VERSION: &str = "dekopon.dev/storage-resource/v1alpha1";
+const DATABASE: &str = "main.db";
+const STABLE_EPOCH: &str = "stable";
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -33,6 +39,14 @@ struct ResourceIdentity {
 }
 
 impl ResourceIdentity {
+    fn new(scope: StorageScope, values: Vec<String>) -> Self {
+        Self {
+            api_version: IDENTITY_VERSION.to_owned(),
+            scope,
+            values,
+        }
+    }
+
     fn valid(&self) -> bool {
         self.api_version == IDENTITY_VERSION
             && self.values.len() <= 7
@@ -42,19 +56,170 @@ impl ResourceIdentity {
                     dekopon_capability::StorageScope::Space
                     | dekopon_capability::StorageScope::PrivateConversation
                     | dekopon_capability::StorageScope::SharedConversation
-                    | dekopon_capability::StorageScope::Agent => 1024,
+                    | dekopon_capability::StorageScope::Agent
+                    | dekopon_capability::StorageScope::Instance => 1024,
                 };
                 value.len() <= maximum
             })
     }
+
+    fn encode(&self) -> Result<Vec<u8>, StorageHostError> {
+        if !self.valid() {
+            return Err(StorageHostError::InvalidArgument);
+        }
+        let bytes = serde_json::to_vec(self).map_err(|error| {
+            tracing::error!(error = %error, "storage.identity.unencodable");
+            StorageHostError::Arithmetic
+        })?;
+        if bytes.len() > 4_096 {
+            return Err(StorageHostError::QuotaExceeded);
+        }
+        Ok(bytes)
+    }
 }
 
 fn identity(request: &StorageGrantRequest) -> ResourceIdentity {
-    ResourceIdentity {
-        api_version: IDENTITY_VERSION.to_owned(),
-        scope: request.scope(),
-        values: request.scope_values(),
+    ResourceIdentity::new(request.scope(), request.scope_values())
+}
+
+fn write_identity(base: &Directory, identity: &[u8]) -> Result<(), StorageHostError> {
+    let mut file = base.create_private("identity")?;
+    file.write_all(identity)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| base.io_error(source))?;
+    base.sync()
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageCopyError {
+    #[error(transparent)]
+    Storage(#[from] StorageHostError),
+    #[error(
+        "checkpoint the agent database before copying because source main.db has pending WAL data"
+    )]
+    UncheckpointedDatabase,
+}
+
+pub fn copy_agent_database(
+    root: &Path,
+    limits: &StorageLimits,
+    provider: &ProviderId,
+    agent: &AgentId,
+    principal: &PrincipalId,
+) -> Result<(), StorageCopyError> {
+    limits.validate().map_err(StorageHostError::from)?;
+    let root = resolve_storage_root_path(root)?;
+    let layout = Layout::open(&root)?;
+    let namespaces = layout.namespaces();
+    let destination = ResourceIdentity::new(
+        StorageScope::Instance,
+        instance_values(
+            provider.to_string(),
+            agent.to_string(),
+            principal.to_string(),
+        ),
+    );
+    let destination_token = namespace_token(&destination.values);
+    if namespaces.exists(&destination_token)? {
+        return Err(StorageHostError::AlreadyExists.into());
     }
+
+    let (mut database, length) = open_agent_database(namespaces, provider, agent)?;
+    let (root_usage, namespace_count) = scan_root_usage(&layout, limits.startup_max_entries)?;
+    if namespace_count as u64 >= limits.max_namespaces || length > limits.max_file_bytes {
+        return Err(StorageHostError::QuotaExceeded.into());
+    }
+    let encoded_identity = destination.encode()?;
+
+    // The layout holds the exclusive writer lock through publication and cleanup.
+    let temporary = namespaces.unique_temporary_name()?;
+    let result = (|| {
+        let staged = namespaces.ensure_directory(&temporary)?;
+        staged.create_private("base.lock")?;
+        write_identity(&staged, &encoded_identity)?;
+        touch_marker(&staged, true)?;
+        let destination_generation = generation_token(&destination_token, STABLE_EPOCH);
+        let (generation, data) = ensure_generation(&staged, &destination_generation)?;
+        let with_database =
+            |usage: Usage| usage.bytes.checked_add(ENTRY_CHARGE)?.checked_add(length);
+        let generation_usage =
+            usage_with_directory_entry(scan_usage(&generation, limits.startup_max_entries)?)?;
+        let staged_usage =
+            usage_with_directory_entry(scan_usage(&staged, limits.startup_max_entries)?)?;
+        if with_database(generation_usage).is_none_or(|bytes| bytes > limits.max_namespace_bytes)
+            || with_database(staged_usage)
+                .and_then(|bytes| root_usage.bytes.checked_add(bytes))
+                .is_none_or(|bytes| bytes > limits.max_root_bytes)
+            || root_usage
+                .entries
+                .checked_add(staged_usage.entries)
+                .and_then(|entries| entries.checked_add(1))
+                .is_none_or(|entries| entries > limits.startup_max_entries)
+        {
+            return Err(StorageHostError::QuotaExceeded);
+        }
+        let mut output = data.create_private(&logical_path_token(
+            &destination_token,
+            &destination_generation,
+            DATABASE,
+        ))?;
+        std::io::copy(&mut database, &mut output)
+            .and_then(|_| output.sync_all())
+            .map_err(|error| data.io_error(error))?;
+        data.sync()?;
+        staged.sync()?;
+        namespaces.rename_to(&temporary, namespaces, &destination_token)?;
+        namespaces.sync()
+    })();
+    if result.is_err() {
+        let cleanup = (|| {
+            if namespaces.exists(&temporary)? {
+                let mut remaining = limits.startup_max_entries;
+                crate::sweep::remove_entry(namespaces, &temporary, &mut remaining)?;
+            }
+            Ok::<_, StorageHostError>(())
+        })();
+        if let Err(error) = cleanup {
+            tracing::warn!(error = %dekopon_core::error_chain(&error), "storage.copy.cleanup");
+        }
+    }
+    result.map_err(StorageCopyError::from)
+}
+
+fn open_agent_database(
+    namespaces: &Directory,
+    provider: &ProviderId,
+    agent: &AgentId,
+) -> Result<(File, u64), StorageCopyError> {
+    let values = agent_values(provider.to_string(), agent.to_string());
+    let base_token = namespace_token(&values);
+    let base = namespaces.open_directory(&base_token)?;
+    if read_identity(&base)? != Some((StorageScope::Agent, values)) || marker_time(&base)?.is_none()
+    {
+        return Err(base.corrupt("identity", "storage-resource-identity").into());
+    }
+    let pointer = read_pointer(&base, &base_token)?;
+    let epoch = pointer
+        .as_ref()
+        .map_or(STABLE_EPOCH, |(_, pointer)| pointer.epoch.as_str());
+    let generation = generation_token(&base_token, epoch);
+    let data = base.open_directory(&generation)?.open_directory("data")?;
+    let wal = logical_path_token(&base_token, &generation, "main.db-wal");
+    if data.exists(&wal)? {
+        let wal = data.open_private(&wal, false)?;
+        if wal.metadata().map_err(|error| data.io_error(error))?.len() != 0 {
+            return Err(StorageCopyError::UncheckpointedDatabase);
+        }
+    }
+    let database = data.open_private(
+        &logical_path_token(&base_token, &generation, DATABASE),
+        false,
+    )?;
+    let length = database
+        .metadata()
+        .map_err(|error| data.io_error(error))?
+        .len();
+    Ok((database, length))
 }
 
 pub(crate) fn read_identity(
@@ -180,7 +345,7 @@ impl NamespacePlan {
     ) -> Result<Self, StorageHostError> {
         let values = request.scope_values();
         let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
-        let base_token = token(DOMAIN_NAMESPACE_PATH, &fields);
+        let base_token = crate::namespace_token(&values);
         let scope_commitment = commitment(DOMAIN_AUDIT_SCOPE, &fields);
         debug_assert_ne!(base_token, scope_commitment);
 
@@ -201,16 +366,7 @@ impl NamespacePlan {
         .map_err(|error: StorageHostError| error.in_namespace(&base_token, None))?;
 
         let expected = identity(request);
-        if !expected.valid() {
-            return Err(StorageHostError::InvalidArgument);
-        }
-        let resource_identity = serde_json::to_vec(&expected).map_err(|error| {
-            tracing::error!(error = %error, "storage.identity.unencodable");
-            StorageHostError::Arithmetic
-        })?;
-        if resource_identity.len() > 4_096 {
-            return Err(StorageHostError::QuotaExceeded);
-        }
+        let resource_identity = expected.encode()?;
         let base = existing_base.as_ref();
         let new_metadata = if let Some(base) = base {
             match (read_identity(base)?, marker_time(base)?) {
@@ -358,11 +514,7 @@ impl NamespacePlan {
             base.sync()?;
         }
         if self.new_metadata {
-            let mut file = base.create_private("identity")?;
-            file.write_all(&self.resource_identity)
-                .and_then(|()| file.sync_all())
-                .map_err(|source| base.io_error(source))?;
-            base.sync()?;
+            write_identity(&base, &self.resource_identity)?;
         }
         touch_marker(&base, self.new_metadata)?;
         Ok(Namespace {
@@ -535,7 +687,7 @@ fn select_relaxed(
     maximum_entries: u64,
     set_aside_existing: bool,
 ) -> Result<Selection, StorageHostError> {
-    let generation_token = token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]);
+    let generation_token = generation_token(base_token, STABLE_EPOCH);
     let set_aside = match base {
         Some(base) if set_aside_existing && base.exists(&generation_token)? => {
             Some(crate::key::hex(&random_bytes(32)?))
@@ -568,10 +720,7 @@ fn reuse_epoch(
     authority_pointer: Option<Vec<u8>>,
     continuity: Option<ContinuityOutcome>,
 ) -> Result<Selection, StorageHostError> {
-    let generation_token = token(
-        DOMAIN_GENERATION,
-        &[base_token.as_bytes(), epoch.as_bytes()],
-    );
+    let generation_token = generation_token(base_token, epoch);
     let retained = retained_generation(base, base_token, &generation_token, maximum_entries)?
         .ok_or_else(|| {
             base.corrupt(&generation_token, "missing-current-generation")
@@ -596,10 +745,7 @@ fn mint_epoch(
     continuity: Option<ContinuityOutcome>,
 ) -> Result<Selection, StorageHostError> {
     let epoch = crate::key::hex(&random_bytes(32)?);
-    let generation_token = token(
-        DOMAIN_GENERATION,
-        &[base_token.as_bytes(), epoch.as_bytes()],
-    );
+    let generation_token = generation_token(base_token, &epoch);
     let authority_pointer = encode_pointer(scheme, authority, epoch)?;
     let retained_peak_bytes = match base {
         Some(base) => retained_generation(base, base_token, &generation_token, maximum_entries)?,
@@ -788,6 +934,10 @@ fn ensure_generation(
     Ok((directory, data))
 }
 
+fn generation_token(base: &str, epoch: &str) -> String {
+    token(DOMAIN_GENERATION, &[base.as_bytes(), epoch.as_bytes()])
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PointerScheme {
     V1,
@@ -814,12 +964,8 @@ fn read_pointer(
         _ => None,
     };
     if scheme.is_none() || !is_token(&document.epoch) || !is_token(&document.authority) {
-        let previous = is_token(&document.epoch).then(|| {
-            token(
-                DOMAIN_GENERATION,
-                &[base_token.as_bytes(), document.epoch.as_bytes()],
-            )
-        });
+        let previous =
+            is_token(&document.epoch).then(|| generation_token(base_token, &document.epoch));
         return Err(base_directory
             .corrupt("current", "authority-pointer")
             .in_namespace(base_token, previous.as_deref()));

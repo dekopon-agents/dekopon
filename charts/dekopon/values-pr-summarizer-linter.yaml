@@ -149,13 +149,12 @@ gateway:
           apiKeyEnv: OPENAI_API_KEY
           timeoutMs: 120000
           classes: [reasoning]
+          generation:
+            tokenParam: maxCompletionTokens
       routes:
         - transport: workspace-slack
           conversation: { kind: [directMessage] }
           agent: pr-summarizer-linter
-          limits:
-            maxSteps: 8
-            maxCapabilityCalls: 16
           memory:
             mode: persistent
             # Never broaden the deployment example's replay audience implicitly.

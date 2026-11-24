@@ -2,10 +2,10 @@
 #![allow(clippy::unwrap_used, clippy::disallowed_methods)]
 
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuditSink, AuthenticatedContext, Broker, BrokerLimits,
-    CapabilityRoute, ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
-    Conversation, ConversationKind, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
-    PolicyEngine, PolicyWorld, Trigger,
+    AssetInvocationResult, Attestation, AttestorGrant, AuditSink, AuthenticatedContext, Broker,
+    BrokerLimits, CapabilityRoute, ChatScopeClaim, ChatTransportKind, ConstraintCatalog,
+    ConstraintSet, Conversation, ConversationKind, IdentityDirectory, InMemoryAuditLog,
+    InvocationRequest, PolicyEngine, PolicyWorld, Trigger,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{
@@ -132,6 +132,38 @@ when { context.via == "gateway" && context.agent == "reviewer" };
     (broker, storage)
 }
 
+async fn invoke_storage_probe(
+    broker: &Broker,
+    gateway: &AuthenticatedContext,
+    grant: &AttestorGrant,
+    claim: &Attestation,
+    request: InvocationRequest,
+) -> (AssetInvocationResult, Vec<u8>) {
+    let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
+    let capture = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut bytes).unwrap();
+        bytes
+    });
+    let result = broker
+        .invoke(
+            gateway,
+            Some(grant),
+            Some(claim),
+            request,
+            dekopon_broker_host::asset::AssetInputs {
+                streams: Some(dekopon_broker_host::Streams {
+                    stdin: None,
+                    stdout: host.into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    (result, capture.await.unwrap())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audience() {
     let gateway = AuthenticatedContext::new(
@@ -144,16 +176,31 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
     let grant = AttestorGrant {
         namespaces: Some(vec!["drn:slack:*:t0123abc:*".parse().unwrap()]),
     };
-    for scope in [StorageScope::Agent, StorageScope::Space] {
+    for scope in [
+        StorageScope::Agent,
+        StorageScope::Space,
+        StorageScope::Instance,
+    ] {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap().join("storage");
         let (broker, _) = build_scoped_broker(&root, false, scope).await;
-        for (index, (kind, channel, mapped)) in [
-            (ConversationKind::DirectMessage, "d0123abc", false),
-            (ConversationKind::Channel, "cunmapped", false),
-            (ConversationKind::Channel, "cspace", true),
-            (ConversationKind::Thread, "cspace", true),
-            (ConversationKind::Channel, "cspace2", true),
+        for (index, (kind, channel, mapped, trigger)) in [
+            (
+                ConversationKind::DirectMessage,
+                "d0123abc",
+                false,
+                Trigger::Message,
+            ),
+            (
+                ConversationKind::Channel,
+                "cunmapped",
+                false,
+                Trigger::Message,
+            ),
+            (ConversationKind::Channel, "cspace", true, Trigger::Message),
+            (ConversationKind::Thread, "cspace", true, Trigger::Message),
+            (ConversationKind::Channel, "cspace2", true, Trigger::Message),
+            (ConversationKind::Thread, "cspace", true, Trigger::Wake),
         ]
         .into_iter()
         .enumerate()
@@ -167,11 +214,13 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
                 input: json!({"mode":"success"}),
                 secret_use: None,
             };
+            let subject = if trigger == Trigger::Wake {
+                "drn:slack:channel:t0123abc:cspace"
+            } else {
+                "drn:slack:user:t0123abc:u9xyz"
+            };
             let claim = Attestation::for_chat(
-                dekopon_core::AttestedSubject::one(
-                    "drn:slack:user:t0123abc:u9xyz".parse().expect("subject"),
-                )
-                .unwrap(),
+                dekopon_core::AttestedSubject::one(subject.parse().expect("subject")).unwrap(),
                 "reviewer".parse().unwrap(),
                 ChatScopeClaim {
                     participant: None,
@@ -184,13 +233,13 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
                         id: channel.to_owned(),
                         thread: Some("1712345678.000100".to_owned()),
                     },
-                    trigger: Trigger::Message,
+                    trigger,
                     delivery: None,
                 },
             )
             .bound_to(request.id.clone());
             let allowed = match scope {
-                StorageScope::Agent => !mapped,
+                StorageScope::Agent | StorageScope::Instance => !mapped,
                 StorageScope::Space => mapped,
                 StorageScope::PrivateConversation | StorageScope::SharedConversation => {
                     unreachable!()
@@ -208,13 +257,7 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
                     vec![]
                 })
             );
-            let (host, mut stdout) = std::os::unix::net::UnixStream::pair().unwrap();
-            let capture = tokio::task::spawn_blocking(move || {
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut stdout, &mut bytes).unwrap();
-                bytes
-            });
-            if mapped && scope == StorageScope::Space {
+            if mapped && scope == StorageScope::Space && trigger == Trigger::Message {
                 let mut other = claim.clone();
                 other.subjects = dekopon_core::AttestedSubject::one(
                     "drn:slack:user:t0123abc:u8xyz".parse().unwrap(),
@@ -232,23 +275,8 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
                     Some(vec!["storage-probe.run".parse().unwrap()])
                 );
             }
-            let result = broker
-                .invoke(
-                    &gateway,
-                    Some(&grant),
-                    Some(&claim),
-                    request,
-                    dekopon_broker_host::asset::AssetInputs {
-                        streams: Some(dekopon_broker_host::Streams {
-                            stdin: None,
-                            stdout: host.into(),
-                        }),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap();
-            let output = capture.await.unwrap();
+            let (result, output) =
+                invoke_storage_probe(&broker, &gateway, &grant, &claim, request).await;
             assert_eq!(result.result.outcome == InvocationOutcome::Denied, !allowed);
             if scope == StorageScope::Space && kind == ConversationKind::Channel && mapped {
                 assert_eq!(
@@ -257,7 +285,7 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
                     "{result:?}"
                 );
             }
-            if index == 0 && scope == StorageScope::Agent {
+            if index == 0 && matches!(scope, StorageScope::Agent | StorageScope::Instance) {
                 assert_eq!(
                     result.result.outcome,
                     InvocationOutcome::Succeeded,
@@ -275,6 +303,108 @@ async fn storage_scope_is_filtered_and_refused_on_every_frame_outside_its_audien
                 .is_empty()
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_principal_reaches_the_same_instance_database_across_transports() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap().join("storage");
+    let (broker, _) = build_scoped_broker(&root, false, StorageScope::Instance).await;
+    let principal: PrincipalId = "gateway".parse().unwrap();
+    let gateway =
+        AuthenticatedContext::new(principal.clone(), Actor::Service { principal }).unwrap();
+    let grant = AttestorGrant { namespaces: None };
+    let mut directories = Vec::new();
+    for (subject, kind, transport, container, channel, mode) in [
+        (
+            "drn:slack:user:t0123abc:u9xyz",
+            ChatTransportKind::Slack,
+            "scientist-slack",
+            Some("t0123abc"),
+            "d0123abc",
+            "success",
+        ),
+        (
+            "drn:discord:user::123",
+            ChatTransportKind::Discord,
+            "scientist-discord",
+            None,
+            "789",
+            "drop-after-denial",
+        ),
+    ] {
+        let request = InvocationRequest {
+            id: format!("instance-{transport}").parse().unwrap(),
+            capability: "storage-probe.run".parse().unwrap(),
+            trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
+                .parse()
+                .unwrap(),
+            input: json!({"mode":mode}),
+            secret_use: None,
+        };
+        let claim = Attestation::for_chat(
+            dekopon_core::AttestedSubject::one(subject.parse().unwrap()).unwrap(),
+            "reviewer".parse().unwrap(),
+            ChatScopeClaim {
+                participant: None,
+                github: None,
+                transport: transport.parse().unwrap(),
+                kind,
+                conversation: Conversation {
+                    kind: ConversationKind::DirectMessage,
+                    container: container.map(str::to_owned),
+                    id: channel.to_owned(),
+                    thread: None,
+                },
+                trigger: Trigger::Message,
+                delivery: None,
+            },
+        )
+        .bound_to(request.id.clone());
+        let (context, refusal) = broker.resolve_context(&gateway, Some(&grant), &claim);
+        assert!(
+            refusal.is_none(),
+            "{:?}",
+            refusal.map(|failure| failure.reason)
+        );
+        assert_eq!(context.principal().as_str(), "alice");
+        let (result, output) =
+            invoke_storage_probe(&broker, &gateway, &grant, &claim, request).await;
+        let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        if mode == "success" {
+            assert_eq!(
+                result.result.outcome,
+                InvocationOutcome::Succeeded,
+                "{result:?}"
+            );
+            assert_eq!(output["shortReadBytes"], 3);
+        } else {
+            assert_eq!(result.result.error.as_deref(), Some("storage-quota"));
+            assert_eq!(output["caught"], "drop-after-denial");
+        }
+        let namespaces = fs::read_dir(root.join("namespaces"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(namespaces.len(), 1);
+        let generations = fs::read_dir(namespaces[0].path())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_dir())
+            .map(|entry| entry.path().join("data"))
+            .collect::<Vec<_>>();
+        assert_eq!(generations.len(), 1);
+        let files = fs::read_dir(&generations[0])
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let bytes = fs::read(files[0].path()).unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(&bytes[..3], b"abc");
+        directories.push(generations[0].clone());
+    }
+    assert_eq!(directories[0], directories[1]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

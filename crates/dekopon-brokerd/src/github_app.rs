@@ -61,6 +61,22 @@ impl GithubAppKey {
                 reason: rejected.to_string(),
             })
     }
+
+    #[cfg(test)]
+    pub(crate) fn public_key(&self) -> &[u8] {
+        self.0.public().as_ref()
+    }
+
+    pub(crate) fn sign_rs256(&self, input: &[u8]) -> Result<Vec<u8>, ring::error::Unspecified> {
+        let mut signature = vec![0; self.0.public().modulus_len()];
+        self.0.sign(
+            &RSA_PKCS1_SHA256,
+            &SystemRandom::new(),
+            input,
+            &mut signature,
+        )?;
+        Ok(signature)
+    }
 }
 
 enum PemLabel {
@@ -194,15 +210,9 @@ impl GithubAppCredential {
             .to_string(),
         );
         let signing_input = format!("{header}.{claims}");
-        let mut signature = vec![0; self.key.0.public().modulus_len()];
-        self.key
-            .0
-            .sign(
-                &RSA_PKCS1_SHA256,
-                &SystemRandom::new(),
-                signing_input.as_bytes(),
-                &mut signature,
-            )
+        let signature = self
+            .key
+            .sign_rs256(signing_input.as_bytes())
             .map_err(|_unspecified| {
                 self.failed("signing", None);
                 RefreshError::Unavailable {
@@ -519,7 +529,7 @@ mod tests {
         let token = jwt(&request);
         let (signing_input, signature) = token.rsplit_once('.').expect("three JWT segments");
         let key = GithubAppKey::from_pem(KEY_PEM).expect("the fixture key parses");
-        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.0.public().as_ref())
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.public_key())
             .verify(
                 signing_input.as_bytes(),
                 &URL_SAFE_NO_PAD

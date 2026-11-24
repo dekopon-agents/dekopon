@@ -32,6 +32,7 @@ pub mod private_file;
 mod redaction;
 mod skill;
 mod space;
+pub mod standin;
 mod subject;
 mod task;
 mod trace;
@@ -384,6 +385,7 @@ pub enum SecretSinkKind {
     HttpBearer,
     HttpBasic,
     HttpBot,
+    VmExecStdin,
 }
 
 impl fmt::Display for SecretSinkKind {
@@ -392,6 +394,7 @@ impl fmt::Display for SecretSinkKind {
             Self::HttpBearer => "httpBearer",
             Self::HttpBasic => "httpBasic",
             Self::HttpBot => "httpBot",
+            Self::VmExecStdin => "vmExecStdin",
         })
     }
 }
@@ -410,6 +413,9 @@ pub enum SecretUseProposal {
     HttpBot {
         secret: SecretDrn,
     },
+    VmExecStdin {
+        secret: SecretDrn,
+    },
 }
 
 impl SecretUseProposal {
@@ -418,7 +424,8 @@ impl SecretUseProposal {
         match self {
             Self::HttpBearer { secret }
             | Self::HttpBasic { secret, .. }
-            | Self::HttpBot { secret } => secret,
+            | Self::HttpBot { secret }
+            | Self::VmExecStdin { secret } => secret,
         }
     }
 
@@ -428,6 +435,7 @@ impl SecretUseProposal {
             Self::HttpBearer { .. } => SecretSinkKind::HttpBearer,
             Self::HttpBasic { .. } => SecretSinkKind::HttpBasic,
             Self::HttpBot { .. } => SecretSinkKind::HttpBot,
+            Self::VmExecStdin { .. } => SecretSinkKind::VmExecStdin,
         }
     }
 
@@ -435,7 +443,7 @@ impl SecretUseProposal {
     pub fn username(&self) -> Option<&str> {
         match self {
             Self::HttpBasic { username, .. } => Some(username),
-            Self::HttpBearer { .. } | Self::HttpBot { .. } => None,
+            Self::HttpBearer { .. } | Self::HttpBot { .. } | Self::VmExecStdin { .. } => None,
         }
     }
 }
