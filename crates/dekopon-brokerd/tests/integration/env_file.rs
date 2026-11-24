@@ -456,3 +456,105 @@ fn a_serving_broker_writes_console_json_to_its_log_file() {
     assert!(!records.is_empty());
     assert!(records.iter().all(|record| record["level"].is_string()));
 }
+
+#[test]
+fn removing_a_provider_under_a_restrictive_umask_keeps_the_lock_readable() {
+    use sha2::{Digest as _, Sha256};
+
+    let directory = private_directory();
+    let store = directory.path().join("store");
+    let blobs = store.join("blobs/sha256");
+    fs::create_dir_all(&blobs).unwrap();
+    for path in [&store, &store.join("blobs"), &blobs] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let providers = ["cli-probe", "clock-probe"].map(|name| {
+        let bytes = fs::read(provider_fixture(&format!("{name}-provider.wasm"))).unwrap();
+        let digest = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = blobs.join(format!("{digest}.wasm"));
+        fs::write(&path, &bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        json!({
+            "source": format!("ghcr.io/example/{name}:1.0.0"),
+            "resolvedVersion": "1.0.0",
+            "manifestDigest": format!("sha256:{}", "a".repeat(64)),
+            "componentDigest": format!("sha256:{digest}"),
+            "componentBytes": bytes.len(),
+            "providerId": name,
+        })
+    });
+    let lock = directory.path().join("providers.lock.yaml");
+    write_owner_only(
+        &lock,
+        json!({
+            "apiVersion": "dekopon.dev/provider-lock/v1alpha1",
+            "providers": providers,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let desired = directory.path().join("providers.yaml");
+    let sources = providers
+        .iter()
+        .map(|provider| json!({"source": provider["source"]}))
+        .collect::<Vec<_>>();
+    write_owner_only(
+        &desired,
+        json!({
+            "apiVersion": "dekopon.dev/provider-set/v1alpha1",
+            "providers": sources,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let sync = [
+        OsStr::new("provider"),
+        OsStr::new("sync"),
+        OsStr::new("--provider-set"),
+        desired.as_os_str(),
+        OsStr::new("--lock-file"),
+        lock.as_os_str(),
+        OsStr::new("--store"),
+        store.as_os_str(),
+    ];
+    let output = finished(broker().args(sync));
+    assert!(output.status.success(), "{}", output_text(&output));
+
+    write_owner_only(
+        &desired,
+        json!({
+            "apiVersion": "dekopon.dev/provider-set/v1alpha1",
+            "providers": [{"source": providers[0]["source"]}],
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let output = finished(
+        std::process::Command::new("sh")
+            .args(["-c", "umask 0400; exec \"$@\"", "provider-lock-umask"])
+            .arg(env!("CARGO_BIN_EXE_dekopon-brokerd"))
+            .args(sync)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        fs::metadata(&lock).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+
+    let output = finished(
+        broker()
+            .args(["provider", "list", "--output", "json", "--lock-file"])
+            .arg(&lock)
+            .arg("--store")
+            .arg(&store),
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["providerId"], "cli-probe");
+}

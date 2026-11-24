@@ -2,7 +2,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::ffi::OsStrExt as _,
+    os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _},
     path::{Path, PathBuf},
 };
 
@@ -116,7 +116,8 @@ pub fn replace_private_file(
                     source,
                 })?;
             let result = file
-                .write_all(bytes)
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .and_then(|()| file.write_all(bytes))
                 .map_err(|source| PrivateFileError {
                     path: temporary.clone(),
                     source,

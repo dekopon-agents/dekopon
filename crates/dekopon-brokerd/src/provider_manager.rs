@@ -1766,7 +1766,15 @@ impl ProviderStore {
             .await
             .map_err(|source| ProviderManagerError::io("could not write provider blob", source))?;
         drop(file);
-        self.publish_blob(&temporary, &destination)?;
+        let uid = self.uid;
+        offload(move || Self::publish_blob(&temporary, &destination, uid))
+            .await
+            .map_err(|source| {
+                ProviderManagerError::io(
+                    "could not join provider blob publication",
+                    io::Error::other(dekopon_core::TaskOutcome::from(source)),
+                )
+            })??;
         Ok(true)
     }
 
@@ -1801,9 +1809,9 @@ impl ProviderStore {
     }
 
     fn publish_blob(
-        &self,
         temporary: &tempfile::NamedTempFile,
         destination: &Path,
+        expected_uid: u32,
     ) -> Result<(), ProviderManagerError> {
         replace_private_file(
             destination,
@@ -1820,7 +1828,7 @@ impl ProviderStore {
                 error.source,
             )
         })?;
-        socket::validate_owned_file(destination, self.uid)
+        socket::validate_owned_file(destination, expected_uid)
             .map_err(|error| ProviderManagerError::file_security(destination, error))
     }
 
@@ -4065,7 +4073,7 @@ providers:
         let destination = store.blob_path(&descriptor.digest).unwrap();
         let mut original = store.prepare_blob(&destination, &descriptor).unwrap();
         original.write_all(b"old blob").unwrap();
-        store.publish_blob(&original, &destination).unwrap();
+        ProviderStore::publish_blob(&original, &destination, store.uid).unwrap();
         assert_eq!(
             fs::metadata(&destination).unwrap().permissions().mode() & 0o7777,
             0o600
@@ -4079,7 +4087,7 @@ providers:
         let mut retry = store.prepare_blob(&destination, &descriptor).unwrap();
         assert!(!stale.exists());
         retry.write_all(b"new blob").unwrap();
-        let error = store.publish_blob(&retry, &destination).unwrap_err();
+        let error = ProviderStore::publish_blob(&retry, &destination, store.uid).unwrap_err();
         assert!(
             matches!(error, ProviderManagerError::Io { source, .. } if source.kind() == io::ErrorKind::AlreadyExists)
         );
@@ -4087,7 +4095,7 @@ providers:
         assert!(retry.path().exists());
 
         fs::remove_file(&destination).unwrap();
-        store.publish_blob(&retry, &destination).unwrap();
+        ProviderStore::publish_blob(&retry, &destination, store.uid).unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"new blob");
         assert_eq!(
             fs::metadata(&destination).unwrap().permissions().mode() & 0o7777,
