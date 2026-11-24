@@ -162,37 +162,54 @@ fn temporary_prefix(path: &Path) -> Option<OsString> {
 }
 
 pub fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) -> Vec<TemporarySweep> {
-    let (Ok(parent), Some(prefix), Some(stem)) = (
-        parent_directory(path),
-        temporary_prefix(path),
-        path.file_stem(),
-    ) else {
+    let (Some(prefix), Some(stem)) = (temporary_prefix(path), path.file_stem()) else {
         return Vec::new();
     };
     let mut legacy_prefix = stem.to_os_string();
     legacy_prefix.push(".tmp-");
+    sweep_matching(path, keep, |name| {
+        name.starts_with(prefix.as_encoded_bytes())
+            || name
+                .strip_prefix(legacy_prefix.as_encoded_bytes())
+                .is_some_and(|pid| !pid.is_empty() && pid.iter().all(u8::is_ascii_digit))
+    })
+}
+
+pub fn sweep_private_temporaries(path: &Path) -> Vec<TemporarySweep> {
+    let Some(prefix) = temporary_prefix(path) else {
+        return Vec::new();
+    };
+    sweep_matching(path, None, |name| {
+        name.starts_with(prefix.as_encoded_bytes())
+    })
+}
+
+fn sweep_matching(
+    path: &Path,
+    keep: Option<&Path>,
+    stale: impl Fn(&[u8]) -> bool,
+) -> Vec<TemporarySweep> {
+    let Ok(parent) = parent_directory(path) else {
+        return Vec::new();
+    };
     let Ok(entries) = fs::read_dir(parent) else {
         return Vec::new();
     };
     let mut results = Vec::new();
     let destination = path.file_name();
     for entry in entries.flatten() {
-        let stale = entry.path();
+        let candidate = entry.path();
         let name = entry.file_name();
-        if Some(name.as_os_str()) == destination || Some(stale.as_path()) == keep {
+        if Some(name.as_os_str()) == destination
+            || Some(candidate.as_path()) == keep
+            || !stale(name.as_encoded_bytes())
+        {
             continue;
         }
-        let name = name.as_encoded_bytes();
-        let legacy = name
-            .strip_prefix(legacy_prefix.as_encoded_bytes())
-            .is_some_and(|pid| !pid.is_empty() && pid.iter().all(u8::is_ascii_digit));
-        if !legacy && !name.starts_with(prefix.as_encoded_bytes()) {
-            continue;
-        }
-        match fs::remove_file(&stale) {
-            Ok(()) => results.push(TemporarySweep::Removed { path: stale }),
+        match fs::remove_file(&candidate) {
+            Ok(()) => results.push(TemporarySweep::Removed { path: candidate }),
             Err(source) => results.push(TemporarySweep::Failed {
-                path: stale,
+                path: candidate,
                 source,
             }),
         }
