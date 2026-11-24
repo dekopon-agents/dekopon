@@ -9,6 +9,7 @@
     )
 )]
 pub mod asset;
+pub mod backoff;
 pub mod github;
 
 #[cfg(feature = "native")]

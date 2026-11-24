@@ -37,10 +37,6 @@ pub(crate) mod whatsapp;
 
 pub(crate) const MAX_INBOUND_TEXT_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_OUTBOUND_TEXT_BYTES: usize = 8 * 1024;
-const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
-const BASE_RECONNECT_DELAY: Duration = Duration::from_millis(500);
-const RECONNECT_JITTER_MS: u64 = 250;
-const MAX_RECONNECT_DOUBLINGS: u32 = 7;
 
 #[derive(Clone, Debug)]
 pub(crate) struct InboundMessage {
@@ -1051,12 +1047,6 @@ fn chunk_end<'f>(
     (end, open)
 }
 
-pub(crate) fn reconnect_delay(failures: u32) -> Duration {
-    let step = BASE_RECONNECT_DELAY.saturating_mul(1_u32 << failures.min(MAX_RECONNECT_DOUBLINGS));
-    step.min(MAX_RECONNECT_DELAY)
-        .saturating_add(Duration::from_millis(jitter_below(RECONNECT_JITTER_MS)))
-}
-
 pub(crate) fn jitter_below(upper: u64) -> u64 {
     if upper == 0 {
         return 0;
@@ -1165,9 +1155,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        BASE_RECONNECT_DELAY, MAX_RECONNECT_DELAY, MAX_RECONNECT_DOUBLINGS, RECONNECT_JITTER_MS,
         SeenIds, TextUnit, TransportIdentity, asset_buffer, credential_client_from, is_stop_word,
-        jitter_below, reconnect_delay, reserve_for_chunk, retry_after_from_body, split_message,
+        jitter_below, reserve_for_chunk, retry_after_from_body, split_message,
     };
 
     #[test]
@@ -1242,30 +1231,11 @@ mod tests {
     }
 
     #[test]
-    fn a_reconnect_delay_doubles_within_its_ceiling_and_jitter() {
-        let ceiling = MAX_RECONNECT_DELAY + Duration::from_millis(RECONNECT_JITTER_MS);
-        for failures in [0_u32, 1, 2, 7, 8, 20, u32::MAX] {
-            let floor = BASE_RECONNECT_DELAY
-                .saturating_mul(1 << failures.min(MAX_RECONNECT_DOUBLINGS))
-                .min(MAX_RECONNECT_DELAY);
-            let delay = reconnect_delay(failures);
-            assert!(
-                delay >= floor && delay <= ceiling,
-                "{failures} failures produced {delay:?}, outside {floor:?}..={ceiling:?}"
-            );
-        }
-        assert_eq!(
-            reconnect_delay(7).min(MAX_RECONNECT_DELAY),
-            reconnect_delay(u32::MAX).min(MAX_RECONNECT_DELAY)
-        );
-    }
-
-    #[test]
     fn jitter_stays_below_its_bound_and_is_not_a_constant() {
         assert_eq!(jitter_below(0), 0);
         assert_eq!(jitter_below(1), 0);
         for _ in 0..256 {
-            assert!(jitter_below(RECONNECT_JITTER_MS) < RECONNECT_JITTER_MS);
+            assert!(jitter_below(250) < 250);
         }
         let drawn: HashSet<u64> = (0..64).map(|_| jitter_below(u64::MAX)).collect();
         assert!(drawn.len() > 1, "the jitter is the same value every time");

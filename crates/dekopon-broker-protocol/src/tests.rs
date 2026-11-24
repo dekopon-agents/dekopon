@@ -2796,6 +2796,27 @@ async fn open_waits_through_an_absent_then_refusing_broker_until_one_accepts() {
 }
 
 #[cfg(unix)]
+#[test]
+fn connect_retry_jitter_respects_the_cap_and_remaining_window() {
+    use super::{CONNECT_BACKOFF, connect_retry_delay};
+
+    let mut backoff = CONNECT_BACKOFF;
+    let window = Duration::from_secs(10);
+    let jitter = Duration::MAX;
+    for millis in [99, 149, 249, 449, 849, 1_000, 1_000] {
+        assert_eq!(
+            connect_retry_delay(&mut backoff, window, jitter),
+            Duration::from_millis(millis)
+        );
+    }
+    let remaining = Duration::from_millis(25);
+    assert_eq!(
+        connect_retry_delay(&mut backoff, remaining, jitter),
+        remaining
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn open_gives_up_on_an_absent_broker_at_its_window() {
     use super::{BrokerClient, ClientError};

@@ -19,6 +19,8 @@ use std::{
 
 pub use dekopon_capability::{InvocationOutcome, InvocationResult};
 pub use dekopon_core::ProviderFailureDetail;
+#[cfg(unix)]
+use dekopon_core::backoff::Backoff;
 
 mod conversation;
 #[cfg(unix)]
@@ -1721,9 +1723,24 @@ pub struct BrokerClient {
 }
 
 #[cfg(unix)]
-const CONNECT_BACKOFF: Duration = Duration::from_millis(50);
+const CONNECT_JITTER_MS: u64 = 50;
 #[cfg(unix)]
 const MAX_CONNECT_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(unix)]
+const CONNECT_BACKOFF: Backoff = Backoff::new(
+    Duration::from_millis(50),
+    MAX_CONNECT_BACKOFF,
+    Duration::from_millis(CONNECT_JITTER_MS - 1),
+);
+
+#[cfg(unix)]
+fn connect_retry_delay(backoff: &mut Backoff, remaining: Duration, jitter: Duration) -> Duration {
+    backoff.record_failure();
+    backoff
+        .delay(jitter)
+        .min(MAX_CONNECT_BACKOFF)
+        .min(remaining)
+}
 
 #[cfg(unix)]
 impl BrokerClient {
@@ -2141,11 +2158,17 @@ impl BrokerClient {
                 Err(error) if error.is_absent_broker() => error,
                 result => return result,
             };
-            let remaining = self.connect_window.saturating_sub(started.elapsed());
+            let failed_at = tokio::time::Instant::now();
+            let remaining = self
+                .connect_window
+                .saturating_sub(failed_at.duration_since(started));
             if remaining.is_zero() {
                 return Err(absent);
             }
-            tokio::time::sleep(backoff.min(remaining)).await;
+            let jitter =
+                Duration::from_millis(getrandom::u64().unwrap_or_default() % CONNECT_JITTER_MS);
+            let delay = connect_retry_delay(&mut backoff, remaining, jitter);
+            tokio::time::sleep_until(failed_at + delay).await;
             budget = self
                 .connect_window
                 .saturating_sub(started.elapsed())
@@ -2153,7 +2176,6 @@ impl BrokerClient {
             if budget.is_zero() {
                 return Err(absent);
             }
-            backoff = backoff.saturating_mul(2).min(MAX_CONNECT_BACKOFF);
         }
     }
 

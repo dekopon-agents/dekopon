@@ -1,20 +1,27 @@
 use std::{sync::Arc, time::Duration};
 
+use dekopon_core::backoff::Backoff;
 use futures_util::future::BoxFuture;
 use tokio::time::{Instant, sleep, timeout};
 
 use super::{
     AssetFetcher, ChatDriver, ChatTransport, ThreadOwnership, TransportError, TransportEvent,
-    TransportIdentity, reconnect_delay,
+    TransportIdentity, jitter_below,
 };
 
 const MAX_FAILURES: u32 = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTHY_RESET: Duration = Duration::from_secs(5 * 60);
+const RECONNECT_JITTER_MS: u64 = 250;
+const RECONNECT_BACKOFF: Backoff = Backoff::new(
+    Duration::from_millis(500),
+    Duration::from_secs(60),
+    Duration::from_millis(RECONNECT_JITTER_MS - 1),
+);
 
 pub(crate) struct RecoveringTransport {
     inner: Box<dyn ChatTransport>,
-    failures: u32,
+    backoff: Backoff,
     connected_since: Option<Instant>,
     identity: Option<TransportIdentity>,
 }
@@ -23,7 +30,7 @@ impl RecoveringTransport {
     pub(crate) fn new(inner: Box<dyn ChatTransport>) -> Self {
         Self {
             inner,
-            failures: 0,
+            backoff: RECONNECT_BACKOFF,
             connected_since: None,
             identity: None,
         }
@@ -35,24 +42,27 @@ impl RecoveringTransport {
             .take()
             .is_some_and(|since| since.elapsed() >= HEALTHY_RESET)
         {
-            self.failures = 0;
+            self.backoff.reset();
         }
-        self.failures = self.failures.saturating_add(1);
+        self.backoff.record_failure();
         if !self.inner.retryable(&error) {
             return Err(error);
         }
-        if self.failures >= MAX_FAILURES {
+        let failures = self.backoff.failures();
+        if failures >= MAX_FAILURES {
             return Err(TransportError::RecoveryExhausted {
-                failures: self.failures,
+                failures,
                 source: Box::new(error),
             });
         }
-        let delay = reconnect_delay(self.failures - 1);
+        let delay = self
+            .backoff
+            .delay(Duration::from_millis(jitter_below(RECONNECT_JITTER_MS)));
         tracing::warn!(
             event = "gateway_transport_recovering",
             transport = self.name(),
             category = error.category(),
-            failure = self.failures,
+            failure = failures,
             delay_ms = delay.as_millis() as u64,
             "gateway.transport.recovering"
         );
@@ -154,6 +164,17 @@ mod tests {
 
     use super::*;
     use crate::transport::{OutboundReply, ReplyTarget};
+
+    #[test]
+    fn reconnect_retry_adds_jitter_after_the_sixty_second_cap() {
+        let mut backoff = RECONNECT_BACKOFF;
+        for millis in [
+            749, 1_249, 2_249, 4_249, 8_249, 16_249, 32_249, 60_249, 60_249,
+        ] {
+            backoff.record_failure();
+            assert_eq!(backoff.delay(Duration::MAX), Duration::from_millis(millis));
+        }
+    }
 
     struct NoWrites;
     #[async_trait]
@@ -264,7 +285,7 @@ mod tests {
     async fn startup_recovery_succeeds_without_resetting_the_episode() {
         let mut transport = scripted([(Duration::ZERO, false), (Duration::ZERO, true)], vec![]);
         transport.connect().await.expect("second attempt connects");
-        assert_eq!(transport.failures, 1);
+        assert_eq!(transport.backoff.failures(), 1);
         assert!(transport.connected_since.is_some());
     }
 
@@ -295,7 +316,8 @@ mod tests {
             .await
             .expect("new episode");
         assert_eq!(
-            transport.failures, 1,
+            transport.backoff.failures(),
+            1,
             "idle health does not require user traffic"
         );
     }
@@ -387,6 +409,10 @@ mod tests {
             .await
             .expect_err("adapter returned a different identity");
         assert!(matches!(error, TransportError::IdentityChanged));
-        assert_eq!(transport.failures, 0, "identity change is never retried");
+        assert_eq!(
+            transport.backoff.failures(),
+            0,
+            "identity change is never retried"
+        );
     }
 }
