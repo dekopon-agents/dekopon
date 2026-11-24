@@ -2,9 +2,9 @@ use std::{io::Read as _, os::unix::fs::PermissionsExt as _, path::Path, sync::Ar
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
-    ConstraintCatalog, ConstraintSet, IdentityDirectory, InMemoryAuditLog, PolicyEngine,
-    PolicyWorld,
+    Attestation, AttestorGrant, AuditSink, AuthenticatedContext, Broker, BrokerLimits,
+    CapabilityRoute, ConstraintCatalog, ConstraintSet, IdentityDirectory, InMemoryAuditLog,
+    PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{
     BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome, Streams, asset::AssetInputs,
@@ -395,7 +395,9 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             policy,
             constraints,
             IdentityDirectory::new([(subject.clone(), caller)]).unwrap(),
-            Arc::new(InMemoryAuditLog::new(32).unwrap()),
+            Arc::new(AuditSink::InMemory(Arc::new(
+                InMemoryAuditLog::new(32).unwrap(),
+            ))),
             BrokerLimits::default(),
         )
         .unwrap();
@@ -412,7 +414,7 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             "agent".parse().unwrap(),
         );
         let argv = ARGV.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let propose = async |broker: &Broker<InMemoryAuditLog>| {
+        let propose = async |broker: &Broker| {
             broker
                 .run_command(
                     &actor,

@@ -1869,6 +1869,21 @@ impl AuditLog for TraceOnlyAuditLog {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum AuditSink {
+    TraceOnly(TraceOnlyAuditLog),
+    InMemory(Arc<InMemoryAuditLog>),
+}
+
+impl AuditLog for AuditSink {
+    async fn append(&self, event: AuditEvent) -> Result<(), AuditError> {
+        match self {
+            Self::TraceOnly(log) => log.append(event).await,
+            Self::InMemory(log) => log.append(event).await,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AuditConfigurationError {
     #[error("audit record maximum must be greater than zero")]
@@ -1891,7 +1906,7 @@ impl AuditError {
 }
 
 #[derive(Debug)]
-pub struct Broker<A> {
+pub struct Broker<A = AuditSink> {
     registry: BrokerProviderRegistry,
     policy: Arc<PolicyEngine>,
     policy_digest: String,

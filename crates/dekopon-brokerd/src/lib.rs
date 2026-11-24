@@ -41,7 +41,7 @@ use std::{
 
 use config::{LoadMode, Resident};
 use dekopon_broker::{
-    AuditLog, Broker, ConstraintCatalog, IdentityDirectory, Leniency, PolicyBuildError,
+    AuditLog, AuditSink, Broker, ConstraintCatalog, IdentityDirectory, Leniency, PolicyBuildError,
     PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
 pub use dekopon_broker_host::enable_test_component_memoization;
@@ -1454,7 +1454,7 @@ struct Runtime {
 
 struct Ready {
     identity_digest: String,
-    broker: Arc<Broker<TraceOnlyAuditLog>>,
+    broker: Arc<Broker>,
     scheduled: secrets::ScheduledCatalog,
     chatgpt: Vec<Arc<dekopon_model::chatgpt::CredentialFile>>,
     identities: BTreeMap<u32, MappedPeer>,
@@ -1700,7 +1700,7 @@ async fn prepare(
         policy,
         constraints,
         identity_directory,
-        Arc::new(TraceOnlyAuditLog),
+        Arc::new(AuditSink::TraceOnly(TraceOnlyAuditLog)),
         config.broker_limits,
         leniency,
     )

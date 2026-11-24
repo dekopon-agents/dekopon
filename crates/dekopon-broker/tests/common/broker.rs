@@ -1,6 +1,6 @@
 use dekopon_broker::{
-    Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, IdentityDirectory,
-    InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    AuditSink, Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet,
+    IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints};
@@ -41,7 +41,7 @@ pub(crate) async fn configured_broker(
     policy: PolicyEngine,
     identities: IdentityDirectory,
     audit: Arc<InMemoryAuditLog>,
-) -> Broker<InMemoryAuditLog> {
+) -> Broker {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -55,7 +55,7 @@ pub(crate) async fn configured_broker(
         ConstraintCatalog::new([constraint_set("cli-probe.reverse")])
             .expect("one capability builds a catalog"),
         identities,
-        audit,
+        Arc::new(AuditSink::InMemory(audit)),
         BrokerLimits::default(),
     )
     .expect("the broker starts")

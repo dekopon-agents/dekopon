@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuditEvent, Broker, BrokerBuildError, BrokerLimits,
+    Attestation, AttestorGrant, AuditEvent, AuditSink, Broker, BrokerBuildError, BrokerLimits,
     CapabilityRoute, ChatMemoryConfig, ChatTransportKind, ConstraintCatalog, ConstraintSet,
     Conversation, ConversationKind, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
     RouteConflict,
@@ -198,7 +198,7 @@ fn local_claim(transport: &str, conversation: &str) -> Attestation {
     )
 }
 
-async fn smoke_memory_broker(root: &std::path::Path) -> Broker<InMemoryAuditLog> {
+async fn smoke_memory_broker(root: &std::path::Path) -> Broker {
     smoke_memory_broker_with(root, StorageLimits::default(), memory_config()).await
 }
 
@@ -206,7 +206,7 @@ async fn smoke_memory_broker_with(
     root: &std::path::Path,
     limits: StorageLimits,
     memory: ChatMemoryConfig,
-) -> Broker<InMemoryAuditLog> {
+) -> Broker {
     let storage = StorageHost::open(root, limits).expect("storage");
     let registry = BrokerProviderRegistry::load_with_storage(
         [std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -287,7 +287,9 @@ async fn smoke_memory_broker_with(
             "maintainer".parse().expect("principal"),
         )])
         .expect("directory"),
-        Arc::new(InMemoryAuditLog::new(64).expect("audit")),
+        Arc::new(AuditSink::InMemory(Arc::new(
+            InMemoryAuditLog::new(64).expect("audit"),
+        ))),
         BrokerLimits::default(),
     )
     .expect("broker")
@@ -305,7 +307,7 @@ fn local_delivery(sequence: u64) -> DeliveryIdentity {
     }
 }
 
-async fn record_marker(broker: &Broker<InMemoryAuditLog>, marker: &str, sequence: u64) {
+async fn record_marker(broker: &Broker, marker: &str, sequence: u64) {
     let id = format!("record-{sequence}")
         .parse::<InvocationId>()
         .expect("id");
@@ -331,7 +333,7 @@ async fn record_marker(broker: &Broker<InMemoryAuditLog>, marker: &str, sequence
     );
 }
 
-async fn recent_user(broker: &Broker<InMemoryAuditLog>, label: &str) -> serde_json::Value {
+async fn recent_user(broker: &Broker, label: &str) -> serde_json::Value {
     let claim = local_claim("local-dev", "real-session");
     let peer = gateway();
     let grant = attestor_grant();
@@ -792,7 +794,9 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
             "maintainer".parse().expect("principal"),
         )])
         .expect("identities"),
-        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
+        Arc::new(AuditSink::InMemory(Arc::new(
+            InMemoryAuditLog::new(32).expect("audit"),
+        ))),
         BrokerLimits::default(),
     )
     .expect("broker");
@@ -925,7 +929,9 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
         policy,
         constraints,
         IdentityDirectory::empty(),
-        Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+        Arc::new(AuditSink::InMemory(Arc::new(
+            InMemoryAuditLog::new(8).expect("audit"),
+        ))),
         BrokerLimits::default(),
     )
     .expect("broker without chat memory");
@@ -1021,7 +1027,9 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
                 "maintainer".parse().expect("principal"),
             )])
             .expect("identities"),
-            Arc::new(InMemoryAuditLog::new(32).expect("audit")),
+            Arc::new(AuditSink::InMemory(Arc::new(
+                InMemoryAuditLog::new(32).expect("audit"),
+            ))),
             BrokerLimits::default(),
         )
         .expect("broker");
@@ -1231,7 +1239,9 @@ async fn chat_memory_without_routes_names_every_missing_role() {
         PolicyEngine::new("", &world).expect("empty policy"),
         constraints,
         IdentityDirectory::empty(),
-        Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+        Arc::new(AuditSink::InMemory(Arc::new(
+            InMemoryAuditLog::new(8).expect("audit"),
+        ))),
         BrokerLimits::default(),
     )
     .expect("a deployment with no complete chat memory route still starts");
@@ -1326,7 +1336,9 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
         PolicyEngine::new("", &world).expect("empty policy"),
         constraints,
         IdentityDirectory::empty(),
-        Arc::new(InMemoryAuditLog::new(8).expect("audit")),
+        Arc::new(AuditSink::InMemory(Arc::new(
+            InMemoryAuditLog::new(8).expect("audit"),
+        ))),
         BrokerLimits::default(),
     )
     .expect_err("conflicting routes refuse startup");

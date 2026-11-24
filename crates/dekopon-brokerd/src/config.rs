@@ -1521,3 +1521,64 @@ mod secret_map_reference_tests {
         assert!(!dekopon_core::error_chain(&error).contains(sentinel));
     }
 }
+
+#[cfg(test)]
+mod decode_diagnostic_tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use super::*;
+
+    fn owner_only(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
+    }
+
+    async fn refusal(path: &Path, root: &Path) -> String {
+        let error = load_in(path, crate::socket::current_uid(), LoadMode::Check)
+            .await
+            .expect_err("malformed configuration");
+        dekopon_core::error_chain(&error).replace(&root.display().to_string(), "<dir>")
+    }
+
+    async fn single_file(contents: &str) -> String {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("brokerd.yaml");
+        owner_only(&path, contents);
+        refusal(&path, directory.path()).await
+    }
+
+    async fn directory(fragments: &[(&str, &str)]) -> String {
+        let directory = tempfile::tempdir().expect("temp dir");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("secure directory");
+        for (name, contents) in fragments {
+            owner_only(&directory.path().join(name), contents);
+        }
+        refusal(directory.path(), directory.path()).await
+    }
+
+    #[tokio::test]
+    async fn decode_refusals_keep_their_location_and_wording() {
+        let base = "apiVersion: dekopon.dev/brokerd/v1alpha1\nsocketPath: /run/broker.sock\n";
+        assert_eq!(
+            single_file(&format!("{base}strict: \"open\n")).await,
+            "broker configuration is not strict valid YAML/JSON: found unexpected end of stream \
+             at line 4 column 1, while scanning a quoted scalar at line 3 column 9"
+        );
+        assert_eq!(
+            single_file(&format!("{base}strict: maybe\n")).await,
+            "broker configuration is not strict valid YAML/JSON: strict: invalid type: string \
+             \"maybe\", expected a boolean at line 3 column 9"
+        );
+        assert_eq!(
+            directory(&[("00-base.yaml", base), ("10-bad.yaml", "strict: \"open\n")]).await,
+            "configuration fragment <dir>/10-bad.yaml is not strict valid YAML: found unexpected end \
+             of stream at line 2 column 1, while scanning a quoted scalar at line 1 column 9"
+        );
+        assert_eq!(
+            directory(&[("00-base.yaml", base), ("10-bad.yaml", "strict: maybe\n")]).await,
+            "broker configuration is not strict valid YAML/JSON: invalid type: string \"maybe\", \
+             expected a boolean"
+        );
+    }
+}

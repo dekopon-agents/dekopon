@@ -1369,8 +1369,8 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     use std::sync::Arc;
 
     use dekopon_broker::{
-        AuthenticatedContext, Broker, BrokerLimits, ConstraintCatalog, IdentityDirectory,
-        InMemoryAuditLog, PolicyEngine, PolicyWorld,
+        AuditSink, AuthenticatedContext, Broker, BrokerLimits, ConstraintCatalog,
+        IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
     };
     use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
     use dekopon_broker_protocol::ResponseEnvelope;
@@ -1429,7 +1429,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
             ),
         ])
         .expect("mappings build a directory"),
-        Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")),
+        Arc::new(AuditSink::InMemory(Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound")))),
         BrokerLimits::default(),
     )
     .expect("broker starts");

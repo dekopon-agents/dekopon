@@ -3,7 +3,7 @@ use dekopon_core::{Actor, PrincipalId};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-pub async fn broker(policies: &str) -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
+pub async fn broker(policies: &str) -> (Broker, Arc<InMemoryAuditLog>) {
     let principal = |name: &str| name.parse::<PrincipalId>().unwrap();
     let mappings = [
         (

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use dekopon_broker::{
-    Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerLimits,
+    Attestation, AttestorGrant, AuditEvent, AuditSink, AuthenticatedContext, Broker, BrokerLimits,
     CapabilityRoute, ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet,
     Conversation, ConversationKind, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
     PolicyEngine, PolicyWorld,
@@ -77,7 +77,7 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
     )
 }
 
-async fn broker() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
+async fn broker() -> (Broker, Arc<InMemoryAuditLog>) {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -102,7 +102,7 @@ async fn broker() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
         ConstraintCatalog::new([constraint_set()]).expect("one capability builds a catalog"),
         IdentityDirectory::new([(subject(MAPPED_SUBJECT), principal("cpetersen"))])
             .expect("one mapping builds a directory"),
-        Arc::clone(&audit),
+        Arc::new(AuditSink::InMemory(Arc::clone(&audit))),
         BrokerLimits::default(),
     )
     .expect("the broker starts");
