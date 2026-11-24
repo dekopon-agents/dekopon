@@ -859,8 +859,6 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
     assert_eq!(resolved.routes.len(), 1);
     assert_eq!(resolved.sessions.max_concurrent, 4);
     assert!(resolved.sessions.reply_on_busy);
-    assert_eq!(resolved.routes[0].limits.max_steps, 8);
-    assert_eq!(resolved.routes[0].limits.max_capability_calls, 16);
     assert_eq!(resolved.shutdown_grace, Duration::from_secs(120));
     assert_eq!(resolved.broker.server_uid, 501);
     assert!(resolved.telemetry.is_none());
@@ -869,6 +867,42 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
         resolved.routes[0].memory,
         MemoryPolicy::Persistent(_)
     ));
+}
+
+async fn route_without_limits() -> crate::routes::BoundRoute {
+    let directory = temporary();
+    let config = resolved(directory.path(), &document(directory.path())).await;
+    let table = RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap();
+    table.routes()[0].clone()
+}
+
+#[tokio::test]
+async fn a_route_without_limits_allows_one_hundred_steps() {
+    assert_eq!(route_without_limits().await.limits.max_steps, 100);
+}
+
+#[tokio::test]
+async fn a_route_without_limits_allows_two_hundred_fifty_six_capability_calls() {
+    assert_eq!(
+        route_without_limits().await.limits.max_capability_calls,
+        256
+    );
+}
+
+#[tokio::test]
+async fn a_route_without_limits_allows_five_and_a_half_minutes_per_script() {
+    assert_eq!(
+        route_without_limits().await.script_timeout,
+        Duration::from_secs(330)
+    );
+}
+
+#[tokio::test]
+async fn a_route_without_limits_allows_thirty_minutes_per_turn() {
+    assert_eq!(
+        route_without_limits().await.max_duration,
+        Some(Duration::from_secs(1800))
+    );
 }
 
 #[tokio::test]
@@ -1366,6 +1400,7 @@ fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
         api_key_env: api_key_env.map(ToOwned::to_owned),
         timeout_ms: 60_000,
         stream: true,
+        generation: None,
         classes: vec!["fast".to_owned()],
         modalities: Vec::new(),
     };
@@ -2434,6 +2469,33 @@ async fn github_and_whatsapp_share_one_listener_with_distinct_secrets() {
 }
 
 #[tokio::test]
+async fn a_wake_interval_can_be_shorter_than_the_default_script_timeout() {
+    let directory = temporary();
+    let mut config = document(directory.path());
+    config["routes"][0]["wakes"] = json!(true);
+    config["sessions"]["wakes"] = json!({"path": "wakes.jsonl", "minIntervalMs": 1000});
+    load(directory.path(), &config).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_wake_interval_shorter_than_an_explicit_script_timeout_is_refused() {
+    let directory = temporary();
+    let mut config = document(directory.path());
+    config["routes"][0]["wakes"] = json!(true);
+    config["routes"][0]["limits"] = json!({"scriptTimeoutMs": 330_000});
+    config["sessions"]["wakes"] = json!({"path": "wakes.jsonl", "minIntervalMs": 300_000});
+    let error = load(directory.path(), &config).await.unwrap_err();
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::WakeIntervalWithinScriptTimeout {
+            route: 0,
+            min_interval_ms: 300_000,
+            script_timeout_ms: 330_000
+        }
+    )));
+}
+
+#[tokio::test]
 async fn a_wake_store_interval_must_exceed_the_routed_script_timeout() {
     let directory = temporary();
     let mut config = document(directory.path());
@@ -2636,7 +2698,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
         ),
         (
             json!({"/sessions": {"wakes": {"path": "wakes.jsonl", "minIntervalMs": 1000}},
-            "/routes/0/wakes": true}),
+            "/routes/0/wakes": true, "/routes/0/limits": {"scriptTimeoutMs": 30_000}}),
             |problem| {
                 matches!(
                     problem,
@@ -4742,6 +4804,7 @@ fn model_config() -> ModelConfig {
         api_key_env: None,
         timeout_ms: 1_000,
         stream: true,
+        generation: None,
         classes: vec!["reasoning".to_owned()],
         modalities: Vec::new(),
     }
@@ -9514,7 +9577,7 @@ async fn losing_every_transport_ends_the_daemon_as_a_failure() {
     )
     .await;
 
-    assert_eq!(outcome, crate::ServeOutcome::TransportsLost);
+    assert!(matches!(outcome, crate::ServeOutcome::TransportsLost));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -9536,7 +9599,7 @@ async fn a_requested_shutdown_ends_the_daemon_successfully() {
     )
     .await;
 
-    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
+    assert!(matches!(outcome, crate::ServeOutcome::Shutdown));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -13926,6 +13989,87 @@ async fn telegram_photos_and_documents_are_routed_as_assets() {
     assert_eq!(document.assets[0].mime, "application/pdf");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_voice_audio_video_and_animation_become_assets() {
+    let cases: [(&str, &str, &str, &[u8]); 4] = [
+        (
+            "voice",
+            "Audio/Ogg; codecs=opus",
+            "audio/ogg",
+            include_bytes!("../tests/fixtures/media/cat-meow-opus.ogg"),
+        ),
+        (
+            "audio",
+            "audio/mp4",
+            "audio/mp4",
+            include_bytes!("../tests/fixtures/media/cat-meow.m4a"),
+        ),
+        (
+            "video",
+            "video/mp4",
+            "video/mp4",
+            include_bytes!("../tests/fixtures/media/cat-gallop.mp4"),
+        ),
+        (
+            "animation",
+            "image/gif",
+            "image/gif",
+            include_bytes!("../tests/fixtures/media/cat-gallop-animated.gif"),
+        ),
+    ];
+    let updates = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (field, raw, _, bytes))| {
+            let mut message = json!({
+                "message_id": 20 + index, "from": {"id": 16034700182_i64, "is_bot": false},
+                "chat": {"id": 4242, "type": "private"}
+            });
+            message[*field] = json!({"file_id": field, "mime_type": raw, "file_size": bytes.len()});
+            if *field == "animation" {
+                message["document"] =
+                    json!({"file_id":"duplicate", "mime_type":"application/octet-stream"});
+            }
+            json!({"update_id": 300 + index, "message": message})
+        })
+        .collect();
+    let handler = telegram_handler(updates);
+    let http = spawn_raw_http_mock(move |path| {
+        if path.starts_with("/file/") {
+            let field = path.rsplit('/').next().unwrap();
+            let (_, _, mime, bytes) = cases.iter().find(|(key, _, _, _)| *key == field).unwrap();
+            return (200, *mime, bytes.to_vec());
+        }
+        let body = if let Some(file_id) = path.split("file_id=").nth(1) {
+            json!({"ok":true, "result":{"file_path":format!("media/{file_id}")}})
+        } else {
+            handler(path, "")
+        };
+        (200, "application/json", serde_json::to_vec(&body).unwrap())
+    });
+    let mut transport = telegram(&http.base);
+    transport.connect().await.expect("telegram connects");
+    let fetcher = transport.asset_fetcher().unwrap();
+
+    for (field, _, mime, bytes) in cases {
+        let message = next_message(&mut transport).await;
+        let [asset] = message.assets.as_slice() else {
+            panic!("one {field} asset");
+        };
+        assert_eq!(asset.mime, mime);
+        assert_eq!(asset.size, Some(bytes.len() as u64));
+        let source = AssetSourceRef::Telegram {
+            file_id: field.to_owned(),
+        };
+        assert_eq!(asset.source, Some(source.clone()));
+        let fetched = fetcher
+            .fetch(&source, dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64)
+            .await
+            .expect("getFile and download return the fixture");
+        assert_eq!(fetched, bytes);
+    }
+}
+
 #[test]
 fn an_asset_note_numbers_what_the_model_cannot_fetch() {
     let pdf = PendingAsset {
@@ -13954,7 +14098,7 @@ fn an_asset_note_numbers_what_the_model_cannot_fetch() {
             vec![pending("clip.mp4", "video/mp4", 1024)],
             true,
             false,
-            &["clip.mp4", "chat-asset:"][..],
+            &["video (video/mp4, 1 KB)", "chat-asset:"][..],
             &["fetch_chat_asset"][..],
         ),
     ] {
@@ -14236,6 +14380,124 @@ async fn telegram_sends_a_png_or_declared_jpeg_as_a_photo_in_the_authenticated_t
             assert!(multipart.contains(expected), "{case}: {expected}");
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_selects_the_bot_api_method_and_multipart_field_for_each_media_label() {
+    let cases: [(&str, &str, &str, &str, &[u8]); 4] = [
+        (
+            "image/gif",
+            "sendAnimation",
+            "animation",
+            "gif",
+            include_bytes!("../tests/fixtures/media/cat-gallop-animated.gif"),
+        ),
+        (
+            "audio/ogg",
+            "sendVoice",
+            "voice",
+            "ogg",
+            include_bytes!("../tests/fixtures/media/cat-meow-opus.ogg"),
+        ),
+        (
+            "audio/mp4",
+            "sendAudio",
+            "audio",
+            "m4a",
+            include_bytes!("../tests/fixtures/media/cat-meow.m4a"),
+        ),
+        (
+            "video/mp4",
+            "sendVideo",
+            "video",
+            "mp4",
+            include_bytes!("../tests/fixtures/media/cat-gallop.mp4"),
+        ),
+    ];
+    for (label, method, field, extension, bytes) in cases {
+        let http = spawn_http_mock(move |path, _| {
+            assert!(path.ends_with(&format!("/{method}")));
+            let mut result = json!({"message_id":12, "message_thread_id":77, "chat":{"id":-1001}});
+            result[field] = json!({"file_id":"media"});
+            json!({"ok":true, "result":result})
+        });
+        let image = GeneratedImage::new(
+            dekopon_model::asset::DiskBlob::from_bytes(bytes).unwrap(),
+            label.to_owned(),
+            dekopon_broker_protocol::AssetEncoding::Identity,
+        );
+        telegram(&http.base)
+            .driver()
+            .reply(
+                &ReplyTarget::Telegram {
+                    chat_id: -1001,
+                    reply_to: Some(3),
+                    message_thread_id: Some(77),
+                },
+                OutboundReply::with_images("Cat media", vec![image]),
+            )
+            .await
+            .expect("Bot API accepted the attachment");
+        let calls = http.calls();
+        let [(path, multipart)] = calls.as_slice() else {
+            panic!("expected one Bot API call for {label}");
+        };
+        assert!(path.ends_with(&format!("/{method}")));
+        for expected in [
+            format!("name=\"{field}\""),
+            format!("filename=\"asset-1.{extension}\""),
+            format!("Content-Type: {label}"),
+            "name=\"reply_parameters\"".to_owned(),
+            "name=\"message_thread_id\"".to_owned(),
+            "Cat media".to_owned(),
+            String::from_utf8_lossy(bytes).into_owned(),
+        ] {
+            assert!(
+                multipart.contains(&expected),
+                "expected multipart part for {label}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_refuses_unsupported_media_with_the_supported_formats_before_calling_the_bot_api()
+{
+    use dekopon_agent::attachment::{AttachmentReference, MediaSendRefusal};
+    let http = spawn_http_mock(|_, _| panic!("no Bot API calls for refused media"));
+    let image = GeneratedImage::new(
+        dekopon_model::asset::DiskBlob::from_bytes(include_bytes!(
+            "../tests/fixtures/media/cat-gallop-animated.webp"
+        ))
+        .unwrap(),
+        "image/webp".into(),
+        dekopon_broker_protocol::AssetEncoding::Identity,
+    );
+    let error = telegram(&http.base)
+        .driver()
+        .reply(
+            &ReplyTarget::Telegram {
+                chat_id: 42,
+                reply_to: None,
+                message_thread_id: None,
+            },
+            OutboundReply::with_images("Cat media", vec![image]),
+        )
+        .await
+        .expect_err("Telegram refuses WebP");
+    assert!(matches!(
+        error,
+        TransportError::MediaSend(MediaSendRefusal::UnsupportedType {
+            asset: AttachmentReference::ReplyAttachment(1),
+            platform: "Telegram",
+            ..
+        }),
+    ));
+    assert_eq!(
+        error.to_string(),
+        "Telegram cannot send attachment 1 with this MIME type. Ask the user for a copy in one of these formats (image/png, image/jpeg, image/gif, audio/ogg, audio/mpeg, audio/mp4, video/mp4)."
+    );
+    assert!(http.calls().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -16806,14 +17068,6 @@ async fn an_unsupported_whatsapp_message_gets_one_refusal_only_when_routed() {
             json!({"id":"789", "mime_type":"application/msword", "caption":"read"}),
         ),
         (
-            "audio",
-            json!({"id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true}),
-        ),
-        (
-            "video",
-            json!({"id":"789", "mime_type":"video/mp4", "caption":"watch"}),
-        ),
-        (
             "sticker",
             json!({"id":"789", "mime_type":"image/webp", "animated":false}),
         ),
@@ -17142,7 +17396,10 @@ async fn photo_burst_serve_flushes_after_quiet_interval_with_one_lead_reply() {
         tokio::task::yield_now().await;
     }
     shutdown.send(()).unwrap();
-    assert_eq!(service.await.unwrap(), crate::ServeOutcome::Shutdown);
+    assert!(matches!(
+        service.await.unwrap(),
+        crate::ServeOutcome::Shutdown
+    ));
     assert_eq!(models.requests(), 1);
     assert_eq!(driver.replies(), ["One answer."]);
     let prompt = models
@@ -17585,7 +17842,7 @@ async fn fatal_transport_supervision_bounds_the_drain_of_a_parked_session() {
     )
     .await
     .expect("fatal exit cannot await a parked reply forever");
-    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
+    assert!(matches!(outcome, crate::ServeOutcome::Shutdown));
     assert!(matches!(
         terminal,
         Err(crate::GatewaydError::TransportConnect { .. })
@@ -17651,6 +17908,81 @@ async fn queued_mp4_delivers_on_empty_text_but_not_when_the_model_fails_before_r
             driver.image_bytes(),
             if fail { vec![vec![]] } else { vec![vec![10]] }
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn whatsapp_gif_and_webp_refusals_reach_the_agent_before_the_final_reply() {
+    use crate::transport::whatsapp::tests_media::{MediaPeer, accepted, admitted, message_webhook};
+    for (mime, bytes, refusal) in [
+        (
+            "image/gif",
+            &include_bytes!("../tests/fixtures/media/cat-gallop-animated.gif")[..],
+            "WhatsApp has no GIF type. Ask the user for an MP4 copy of chat-asset:1.",
+        ),
+        (
+            "image/webp",
+            &include_bytes!("../tests/fixtures/media/cat-gallop-animated.webp")[..],
+            "WhatsApp cannot send WebP replies. Ask the user for an MP4 copy of chat-asset:1.",
+        ),
+    ] {
+        let peer = MediaPeer::new(|_, index| {
+            assert_eq!(index, 0, "only the agent's text reply is posted");
+            accepted()
+        })
+        .await;
+        let (transport, message) = admitted(
+            &peer.origin,
+            &message_webhook("text", json!({"body":"Send the cat"})),
+        )
+        .await;
+        let directory = temporary();
+        let (broker, _observed) = stub_broker_assets(
+            directory.path(),
+            vec![
+                plain_response(probe_listing()),
+                plain_response(upper_proposal("create")),
+                asset_response(bytes, mime),
+                plain_response(upper_proposal("send")),
+                queued_response(1),
+            ],
+        )
+        .await;
+        let models = ModelScript::new([
+            script_call("probe upper --text create"),
+            script_call("probe upper --text send"),
+            answer("Please send an MP4 copy."),
+        ]);
+        let mut route = route(model_config());
+        route.transport = "wa".to_owned();
+        run_session(
+            runner(broker, Arc::clone(&models), 4),
+            route,
+            message,
+            transport.driver(),
+        )
+        .await;
+        assert!(
+            tool_message(&models, 2)
+                .lines()
+                .any(|line| line == format!("[gateway: chat-asset:1 was not queued: {refusal}]"))
+        );
+        {
+            let requests = peer.requests.lock();
+            let [request] = requests.as_slice() else {
+                panic!("only the text reply should reach WhatsApp");
+            };
+            assert_eq!(request.path, "/v25.0/456/messages");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["type"], "text");
+            assert_eq!(
+                body["text"]["body"]
+                    .as_str()
+                    .and_then(|text| text.lines().next()),
+                Some("Please send an MP4 copy.")
+            );
+        }
+        peer.finish().await;
     }
 }
 
@@ -17782,6 +18114,8 @@ mod participants;
 mod pull_request_links;
 #[path = "tests/reload_evidence.rs"]
 mod reload_evidence;
+#[path = "tests/reload_watch.rs"]
+mod reload_watch;
 #[path = "tests/reply_attachments.rs"]
 mod reply_attachments;
 #[path = "tests/sealed_handoff.rs"]
@@ -23763,6 +24097,9 @@ async fn a_journal_initializes_follow_state_before_the_first_route_is_enabled() 
         crate::follow::FollowTicket::Active { .. }
     ));
 }
+
+#[path = "tests/grant_holds.rs"]
+mod grant_holds;
 
 #[path = "tests/thread_budget.rs"]
 mod thread_budget;

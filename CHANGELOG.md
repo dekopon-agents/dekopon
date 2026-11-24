@@ -7,6 +7,41 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.95.0] - 2026-11-23
+
+### Added
+
+- Broker check logs phase timings at INFO and reports them in JSON.
+- Broker check accepts --download-concurrency to bound provider fetches.
+- Broker check accepts --provider-verification relaxed to check pinned artifact availability.
+- `dekopon-brokerd check --materialized` validates local secret files and fails when a check is skipped.
+
+### Changed
+
+- Raise default route and model output limits for longer tasks.
+
+## [dekopon-chart-0.82.0] - 2026-11-23
+
+### Changed
+
+- Chart 0.82.0 targets core v0.95.0 and renders the `v0.95.0` image tag.
+
+## [0.94.0] - 2026-11-22
+
+### Added
+
+- provider SDK enables clap suggestions so a mistyped flag gets a tip.
+
+### Fixed
+
+- A panicked configuration reload task now stops the gateway or broker with a non-zero exit that names the cause, instead of the gateway serving on without reloads.
+
+## [dekopon-chart-0.81.0] - 2026-11-22
+
+### Changed
+
+- Chart 0.81.0 targets core v0.94.0 and renders the `v0.94.0` image tag.
+
 ## [0.93.0] - 2026-11-22
 
 ### Added

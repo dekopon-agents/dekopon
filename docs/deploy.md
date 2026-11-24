@@ -1,9 +1,7 @@
 # Deploy
 
-Kubernetes is the preferred deployment. The Mac path serves people moving from OpenClaw or Hermes.
-Both run `dekopon-brokerd`, holding policy and provider credentials, and `dekopon-gatewayd`, holding
-chat and model credentials, joined by one Unix socket. Write policy as the [authorization
-example](authorization.md#example) does, including its request `forbid`.
+Kubernetes is preferred. The Mac path serves people moving from OpenClaw or Hermes.
+Use the [policy example](authorization.md#example) and its request `forbid`.
 
 ## Shapes
 
@@ -16,6 +14,17 @@ example](authorization.md#example) does, including its request `forbid`.
 Nothing listens on a network port unless you configure a `githubWebhook` or `whatsappCloudApi`
 transport or the model proxy.
 
+## Route and model limits
+
+A route defaults to 100 model steps and 256 capability calls per turn. The script timeout is
+330,000 ms (5 minutes 30 seconds) and the turn deadline is 1,800,000 ms (30 minutes). OpenRouter and
+OpenAI-compatible models default `generation.maxOutputTokens` to 32,768.
+For each limit, raise for wiggle room, lower to tighten the leash.
+
+For hosted OpenAI reasoning models, set `generation.tokenParam: maxCompletionTokens`. The default
+`maxTokens` uses the field Ollama accepts. For wake checks to fit between polls, set a shorter
+explicit script timeout.
+
 ## Files
 
 Each daemon [refuses](../crates/dekopon-core/src/trusted_file.rs) a symlink, a second hard link,
@@ -23,9 +32,7 @@ or a file another UID owns (on a read-only mount the gateway also takes root's f
 projection). Configuration and policy must not be group- or world-writable;
 the secret map, credential files and `--env-file` must be `0600`. Directories above the socket,
 providers and storage must not be group- or world-writable unless sticky, and above `--env-file`
-and `--log-file` must belong to root or the daemon. `dekopon-brokerd check` skips credential files
-and an unreadable secret map: the map's owner and mode fail at start, a `secureFile`'s at first use. macOS refuses a socket
-path of 104 bytes or more.
+and `--log-file` must belong to root or the daemon. macOS refuses a socket path of 104 bytes or more.
 
 ## Kubernetes
 
@@ -34,11 +41,8 @@ helm upgrade --install dekopon oci://ghcr.io/dekopon-agents/charts/dekopon \
   -n dekopon --create-namespace -f my-values.yaml
 ```
 
-[`values.yaml`](../charts/dekopon/values.yaml) is the reference. The defaults start a broker with
-nothing to run; a chat deployment sets `gateway.enabled` and supplies policy, configuration, a
-catalog and credentials, as [`examples/conditional-write`](../examples/conditional-write/) does.
-
-What the values don't make obvious:
+For chat, enable the gateway in [`values.yaml`](../charts/dekopon/values.yaml) and supply the files
+and credentials shown in [`examples/conditional-write`](../examples/conditional-write/).
 
 - **The broker must map the gateway.** The gateway runs as UID 65533 and the broker as 65532. With
   `broker.configDirectory.peers` the chart renders that mapping, with the gateway's `attestor`
@@ -70,9 +74,6 @@ What the values don't make obvious:
   Deployment is one replica with `Recreate`. After a deliberate re-login, set
   `gateway.chatgpt.reseed: true` for one roll. A broker credential of this kind (`broker.chatgpt`)
   needs a second login with `--auth-file`: two holders of one token family eventually revoke it.
-
-The chart runs `ghcr.io/dekopon-agents/dekopon`: both daemons and the console, distroless, with a
-`-wasmtime-optimization` tag for the memory-optimized Wasmtime.
 
 ## Mac
 
@@ -149,7 +150,8 @@ administrator:
 Upgrade both daemons together from one release; their protocol has no cross-release negotiation.
 
 1. Run the new release's `dekopon-brokerd check` and `dekopon-gatewayd check` on the configuration
-   each will serve; start nothing until both pass.
+   each will serve. For a broker tree with its credential files mounted or copied into place,
+   pass `--materialized` to the broker check. Start both daemons after the checks pass.
 2. Stop the gateway, then the broker.
 3. Replace both binaries; with a managed provider set, run the new broker's `provider precompile`.
 4. Start the broker, wait for its `probe`, then start the gateway.

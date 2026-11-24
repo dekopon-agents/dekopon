@@ -1218,7 +1218,7 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
                 "system",
                 concat!(
                     "Answer in one short sentence. You have no authority of your own.\n\n",
-                    "[gateway: 4 steps and 4 capability calls per message.]"
+                    "[gateway: 4 steps, 4 capability calls and 30 minutes per message.]"
                 )
             ),
             ("system", FIDELITY_NOTICE),
@@ -1285,7 +1285,7 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
                 "system".to_owned(),
                 concat!(
                     "Answer in one short sentence. You have no authority of your own.\n\n",
-                    "[gateway: 4 steps and 4 capability calls per message.]"
+                    "[gateway: 4 steps, 4 capability calls and 30 minutes per message.]"
                 )
                 .to_owned(),
             ),

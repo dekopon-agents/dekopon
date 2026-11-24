@@ -439,11 +439,13 @@ async fn media_errors_are_bounded_and_name_the_failed_check() {
 
 #[tokio::test]
 async fn image_upload_is_multipart_and_only_message_acceptance_is_delivery() {
+    let png = &include_bytes!("../../../tests/fixtures/media/cat-two-kittens-1914.png")[..];
+    let jpeg = &include_bytes!("../../../tests/fixtures/media/cat-black-kitten-nala.jpg")[..];
     for (caption, label, bytes, filename) in [
-        (String::new(), "image/png", PNG, "asset-1.png"),
-        ("🟣".repeat(1024), "image/png", PNG, "asset-1.png"),
-        ("🟣".repeat(1025), "image/png", PNG, "asset-1.png"),
-        (String::new(), "image/jpeg", JPEG, "asset-1.jpg"),
+        (String::new(), "image/png", png, "asset-1.png"),
+        ("🟣".repeat(1024), "image/png", png, "asset-1.png"),
+        ("🟣".repeat(1025), "image/png", png, "asset-1.png"),
+        (String::new(), "image/jpeg", jpeg, "asset-1.jpg"),
     ] {
         let peer = MediaPeer::new(|_, index| {
             if index == 0 {
@@ -592,8 +594,111 @@ async fn identity_and_base64_outputs_at_the_decoded_ceiling_upload_identical_byt
     }
 }
 
+const VOICE: &[u8] = include_bytes!("../../../tests/fixtures/media/cat-meow-opus.ogg");
+const AUDIO: &[u8] = include_bytes!("../../../tests/fixtures/media/cat-meow.m4a");
+const VIDEO: &[u8] = include_bytes!("../../../tests/fixtures/media/cat-gallop.mp4");
+
+fn attachment(label: &str, bytes: &[u8]) -> GeneratedImage {
+    GeneratedImage::new(
+        dekopon_model::asset::DiskBlob::from_bytes(bytes).unwrap(),
+        label.to_owned(),
+        dekopon_broker_protocol::AssetEncoding::Identity,
+    )
+}
+
 #[tokio::test]
-async fn oversized_images_and_mp4_refuse_before_any_whatsapp_upload_or_text() {
+async fn whatsapp_audio_and_video_upload_and_send_with_their_message_kind() {
+    for (label, bytes, filename, kind) in [
+        ("audio/ogg", VOICE, "asset-1.ogg", "audio"),
+        ("audio/mp4", AUDIO, "asset-1.m4a", "audio"),
+        ("video/mp4", VIDEO, "asset-1.mp4", "video"),
+    ] {
+        let peer = MediaPeer::new(|_, index| match index {
+            0 => json_reply(json!({"id":"987"})),
+            1 | 2 => accepted(),
+            _ => panic!("no extra request"),
+        })
+        .await;
+        driver(&peer.origin)
+            .reply(
+                &target(),
+                OutboundReply::with_images("Cat media", vec![attachment(label, bytes)]),
+            )
+            .await
+            .expect("upload and message accepted");
+        {
+            let requests = peer.requests.lock();
+            assert_eq!(requests[0].path, "/v25.0/456/media");
+            let upload = String::from_utf8_lossy(&requests[0].body);
+            assert!(upload.contains(&format!("filename=\"{filename}\"")));
+            assert!(upload.contains(&format!("Content-Type: {label}")));
+            assert!(
+                requests[0]
+                    .body
+                    .windows(bytes.len())
+                    .any(|part| part == bytes)
+            );
+            assert_eq!(requests[1].path, "/v25.0/456/messages");
+            let sent: Value = serde_json::from_slice(&requests[1].body).unwrap();
+            assert_eq!(sent["type"], kind);
+            assert_eq!(sent[kind]["id"], "987");
+            if kind == "audio" {
+                assert_eq!(requests.len(), 3);
+                assert!(sent[kind].get("caption").is_none());
+                assert_eq!(requests[2].path, "/v25.0/456/messages");
+                let text: Value = serde_json::from_slice(&requests[2].body).unwrap();
+                assert_eq!(text["text"]["body"], "Cat media");
+            } else {
+                assert_eq!(requests.len(), 2);
+                assert_eq!(sent[kind]["caption"], "Cat media");
+            }
+        }
+        peer.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn whatsapp_gif_and_either_webp_shape_refuse_before_any_requests() {
+    use dekopon_agent::attachment::{AttachmentReference, MediaSendRefusal};
+    let asset = AttachmentReference::ReplyAttachment(1);
+    for (label, bytes, reason, expected) in [
+        (
+            "image/gif",
+            &include_bytes!("../../../tests/fixtures/media/cat-gallop-animated.gif")[..],
+            MediaSendRefusal::WhatsappGif { asset },
+            "WhatsApp has no GIF type. Ask the user for an MP4 copy of attachment 1.",
+        ),
+        (
+            "image/webp",
+            &include_bytes!("../../../tests/fixtures/media/cat-gallop-animated.webp")[..],
+            MediaSendRefusal::WhatsappWebp { asset },
+            "WhatsApp cannot send WebP replies. Ask the user for an MP4 copy of attachment 1.",
+        ),
+        (
+            "image/webp",
+            &include_bytes!("../../../tests/fixtures/media/cat-siamese-still.webp")[..],
+            MediaSendRefusal::WhatsappWebp { asset },
+            "WhatsApp cannot send WebP replies. Ask the user for an MP4 copy of attachment 1.",
+        ),
+    ] {
+        let peer = MediaPeer::new(|_, _| panic!("preflight sends nothing")).await;
+        let error = driver(&peer.origin)
+            .reply(
+                &target(),
+                OutboundReply::with_images("Cat media", vec![attachment(label, bytes)]),
+            )
+            .await
+            .expect_err("unsupported media refused");
+        assert!(matches!(&error, TransportError::MediaSend(actual) if actual == &reason));
+        assert_eq!(error.to_string(), expected);
+        assert!(peer.requests.lock().is_empty());
+        peer.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn oversized_whatsapp_media_names_the_cap_before_any_upload_or_text() {
+    use dekopon_agent::attachment::{AttachmentReference, MediaSendRefusal};
     use dekopon_broker_protocol::AssetEncoding;
     let mut bytes = PNG.to_vec();
     bytes.resize(media::MAX_IMAGE_BYTES + 1, 0);
@@ -609,29 +714,42 @@ async fn oversized_images_and_mp4_refuse_before_any_whatsapp_upload_or_text() {
             )
             .await
             .expect_err("too large");
-        assert!(
-            matches!(error, TransportError::Service { ref code } if code == "image-too-large"),
-            "{error:?}"
-        );
+        assert!(matches!(
+            error,
+            TransportError::MediaSend(MediaSendRefusal::WhatsappSize {
+                asset: AttachmentReference::ReplyAttachment(2),
+                megabytes: 5,
+                ..
+            })
+        ));
         assert!(peer.requests.lock().is_empty());
         peer.finish().await;
     }
 
-    {
-        let peer = MediaPeer::new(|_, _| panic!("MP4 must not reach Meta")).await;
-        let image = GeneratedImage::new(
-            dekopon_model::asset::DiskBlob::from_bytes(b"mp4\0frames").unwrap(),
-            "video/mp4".into(),
-            dekopon_broker_protocol::AssetEncoding::Identity,
-        );
-        let error = driver(&peer.origin)
-            .reply(&target(), OutboundReply::with_images("clip", vec![image]))
-            .await
-            .expect_err("photo-only adapter refuses MP4");
-        assert!(matches!(error, TransportError::AssetType { .. }));
-        assert!(peer.requests.lock().is_empty());
-        peer.finish().await;
-    }
+    let peer = MediaPeer::new(|_, _| panic!("oversized MP4 must not reach the peer")).await;
+    let mut bytes = VIDEO.to_vec();
+    bytes.resize(16_000_001, 0);
+    let error = driver(&peer.origin)
+        .reply(
+            &target(),
+            OutboundReply::with_images("clip", vec![attachment("video/mp4", &bytes)]),
+        )
+        .await
+        .expect_err("video over the 16 MB cap");
+    assert!(matches!(
+        error,
+        TransportError::MediaSend(MediaSendRefusal::WhatsappSize {
+            asset: AttachmentReference::ReplyAttachment(1),
+            megabytes: 16,
+            ..
+        })
+    ));
+    assert_eq!(
+        error.to_string(),
+        "WhatsApp caps audio and video at 16 MB. Ask the user for a smaller copy of attachment 1."
+    );
+    assert!(peer.requests.lock().is_empty());
+    peer.finish().await;
 }
 
 pub(crate) async fn admitted_photo(
@@ -946,11 +1064,6 @@ async fn an_unsigned_or_group_document_enqueues_nothing() {
 #[tokio::test]
 async fn an_unhandled_message_kind_or_refused_image_is_marked_for_refusal_and_never_fetched() {
     for (kind, body) in [
-        (
-            "audio",
-            json!({"id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true}),
-        ),
-        ("video", json!({"id":"789", "mime_type":"video/mp4"})),
         (
             "sticker",
             json!({"id":"789", "mime_type":"image/webp", "animated":false}),

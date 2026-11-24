@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;
 use thiserror::Error;
 
-use crate::wire::Field;
+use crate::{model::DEFAULT_MAX_OUTPUT_TOKENS, wire::Field};
 
 #[derive(Clone, Debug, Default)]
 pub struct Settings {
@@ -18,6 +18,15 @@ pub struct Generation {
     pub max_output_tokens: Option<NonZeroU32>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+}
+
+impl Generation {
+    #[must_use]
+    pub fn output_limit(generation: Option<&Self>) -> NonZeroU32 {
+        generation
+            .and_then(|settings| settings.max_output_tokens)
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -95,10 +104,10 @@ struct Provider<'a> {
 impl Settings {
     pub fn request_fields(&self) -> Result<Vec<(Field, String)>, serde_json::Error> {
         let generation = self.generation.as_ref();
-        let mut fields = Vec::new();
-        if let Some(value) = generation.and_then(|settings| settings.max_output_tokens) {
-            fields.push((Field::MaxTokens, serde_json::to_string(&value)?));
-        }
+        let mut fields = vec![(
+            Field::MaxTokens,
+            serde_json::to_string(&Generation::output_limit(generation))?,
+        )];
         if let Some(value) = generation.and_then(|settings| settings.temperature) {
             fields.push((Field::Temperature, serde_json::to_string(&value)?));
         }

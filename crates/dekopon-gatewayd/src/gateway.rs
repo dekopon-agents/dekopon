@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    convert::Infallible,
     future::Future,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -30,10 +31,13 @@ use crate::{
     via_label, wake,
 };
 
+mod reload;
+
 pub(crate) struct Gateway {
     runner: Arc<SessionRunner>,
     active: Arc<ArcSwap<ServingGeneration>>,
     reload: Option<ReloadState>,
+    reloading: JoinSet<GatewaydError>,
     identities: Arc<BTreeMap<String, TransportIdentity>>,
     drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
 }
@@ -251,9 +255,19 @@ impl Gateway {
             runner,
             active: generation.0,
             reload: None,
+            reloading: JoinSet::new(),
             identities,
             drivers,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_reload<T>(mut self, task: T) -> Self
+    where
+        T: Future<Output = GatewaydError> + Send + 'static,
+    {
+        self.reloading.spawn(task);
+        self
     }
 
     #[cfg(test)]
@@ -388,9 +402,9 @@ impl Gateway {
         F: Future<Output = ()> + Send,
     {
         let mut sessions = JoinSet::new();
-        let mut reloading = JoinSet::new();
+        let mut reloading = std::mem::take(&mut self.reloading);
         if let Some(reload) = self.reload.take() {
-            reloading.spawn(reload.run());
+            reloading.spawn(async move { match reload.run().await {} });
         }
         let mut follow_pending = follow::Debounce::default();
         let mut ticks = JoinSet::new();
@@ -412,6 +426,10 @@ impl Gateway {
             tokio::select! {
                 biased;
                 () = &mut shutdown => break,
+                ended = reload::reload_ended(&mut reloading) => {
+                    outcome = ended;
+                    break;
+                },
                 () = async {
                     match wake_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -553,7 +571,11 @@ impl Gateway {
             }
         }
 
-        reloading.shutdown().await;
+        if let Some(ended) = reload::drain_bounded(grace, &mut reloading).await
+            && outcome.is_clean()
+        {
+            outcome = ended;
+        }
         drop(notices);
         collector.shutdown();
         drop(follow_pending);
@@ -1178,6 +1200,7 @@ fn reload_reason(problem: &GatewaydError) -> &'static str {
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
+        | GatewaydError::ReloadTask(_)
         | GatewaydError::Problems { .. } => "preparation",
     }
 }
@@ -1237,6 +1260,7 @@ pub(crate) fn reload_problem(problem: &GatewaydError) -> String {
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
+        | GatewaydError::ReloadTask(_)
         | GatewaydError::Problems { .. } => error_chain(problem),
     }
 }
@@ -1264,13 +1288,14 @@ fn reload_entries(problem: &GatewaydError) -> Vec<(&'static str, String)> {
         | GatewaydError::CacheKeySecret(_)
         | GatewaydError::WakeStore(_)
         | GatewaydError::Proxy(_)
+        | GatewaydError::ReloadTask(_)
         | GatewaydError::Probe(_)
         | GatewaydError::Problems { .. } => vec![(reload_reason(problem), reload_problem(problem))],
     }
 }
 
 impl ReloadState {
-    async fn run(mut self) {
+    async fn run(mut self) -> Infallible {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.reset();

@@ -27,4 +27,5 @@ routes:
   - transport: support-whatsapp
     conversation: { kind: [directMessage] }
     agent: image-editor
+    # To size route and model limits, see https://github.com/dekopon-agents/dekopon/blob/main/docs/deploy.md#route-and-model-limits
     # A handle-aware image provider attaches; a separately granted asset.send delivers PNG/JPEG.

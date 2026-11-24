@@ -199,7 +199,7 @@ async fn append_freezes_attachment_slots_only_for_enabled_inbound_kinds() {
                     (1, 1, AssetKind::Image, Some(3)),
                     (2, 2, AssetKind::TextDocument, Some(3)),
                     (4, 3, AssetKind::BinaryDocument, Some(3)),
-                    (5, 4, AssetKind::Other, Some(3))
+                    (5, 4, AssetKind::Video, Some(3))
                 ]
             );
             let records = journal_records(&journal_path(dir.path(), &stem));

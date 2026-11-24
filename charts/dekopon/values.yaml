@@ -359,6 +359,8 @@ gateway:
   # transport, a model endpoint, and an agent catalog, and the chart can invent none of them.
   enabled: false
 
+  # Size route limits and generation.maxOutputTokens for the work.
+  # See https://github.com/dekopon-agents/dekopon/blob/main/docs/deploy.md#route-and-model-limits
   config:
     inline: ""
     existingSecret: ""

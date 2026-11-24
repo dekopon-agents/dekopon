@@ -136,6 +136,36 @@ async fn signed_jwt_boot_reports_invalid_ttl_audience_and_private_key_together()
 }
 
 #[tokio::test]
+async fn materialized_check_validates_persona_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = secret_map(directory.path(), 300, "https://alpha.example.test", 0o640).await;
+    let uid = rustix::process::geteuid().as_raw();
+
+    super::load_shapes(&path, uid, None).await.unwrap();
+    let mut material_problems = Vec::new();
+    super::load_shapes(&path, uid, Some(&mut material_problems))
+        .await
+        .unwrap();
+
+    assert_eq!(material_problems.len(), 2);
+    for (problem, persona) in material_problems.iter().zip([PERSONA, SECOND_PERSONA]) {
+        let SecretMapError::SignedJwtValidation { jwt_problems, .. } = problem else {
+            panic!("expected typed signedJwt conflicts: {problem}");
+        };
+        assert!(matches!(
+            jwt_problems.as_slice(),
+            [super::SignedJwtProblem {
+                secret,
+                source: SignedJwtConfigError::KeyRead(FileHygieneError::InsecureMode {
+                    tier: FileTier::Private,
+                    ..
+                }),
+            }] if secret.as_str() == persona
+        ));
+    }
+}
+
+#[tokio::test]
 async fn duplicate_personas_report_every_signed_jwt_conflict() {
     let directory = tempfile::tempdir().unwrap();
     let path = secret_map(directory.path(), 301, "", 0o600).await;
