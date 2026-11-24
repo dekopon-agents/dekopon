@@ -27,6 +27,7 @@ mod secrets;
 mod self_reload;
 mod server;
 mod socket;
+mod token_issuer;
 mod workflows;
 
 use std::{

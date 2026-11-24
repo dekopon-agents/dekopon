@@ -1413,6 +1413,8 @@ pub struct BrokerProviderRegistry {
     routes: BTreeMap<CapabilityId, usize>,
     storage_host: Option<StorageHost>,
     assets: Option<dekopon_http_host::asset::AssetDirectory>,
+    #[cfg(feature = "native-test")]
+    test_imports: Option<TestImports>,
     compiled_cache: CompiledCacheCounts,
 }
 
@@ -1609,6 +1611,8 @@ impl BrokerProviderRegistry {
                 routes,
                 storage_host,
                 assets: None,
+                #[cfg(feature = "native-test")]
+                test_imports: None,
                 compiled_cache,
             })
         }
@@ -1841,6 +1845,19 @@ impl BrokerProviderRegistry {
         .await
     }
 
+    #[cfg(feature = "native-test")]
+    #[must_use]
+    pub fn with_test_http_transport(
+        mut self,
+        transport: dekopon_http_host::test_transport::Transport,
+    ) -> Self {
+        self.test_imports = Some(TestImports {
+            http_transport: Some(transport),
+            ..TestImports::default()
+        });
+        self
+    }
+
     pub async fn invoke_with_storage(
         &self,
         authorized: AuthorizedInvocation,
@@ -1849,6 +1866,10 @@ impl BrokerProviderRegistry {
         invocation: HttpInvocation,
         assets: asset::AssetInputs,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
+        #[cfg(feature = "native-test")]
+        let test_imports = self.test_imports.as_ref();
+        #[cfg(not(feature = "native-test"))]
+        let test_imports = None;
         self.invoke_authorized(
             authorized,
             credential,
@@ -1856,7 +1877,7 @@ impl BrokerProviderRegistry {
             invocation.slots,
             invocation.authorizer,
             assets,
-            None,
+            test_imports,
         )
         .await
     }

@@ -50,6 +50,12 @@ enum Value {
 }
 
 impl Fields {
+    pub fn values(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().map(|(_, value)| match value {
+            Value::Str(text) | Value::Formatted(text) => text.as_str(),
+        })
+    }
+
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
         self.0
