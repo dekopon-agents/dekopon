@@ -154,3 +154,9 @@ impl Projection {
         }
     }
 }
+
+#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+pub fn mount_owner(path: &Path, expected_uid: u32) -> Result<u32, ProjectionError> {
+    let _owner = (path, expected_uid);
+    todo!("skeleton: daemon/durable-replace")
+}
