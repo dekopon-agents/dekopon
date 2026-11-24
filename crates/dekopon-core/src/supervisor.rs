@@ -23,21 +23,6 @@ impl SupervisorError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ChildName(&'static str);
-
-impl ChildName {
-    #[must_use]
-    pub const fn new(name: &'static str) -> Self {
-        Self(name)
-    }
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        self.0
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OnShutdown {
     AbortAfterGrace,
@@ -70,24 +55,20 @@ impl Shutdown {
 
 #[derive(Debug)]
 #[must_use]
-pub struct ChildExit<E> {
-    pub child: ChildName,
+pub struct ChildExit<K, E> {
+    pub child: K,
     pub outcome: TaskOutcome<E>,
 }
 
-// Owner: the daemon's run loop; bound: `max_children`, one task per child and no restarts (a
-// child that recovers, like a transport reader, does it inside its own future); no queue;
-// shutdown: `shutdown` signals every child, aborts the AbortAfterGrace ones still running after
-// `abortable` and the Finish ones still running at `hard_stop`.
 #[derive(Debug)]
-pub struct Supervisor<E> {
+pub struct Supervisor<K, E> {
     children: JoinSet<Result<(), E>>,
-    names: HashMap<Id, (ChildName, OnShutdown, AbortHandle)>,
+    names: HashMap<Id, (K, OnShutdown, AbortHandle)>,
     shutdown: watch::Sender<bool>,
     max_children: NonZeroUsize,
 }
 
-impl<E: Send + 'static> Supervisor<E> {
+impl<K: Copy + Send + 'static, E: Send + 'static> Supervisor<K, E> {
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     #[must_use]
     pub fn new(max_children: NonZeroUsize) -> Self {
@@ -98,7 +79,7 @@ impl<E: Send + 'static> Supervisor<E> {
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     pub fn add<F, Fut>(
         &mut self,
-        name: ChildName,
+        child_key: K,
         on_shutdown: OnShutdown,
         child: F,
     ) -> Result<(), SupervisorError>
@@ -109,7 +90,7 @@ impl<E: Send + 'static> Supervisor<E> {
         let _registration = (
             &mut self.children,
             self.max_children,
-            name,
+            child_key,
             on_shutdown,
             child,
         );
@@ -117,13 +98,13 @@ impl<E: Send + 'static> Supervisor<E> {
     }
 
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
-    pub async fn run(&mut self) -> ChildExit<E> {
+    pub async fn run(&mut self) -> ChildExit<K, E> {
         let _children = (&mut self.children, &mut self.names);
         todo!("skeleton: daemon/supervisor")
     }
 
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
-    pub async fn shutdown(self, grace: ShutdownGrace) -> Vec<ChildExit<E>> {
+    pub async fn shutdown(self, grace: ShutdownGrace) -> Vec<ChildExit<K, E>> {
         let _shutdown = (self.shutdown, self.children, self.names, grace);
         todo!("skeleton: daemon/supervisor")
     }
@@ -190,7 +171,7 @@ mod tests {
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     #[test]
     #[ignore = "skeleton: daemon/supervisor"]
-    fn an_aborted_child_exit_keeps_its_name() {
+    fn an_aborted_child_exit_keeps_its_key() {
         todo!("skeleton: daemon/supervisor")
     }
 }

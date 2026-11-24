@@ -70,9 +70,7 @@ pub use subject::{
     SubjectScope,
 };
 #[cfg(feature = "tokio-task")]
-pub use supervisor::{
-    ChildExit, ChildName, OnShutdown, Shutdown, ShutdownGrace, Supervisor, SupervisorError,
-};
+pub use supervisor::{ChildExit, OnShutdown, Shutdown, ShutdownGrace, Supervisor, SupervisorError};
 pub use task::{TaskOutcome, install_panic_hook};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]

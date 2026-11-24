@@ -250,6 +250,16 @@ fn mount_owner(path: &Path, file: &fs::File, expected_uid: u32) -> Result<u32, F
     todo!("skeleton: daemon/durable-replace")
 }
 
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/durable-replace wires it into mount_owner"
+)]
+#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+const fn permitted_owner(observed: u32, read_only: bool, expected_uid: u32) -> Option<u32> {
+    let _rule = (observed, read_only, expected_uid);
+    todo!()
+}
+
 fn read_bounded(
     path: &Path,
     reader: impl Read,
