@@ -1024,10 +1024,11 @@ fn save_credentials(path: &Path, credentials: &ChatGptCredentials) -> Result<(),
             source,
         })?;
     bytes.push(b'\n');
-    private_file::replace_private_file(path, &bytes).map_err(|error| ChatGptError::WriteAuth {
-        path: error.path,
-        source: error.source,
-    })
+    private_file::replace_private_file(path, private_file::PrivateFileContents::Bytes(&bytes))
+        .map_err(|error| ChatGptError::WriteAuth {
+            path: error.path,
+            source: error.source,
+        })
 }
 
 // Sweeping other writers' plaintext is safe because refreshes lock and logins are human-paced.
@@ -2531,7 +2532,7 @@ mod tests {
     fn saving_sweeps_abandoned_credential_temporaries() {
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("auth.json");
-        let abandoned = temp.path().join("auth.tmp-424242");
+        let abandoned = temp.path().join("auth.json.tmp-424242");
         let unrelated = temp.path().join("other-client.tmp-424242");
         fs::write(&abandoned, "abandoned credential").expect("write abandoned fixture");
         fs::write(&unrelated, "untouched").expect("write unrelated fixture");
@@ -2560,7 +2561,7 @@ mod tests {
     fn logout_removes_abandoned_credential_temporaries_too() {
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("auth.json");
-        let abandoned = temp.path().join("auth.tmp-424242");
+        let abandoned = temp.path().join("auth.json.tmp-424242");
         let unrelated = temp.path().join("other-client.json");
         save_credentials(&path, &credential_fixture("acct-test", "refresh-secret", 0))
             .expect("save credentials");

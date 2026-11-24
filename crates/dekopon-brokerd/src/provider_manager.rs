@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Write as _},
+    io::{self},
     os::unix::fs::{
         DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     },
@@ -17,7 +17,12 @@ use dekopon_broker_host::{
 };
 use dekopon_core::{
     AncestorOwners, AncestorPolicy, FileHygieneError, FileTier, ProviderId,
-    check_trusted_ancestors, check_trusted_metadata, offload, read_trusted_file,
+    check_trusted_ancestors, check_trusted_metadata, offload,
+    private_file::{
+        PrivateFileContents, PrivateFilePublication, TemporarySweep, replace_private_file,
+        sweep_stale_temporaries, sync_directory,
+    },
+    read_trusted_file,
 };
 use futures_util::StreamExt as _;
 use http_auth::parser::ChallengeParser;
@@ -28,7 +33,6 @@ use reqwest::{
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::Instrument as _;
@@ -1746,17 +1750,7 @@ impl ProviderStore {
                 .await?;
             return Ok(false);
         }
-        self.ensure_capacity(descriptor.size)?;
-        let temporary = tempfile::Builder::new()
-            .prefix(".provider-")
-            .tempfile_in(&self.sha256)
-            .map_err(|source| {
-                ProviderManagerError::io_at(
-                    "could not create provider blob temporary file",
-                    &self.sha256,
-                    source,
-                )
-            })?;
+        let temporary = self.prepare_blob(&destination, descriptor)?;
         let std_file = temporary.reopen().map_err(|source| {
             ProviderManagerError::io_at(
                 "could not create provider blob temporary file",
@@ -1771,21 +1765,63 @@ impl ProviderStore {
         file.flush()
             .await
             .map_err(|source| ProviderManagerError::io("could not write provider blob", source))?;
-        file.sync_all().await.map_err(|source| {
-            ProviderManagerError::io("could not synchronize provider blob", source)
-        })?;
         drop(file);
-        temporary.persist_noclobber(&destination).map_err(|error| {
+        self.publish_blob(&temporary, &destination)?;
+        Ok(true)
+    }
+
+    fn prepare_blob(
+        &self,
+        destination: &Path,
+        descriptor: &LayerDescriptor,
+    ) -> Result<tempfile::NamedTempFile, ProviderManagerError> {
+        for outcome in sweep_stale_temporaries(destination, None) {
+            match outcome {
+                TemporarySweep::Removed { .. } => (),
+                TemporarySweep::Failed { path, source } => {
+                    return Err(ProviderManagerError::io_at(
+                        "could not remove provider blob temporary file",
+                        path,
+                        source,
+                    ));
+                }
+            }
+        }
+        self.ensure_capacity(descriptor.size)?;
+        tempfile::Builder::new()
+            .prefix(&format!("{}.wasm.tmp-", digest_hex(&descriptor.digest)?))
+            .tempfile_in(&self.sha256)
+            .map_err(|source| {
+                ProviderManagerError::io_at(
+                    "could not create provider blob temporary file",
+                    &self.sha256,
+                    source,
+                )
+            })
+    }
+
+    fn publish_blob(
+        &self,
+        temporary: &tempfile::NamedTempFile,
+        destination: &Path,
+    ) -> Result<(), ProviderManagerError> {
+        replace_private_file(
+            destination,
+            PrivateFileContents::Prepared {
+                file: temporary.as_file(),
+                temporary: temporary.path(),
+                publication: PrivateFilePublication::NoClobber,
+            },
+        )
+        .map_err(|error| {
             ProviderManagerError::io_at(
                 "could not atomically publish provider blob",
-                destination.clone(),
-                error.error,
+                error.path,
+                error.source,
             )
         })?;
-        sync_directory(&self.sha256)?;
-        socket::validate_owned_file(&destination, self.uid)
-            .map_err(|error| ProviderManagerError::file_security(&destination, error))?;
-        Ok(true)
+        socket::validate_owned_file(destination, self.uid)
+            .map_err(|error| ProviderManagerError::file_security(destination, error))
     }
 
     fn ensure_capacity(&self, requested: u64) -> Result<(), ProviderManagerError> {
@@ -2074,7 +2110,13 @@ fn ensure_private_directory(path: &Path, expected_uid: u32) -> Result<(), Provid
                 }
             }
             validate_directory(path, expected_uid, true)?;
-            sync_directory(parent)
+            sync_directory(parent).map_err(|source| {
+                ProviderManagerError::io_at(
+                    "could not synchronize provider directory",
+                    parent,
+                    source,
+                )
+            })
         }
         Err(source) => Err(ProviderManagerError::io_at(
             INSPECT_STORE_PATH,
@@ -2090,43 +2132,25 @@ fn atomic_write(path: &Path, bytes: &[u8], expected_uid: u32) -> Result<(), Prov
     if let Ok(metadata) = fs::symlink_metadata(&path) {
         validate_file_metadata(&metadata, &path, expected_uid, false)?;
     }
-    let parent = path.parent().ok_or_else(|| {
-        ProviderManagerError::config_detail(PATH_HAS_NO_PARENT, path.display().to_string())
-    })?;
-    let mut temporary = NamedTempFile::new_in(parent).map_err(|source| {
-        ProviderManagerError::io_at(
-            "could not create provider-lock temporary file",
-            parent,
-            source,
-        )
-    })?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|source| ProviderManagerError::io(WRITE_LOCK_TEMPORARY, source))?;
-    temporary
-        .write_all(bytes)
-        .map_err(|source| ProviderManagerError::io(WRITE_LOCK_TEMPORARY, source))?;
-    temporary.as_file_mut().sync_all().map_err(|source| {
-        ProviderManagerError::io("could not synchronize provider-lock temporary file", source)
-    })?;
-    temporary.persist(&path).map_err(|error| {
+    for outcome in sweep_stale_temporaries(&path, None) {
+        match outcome {
+            TemporarySweep::Removed { .. } => (),
+            TemporarySweep::Failed { path, source } => {
+                return Err(ProviderManagerError::io_at(
+                    "could not remove provider-lock temporary file",
+                    path,
+                    source,
+                ));
+            }
+        }
+    }
+    replace_private_file(&path, PrivateFileContents::Bytes(bytes)).map_err(|error| {
         ProviderManagerError::io_at(
             "could not atomically publish provider lock",
-            path.clone(),
-            error.error,
+            error.path,
+            error.source,
         )
-    })?;
-    sync_directory(parent)?;
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<(), ProviderManagerError> {
-    fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| {
-            ProviderManagerError::io_at("could not synchronize provider directory", path, source)
-        })
+    })
 }
 
 async fn bounded_response_bytes(
@@ -2269,7 +2293,6 @@ const READ_PROVIDER_STATE: &str = "could not read provider state";
 const INSPECT_STORE_PATH: &str = "could not inspect provider store path";
 const SCAN_STORE_DIRECTORY: &str = "could not inspect provider store directory";
 const LOCK_STORE_OPERATION: &str = "could not lock provider store operation";
-const WRITE_LOCK_TEMPORARY: &str = "could not write provider-lock temporary file";
 const STATE_TOO_LARGE: &str = "provider state exceeds its hard byte ceiling";
 const COMPONENT_SIZE: &str = "provider component size is outside its hard bounds";
 const INVALID_DIGEST: &str =
@@ -4000,6 +4023,77 @@ providers:
             store.ensure_capacity(1),
             Err(ProviderManagerError::StoreFull { .. })
         ));
+    }
+
+    #[test]
+    fn a_provider_lock_named_like_a_temporary_survives_interrupted_replacement_and_retries() {
+        let directory = tempfile::tempdir().expect("lock fixture");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory
+            .path()
+            .join(format!("providers.tmp-{}", std::process::id()));
+        let _operation = lock_activation(&path, socket::current_uid()).unwrap();
+        atomic_write(&path, b"old lock", socket::current_uid()).unwrap();
+        let temporary = dekopon_core::private_file::temporary_path(&path);
+        fs::write(&temporary, b"partial lock").unwrap();
+        fs::File::open(&temporary).unwrap().sync_all().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"old lock");
+
+        atomic_write(&path, b"new lock", socket::current_uid()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new lock");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn provider_blob_publication_is_private_no_clobber_and_retries_abandoned_staging() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().expect("store fixture");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let store =
+            ProviderStore::open(&directory.path().join("store"), socket::current_uid(), true)
+                .unwrap();
+        let _operation = store.lock().unwrap();
+        let descriptor = LayerDescriptor {
+            digest: format!("sha256:{}", "a".repeat(64)),
+            size: 8,
+        };
+        let destination = store.blob_path(&descriptor.digest).unwrap();
+        let mut original = store.prepare_blob(&destination, &descriptor).unwrap();
+        original.write_all(b"old blob").unwrap();
+        store.publish_blob(&original, &destination).unwrap();
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+
+        let mut interrupted = store.prepare_blob(&destination, &descriptor).unwrap();
+        interrupted.write_all(b"partial").unwrap();
+        interrupted.as_file().sync_all().unwrap();
+        let stale = interrupted.into_temp_path().keep().unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"old blob");
+        let mut retry = store.prepare_blob(&destination, &descriptor).unwrap();
+        assert!(!stale.exists());
+        retry.write_all(b"new blob").unwrap();
+        let error = store.publish_blob(&retry, &destination).unwrap_err();
+        assert!(
+            matches!(error, ProviderManagerError::Io { source, .. } if source.kind() == io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"old blob");
+        assert!(retry.path().exists());
+
+        fs::remove_file(&destination).unwrap();
+        store.publish_blob(&retry, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new blob");
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(!retry.path().exists());
     }
 
     #[test]

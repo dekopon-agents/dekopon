@@ -557,7 +557,10 @@ async fn save_bytes(path: &Path, lock: PrivateFileLock, bytes: Vec<u8>) -> Resul
         drop(dekopon_core::private_file::sweep_stale_temporaries(
             &path, None,
         ));
-        dekopon_core::private_file::replace_private_file(&path, &bytes)
+        dekopon_core::private_file::replace_private_file(
+            &path,
+            dekopon_core::private_file::PrivateFileContents::Bytes(&bytes),
+        )
     })
     .await
     .map_err(|_source| SourceError::Internal)?;

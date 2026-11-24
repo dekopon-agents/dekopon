@@ -1,4 +1,7 @@
 use super::*;
+use dekopon_core::private_file::{
+    PrivateFileContents, PrivateFilePublication, replace_private_file,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
@@ -237,11 +240,7 @@ impl Retention {
                 Err(error) => return Err(error.into()),
             }
         }
-        match fs::remove_file(dir.join("index.pending")) {
-            Ok(()) => (),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
-        }
+        Self::clear_index_temporary(dir)?;
         store.persist()?;
         Ok(store)
     }
@@ -264,19 +263,39 @@ impl Retention {
         Ok(digest.0.finalize().into())
     }
 
+    fn clear_index_temporary(dir: &Path) -> Result<(), BlobError> {
+        let pending = dir.join("index.pending");
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&pending)
+        {
+            Ok(file) => {
+                if file.metadata()?.uid() != crate::current_uid() {
+                    return Err(BlobError::Io(io::ErrorKind::PermissionDenied));
+                }
+                fs::remove_file(pending)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     fn persist(&mut self) -> Result<(), BlobError> {
         if let Some(dir) = &self.dir {
             let digest = self.index_digest()?;
             if self.persisted == Some(digest) {
                 return Ok(());
             }
+            Self::clear_index_temporary(dir)?;
+            let temporary = dir.join("index.pending");
             let mut file = OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .custom_flags(libc::O_NOFOLLOW)
                 .mode(0o600)
-                .open(dir.join("index.pending"))?;
+                .open(&temporary)?;
             if file.metadata()?.uid() != crate::current_uid() {
                 return Err(BlobError::Io(io::ErrorKind::PermissionDenied));
             }
@@ -284,9 +303,15 @@ impl Retention {
             serde_json::to_writer(&mut file, &self.index).map_err(|error| {
                 BlobError::Io(error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData))
             })?;
-            file.sync_all()?;
-            fs::rename(dir.join("index.pending"), dir.join("index.json"))?;
-            File::open(dir)?.sync_all()?;
+            replace_private_file(
+                &dir.join("index.json"),
+                PrivateFileContents::Prepared {
+                    file: &file,
+                    temporary: &temporary,
+                    publication: PrivateFilePublication::Replace,
+                },
+            )
+            .map_err(|error| error.source)?;
             self.persisted = Some(digest);
         }
         Ok(())
@@ -910,5 +935,49 @@ impl Drop for Publication {
         self.range
             .end
             .fetch_min(self.access.next_asset_id(), Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_index_replacement_preserves_the_old_index_until_publication_and_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut retention = Retention::open(directory.path(), 8).unwrap();
+        let path = directory.path().join("index.json");
+        let before = fs::read(&path).unwrap();
+        let temporary = directory.path().join("index.pending");
+        fs::write(&temporary, b"partial index").unwrap();
+        fs::File::open(&temporary).unwrap().sync_all().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        retention.persisted = None;
+        retention.persist().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn an_index_temporary_symlink_is_refused_without_touching_either_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut retention = Retention::open(directory.path(), 8).unwrap();
+        let path = directory.path().join("index.json");
+        let before = fs::read(&path).unwrap();
+        let target = directory.path().join("unrelated");
+        fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, directory.path().join("index.pending")).unwrap();
+        retention.persisted = None;
+        assert_eq!(
+            retention.persist(),
+            Err(BlobError::Io(io::ErrorKind::FilesystemLoop))
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(&target).unwrap(), b"untouched");
     }
 }

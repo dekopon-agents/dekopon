@@ -1015,7 +1015,11 @@ fn write(path: &Path, wakes: &[Wake]) -> Result<(), WakeStoreError> {
         serde_json::to_writer(&mut bytes, &Line::from(wake)).map_err(io::Error::from)?;
         bytes.push(b'\n');
     }
-    replace_private_file(path, &bytes).map_err(|error| error.source.into())
+    replace_private_file(
+        path,
+        dekopon_core::private_file::PrivateFileContents::Bytes(&bytes),
+    )
+    .map_err(|error| error.source.into())
 }
 
 #[cfg(test)]

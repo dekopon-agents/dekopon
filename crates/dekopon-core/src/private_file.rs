@@ -76,57 +76,112 @@ pub fn lock_path(path: &Path) -> Option<PathBuf> {
     Some(path.with_file_name(lock_name))
 }
 
-pub fn temporary_path(path: &Path) -> PathBuf {
-    path.with_extension(format!("tmp-{}", std::process::id()))
+#[derive(Clone, Copy, Debug)]
+pub enum PrivateFilePublication {
+    Replace,
+    NoClobber,
 }
 
-pub fn replace_private_file(path: &Path, bytes: &[u8]) -> Result<(), PrivateFileError> {
-    let parent = path.parent().ok_or_else(|| PrivateFileError {
-        path: path.to_path_buf(),
+#[derive(Debug)]
+pub enum PrivateFileContents<'a> {
+    Bytes(&'a [u8]),
+    Prepared {
+        file: &'a File,
+        temporary: &'a Path,
+        publication: PrivateFilePublication,
+    },
+}
+
+pub fn temporary_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".tmp-{}", std::process::id()));
+    PathBuf::from(name)
+}
+
+pub fn replace_private_file(
+    path: &Path,
+    contents: PrivateFileContents<'_>,
+) -> Result<(), PrivateFileError> {
+    match contents {
+        PrivateFileContents::Bytes(bytes) => {
+            let temporary = temporary_path(path);
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            set_private_file_mode(&mut options);
+            let mut file = options
+                .open(&temporary)
+                .map_err(|source| PrivateFileError {
+                    path: temporary.clone(),
+                    source,
+                })?;
+            let result = file
+                .write_all(bytes)
+                .map_err(|source| PrivateFileError {
+                    path: temporary.clone(),
+                    source,
+                })
+                .and_then(|()| {
+                    publish_private_file(&file, &temporary, path, PrivateFilePublication::Replace)
+                });
+            if result.is_err() {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "discard cleanup's result to preserve the original error; this call owns the successfully created temporary"
+                )]
+                let _ = fs::remove_file(&temporary);
+            }
+            result
+        }
+        PrivateFileContents::Prepared {
+            file,
+            temporary,
+            publication,
+        } => publish_private_file(file, temporary, path, publication),
+    }
+}
+
+fn publish_private_file(
+    file: &File,
+    temporary: &Path,
+    destination: &Path,
+    publication: PrivateFilePublication,
+) -> Result<(), PrivateFileError> {
+    let parent = destination.parent().ok_or_else(|| PrivateFileError {
+        path: destination.to_path_buf(),
         source: io::Error::from(io::ErrorKind::InvalidInput),
     })?;
-    let temporary = temporary_path(path);
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    set_private_file_mode(&mut options);
-    let result = (|| {
-        let mut file = options
-            .open(&temporary)
-            .map_err(|source| PrivateFileError {
-                path: temporary.clone(),
-                source,
-            })?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|source| PrivateFileError {
-                path: temporary.clone(),
-                source,
-            })?;
-        replace_file(&temporary, path).map_err(|source| PrivateFileError {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        // Without the directory sync, a power failure can lose the rename despite the file sync.
-        sync_directory(parent).map_err(|source| PrivateFileError {
-            path: parent.to_path_buf(),
-            source,
-        })
-    })();
-    if result.is_err() {
-        #[expect(
-            clippy::let_underscore_must_use,
-            reason = "discard cleanup's result to return the original write error instead of replacing it with a temporary removal error"
-        )]
-        let _ = fs::remove_file(&temporary);
+    if temporary == destination || temporary.parent() != Some(parent) {
+        return Err(PrivateFileError {
+            path: temporary.to_path_buf(),
+            source: io::Error::from(io::ErrorKind::InvalidInput),
+        });
     }
-    result
+    file.sync_all().map_err(|source| PrivateFileError {
+        path: temporary.to_path_buf(),
+        source,
+    })?;
+    match publication {
+        PrivateFilePublication::Replace => fs::rename(temporary, destination),
+        PrivateFilePublication::NoClobber => {
+            fs::hard_link(temporary, destination).and_then(|()| fs::remove_file(temporary))
+        }
+    }
+    .map_err(|source| PrivateFileError {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    // Without the directory sync, a power failure can lose publication despite the file sync.
+    sync_directory(parent).map_err(|source| PrivateFileError {
+        path: parent.to_path_buf(),
+        source,
+    })
 }
 
 pub fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) -> Vec<TemporarySweep> {
-    let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) else {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Vec::new();
     };
-    let mut prefix = OsString::from(stem);
+    let mut prefix = OsString::from(name);
     prefix.push(".tmp-");
     let Some(prefix) = prefix.to_str() else {
         return Vec::new();
@@ -137,7 +192,7 @@ pub fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) -> Vec<Temporar
     let mut results = Vec::new();
     for entry in entries.flatten() {
         let stale = entry.path();
-        if Some(stale.as_path()) == keep {
+        if stale == path || Some(stale.as_path()) == keep {
             continue;
         }
         let Some(name) = stale.file_name().and_then(|name| name.to_str()) else {
@@ -157,7 +212,7 @@ pub fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) -> Vec<Temporar
     results
 }
 
-fn sync_directory(parent: &Path) -> io::Result<()> {
+pub fn sync_directory(parent: &Path) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
@@ -166,17 +221,16 @@ fn set_private_file_mode(options: &mut OpenOptions) {
     options.mode(0o600);
 }
 
-fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(temporary, destination)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt as _, sync::mpsc, thread, time::Duration};
 
     use tempfile::TempDir;
 
-    use super::{PrivateFileLock, TemporarySweep, replace_private_file, sweep_stale_temporaries};
+    use super::{
+        PrivateFileContents, PrivateFileLock, TemporarySweep, replace_private_file,
+        sweep_stale_temporaries, temporary_path,
+    };
 
     #[test]
     fn two_handles_to_one_lock_file_exclude_each_other() {
@@ -205,7 +259,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("record.json");
         fs::write(&path, b"old").unwrap();
-        replace_private_file(&path, b"new").unwrap();
+        replace_private_file(&path, PrivateFileContents::Bytes(b"new")).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -215,10 +269,61 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_create_does_not_unlink_another_writers_temporary() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("record.json");
+        let temporary = temporary_path(&path);
+        fs::write(&path, b"old").unwrap();
+        fs::write(&temporary, b"another writer").unwrap();
+        let error = replace_private_file(&path, PrivateFileContents::Bytes(b"new")).unwrap_err();
+        assert_eq!(error.source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert_eq!(fs::read(&temporary).unwrap(), b"another writer");
+    }
+
+    #[test]
+    fn a_sweep_matches_the_complete_filename_and_preserves_the_destination() {
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join(format!("providers.tmp-{}", std::process::id()));
+        let unrelated = dir.path().join("providers.other.tmp-123");
+        let temporary = temporary_path(&path);
+        fs::write(&path, b"old").unwrap();
+        fs::write(&unrelated, b"unrelated").unwrap();
+        fs::write(&temporary, b"partial").unwrap();
+        let events = sweep_stale_temporaries(&path, None);
+        assert!(
+            matches!(events.as_slice(), [TemporarySweep::Removed { path }] if path == &temporary)
+        );
+        assert_eq!(fs::read(path).unwrap(), b"old");
+        assert_eq!(fs::read(unrelated).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn a_prepared_destination_cannot_be_its_own_temporary() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("record");
+        fs::write(&path, b"old").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let error = replace_private_file(
+            &path,
+            PrivateFileContents::Prepared {
+                file: &file,
+                temporary: &path,
+                publication: super::PrivateFilePublication::Replace,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.source.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(path).unwrap(), b"old");
+    }
+
+    #[test]
     fn a_sweep_reports_a_removed_temporary() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("record.json");
-        let stale = dir.path().join("record.tmp-123");
+        let stale = dir.path().join("record.json.tmp-123");
         fs::write(&stale, b"old").unwrap();
         let events = sweep_stale_temporaries(&path, None);
         assert!(matches!(events.as_slice(), [TemporarySweep::Removed { path }] if path == &stale));
@@ -229,7 +334,7 @@ mod tests {
     fn a_sweep_preserves_the_keep_path() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("record.json");
-        let keep = dir.path().join("record.tmp-123");
+        let keep = dir.path().join("record.json.tmp-123");
         fs::write(&keep, b"still here").unwrap();
         assert!(sweep_stale_temporaries(&path, Some(&keep)).is_empty());
         assert_eq!(fs::read(keep).unwrap(), b"still here");

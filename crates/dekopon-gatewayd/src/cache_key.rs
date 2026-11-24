@@ -1,11 +1,16 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, Read as _, Write as _},
-    os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
+    fs::{self},
+    io::{self, Read as _},
+    os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
 };
 
-use dekopon_core::AgentId;
+use dekopon_core::{
+    AgentId,
+    private_file::{
+        PrivateFileContents, TemporarySweep, replace_private_file, sweep_stale_temporaries,
+    },
+};
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::{Sha256, digest::Update};
 use thiserror::Error;
@@ -130,20 +135,13 @@ fn read(path: &Path) -> Result<[u8; SECRET_BYTES], Reset> {
 }
 
 fn write(path: &Path, bytes: &[u8; SECRET_BYTES]) -> io::Result<()> {
-    let staging = path.with_extension("secret.tmp");
-    if let Err(error) = fs::remove_file(&staging)
-        && error.kind() != io::ErrorKind::NotFound
-    {
-        return Err(error);
+    for outcome in sweep_stale_temporaries(path, None) {
+        match outcome {
+            TemporarySweep::Removed { .. } => (),
+            TemporarySweep::Failed { source, .. } => return Err(source),
+        }
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&staging)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&staging, path)
+    replace_private_file(path, PrivateFileContents::Bytes(bytes)).map_err(|error| error.source)
 }
 
 pub(crate) fn absorb(digest: &mut impl Update, part: &[u8]) {
@@ -157,4 +155,31 @@ fn finish(prefix: &str, mac: Hmac<Sha256>) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     format!("{prefix}-{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+    use dekopon_core::private_file::temporary_path;
+
+    #[test]
+    fn a_cache_key_replacement_preserves_the_old_secret_until_publication_and_retries() {
+        let directory = crate::tests::temporary();
+        let path = directory.path().join(SECRET_FILE);
+        write(&path, &[1; SECRET_BYTES]).unwrap();
+        let temporary = temporary_path(&path);
+        fs::write(&temporary, b"partial secret").unwrap();
+        fs::File::open(&temporary).unwrap().sync_all().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), [1; SECRET_BYTES]);
+
+        write(&path, &[2; SECRET_BYTES]).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), [2; SECRET_BYTES]);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(!temporary.exists());
+    }
 }
