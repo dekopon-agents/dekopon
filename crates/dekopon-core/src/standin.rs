@@ -138,6 +138,26 @@ fn deserialize_causes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<
 
 struct RejectExcess(&'static str);
 
+#[cfg(unix)]
+impl<K: Ord + Serialize + de::DeserializeOwned> Streaks<K> {
+    #[expect(clippy::todo, reason = "skeleton: daemon/standin-streak")]
+    pub fn restore(file: &crate::DurableFile) -> Result<Self, crate::DaemonError> {
+        let _file = file;
+        todo!("skeleton: daemon/standin-streak")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/standin-streak")]
+    pub fn persist(&self, file: &mut crate::DurableFile) -> Result<(), crate::DaemonError> {
+        let _persist = (&self.active, file);
+        todo!("skeleton: daemon/standin-streak")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/standin-streak")]
+    pub fn reset(&mut self) {
+        todo!("skeleton: daemon/standin-streak")
+    }
+}
+
 impl<'de> de::DeserializeSeed<'de> for RejectExcess {
     type Value = ();
 
@@ -310,5 +330,33 @@ mod tests {
         let causes = std::iter::repeat_n("timeout", 1_000).inspect(|_| causes_read += 1);
         assert!(deserialize_causes(SeqDeserializer::<_, Error>::new(causes)).is_err());
         assert_eq!(causes_read, MAX_CAUSES + 1);
+    }
+
+    #[test]
+    #[ignore = "skeleton: daemon/standin-streak"]
+    #[expect(clippy::todo, reason = "skeleton: daemon/standin-streak")]
+    fn a_failed_persist_keeps_the_previous_record() {
+        todo!("skeleton: daemon/standin-streak")
+    }
+
+    #[test]
+    #[ignore = "skeleton: daemon/standin-streak"]
+    #[expect(clippy::todo, reason = "skeleton: daemon/standin-streak")]
+    fn a_reset_clears_every_streak_without_a_recovery() {
+        todo!("skeleton: daemon/standin-streak")
+    }
+
+    #[test]
+    #[ignore = "skeleton: daemon/standin-streak"]
+    #[expect(clippy::todo, reason = "skeleton: daemon/standin-streak")]
+    fn a_persisted_record_over_either_cap_is_refused_on_restore() {
+        todo!("skeleton: daemon/standin-streak")
+    }
+
+    #[test]
+    #[ignore = "skeleton: daemon/standin-streak"]
+    #[expect(clippy::todo, reason = "skeleton: daemon/standin-streak")]
+    fn a_restored_record_continues_the_streak_without_a_second_notice() {
+        todo!("skeleton: daemon/standin-streak")
     }
 }

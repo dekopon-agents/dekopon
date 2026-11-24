@@ -230,6 +230,16 @@ pub fn read_trusted_file(
     read_bounded(path, file, metadata.len(), max_bytes)
 }
 
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/durable-replace wires it into read_trusted_file"
+)]
+#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+pub(crate) fn open_error(path: &Path, source: std::io::Error) -> FileHygieneError {
+    let _open = (path, source);
+    todo!("skeleton: daemon/durable-replace")
+}
+
 fn read_bounded(
     path: &Path,
     reader: impl Read,
@@ -533,5 +543,12 @@ mod tests {
             read_bounded(&path, &b"12345678"[..], 4, 8).unwrap(),
             b"12345678"
         );
+    }
+
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    fn a_projected_symlink_is_refused_as_not_regular() {
+        todo!("skeleton: daemon/durable-replace")
     }
 }

@@ -19,7 +19,10 @@ mod attribute;
 mod backoff;
 #[cfg(feature = "cli")]
 mod cli_error;
+mod daemon;
 mod diagnostics;
+#[cfg(unix)]
+mod durable;
 #[cfg(unix)]
 pub mod env_file;
 mod failure;
@@ -34,6 +37,8 @@ mod skill;
 mod space;
 pub mod standin;
 mod subject;
+#[cfg(feature = "tokio-task")]
+mod supervisor;
 mod task;
 mod trace;
 #[cfg(unix)]
@@ -50,7 +55,10 @@ pub use attribute::{BoundedDisplay, MAX_ATTRIBUTE_BYTES, bounded_attribute, boun
 pub use backoff::Backoff;
 #[cfg(feature = "cli")]
 pub use cli_error::render_cli_error;
+pub use daemon::DaemonError;
 pub use diagnostics::{MAX_PROBLEM_BYTES, MAX_RENDERED_PROBLEMS, bounded_problems, error_chain};
+#[cfg(unix)]
+pub use durable::DurableFile;
 pub use failure::{MAX_FAILURE_CODE_BYTES, MAX_FAILURE_MESSAGE_BYTES, ProviderFailureDetail};
 #[cfg(feature = "offload-tracing")]
 pub use offload::OffloadTrace;
@@ -67,6 +75,8 @@ pub use subject::{
     AttestedSubject, Namespace, PrincipalKind, Subject, SubjectError, SubjectField, SubjectKind,
     SubjectScope,
 };
+#[cfg(feature = "tokio-task")]
+pub use supervisor::{ChildExit, ChildName, RestartPolicy, Shutdown, Supervisor};
 pub use task::{TaskOutcome, install_panic_hook};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
