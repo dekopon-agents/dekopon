@@ -341,7 +341,7 @@ async fn a_refresh_replaces_the_record_and_the_next_resolution_reuses_it() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("record.json");
     expired(&path);
-    let stale = dir.path().join("record.tmp-123");
+    let stale = dir.path().join("record.json.tmp-123");
     fs::write(&stale, b"abandoned-private-record").unwrap();
     let api = TokenApi::serving(|_| success());
     let resolver = resolver(&path, &api.endpoint, &["one"]);

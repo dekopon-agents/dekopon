@@ -2129,7 +2129,7 @@ mod tests {
         ]);
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("auth.json");
-        let stale = path.with_extension("tmp-0");
+        let stale = temp.path().join("auth.json.tmp-0");
         fs::write(&stale, "abandoned synthetic credential").unwrap();
         let endpoint = format!("{}/login-prefix", server.base_url());
         let mut child = Command::new(std::env::current_exe().unwrap())
