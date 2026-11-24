@@ -435,10 +435,3 @@ fn instructions_file_is_read_through_a_config_map_symlink() {
         Some("Review carefully.")
     );
 }
-
-#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
-#[test]
-#[ignore = "skeleton: daemon/durable-replace"]
-fn a_root_owned_file_counts_as_owned_only_on_a_read_only_mount() {
-    todo!("skeleton: daemon/durable-replace")
-}

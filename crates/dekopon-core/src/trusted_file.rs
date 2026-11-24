@@ -235,6 +235,21 @@ pub fn read_trusted_file(
     read_bounded(path, file, metadata.len(), max_bytes)
 }
 
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/durable-replace wires it into read_trusted_file"
+)]
+#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+fn mount_owner(path: &Path, file: &fs::File, expected_uid: u32) -> Result<u32, FileHygieneError> {
+    let _owner = (
+        path,
+        file,
+        expected_uid,
+        rustix::fs::StatVfsMountFlags::RDONLY,
+    );
+    todo!("skeleton: daemon/durable-replace")
+}
+
 fn read_bounded(
     path: &Path,
     reader: impl Read,
@@ -544,6 +559,13 @@ mod tests {
     #[ignore = "skeleton: daemon/durable-replace"]
     #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
     fn a_mount_scoped_read_does_not_assert_the_mode() {
+        todo!("skeleton: daemon/durable-replace")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    fn a_root_owned_file_counts_as_owned_only_on_a_read_only_mount() {
         todo!("skeleton: daemon/durable-replace")
     }
 }

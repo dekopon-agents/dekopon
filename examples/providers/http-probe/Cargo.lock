@@ -137,6 +137,7 @@ name = "dekopon-core"
 version = "0.96.0"
 dependencies = [
  "libc",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml_ng",

@@ -1,7 +1,10 @@
-use std::{future::Future, num::NonZeroUsize, time::Duration};
+use std::{collections::HashMap, future::Future, num::NonZeroUsize, time::Duration};
 
 use thiserror::Error;
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    sync::watch,
+    task::{Id, JoinSet},
+};
 
 use crate::TaskOutcome;
 
@@ -41,6 +44,12 @@ pub enum OnShutdown {
     Finish,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ShutdownGrace {
+    pub abortable: Duration,
+    pub hard_stop: Duration,
+}
+
 #[derive(Clone, Debug)]
 pub struct Shutdown(watch::Receiver<bool>);
 
@@ -68,11 +77,12 @@ pub struct ChildExit<E> {
 
 // Owner: the daemon's run loop; bound: `max_children`, one task per child and no restarts (a
 // child that recovers, like a transport reader, does it inside its own future); no queue;
-// shutdown: `shutdown` signals every child, joins them for the grace, aborts the AbortAfterGrace
-// ones still running and keeps joining the Finish ones.
+// shutdown: `shutdown` signals every child, aborts the AbortAfterGrace ones still running after
+// `abortable` and the Finish ones still running at `hard_stop`.
 #[derive(Debug)]
 pub struct Supervisor<E> {
-    children: JoinSet<(ChildExit<E>, OnShutdown)>,
+    children: JoinSet<Result<(), E>>,
+    names: HashMap<Id, (ChildName, OnShutdown)>,
     shutdown: watch::Sender<bool>,
     max_children: NonZeroUsize,
 }
@@ -108,13 +118,13 @@ impl<E: Send + 'static> Supervisor<E> {
 
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     pub async fn run(&mut self) -> ChildExit<E> {
-        let _children = &mut self.children;
+        let _children = (&mut self.children, &mut self.names);
         todo!("skeleton: daemon/supervisor")
     }
 
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
-    pub async fn shutdown(self, grace: Duration) -> Vec<ChildExit<E>> {
-        let _shutdown = (self.shutdown, self.children, grace);
+    pub async fn shutdown(self, grace: ShutdownGrace) -> Vec<ChildExit<E>> {
+        let _shutdown = (self.shutdown, self.children, self.names, grace);
         todo!("skeleton: daemon/supervisor")
     }
 }
@@ -167,6 +177,20 @@ mod tests {
     #[test]
     #[ignore = "skeleton: daemon/supervisor"]
     fn a_child_that_returns_ok_ends_run_as_completed() {
+        todo!("skeleton: daemon/supervisor")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
+    #[test]
+    #[ignore = "skeleton: daemon/supervisor"]
+    fn a_finish_child_still_running_at_the_hard_stop_is_aborted() {
+        todo!("skeleton: daemon/supervisor")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
+    #[test]
+    #[ignore = "skeleton: daemon/supervisor"]
+    fn an_aborted_child_exit_keeps_its_name() {
         todo!("skeleton: daemon/supervisor")
     }
 }
