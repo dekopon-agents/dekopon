@@ -174,4 +174,18 @@ mod tests {
     fn an_aborted_child_exit_keeps_its_key() {
         todo!("skeleton: daemon/supervisor")
     }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
+    #[test]
+    #[ignore = "skeleton: daemon/supervisor"]
+    fn run_with_no_children_stays_pending() {
+        todo!("skeleton: daemon/supervisor")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
+    #[test]
+    #[ignore = "skeleton: daemon/supervisor"]
+    fn a_run_cancelled_by_select_loses_no_exit() {
+        todo!("skeleton: daemon/supervisor")
+    }
 }

@@ -178,8 +178,21 @@ pub fn publish_staged(
     path: &Path,
     staged: TempPath,
     publish: Publish,
-) -> Result<(), PrivateFileError> {
+) -> Result<Published, PrivateFileError> {
     let _publish = (path, staged, publish);
+    todo!("skeleton: daemon/durable-replace")
+}
+
+#[derive(Debug)]
+#[must_use]
+pub enum Published {
+    Synced,
+    Unsynced(PrivateFileError),
+}
+
+#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+pub fn sweep_private_directory(directory: &Path) -> Vec<TemporarySweep> {
+    let _sweep = directory;
     todo!("skeleton: daemon/durable-replace")
 }
 
@@ -378,6 +391,20 @@ mod tests {
     #[test]
     #[ignore = "skeleton: daemon/durable-replace"]
     fn a_sweep_after_a_killed_writer_removes_its_staged_temporary() {
+        todo!("skeleton: daemon/durable-replace")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    fn a_failed_directory_sync_after_the_rename_reports_unsynced() {
+        todo!("skeleton: daemon/durable-replace")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    fn a_directory_sweep_removes_a_killed_writers_temporary_for_any_destination() {
         todo!("skeleton: daemon/durable-replace")
     }
 }
