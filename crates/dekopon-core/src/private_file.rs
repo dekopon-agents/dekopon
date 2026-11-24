@@ -161,6 +161,28 @@ fn temporary_prefix(path: &Path) -> Option<OsString> {
     Some(prefix)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Publish {
+    Replace,
+    NoClobber,
+}
+
+#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+pub fn stage_private_file(path: &Path) -> Result<tempfile::NamedTempFile, PrivateFileError> {
+    let _stage = path;
+    todo!("skeleton: daemon/durable-replace")
+}
+
+#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+pub fn publish_staged(
+    path: &Path,
+    staged: TempPath,
+    publish: Publish,
+) -> Result<(), PrivateFileError> {
+    let _publish = (path, staged, publish);
+    todo!("skeleton: daemon/durable-replace")
+}
+
 pub fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) -> Vec<TemporarySweep> {
     let (Some(prefix), Some(stem)) = (temporary_prefix(path), path.file_stem()) else {
         return Vec::new();
@@ -329,5 +351,33 @@ mod tests {
         fs::write(&keep, b"still here").unwrap();
         assert!(sweep_stale_temporaries(&path, Some(&keep)).is_empty());
         assert_eq!(fs::read(keep).unwrap(), b"still here");
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    fn a_staged_write_dropped_before_publish_leaves_the_previous_record() {
+        todo!("skeleton: daemon/durable-replace")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    fn a_no_clobber_publish_over_a_present_record_keeps_the_record() {
+        todo!("skeleton: daemon/durable-replace")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    fn every_staged_temporary_matches_the_sweep_prefix() {
+        todo!("skeleton: daemon/durable-replace")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    fn a_sweep_after_a_killed_writer_removes_its_staged_temporary() {
+        todo!("skeleton: daemon/durable-replace")
     }
 }

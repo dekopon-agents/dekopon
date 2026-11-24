@@ -1,10 +1,26 @@
 use std::{error::Error, future::Future, time::Duration};
 
+use thiserror::Error;
 use tokio::{sync::watch, task::JoinSet};
 
-use crate::{Backoff, DaemonError, TaskOutcome};
+use crate::{Backoff, TaskOutcome};
 
 const MAX_CHILDREN: usize = 16;
+
+#[derive(Debug, Error)]
+pub enum SupervisorError {
+    #[error("the supervisor already holds its maximum number of children")]
+    TooManyChildren,
+}
+
+impl SupervisorError {
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::TooManyChildren => "too-many-children",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChildName(&'static str);
@@ -22,9 +38,12 @@ impl ChildName {
 }
 
 #[derive(Clone, Debug)]
-pub struct RestartPolicy {
-    pub backoff: Backoff,
-    pub healthy_after: Duration,
+pub enum ChildPolicy {
+    Fatal,
+    Restart {
+        backoff: Backoff,
+        healthy_after: Duration,
+    },
 }
 
 #[derive(Debug)]
@@ -45,38 +64,42 @@ pub struct ChildExit {
     pub outcome: TaskOutcome,
 }
 
-// Owner: the daemon's boot path; bound: MAX_CHILDREN registrations, one task each; no queue, a
-// failed child waits out its backoff before it restarts; shutdown: `shutdown` signals every child,
-// joins them for the grace and aborts the rest.
+// Owner: the daemon's run loop; bound: MAX_CHILDREN registrations, one task each in `children`;
+// no queue: a Restart child waits out its backoff before it runs again, and a Fatal child's exit
+// ends `run`; shutdown: `shutdown` signals every child, joins for the grace and aborts the rest.
 #[derive(Debug)]
 pub struct Supervisor {
     children: JoinSet<ChildExit>,
     shutdown: watch::Sender<bool>,
-    policy: RestartPolicy,
+}
+
+impl Default for Supervisor {
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
+    fn default() -> Self {
+        todo!("skeleton: daemon/supervisor")
+    }
 }
 
 impl Supervisor {
-    #[must_use]
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
-    pub fn new(policy: RestartPolicy) -> Self {
-        let _policy = policy;
-        todo!("skeleton: daemon/supervisor")
-    }
-
-    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
-    pub fn add<F, Fut, E>(&mut self, name: ChildName, factory: F) -> Result<(), DaemonError>
+    pub fn add<F, Fut, E>(
+        &mut self,
+        name: ChildName,
+        policy: ChildPolicy,
+        factory: F,
+    ) -> Result<(), SupervisorError>
     where
         F: FnMut(Shutdown) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
         E: Error + Send + 'static,
     {
-        let _registration = (
-            &mut self.children,
-            &self.policy,
-            MAX_CHILDREN,
-            name,
-            factory,
-        );
+        let _registration = (&mut self.children, MAX_CHILDREN, name, policy, factory);
+        todo!("skeleton: daemon/supervisor")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
+    pub async fn run(&mut self) -> ChildExit {
+        let _children = &mut self.children;
         todo!("skeleton: daemon/supervisor")
     }
 
@@ -89,31 +112,38 @@ impl Supervisor {
 
 #[cfg(test)]
 mod tests {
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     #[test]
     #[ignore = "skeleton: daemon/supervisor"]
-    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     fn shutdown_aborts_a_child_that_outlives_the_grace() {
         todo!("skeleton: daemon/supervisor")
     }
 
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     #[test]
     #[ignore = "skeleton: daemon/supervisor"]
-    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
-    fn a_healthy_run_resets_the_restart_backoff() {
+    fn a_restarted_child_that_stays_healthy_resets_its_backoff() {
         todo!("skeleton: daemon/supervisor")
     }
 
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     #[test]
     #[ignore = "skeleton: daemon/supervisor"]
-    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     fn a_child_past_the_maximum_is_refused() {
         todo!("skeleton: daemon/supervisor")
     }
 
+    #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
     #[test]
     #[ignore = "skeleton: daemon/supervisor"]
+    fn a_panicked_fatal_child_ends_run_with_its_cause() {
+        todo!("skeleton: daemon/supervisor")
+    }
+
     #[expect(clippy::todo, reason = "skeleton: daemon/supervisor")]
-    fn a_panicked_child_restarts_after_its_backoff() {
+    #[test]
+    #[ignore = "skeleton: daemon/supervisor"]
+    fn a_failed_restart_child_runs_again_after_its_backoff() {
         todo!("skeleton: daemon/supervisor")
     }
 }

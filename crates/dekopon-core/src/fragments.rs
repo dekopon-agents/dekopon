@@ -47,14 +47,6 @@ pub enum FragmentError {
     Conflicts { conflicts: Vec<FragmentConflict> },
     #[error("configuration fragments disagree on apiVersion")]
     MixedApiVersions,
-    #[error(transparent)]
-    Hygiene(#[from] crate::FileHygieneError),
-    #[error("could not decode configuration fragment {path}")]
-    Decode {
-        path: PathBuf,
-        #[source]
-        source: serde_yaml::Error,
-    },
 }
 
 fn render(conflicts: &[FragmentConflict]) -> String {
@@ -92,17 +84,6 @@ pub fn scan_directory(
     }
     paths.sort();
     Ok(paths)
-}
-
-#[expect(clippy::todo, reason = "skeleton: core/fragment-loader")]
-pub fn load_directory(
-    directory: &Path,
-    expected_uid: u32,
-    extension: &str,
-    max_bytes: usize,
-) -> Result<Vec<(PathBuf, Mapping)>, FragmentError> {
-    let _load = (directory, expected_uid, extension, max_bytes);
-    todo!("skeleton: core/fragment-loader")
 }
 
 pub fn merge(
@@ -256,12 +237,5 @@ mod tests {
             names
         };
         assert_eq!(names(&forward), names(&backward));
-    }
-
-    #[test]
-    #[ignore = "skeleton: core/fragment-loader"]
-    #[expect(clippy::todo, reason = "skeleton: core/fragment-loader")]
-    fn a_fragment_that_fails_hygiene_is_refused_by_path() {
-        todo!("skeleton: core/fragment-loader")
     }
 }

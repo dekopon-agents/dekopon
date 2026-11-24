@@ -12,23 +12,28 @@ use thiserror::Error;
 pub enum FileTier {
     Private,
     NotWorldWritable,
+    MountScoped,
 }
 
 impl FileTier {
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
     #[must_use]
     pub const fn forbidden_bits(self) -> u32 {
         match self {
             Self::Private => 0o077,
             Self::NotWorldWritable => 0o022,
+            Self::MountScoped => todo!(),
         }
     }
 }
 
 impl fmt::Display for FileTier {
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Private => "private",
             Self::NotWorldWritable => "not-world-writable",
+            Self::MountScoped => todo!("skeleton: daemon/durable-replace"),
         })
     }
 }
