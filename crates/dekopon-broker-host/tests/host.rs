@@ -1286,6 +1286,19 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     assert!(stderr.contains("\nUsage: probe <COMMAND>\n"), "{stderr:?}");
 
     let outcome = registry
+        .run_command("probe", &["uper".to_owned()], false)
+        .await
+        .expect("a subcommand typo renders a usage error");
+    let CommandRunOutcome::Rendered { stderr, status, .. } = outcome else {
+        panic!("expected a rendered subcommand error, got {outcome:?}");
+    };
+    assert_eq!(status, 2);
+    assert!(
+        stderr.contains("tip: a similar subcommand exists: 'upper'"),
+        "{stderr:?}"
+    );
+
+    let outcome = registry
         .run_command("probe", &["count".to_owned(), "-".to_owned()], false)
         .await
         .expect("a decline is an outcome, not a host error");

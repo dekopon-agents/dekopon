@@ -16,7 +16,22 @@ use dekopon_core::offload;
 use dekopon_model_token_governor::ModelUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, ops::ControlFlow, time::Duration};
+use std::{collections::HashMap, num::NonZeroU32, ops::ControlFlow, time::Duration};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum TokenParam {
+    #[default]
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OutputLimit {
+    MaxTokens(NonZeroU32),
+    MaxCompletionTokens(NonZeroU32),
+}
 
 pub struct OpenAiClient {
     http: InferenceHttp,
@@ -25,6 +40,7 @@ pub struct OpenAiClient {
     name: String,
     bearer_token: Option<Redacted<String>>,
     stream: bool,
+    output_limit: Option<OutputLimit>,
 }
 
 impl OpenAiClient {
@@ -60,6 +76,7 @@ impl OpenAiClient {
             model,
             bearer_token,
             stream: true,
+            output_limit: None,
         })
     }
 
@@ -76,6 +93,15 @@ impl OpenAiClient {
     #[must_use]
     pub fn with_streaming(mut self, stream: bool) -> Self {
         self.stream = stream;
+        self
+    }
+
+    #[must_use]
+    pub fn with_output_limit(mut self, limit: NonZeroU32, parameter: TokenParam) -> Self {
+        self.output_limit = Some(match parameter {
+            TokenParam::MaxTokens => OutputLimit::MaxTokens(limit),
+            TokenParam::MaxCompletionTokens => OutputLimit::MaxCompletionTokens(limit),
+        });
         self
     }
 
@@ -109,6 +135,7 @@ impl OpenAiClient {
                     messages: &messages,
                     tools: &tools,
                     tool_choice: "auto",
+                    output_limit: self.output_limit,
                     prompt_cache_key: request.options.prompt_cache_key(),
                     stream: self.stream.then_some(true),
                     stream_options: self.stream.then_some(StreamOptions {
@@ -336,6 +363,8 @@ struct ChatRequest<'a> {
     messages: &'a [WireMessage<'a>],
     tools: &'a [OpenAiTool<'a>],
     tool_choice: &'static str,
+    #[serde(flatten)]
+    output_limit: Option<OutputLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -362,6 +391,17 @@ impl ChatRequest<'_> {
         body.value(self.tools)?;
         body.raw(b",\"tool_choice\":");
         body.value(self.tool_choice)?;
+        if let Some(output_limit) = self.output_limit {
+            let (field, limit) = match output_limit {
+                OutputLimit::MaxTokens(limit) => (b",\"max_tokens\":".as_slice(), limit),
+                OutputLimit::MaxCompletionTokens(limit) => {
+                    (b",\"max_completion_tokens\":".as_slice(), limit)
+                }
+            };
+            tracing::Span::current().record("generation.max_output_tokens", limit);
+            body.raw(field);
+            body.value(&limit)?;
+        }
         if let Some(key) = self.prompt_cache_key {
             body.raw(b",\"prompt_cache_key\":");
             body.value(key)?;
@@ -980,6 +1020,7 @@ pub(crate) async fn request_body_json(messages: &[ModelMessage]) -> serde_json::
         messages: &prepared,
         tools: &[],
         tool_choice: "auto",
+        output_limit: None,
         prompt_cache_key: None,
         stream: None,
         stream_options: None,
@@ -2241,6 +2282,7 @@ mod tests {
                     messages: &wire_messages(&messages).await,
                     tools: &tools,
                     tool_choice: "auto",
+                    output_limit: None,
                     prompt_cache_key: None,
                     stream: Some(true),
                     stream_options: Some(StreamOptions {
@@ -2311,6 +2353,7 @@ mod tests {
                 messages: &wire,
                 tools: &tools,
                 tool_choice: "auto",
+                output_limit: None,
                 prompt_cache_key,
                 stream: Some(true),
                 stream_options: Some(StreamOptions {

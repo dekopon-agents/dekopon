@@ -23,6 +23,7 @@ use dekopon_agent::{
 };
 use dekopon_broker_protocol::{AssetEncoding, AssetRow, NewAsset};
 use dekopon_core::OffloadTrace;
+use dekopon_core::asset::AssetKind;
 use dekopon_core::offload;
 use dekopon_model::asset::{BlobError, BlobReference, BlobSource, DiskBlob};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,15 @@ use crate::{
 };
 
 pub(crate) const MAX_ASSETS_PER_MESSAGE: usize = 32;
+pub(crate) const VOICE_NOTE_NAME: &str = "voice note";
+
+pub(crate) fn platform_mime(mime: &str) -> String {
+    mime.split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AssetRef {
@@ -623,20 +633,20 @@ fn cat_reads(content_type: &str) -> bool {
 }
 
 pub(crate) fn is_readable(mime: &str) -> bool {
-    match dekopon_core::asset::AssetKind::of(mime) {
-        dekopon_core::asset::AssetKind::Image
-        | dekopon_core::asset::AssetKind::TextDocument
-        | dekopon_core::asset::AssetKind::BinaryDocument => true,
-        dekopon_core::asset::AssetKind::Other => false,
+    match AssetKind::of(mime) {
+        AssetKind::Image | AssetKind::TextDocument | AssetKind::BinaryDocument => true,
+        AssetKind::Audio | AssetKind::Video | AssetKind::Other => false,
     }
 }
 
 pub(crate) fn is_image(mime: &str) -> bool {
-    match dekopon_core::asset::AssetKind::of(mime) {
-        dekopon_core::asset::AssetKind::Image => true,
-        dekopon_core::asset::AssetKind::TextDocument
-        | dekopon_core::asset::AssetKind::BinaryDocument
-        | dekopon_core::asset::AssetKind::Other => false,
+    match AssetKind::of(mime) {
+        AssetKind::Image => true,
+        AssetKind::TextDocument
+        | AssetKind::BinaryDocument
+        | AssetKind::Audio
+        | AssetKind::Video
+        | AssetKind::Other => false,
     }
 }
 
@@ -722,9 +732,20 @@ impl NoteLine {
             Self::ImagesOff => format!(
                 "\n  chat-asset:{id} — {name} ({mime}, {size}) — this agent's model cannot be shown images{arrived}"
             ),
-            Self::CommandOnly => format!(
-                "\n  chat-asset:{id} — {name} ({mime}, {size}) — not readable here; a command can take it as chat-asset:{id}{arrived}"
-            ),
+            Self::CommandOnly => {
+                use dekopon_core::asset::AssetKind;
+                let name = match AssetKind::of(mime) {
+                    AssetKind::Audio if name == VOICE_NOTE_NAME => VOICE_NOTE_NAME,
+                    kind @ (AssetKind::Audio | AssetKind::Video) => kind.label(),
+                    AssetKind::Image
+                    | AssetKind::TextDocument
+                    | AssetKind::BinaryDocument
+                    | AssetKind::Other => name,
+                };
+                format!(
+                    "\n  chat-asset:{id} — {name} ({mime}, {size}) — not readable here; a command can take it as chat-asset:{id}{arrived}"
+                )
+            }
             Self::Invisible => format!(
                 "\n  {name} ({mime}, {size}) — the gateway cannot see this file at all{arrived}"
             ),
@@ -941,9 +962,21 @@ impl Registered {
     }
 }
 
-fn byte_limit(mime: &str) -> u64 {
+fn byte_limit(mime: &str, source: Option<&AssetSourceRef>) -> u64 {
     let top = mime.split_once('/').map_or(mime, |(top, _)| top).trim();
-    if top.eq_ignore_ascii_case("image") {
+    let gateway_media = match source {
+        Some(AssetSourceRef::WhatsApp { .. } | AssetSourceRef::Telegram { .. }) => {
+            top.eq_ignore_ascii_case("audio") || top.eq_ignore_ascii_case("video")
+        }
+        Some(
+            AssetSourceRef::Fauxlack { .. }
+            | AssetSourceRef::Slack { .. }
+            | AssetSourceRef::Discord { .. }
+            | AssetSourceRef::Generated { .. },
+        )
+        | None => false,
+    };
+    if top.eq_ignore_ascii_case("image") || gateway_media {
         dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64
     } else {
         dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64
@@ -1179,7 +1212,18 @@ impl ChatAssetSource for SessionAssets {
             let blob = self
                 .resolve(&asset, Recency::Touch)
                 .await
-                .map_err(AssetFailure::for_capability)?;
+                .map_err(|failure| {
+                    if let AssetFailure::TooLarge { limit, .. } = failure
+                        && matches!(
+                            AssetKind::of(&asset.mime),
+                            AssetKind::Audio | AssetKind::Video
+                        )
+                    {
+                        ChatAssetRefusal::AssetTooLarge { asset: id, limit }
+                    } else {
+                        failure.for_capability()
+                    }
+                })?;
             Ok(ResolvedInput {
                 row: asset.row(Some(blob.len() as u64)),
                 blob,
@@ -1230,7 +1274,7 @@ impl SessionAssets {
         if let Some(data) = self.store.pin_for_use(&self.access, asset.id, recency)? {
             return Ok(Located::Resident(data));
         }
-        let limit = byte_limit(&asset.mime);
+        let limit = byte_limit(&asset.mime, asset.source.as_ref());
         if let Some(size) = asset.size
             && size > limit
         {
@@ -1387,6 +1431,7 @@ impl Attempt {
                 | ChatAssetRefusal::UnsupportedMedia
                 | ChatAssetRefusal::PerInvocationLimit
                 | ChatAssetRefusal::ByteBudget
+                | ChatAssetRefusal::AssetTooLarge { .. }
                 | ChatAssetRefusal::Unavailable
                 | ChatAssetRefusal::DataUrl => RefetchOutcome::Unavailable,
             },
@@ -1503,7 +1548,7 @@ impl AssetStore {
                 let (sender, outcome) = watch::channel(None);
                 let attempt_ticket = ticket(attempt);
                 let permits = Arc::clone(&self.downloads.permits);
-                let limit = byte_limit(&row.asset.mime);
+                let limit = byte_limit(&row.asset.mime, row.asset.source.as_ref());
                 let task = self.downloads.spawn(
                     async move {
                         // Built on first poll: a runtime that drops the unpolled future inside
@@ -1704,7 +1749,9 @@ impl MemoryAssets<'_> {
         let native = match kind {
             AssetKind::Image => self.images_supported,
             AssetKind::BinaryDocument => true,
-            AssetKind::TextDocument | AssetKind::Other => false,
+            AssetKind::TextDocument | AssetKind::Audio | AssetKind::Video | AssetKind::Other => {
+                false
+            }
         };
         native
             && self
@@ -1791,7 +1838,9 @@ impl AssetStore {
     ) -> Result<SummaryInput, NotReadable> {
         use dekopon_core::asset::AssetKind;
         match kind {
-            AssetKind::Other => return Err(NotReadable::NotResident),
+            AssetKind::Audio | AssetKind::Video | AssetKind::Other => {
+                return Err(NotReadable::NotResident);
+            }
             AssetKind::Image | AssetKind::TextDocument | AssetKind::BinaryDocument => {}
         }
         let blob = self
@@ -1830,7 +1879,7 @@ impl AssetStore {
                     String::from_utf8_lossy(&bytes).into_owned(),
                 ))
             }
-            AssetKind::Other => Err(NotReadable::NotResident),
+            AssetKind::Audio | AssetKind::Video | AssetKind::Other => Err(NotReadable::NotResident),
         }
     }
 }
@@ -2002,7 +2051,8 @@ impl AssetStore {
             | Attachment::PlatformGone => (),
         }
         row.asset.size = Some(bytes.len() as u64);
-        let result = if bytes.len() as u64 > byte_limit(&row.asset.mime) {
+        let result = if bytes.len() as u64 > byte_limit(&row.asset.mime, row.asset.source.as_ref())
+        {
             Err(BlobError::TooLarge)
         } else {
             retention
@@ -2310,7 +2360,9 @@ pub(crate) mod retention_tests {
     async fn asset_kind_agrees_with_the_allowlist() {
         use crate::memory::journal::{Entry, Keep, records::tests::journal};
         use dekopon_agent::prompt::{PromptLimits, SessionInputs, run_prompt_session};
-        use dekopon_core::asset::AssetKind::{self, BinaryDocument, Image, Other, TextDocument};
+        use dekopon_core::asset::AssetKind::{
+            self, Audio, BinaryDocument, Image, Other, TextDocument, Video,
+        };
         use dekopon_model::model::{ContentPart, ModelMessage};
 
         let cases = [
@@ -2340,13 +2392,13 @@ pub(crate) mod retention_tests {
                 BinaryDocument,
             ),
             ("application/rtf", BinaryDocument),
-            ("video/quicktime", Other),
+            ("video/quicktime", Video),
             ("application/zip", Other),
             ("text/x-python", Other),
             ("application/yaml", Other),
             ("image/svg+xml", Other),
             ("image/heic", Other),
-            ("audio/mpeg", Other),
+            ("audio/mpeg", Audio),
             ("application/octet-stream", Other),
         ];
         let store = store(1024 * 1024);
@@ -2397,7 +2449,7 @@ pub(crate) mod retention_tests {
             let (readable, image) = match expected {
                 Image => (true, true),
                 TextDocument | BinaryDocument => (true, false),
-                Other => (false, false),
+                Audio | Video | Other => (false, false),
             };
             assert_eq!(is_readable(mime), readable, "{mime}");
             assert_eq!(is_image(mime), image, "{mime}");
@@ -2440,7 +2492,7 @@ pub(crate) mod retention_tests {
                     native,
                     match kind {
                         Image | BinaryDocument => 1,
-                        TextDocument | Other => 0,
+                        TextDocument | Audio | Video | Other => 0,
                     },
                     "{mime}"
                 );
@@ -4125,6 +4177,152 @@ pub(crate) mod retention_tests {
         })
         .await
         .unwrap();
+    }
+
+    const VOICE: &[u8] = include_bytes!("../tests/fixtures/media/cat-meow-opus.ogg");
+    const VIDEO: &[u8] = include_bytes!("../tests/fixtures/media/cat-gallop.mp4");
+
+    async fn whatsapp_command_media(
+        kind: &str,
+        media: serde_json::Value,
+        label: &'static str,
+        bytes: &'static [u8],
+        expected: dekopon_core::asset::AssetKind,
+        name: &str,
+    ) {
+        use crate::transport::{
+            ChatTransport as _,
+            whatsapp::tests_media::{MediaPeer, admitted, bytes_reply, message_webhook, metadata},
+        };
+
+        let peer = MediaPeer::new(move |origin, index| match index {
+            0 => metadata(origin, label, bytes),
+            1 => bytes_reply(bytes),
+            _ => panic!("one metadata lookup and one download"),
+        })
+        .await;
+        let (transport, message) = admitted(&peer.origin, &message_webhook(kind, media)).await;
+        assert_eq!(message.input_refusal, None);
+        let store = store(bytes.len());
+        let access = access("one");
+        let registered = store.assets_for_access(&access, message.assets, Instant::now());
+        let [id] = registered.arrived.as_slice() else {
+            panic!("one registered {kind} asset");
+        };
+        let id = *id;
+        let session = SessionAssets::new(
+            Arc::clone(&store),
+            access.clone(),
+            transport.asset_fetcher(),
+            Handle::current(),
+            true,
+        );
+        let input = session
+            .resolve_input(id)
+            .await
+            .expect("a command can read the bytes");
+        assert_eq!(input.blob.read().unwrap(), bytes);
+        assert_eq!(input.row.content_type, crate::asset::platform_mime(label));
+
+        let registered = store.assets_for_access(&access, Vec::new(), Instant::now());
+        let asset = &registered.inventory[0];
+        assert_eq!(dekopon_core::asset::AssetKind::of(&asset.mime), expected);
+        assert!(!asset.is_fetchable(true));
+        assert_eq!(
+            NoteLine::for_asset(asset, true, TextReader::AssetCat).render(asset, true),
+            format!(
+                "\n  chat-asset:{id} — {name} ({}, {}) — not readable here; a command can take it as chat-asset:{id} — attached to this message",
+                asset.mime,
+                kibibytes(bytes.len() as u64)
+            )
+        );
+        assert_eq!(peer.requests.lock().len(), 2);
+        peer.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_whatsapp_voice_note_becomes_a_command_only_audio_asset() {
+        whatsapp_command_media(
+            "audio",
+            serde_json::json!({"id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true}),
+            "audio/ogg; codecs=opus",
+            VOICE,
+            dekopon_core::asset::AssetKind::Audio,
+            "voice note",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_whatsapp_video_becomes_a_command_only_video_asset() {
+        whatsapp_command_media(
+            "video",
+            serde_json::json!({"id":"789", "mime_type":"video/mp4", "caption":"Watch this"}),
+            "video/mp4",
+            VIDEO,
+            dekopon_core::asset::AssetKind::Video,
+            "video",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_whatsapp_voice_note_over_eight_mib_tells_the_agent_the_cap() {
+        use crate::transport::{
+            ChatTransport as _,
+            whatsapp::tests_media::{MediaPeer, admitted, bytes_reply, message_webhook, metadata},
+        };
+        const CAP: usize = dekopon_core::asset::MAX_DECODED_ASSET_BYTES;
+        let mut oversized = VOICE.to_vec();
+        oversized.resize(CAP + 1, 0);
+        let peer = MediaPeer::new(move |origin, index| match index {
+            0 => metadata(origin, "audio/ogg; codecs=opus", VOICE),
+            1 => bytes_reply(&oversized),
+            _ => panic!("no request after refusal"),
+        })
+        .await;
+        let (transport, message) = admitted(
+            &peer.origin,
+            &message_webhook(
+                "audio",
+                serde_json::json!({
+                    "id":"789", "mime_type":"audio/ogg; codecs=opus", "voice":true,
+                }),
+            ),
+        )
+        .await;
+        let store = store(CAP * 2);
+        let access = access("one");
+        let id = store
+            .assets_for_access(&access, message.assets, Instant::now())
+            .arrived[0];
+        let session = SessionAssets::new(
+            store,
+            access,
+            transport.asset_fetcher(),
+            Handle::current(),
+            true,
+        );
+        let refusal = session
+            .resolve_input(id)
+            .await
+            .err()
+            .expect("oversize is refused");
+        assert_eq!(
+            refusal,
+            ChatAssetRefusal::AssetTooLarge {
+                asset: id,
+                limit: CAP as u64
+            }
+        );
+        assert_eq!(
+            refusal.note(),
+            format!(
+                "chat-asset:{id} exceeds the 8 MiB asset cap. Ask the user for a smaller file."
+            )
+        );
+        assert_eq!(peer.requests.lock().len(), 2);
+        peer.finish().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

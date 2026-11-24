@@ -5299,12 +5299,19 @@ mod tests {
             .with(capture.clone())
             .set_default();
         let photos = (1..=8)
-            .map(|id| FetchedAsset {
-                name: format!("photo-{id}.png"),
-                mime: "image/png".into(),
-                data: dekopon_model::asset::DiskBlob::from_bytes(&[id; 32])
-                    .unwrap()
-                    .into(),
+            .map(|id| {
+                let (extension, mime) = if id == 8 {
+                    ("jpg", "image/jpeg")
+                } else {
+                    ("png", "image/png")
+                };
+                FetchedAsset {
+                    name: format!("photo-{id}.{extension}"),
+                    mime: mime.into(),
+                    data: dekopon_model::asset::DiskBlob::from_bytes(&[id; 32])
+                        .unwrap()
+                        .into(),
+                }
             })
             .collect();
         let assets = FixedAssets(photos);
@@ -5334,7 +5341,11 @@ mod tests {
             capture
                 .events_where(
                     "dekopon_agent::audit",
-                    &[("audit.event", "agent.asset.fetched"), ("asset.id", "8")]
+                    &[
+                        ("audit.event", "agent.asset.fetched"),
+                        ("asset.id", "8"),
+                        ("asset.mime", "image/jpeg"),
+                    ]
                 )
                 .len(),
             1

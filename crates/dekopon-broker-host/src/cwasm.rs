@@ -101,7 +101,7 @@ impl Cache {
             Ok(None) => {}
             Err(error) => refuse_unreadable(&error)?,
         }
-        let (_, publication) = self.publish_with_outcome(engine, wasm, source_sha256)?;
+        let (_, publication) = self.publish_component(engine, wasm, source_sha256)?;
         Ok(publication)
     }
 
@@ -147,16 +147,6 @@ impl Cache {
     }
 
     pub(crate) fn publish_component(
-        &self,
-        engine: &Engine,
-        wasm: &[u8],
-        source_sha256: &str,
-    ) -> wasmtime::Result<Component> {
-        self.publish_with_outcome(engine, wasm, source_sha256)
-            .map(|(component, _)| component)
-    }
-
-    fn publish_with_outcome(
         &self,
         engine: &Engine,
         wasm: &[u8],

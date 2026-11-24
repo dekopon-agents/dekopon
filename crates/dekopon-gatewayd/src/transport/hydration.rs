@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use dekopon_agent::attachment::GeneratedImage;
+use dekopon_agent::attachment::{AttachmentReference, GeneratedImage, MediaSendRefusal};
 use dekopon_core::OffloadTrace;
 use dekopon_core::offload;
 use dekopon_model::asset::BlobError;
@@ -145,28 +145,26 @@ fn hydrate_images_with(
     }
 }
 
-pub(super) enum AcceptedTypes {
-    Files,
-    Photos,
-}
-pub(super) fn validate_types(
+pub(super) fn classify_media<T>(
     images: &[GeneratedImage],
-    accepted: AcceptedTypes,
-) -> Result<(), TransportError> {
+    classify: fn(AttachmentReference, &GeneratedImage) -> Result<T, MediaSendRefusal>,
+) -> Result<Vec<T>, TransportError> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            classify(image.attachment_reference(index), image).map_err(TransportError::from)
+        })
+        .collect()
+}
+
+pub(super) fn validate_file_types(images: &[GeneratedImage]) -> Result<(), TransportError> {
     for image in images {
         let label = image.media_type();
-        let valid =
-            !label.contains('*') && reqwest::multipart::Part::text("").mime_str(label).is_ok();
-        let allowed = match accepted {
-            AcceptedTypes::Files => valid,
-            AcceptedTypes::Photos => valid && matches!(label, "image/png" | "image/jpeg"),
-        };
-        if !allowed {
-            let accepted = match accepted {
-                AcceptedTypes::Files => "any concrete valid media type",
-                AcceptedTypes::Photos => "image/png, image/jpeg",
-            };
-            return Err(TransportError::AssetType { accepted });
+        if label.contains('*') || reqwest::multipart::Part::text("").mime_str(label).is_err() {
+            return Err(TransportError::AssetType {
+                accepted: "any concrete valid media type",
+            });
         }
     }
     Ok(())
@@ -175,8 +173,7 @@ pub(super) fn validate_types(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn file_and_photo_adapters_refuse_unsupported_labels_before_hydration() {
-        use super::{AcceptedTypes, validate_types};
+    fn file_adapters_refuse_invalid_or_wildcard_labels_before_hydration() {
         use dekopon_broker_protocol::AssetEncoding;
         use dekopon_model::asset::DiskBlob;
         for label in [
@@ -195,26 +192,14 @@ mod tests {
                 label.to_owned(),
                 AssetEncoding::Identity,
             )];
-            for (adapter, allowed, expected) in [
-                (
-                    AcceptedTypes::Files,
-                    !matches!(label, "" | "image/*" | "not a mime"),
-                    "any concrete valid media type",
-                ),
-                (
-                    AcceptedTypes::Photos,
-                    matches!(label, "image/png" | "image/jpeg"),
-                    "image/png, image/jpeg",
-                ),
-            ] {
-                match validate_types(&images, adapter) {
-                    Ok(()) => assert!(allowed, "{label} must be refused"),
-                    Err(TransportError::AssetType { accepted }) => {
-                        assert!(!allowed, "{label} must be accepted");
-                        assert_eq!(accepted, expected);
-                    }
-                    Err(error) => panic!("expected AssetType for {label}, got {error:?}"),
+            let allowed = !matches!(label, "" | "image/*" | "not a mime");
+            match super::validate_file_types(&images) {
+                Ok(()) => assert!(allowed, "{label} must be refused"),
+                Err(TransportError::AssetType { accepted }) => {
+                    assert!(!allowed, "{label} must be accepted");
+                    assert_eq!(accepted, "any concrete valid media type");
                 }
+                Err(error) => panic!("expected AssetType for {label}, got {error:?}"),
             }
         }
     }

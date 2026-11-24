@@ -265,6 +265,42 @@ impl Metering {
         })
     }
 
+    pub fn admit_up_to(self: &Arc<Self>, call: Call, want: Tokens) -> Result<Admission, Refusal> {
+        let asked = Estimate {
+            input: want,
+            output_reserve: Tokens(0),
+        };
+        let reservation = match self.budgets.get(&call.agent) {
+            Some(budget) => {
+                let mut budget = budget.lock();
+                if budget.covers(&call.model) {
+                    match budget.reserve_up_to(self.now(), want) {
+                        Ok(reservation) => Some(reservation),
+                        Err(refusal) => {
+                            drop(budget);
+                            record(&call, asked, &Charge::refused(), None);
+                            return Err(refusal);
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        Ok(Admission {
+            call,
+            estimate: reservation.as_ref().map_or(asked, |reservation| Estimate {
+                input: reservation.tokens(),
+                output_reserve: Tokens(0),
+            }),
+            reservation,
+            observed: Mutex::new(Observed::default()),
+            metering: Arc::clone(self),
+            settled: false,
+        })
+    }
+
     pub fn begin_restore(&self) {
         for budget in self.budgets.values() {
             budget.lock().begin_restore();
@@ -323,6 +359,11 @@ pub struct HistoryRow {
 }
 
 impl Admission {
+    #[must_use]
+    pub const fn estimate(&self) -> Estimate {
+        self.estimate
+    }
+
     pub fn observe_usage(&self, usage: ModelUsage) {
         let mut observed = self.observed.lock();
         observed.usage = Some(observed.usage.unwrap_or_default().merged(usage));

@@ -60,8 +60,8 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     ));
     let route = config.routes.first().expect("one route");
     assert_eq!(route.transport, transport.name());
-    assert_eq!(route.limits.max_steps, 8);
-    assert_eq!(route.limits.max_capability_calls, 16);
+    assert_eq!(route.limits.max_steps, 100);
+    assert_eq!(route.limits.max_capability_calls, 256);
     assert!(matches!(
         &route.memory,
         dekopon_gatewayd::MemoryConfig::Persistent {

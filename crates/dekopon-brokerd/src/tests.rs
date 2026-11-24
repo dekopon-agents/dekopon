@@ -3476,6 +3476,97 @@ async fn check_and_boot_have_equal_digests_for_private_map_names_absent_from_pol
 }
 
 #[tokio::test]
+async fn materialized_check_reports_each_failed_secret_without_exposing_material() {
+    use super::{BrokerdError, SecretMapError};
+
+    let mut fixture = ResidentFixture::boot_with(|_, document| {
+        document["capabilities"]["cli-probe"]["constraints"]["http"] = json!({
+            "allowedHosts": ["api.example.test"], "allowedMethods": ["GET"],
+            "maxRequests": 1, "maxRequestBytes": 1024, "maxResponseBytes": 1024
+        });
+    })
+    .await;
+    let missing = fixture.root.path().join("missing-token");
+    let projected = fixture.root.path().join("token.json");
+    let key = fixture.root.path().join("app.pem");
+    let map = fixture.root.path().join("secret-map.yaml");
+    let sentinel = "fixture-secret-material";
+    write_owner_only(&projected, sentinel.as_bytes());
+    write_owner_only(&key, sentinel.as_bytes());
+
+    let binding = |id| {
+        json!({
+            "id": id,
+            "capabilities": ["cli-probe.upper"],
+            "sink": "httpBearer",
+            "allowedHosts": ["api.example.test"],
+            "allowedMethods": ["GET"],
+            "allowedPaths": [{"match": "exact", "path": "/v1/thing"}]
+        })
+    };
+    write_config(
+        &map,
+        &json!({
+            "apiVersion": "dekopon.dev/secret-map/v1alpha1",
+            "mapRevision": "test",
+            "secrets": [
+                {
+                    "drn": "drn:secret:api/missing",
+                    "source": {"kind": "secureFile", "path": missing},
+                    "destinations": ["api.example.test"],
+                    "bindings": [binding("missing")]
+                },
+                {
+                    "drn": "drn:secret:api/projected",
+                    "source": {"kind": "secureFile", "path": projected},
+                    "projection": {"format": "json", "pointer": "/token"},
+                    "destinations": ["api.example.test"],
+                    "bindings": [binding("projected")]
+                },
+                {
+                    "drn": "drn:secret:github/app",
+                    "source": {
+                        "kind": "githubApp", "appId": 1, "installationId": 2, "privateKey": key
+                    },
+                    "destinations": ["api.example.test"],
+                    "bindings": [binding("app")]
+                }
+            ]
+        }),
+    );
+    fixture.document["secretMapPath"] = json!(map);
+    write_config(&fixture.path, &fixture.document);
+
+    let flagless = super::check(&fixture.path, None, None).await;
+    assert!(flagless.problems.is_empty(), "{flagless:?}");
+
+    let report = super::check(super::CheckConfig::Materialized(&fixture.path), None, None).await;
+    let expected = [
+        ("drn:secret:api/missing", "secureFile", &missing),
+        ("drn:secret:api/projected", "secureFile", &projected),
+        ("drn:secret:github/app", "privateKey", &key),
+    ];
+    assert_eq!(report.problems.len(), expected.len(), "{report:?}");
+    for (problem, (expected_drn, expected_field, expected_path)) in
+        report.problems.iter().zip(expected)
+    {
+        let BrokerdError::Secrets(SecretMapError::Material {
+            drn, field, path, ..
+        }) = problem
+        else {
+            panic!("expected a material problem, got {problem:?}");
+        };
+        assert_eq!(
+            (drn.as_str(), *field, path),
+            (expected_drn, expected_field, expected_path)
+        );
+        assert!(!dekopon_core::error_chain(problem).contains(sentinel));
+        assert!(!format!("{problem:?}").contains(sentinel));
+    }
+    assert!(report.policy_digest.is_some());
+}
+
+#[tokio::test]
 async fn check_reads_binding_shapes_and_refuses_a_swap_target_without_one_binding() {
     use super::{BrokerdError, Mode};
     let root = tempfile::tempdir().unwrap();
@@ -3640,6 +3731,8 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
             Some(super::CheckProviders {
                 provider_set: provider_set.clone(),
                 store: store.clone(),
+                download_concurrency: super::DEFAULT_DOWNLOAD_CONCURRENCY,
+                verification: super::ProviderVerification::Strict,
             }),
             None,
         )
@@ -3648,6 +3741,17 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
     assert!(report.problems.is_empty(), "{report:?}");
     #[cfg(target_os = "linux")]
     assert!(report.peak_rss_bytes.expect("process peak RSS") > 0);
+    let timings = report.timings.expect("check timings");
+    let validate = timings.validate_load.expect("validate load timing");
+    assert_eq!(
+        (validate.compiled_cache_hits, validate.compiled_cache_misses),
+        (Some(0), Some(1))
+    );
+    let prepare = timings.prepare_load.expect("prepare load timing");
+    assert_eq!(
+        (prepare.compiled_cache_hits, prepare.compiled_cache_misses),
+        (Some(1), Some(0))
+    );
     let cache = store.join("store/cwasm/v1");
     let objects = cache.join("sha256");
     let current_object = fs::read_dir(&objects)
@@ -3663,6 +3767,15 @@ async fn provider_set_check_prunes_stale_cache_entries_and_keeps_the_current_obj
     write_owner_only(&unreferenced, b"unreferenced");
     let report = check().await;
     assert!(report.problems.is_empty(), "{report:?}");
+    let validate = report
+        .timings
+        .expect("check timings")
+        .validate_load
+        .expect("validate load timing");
+    assert_eq!(
+        (validate.compiled_cache_hits, validate.compiled_cache_misses),
+        (Some(1), Some(0))
+    );
     assert!(!old_generation.exists());
     assert!(!unreferenced.exists());
     assert!(current_object.is_file());
@@ -3839,6 +3952,26 @@ async fn check_keeps_going_past_a_collision_and_names_the_stage_it_could_not_run
             stage: Stage::Providers
         }
     )));
+
+    let materialized = super::check(super::CheckConfig::Materialized(&directory), None, None).await;
+    assert!(matches!(
+        materialized.problems.as_slice(),
+        [
+            BrokerdError::Config(config::ConfigError::Fragments(
+                FragmentError::Conflicts { .. }
+            )),
+            BrokerdError::ProviderSetRequired,
+            BrokerdError::CheckSkipped {
+                stage: Stage::Providers
+            },
+        ]
+    ));
+    assert!(
+        !materialized
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, StartupWarning::Skipped { .. }))
+    );
 }
 
 #[tokio::test]
@@ -3876,6 +4009,21 @@ async fn check_binds_no_socket_and_reports_the_digests_boot_serves() {
             .iter()
             .any(|warning| matches!(warning, StartupWarning::DefaultSecretsUnchecked))
     );
+    let materialized = super::check(super::CheckConfig::Materialized(&path), None, None).await;
+    assert!(matches!(
+        materialized.problems.as_slice(),
+        [
+            super::BrokerdError::Secrets(super::SecretMapError::Read { path, .. }),
+            super::BrokerdError::CheckSkipped { stage: super::Stage::Providers },
+        ] if path == &secret_map
+    ));
+    assert!(
+        !materialized
+            .warnings
+            .iter()
+            .any(|warning| matches!(warning, StartupWarning::DefaultSecretsUnchecked))
+    );
+
     write_owner_only(
         &secret_map,
         fs::read_to_string(example.join("secret-map.yaml.example"))
@@ -4024,7 +4172,10 @@ impl ManagedBroker {
         fs::rename(staged, self.lock()).expect("atomic lock replacement");
     }
 
-    fn serve<F>(&self, shutdown: F) -> tokio::task::JoinHandle<Result<(), super::BrokerdError>>
+    pub(super) fn serve<F>(
+        &self,
+        shutdown: F,
+    ) -> tokio::task::JoinHandle<Result<(), super::BrokerdError>>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
@@ -4036,7 +4187,10 @@ impl ManagedBroker {
         ))
     }
 
-    async fn ready(&self, task: &tokio::task::JoinHandle<Result<(), super::BrokerdError>>) {
+    pub(super) async fn ready(
+        &self,
+        task: &tokio::task::JoinHandle<Result<(), super::BrokerdError>>,
+    ) {
         tokio::time::timeout(std::time::Duration::from_secs(120), async {
             let parent = fs::symlink_metadata(self.directory.path()).unwrap();
             loop {
@@ -4252,7 +4406,7 @@ async fn socket_generation_handshake_observes_only_confirmed_activation() {
 
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-async fn stopped_within(
+pub(super) async fn stopped_within(
     task: tokio::task::JoinHandle<Result<(), super::BrokerdError>>,
 ) -> Result<(), super::BrokerdError> {
     tokio::time::timeout(std::time::Duration::from_secs(10), task)
@@ -4430,6 +4584,112 @@ impl WorkflowFixture {
             })
             .collect()
     }
+}
+
+#[tokio::test]
+async fn strict_check_rejects_corrupt_wasm() {
+    let fixture = WorkflowFixture::new();
+    write_owner_only(
+        &fixture._root.path().join("cli-probe.wasm"),
+        b"corrupt wasm",
+    );
+
+    let report = super::check(&fixture.config, None, None).await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::Host(
+                dekopon_broker_host::BrokerHostError::Compile { .. }
+            )]
+        ),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn strict_check_rejects_conflicting_provider_routes() {
+    let fixture = WorkflowFixture::new();
+    let component = fs::read(fixture._root.path().join("cli-probe.wasm")).unwrap();
+    write_owner_only(&fixture._root.path().join("http-probe.wasm"), &component);
+
+    let report = super::check(&fixture.config, None, None).await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::Host(
+                dekopon_broker_host::BrokerHostError::ConflictingProviders { report }
+            )] if report.capabilities.iter().any(|capability| capability.as_str() == "cli-probe.upper")
+        ),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn strict_check_rejects_workflow_arguments_that_propose_the_wrong_capability() {
+    use super::workflows::{ParseFailure, Refused};
+
+    let fixture = WorkflowFixture::new();
+    fixture.write(
+        MAPPED_SUBJECT,
+        "    - {step: wrong, argv: [probe, upper, --text, hi], capability: http-probe.fetch}\n",
+    );
+    let refusals = fixture.refusals().await;
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(
+        matches!(
+            &refusals[0].refused,
+            Refused::Parse(parse) if matches!(
+                &parse.failure,
+                ParseFailure::Proposed { capability } if capability.as_str() == "cli-probe.upper"
+            )
+        ),
+        "{refusals:?}"
+    );
+}
+
+#[tokio::test]
+async fn relaxed_check_skips_workflow_loading_and_leaves_the_store_unopened() {
+    let fixture = WorkflowFixture::new();
+    let mut document = attested_document(current_uid());
+    document.as_object_mut().unwrap().remove("providers");
+    document["providerSet"] = json!({"lockPath": "providers.lock.yaml", "storePath": "store"});
+    write_config(&fixture.config, &document);
+    let store = fixture._root.path().join("store");
+    let missing_set = fixture._root.path().join("providers.yaml");
+    let report = super::check(
+        &fixture.config,
+        Some(super::CheckProviders {
+            provider_set: missing_set,
+            store: store.clone(),
+            download_concurrency: super::DEFAULT_DOWNLOAD_CONCURRENCY,
+            verification: super::ProviderVerification::Relaxed,
+        }),
+        Some(&fixture.workflows.join("missing")),
+    )
+    .await;
+    assert!(
+        matches!(
+            report.problems.as_slice(),
+            [super::BrokerdError::ProviderSet(_)]
+        ),
+        "{report:?}"
+    );
+    assert!(
+        matches!(
+            report.warnings.as_slice(),
+            [
+                super::StartupWarning::RelaxedVerification {
+                    stage: super::Stage::Providers
+                },
+                super::StartupWarning::RelaxedVerification {
+                    stage: super::Stage::Workflows
+                },
+                ..
+            ]
+        ),
+        "{report:?}"
+    );
+    assert!(!store.exists());
 }
 
 const MAPPED_SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";

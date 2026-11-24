@@ -174,7 +174,7 @@ impl RoutingTable {
                     max_steps: route.limits.max_steps,
                     max_capability_calls: route.limits.max_capability_calls,
                 },
-                max_duration: route.limits.max_duration_ms.map(Duration::from_millis),
+                max_duration: Some(route.limits.max_duration()),
                 script_timeout: route.limits.script_timeout(),
                 job_timeout: route.limits.job_timeout_ms.map(Duration::from_millis),
                 progress_detail: route.progress_detail,

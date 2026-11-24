@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Write as _},
+    num::NonZeroUsize,
     os::unix::fs::{
         DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
     },
@@ -24,10 +25,10 @@ use dekopon_core::{
     },
     read_trusted_file,
 };
-use futures_util::StreamExt as _;
+use futures_util::{StreamExt as _, stream};
 use http_auth::parser::ChallengeParser;
 use reqwest::{
-    StatusCode, Url,
+    Method, StatusCode, Url,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue, WWW_AUTHENTICATE},
 };
 use semver::Version;
@@ -37,7 +38,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::Instrument as _;
 
-use crate::{HARD_MAX_PROVIDERS, socket};
+use crate::{CheckPhase, CheckTimings, HARD_MAX_PROVIDERS, socket};
 
 pub const PROVIDER_ARTIFACT_TYPE: &str = "application/vnd.dekopon.provider.v1+wasm";
 pub const PROVIDER_LAYER_MEDIA_TYPE: &str = "application/wasm";
@@ -195,12 +196,8 @@ pub struct ProviderManager {
 
 impl ProviderManager {
     pub async fn new(options: ProviderManagerOptions) -> Result<Self, ProviderManagerError> {
-        let bundle = load_registry_ca_bundle(
-            std::env::var_os(REGISTRY_CA_BUNDLE_ENV).as_deref(),
-            socket::current_uid(),
-        )
-        .await?;
-        let registry = RegistryClient::new(options.plaintext_loopback_registries, bundle)?;
+        let registry =
+            RegistryClient::with_operator_ca(options.plaintext_loopback_registries).await?;
         Ok(Self {
             paths: options.paths,
             registry,
@@ -208,6 +205,14 @@ impl ProviderManager {
     }
 
     pub async fn sync(&self) -> Result<ProviderSyncReport, ProviderManagerError> {
+        self.sync_for_check(NonZeroUsize::MIN, None).await
+    }
+
+    pub(crate) async fn sync_for_check(
+        &self,
+        concurrency: NonZeroUsize,
+        mut timings: Option<&mut CheckTimings>,
+    ) -> Result<ProviderSyncReport, ProviderManagerError> {
         let uid = socket::current_uid();
         let _activation_operation = lock_activation(&self.paths.lock_file, uid)?;
         let desired = load_provider_set(
@@ -230,24 +235,72 @@ impl ProviderManager {
             })
             .unwrap_or_default();
 
-        let mut candidates = Vec::with_capacity(desired.providers.len());
-        let mut fetched = 0_usize;
-        for provider in desired.providers {
-            if let Some(locked) = old_by_source.get(&provider.source) {
-                if store.ensure_locked_blob(&self.registry, locked).await? {
-                    fetched += 1;
+        let provider_count = desired.providers.len();
+        let started = std::time::Instant::now();
+        let mut results = stream::iter(desired.providers.into_iter().enumerate())
+            .map(|(index, provider)| {
+                let store = &store;
+                let old_by_source = &old_by_source;
+                async move {
+                    let source = provider.source;
+                    let result = async {
+                        if let Some(locked) = old_by_source.get(&source) {
+                            let fetched = store.ensure_locked_blob(&self.registry, locked).await?;
+                            Ok((CandidateProvider::from_locked(locked.clone()), fetched))
+                        } else {
+                            let resolved = self.registry.resolve(&source).await?;
+                            let fetched = store.install_resolved(&self.registry, &resolved).await?;
+                            Ok((CandidateProvider::from_resolved(resolved), fetched))
+                        }
+                    }
+                    .await;
+                    (index, source, result)
                 }
-                candidates.push(CandidateProvider::from_locked(locked.clone()));
-            } else {
-                let resolved = self.registry.resolve(&provider.source).await?;
-                if store.install_resolved(&self.registry, &resolved).await? {
-                    fetched += 1;
+            })
+            .buffer_unordered(concurrency.get())
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_unstable_by_key(|(index, _, _)| *index);
+        let mut candidates = Vec::with_capacity(provider_count);
+        let mut fetched = 0;
+        let mut failures = Vec::new();
+        for (_, source, result) in results {
+            match result {
+                Ok((candidate, downloaded)) => {
+                    candidates.push(candidate);
+                    fetched += usize::from(downloaded);
                 }
-                candidates.push(CandidateProvider::from_resolved(resolved));
+                Err(error) => failures.push((source, error)),
             }
         }
-
-        let lock = validate_candidates(candidates, &store).await?;
+        if let Some(timings) = &mut timings {
+            let concurrency = concurrency.get().min(provider_count);
+            timings.download_concurrency = Some(concurrency);
+            timings.sync = Some(CheckPhase::record(
+                "sync",
+                started,
+                provider_count,
+                None,
+                failures.is_empty(),
+                Some(concurrency),
+            ));
+        }
+        if !failures.is_empty() {
+            return Err(ProviderManagerError::SyncFailed { failures });
+        }
+        let started = std::time::Instant::now();
+        let validated = validate_candidates(candidates, &store).await;
+        if let Some(timings) = timings {
+            timings.validate_load = Some(CheckPhase::record(
+                "validate_load",
+                started,
+                provider_count,
+                validated.as_ref().ok().map(|(_, cache)| *cache),
+                validated.is_ok(),
+                None,
+            ));
+        }
+        let (lock, _) = validated?;
         let encoded = encode_lock(&lock)?;
         let previous = old_lock.as_ref().map(encode_lock).transpose()?;
         let lock_changed = previous.as_deref() != Some(encoded.as_slice());
@@ -410,6 +463,15 @@ impl ProviderManager {
             providers: lock.providers.len(),
         })
     }
+}
+
+pub(crate) async fn probe_provider_set(
+    path: &Path,
+    concurrency: NonZeroUsize,
+    timings: Option<&mut CheckTimings>,
+) -> Result<(), ProviderManagerError> {
+    let registry = RegistryClient::with_operator_ca(Vec::new()).await?;
+    registry.probe_set(path, concurrency, timings).await
 }
 
 fn export_skills(
@@ -595,9 +657,10 @@ impl CandidateProvider {
 }
 
 async fn validate_candidates(
-    candidates: Vec<CandidateProvider>,
+    mut candidates: Vec<CandidateProvider>,
     store: &ProviderStore,
-) -> Result<ProviderLock, ProviderManagerError> {
+) -> Result<(ProviderLock, dekopon_broker_host::CompiledCacheCounts), ProviderManagerError> {
+    candidates.sort_by(|left, right| left.source.cmp(&right.source));
     let paths = candidates
         .iter()
         .map(|candidate| store.blob_path(&candidate.component_digest))
@@ -665,7 +728,7 @@ async fn validate_candidates(
         providers,
     };
     validate_lock_shape(&lock)?;
-    Ok(lock)
+    Ok((lock, registry.compiled_cache_counts()))
 }
 
 async fn validate_lock(
@@ -749,8 +812,6 @@ async fn load_provider_set(
             problems: conflicts.into_iter().collect(),
         });
     }
-    set.providers
-        .sort_by(|left, right| left.source.cmp(&right.source));
     Ok(set)
 }
 
@@ -1165,6 +1226,91 @@ struct RegistryClient {
 struct RegistryToken(String);
 
 impl RegistryClient {
+    async fn with_operator_ca(plaintext: Vec<String>) -> Result<Self, ProviderManagerError> {
+        let bundle = load_registry_ca_bundle(
+            std::env::var_os(REGISTRY_CA_BUNDLE_ENV).as_deref(),
+            socket::current_uid(),
+        )
+        .await?;
+        Self::new(plaintext, bundle)
+    }
+
+    async fn probe_set(
+        &self,
+        path: &Path,
+        concurrency: NonZeroUsize,
+        timings: Option<&mut CheckTimings>,
+    ) -> Result<(), ProviderManagerError> {
+        let desired = load_provider_set(path, socket::current_uid()).await?;
+        let count = desired.providers.len();
+        let started = std::time::Instant::now();
+        let mut failures = stream::iter(desired.providers.into_iter().enumerate())
+            .map(|(index, provider)| async move {
+                self.probe(&provider.source)
+                    .await
+                    .err()
+                    .map(|error| (index, (provider.source, error.for_probe())))
+            })
+            .buffer_unordered(concurrency.get())
+            .filter_map(std::future::ready)
+            .collect::<Vec<_>>()
+            .await;
+        if let Some(timings) = timings {
+            let concurrency = concurrency.get().min(count);
+            timings.download_concurrency = Some(concurrency);
+            timings.probe = Some(CheckPhase::record(
+                "relaxed_probe",
+                started,
+                count,
+                None,
+                failures.is_empty(),
+                Some(concurrency),
+            ));
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        failures.sort_unstable_by_key(|(index, _)| *index);
+        Err(ProviderManagerError::ProbeFailed {
+            failures: failures.into_iter().map(|(_, failure)| failure).collect(),
+        })
+    }
+
+    async fn probe(&self, source: &str) -> Result<(), ProviderManagerError> {
+        let resolved = self.resolve(source).await?;
+        let parsed = ParsedSource::parse(&resolved.source)?;
+        let url = self.registry_url(
+            &parsed.reference,
+            &format!("blobs/{}", resolved.layer.digest),
+        )?;
+        let response = self
+            .request_authorized(
+                &parsed.reference,
+                Method::HEAD,
+                url,
+                None,
+                RegistryOperation::Blob,
+            )
+            .await?;
+        if let Some(header) = response.headers().get(CONTENT_LENGTH) {
+            let length = header
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    ProviderManagerError::registry("OCI blob Content-Length is invalid")
+                })?;
+            if length != resolved.layer.size {
+                return Err(ProviderManagerError::digest_mismatch(
+                    BLOB_SIZE_MISMATCH,
+                    resolved.layer.size.to_string(),
+                    length.to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn new(
         plaintext: Vec<String>,
         bundle: Option<RegistryCaBundle>,
@@ -1212,11 +1358,12 @@ impl RegistryClient {
             .ok_or_else(|| ProviderManagerError::config_detail(MISSING_SELECTOR, source))?;
         let url = self.registry_url(&parsed.reference, &format!("manifests/{selector}"))?;
         let response = self
-            .get_authorized(
+            .request_authorized(
                 &parsed.reference,
+                Method::GET,
                 url,
                 Some(OCI_MANIFEST_MEDIA_TYPE),
-                "manifest",
+                RegistryOperation::Manifest,
             )
             .await?;
         let headers = response.headers().clone();
@@ -1296,7 +1443,13 @@ impl RegistryClient {
         let parsed = ParsedSource::parse(source)?;
         let url = self.registry_url(&parsed.reference, &format!("blobs/{}", descriptor.digest))?;
         let response = self
-            .get_authorized(&parsed.reference, url, None, "blob")
+            .request_authorized(
+                &parsed.reference,
+                Method::GET,
+                url,
+                None,
+                RegistryOperation::Blob,
+            )
             .await?;
         if let Some(length) = response.content_length()
             && length != descriptor.size
@@ -1374,57 +1527,103 @@ impl RegistryClient {
         })
     }
 
-    async fn get_authorized(
+    async fn request_authorized(
         &self,
         reference: &OciReference,
+        method: Method,
         url: Url,
         accept: Option<&str>,
-        operation: &'static str,
+        operation: RegistryOperation,
     ) -> Result<reqwest::Response, ProviderManagerError> {
         let key = format!("{}/{}", reference.registry(), reference.repository());
         let cached = self.tokens.lock().get(&key).cloned();
+        let mut authentication = if cached.is_some() {
+            RegistryAuthentication::Bearer
+        } else {
+            RegistryAuthentication::Anonymous
+        };
         let mut response = self
-            .send_get(url.clone(), accept, cached.as_ref(), operation)
+            .send_request(
+                method.clone(),
+                url.clone(),
+                accept,
+                cached.as_ref(),
+                operation,
+            )
             .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
-            let challenge = response
-                .headers()
-                .get(WWW_AUTHENTICATE)
-                .ok_or_else(|| ProviderManagerError::registry(MISSING_CHALLENGE))?
-                .to_str()
-                .map_err(|source| {
-                    ProviderManagerError::registry_source(
-                        "OCI registry authentication challenge header is invalid",
-                        source,
-                    )
-                })?
-                .to_owned();
+            let challenge = Self::bearer_challenge(response.headers()).map_err(|error| {
+                ProviderManagerError::RegistryStatus {
+                    status: StatusCode::UNAUTHORIZED,
+                    operation,
+                    authentication,
+                    source: Some(Box::new(error)),
+                }
+            })?;
             // Registry response text is untrusted and must never reach the surfaced error or
             // ordinary logs.
-            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation).await?;
+            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation.label())
+                .await?;
             let token = self.fetch_token(reference, &challenge).await?;
             self.tokens.lock().insert(key, token.clone());
-            response = self.send_get(url, accept, Some(&token), operation).await?;
+            authentication = RegistryAuthentication::Bearer;
+            response = self
+                .send_request(method, url, accept, Some(&token), operation)
+                .await?;
         }
-        if !response.status().is_success() {
-            let status = response.status();
-            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation).await?;
-            return Err(ProviderManagerError::registry_detail(
-                REGISTRY_STATUS,
-                format!("{operation}: HTTP {status}"),
-            ));
-        }
-        Ok(response)
+        Self::require_success(response, operation, authentication).await
     }
 
-    async fn send_get(
+    fn bearer_challenge(
+        headers: &reqwest::header::HeaderMap,
+    ) -> Result<String, ProviderManagerError> {
+        headers
+            .get(WWW_AUTHENTICATE)
+            .ok_or_else(|| ProviderManagerError::registry(MISSING_CHALLENGE))?
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|source| {
+                ProviderManagerError::registry_source(
+                    "OCI registry authentication challenge header is invalid",
+                    source,
+                )
+            })
+    }
+
+    async fn require_success(
+        response: reqwest::Response,
+        operation: RegistryOperation,
+        authentication: RegistryAuthentication,
+    ) -> Result<reqwest::Response, ProviderManagerError> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let source =
+            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation.label())
+                .await
+                .err()
+                .map(Box::new);
+        Err(ProviderManagerError::RegistryStatus {
+            status,
+            operation,
+            authentication,
+            source,
+        })
+    }
+
+    async fn send_request(
         &self,
+        method: Method,
         url: Url,
         accept: Option<&str>,
         token: Option<&RegistryToken>,
-        operation: &'static str,
+        operation: RegistryOperation,
     ) -> Result<reqwest::Response, ProviderManagerError> {
-        let mut request = self.client.get(url).timeout(REGISTRY_OPERATION_TIMEOUT);
+        let mut request = self
+            .client
+            .request(method, url)
+            .timeout(REGISTRY_OPERATION_TIMEOUT);
         if let Some(accept) = accept {
             request = request.header(ACCEPT, accept);
         }
@@ -1441,7 +1640,7 @@ impl RegistryClient {
         request.send().await.map_err(|source| {
             ProviderManagerError::registry_transport(
                 REGISTRY_REQUEST_FAILED,
-                operation,
+                operation.label(),
                 source.without_url(),
             )
         })
@@ -1481,26 +1680,14 @@ impl RegistryClient {
             );
         }
         let response = self
-            .client
-            .get(realm)
-            .timeout(REGISTRY_OPERATION_TIMEOUT)
-            .send()
-            .await
-            .map_err(|source| {
-                ProviderManagerError::registry_transport(
-                    REGISTRY_REQUEST_FAILED,
-                    "token",
-                    source.without_url(),
-                )
-            })?;
-        if !response.status().is_success() {
-            let status = response.status();
-            bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, "token").await?;
-            return Err(ProviderManagerError::registry_detail(
-                REGISTRY_STATUS,
-                format!("token: HTTP {status}"),
-            ));
-        }
+            .send_request(Method::GET, realm, None, None, RegistryOperation::Token)
+            .await?;
+        let response = Self::require_success(
+            response,
+            RegistryOperation::Token,
+            RegistryAuthentication::Anonymous,
+        )
+        .await?;
         let bytes = bounded_response_bytes(response, HARD_MAX_TOKEN_BYTES, "token").await?;
         let document = serde_json::from_slice::<TokenDocument>(&bytes).map_err(|source| {
             ProviderManagerError::registry_source("OCI registry token response is invalid", source)
@@ -1671,6 +1858,38 @@ struct ProviderStore {
     root: PathBuf,
     sha256: PathBuf,
     uid: u32,
+    usage: parking_lot::Mutex<StoreUsage>,
+    capacity_changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct StoreUsage {
+    occupied: Option<(usize, u64)>,
+    pending: usize,
+}
+
+struct BlobReservation<'a> {
+    store: &'a ProviderStore,
+    bytes: Option<u64>,
+}
+
+impl BlobReservation<'_> {
+    fn published(mut self) {
+        self.bytes = None;
+    }
+}
+
+impl Drop for BlobReservation<'_> {
+    fn drop(&mut self) {
+        let mut usage = self.store.usage.lock();
+        usage.pending -= 1;
+        if let (Some((blobs, occupied)), Some(bytes)) = (&mut usage.occupied, self.bytes) {
+            *blobs -= 1;
+            *occupied -= bytes;
+        }
+        drop(usage);
+        self.store.capacity_changed.notify_waiters();
+    }
 }
 
 impl ProviderStore {
@@ -1692,6 +1911,8 @@ impl ProviderStore {
             root,
             sha256,
             uid: expected_uid,
+            usage: parking_lot::Mutex::default(),
+            capacity_changed: tokio::sync::Notify::new(),
         })
     }
 
@@ -1747,12 +1968,18 @@ impl ProviderStore {
         descriptor: &LayerDescriptor,
     ) -> Result<bool, ProviderManagerError> {
         let destination = self.blob_path(&descriptor.digest)?;
-        if destination.exists() {
-            verify_component_file(&destination, &descriptor.digest, descriptor.size, self.uid)
-                .await?;
-            return Ok(false);
-        }
-        self.ensure_capacity(descriptor.size)?;
+        let reservation = loop {
+            let capacity_changed = self.capacity_changed.notified();
+            if destination.exists() {
+                verify_component_file(&destination, &descriptor.digest, descriptor.size, self.uid)
+                    .await?;
+                return Ok(false);
+            }
+            if let Some(reservation) = self.ensure_capacity(descriptor.size)? {
+                break reservation;
+            }
+            capacity_changed.await;
+        };
         let temporary = tempfile::Builder::new()
             .prefix(BLOB_TEMPORARY_PREFIX)
             .tempfile_in(&self.sha256)
@@ -1771,32 +1998,79 @@ impl ProviderStore {
             )
         })?;
         let mut file = tokio::fs::File::from_std(std_file);
-        registry
-            .download_blob(source, descriptor, &mut file)
-            .await?;
-        file.flush()
-            .await
+        let downloaded = registry.download_blob(source, descriptor, &mut file).await;
+        let flushed = file.flush().await;
+        downloaded?;
+        flushed
             .map_err(|source| ProviderManagerError::io("could not write provider blob", source))?;
         file.sync_all().await.map_err(|source| {
             ProviderManagerError::io("could not synchronize provider blob", source)
         })?;
         drop(file);
-        replace_private_file_noclobber(&destination, temporary.into_temp_path()).map_err(
-            |error| {
-                let reason = if error.path == self.sha256 {
-                    SYNC_PROVIDER_DIRECTORY
-                } else {
-                    "could not atomically publish provider blob"
-                };
-                ProviderManagerError::io_at(reason, error.path, error.source)
-            },
-        )?;
+        match replace_private_file_noclobber(&destination, temporary.into_temp_path()) {
+            Ok(()) => reservation.published(),
+            Err(error) if error.path == self.sha256 => {
+                reservation.published();
+                return Err(ProviderManagerError::io_at(
+                    SYNC_PROVIDER_DIRECTORY,
+                    error.path,
+                    error.source,
+                ));
+            }
+            Err(error) if error.source.kind() == io::ErrorKind::AlreadyExists => {
+                drop(reservation);
+                verify_component_file(&destination, &descriptor.digest, descriptor.size, self.uid)
+                    .await?;
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(ProviderManagerError::io_at(
+                    "could not atomically publish provider blob",
+                    error.path,
+                    error.source,
+                ));
+            }
+        }
         socket::validate_owned_file(&destination, self.uid)
             .map_err(|error| ProviderManagerError::file_security(&destination, error))?;
         Ok(true)
     }
 
-    fn ensure_capacity(&self, requested: u64) -> Result<(), ProviderManagerError> {
+    fn ensure_capacity(
+        &self,
+        requested: u64,
+    ) -> Result<Option<BlobReservation<'_>>, ProviderManagerError> {
+        let mut usage = self.usage.lock();
+        let (blobs, bytes) = match usage.occupied {
+            Some(occupied) => occupied,
+            None => self.scan_usage(requested)?,
+        };
+        usage.occupied = Some((blobs, bytes));
+        if blobs >= HARD_MAX_PROVIDER_STORE_BLOBS
+            || bytes
+                .checked_add(requested)
+                .is_none_or(|total| total > HARD_MAX_PROVIDER_STORE_BYTES)
+        {
+            if usage.pending > 0 {
+                return Ok(None);
+            }
+            return Err(ProviderManagerError::StoreFull {
+                blobs,
+                bytes,
+                requested,
+                maximum_blobs: HARD_MAX_PROVIDER_STORE_BLOBS,
+                maximum_bytes: HARD_MAX_PROVIDER_STORE_BYTES,
+            });
+        }
+        usage.occupied = Some((blobs + 1, bytes + requested));
+        usage.pending += 1;
+        Ok(Some(BlobReservation {
+            store: self,
+            bytes: Some(requested),
+        }))
+    }
+
+    fn scan_usage(&self, requested: u64) -> Result<(usize, u64), ProviderManagerError> {
         let mut blobs = 0_usize;
         let mut bytes = 0_u64;
         let entries = fs::read_dir(&self.sha256).map_err(|source| {
@@ -1837,20 +2111,7 @@ impl ProviderStore {
                     maximum_bytes: HARD_MAX_PROVIDER_STORE_BYTES,
                 })?;
         }
-        if blobs >= HARD_MAX_PROVIDER_STORE_BLOBS
-            || bytes
-                .checked_add(requested)
-                .is_none_or(|total| total > HARD_MAX_PROVIDER_STORE_BYTES)
-        {
-            return Err(ProviderManagerError::StoreFull {
-                blobs,
-                bytes,
-                requested,
-                maximum_blobs: HARD_MAX_PROVIDER_STORE_BLOBS,
-                maximum_bytes: HARD_MAX_PROVIDER_STORE_BYTES,
-            });
-        }
-        Ok(())
+        Ok((blobs, bytes))
     }
 }
 
@@ -2288,7 +2549,6 @@ const RESOLVED_VERSION_MISMATCH: &str =
     "provider lock resolvedVersion does not match its exact tag";
 const REGISTRY_REQUEST_FAILED: &str = "OCI registry request failed";
 const REGISTRY_STREAM_FAILED: &str = "OCI registry response failed while streaming";
-const REGISTRY_STATUS: &str = "OCI registry returned an unsuccessful HTTP status";
 const RESPONSE_TOO_LARGE: &str = "OCI registry response exceeds its byte ceiling";
 const MISSING_CHALLENGE: &str =
     "OCI registry required authentication without a WWW-Authenticate challenge";
@@ -2314,6 +2574,16 @@ pub enum RegistryCaBundleCause {
 
 #[derive(Debug, Error)]
 pub enum ProviderManagerError {
+    #[error("provider sync failed: {}", render_provider_failures(.failures))]
+    SyncFailed { failures: Vec<(String, Self)> },
+    #[error("relaxed verification failed: {}", render_provider_failures(.failures))]
+    ProbeFailed { failures: Vec<(String, Self)> },
+    #[error("pinned artifact {outcome}")]
+    Probe {
+        outcome: ProbeOutcome,
+        #[source]
+        source: Box<Self>,
+    },
     #[error("{REGISTRY_CA_BUNDLE_ENV} names {}, which cannot be used", path.display())]
     RegistryCaBundle {
         path: PathBuf,
@@ -2363,6 +2633,21 @@ pub enum ProviderManagerError {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
+    #[error("OCI registry returned an unsuccessful HTTP status: {}: HTTP {status}", operation.label())]
+    RegistryStatus {
+        operation: RegistryOperation,
+        status: StatusCode,
+        authentication: RegistryAuthentication,
+        #[source]
+        source: Option<Box<Self>>,
+    },
+    #[error("{reason}: {operation}")]
+    RegistryTransport {
+        reason: &'static str,
+        operation: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error("{reason}: expected {expected}, got {actual}")]
     DigestMismatch {
         reason: &'static str,
@@ -2397,7 +2682,98 @@ pub enum ProviderManagerError {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistryOperation {
+    Manifest,
+    Blob,
+    Token,
+}
+
+impl RegistryOperation {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Blob => "blob",
+            Self::Token => "token",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegistryAuthentication {
+    Anonymous,
+    Bearer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeOutcome {
+    Missing,
+    Inconclusive,
+    Invalid,
+}
+
+impl std::fmt::Display for ProbeOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "is missing",
+            Self::Inconclusive => "availability is inconclusive",
+            Self::Invalid => "is invalid",
+        })
+    }
+}
+
+fn render_provider_failures(failures: &[(String, ProviderManagerError)]) -> String {
+    failures
+        .iter()
+        .map(|(source, error)| format!("{source}: {}", dekopon_core::error_chain(error)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 impl ProviderManagerError {
+    fn for_probe(self) -> Self {
+        let outcome = match &self {
+            Self::RegistryStatus {
+                status: StatusCode::NOT_FOUND,
+                operation: RegistryOperation::Manifest | RegistryOperation::Blob,
+                authentication: RegistryAuthentication::Bearer,
+                source,
+            } => {
+                if let Some(Self::RegistryTransport { .. }) = source.as_deref() {
+                    ProbeOutcome::Inconclusive
+                } else {
+                    ProbeOutcome::Missing
+                }
+            }
+            Self::RegistryStatus { .. } | Self::RegistryTransport { .. } => {
+                ProbeOutcome::Inconclusive
+            }
+            Self::RegistryCaBundle { .. }
+            | Self::SkillExportTask { .. }
+            | Self::SkillRead { .. }
+            | Self::SkillOutputNotDirectory { .. }
+            | Self::SkillOutputNotEmpty { .. }
+            | Self::DuplicateSkill { .. }
+            | Self::Configuration { .. }
+            | Self::StateConflicts { .. }
+            | Self::FileSecurity { .. }
+            | Self::Registry { .. }
+            | Self::DigestMismatch { .. }
+            | Self::LockMismatch { .. }
+            | Self::StoreFull { .. }
+            | Self::OperationInProgress { .. }
+            | Self::Host(_)
+            | Self::Io { .. }
+            | Self::SyncFailed { .. }
+            | Self::ProbeFailed { .. }
+            | Self::Probe { .. } => ProbeOutcome::Invalid,
+        };
+        Self::Probe {
+            outcome,
+            source: Box::new(self),
+        }
+    }
+
     fn config(reason: &'static str) -> Self {
         Self::Configuration {
             reason,
@@ -2457,10 +2833,10 @@ impl ProviderManagerError {
         operation: &'static str,
         source: reqwest::Error,
     ) -> Self {
-        Self::Registry {
+        Self::RegistryTransport {
             reason,
-            detail: Some(operation.to_owned()),
-            source: Some(Box::new(source)),
+            operation,
+            source,
         }
     }
 
@@ -2568,11 +2944,12 @@ mod tests {
         let client = RegistryClient::new(Vec::new(), None).expect("client");
         assert!(
             client
-                .send_get(
+                .send_request(
+                    Method::GET,
                     Url::parse(&format!("{}{path}", refused.endpoint)).expect("URL"),
                     None,
                     None,
-                    "manifest"
+                    RegistryOperation::Manifest,
                 )
                 .await
                 .is_err()
@@ -2593,11 +2970,12 @@ mod tests {
             .expect("bundle");
         let client = RegistryClient::new(Vec::new(), bundle).expect("client");
         client
-            .send_get(
+            .send_request(
+                Method::GET,
                 Url::parse(&format!("{}{path}", reached.endpoint)).expect("URL"),
                 None,
                 None,
-                "manifest",
+                RegistryOperation::Manifest,
             )
             .await
             .expect("trusted registry");
@@ -2778,7 +3156,12 @@ mod tests {
         component: Arc<Vec<u8>>,
         manifests: Arc<AtomicUsize>,
         blobs: Arc<AtomicUsize>,
+        heads: Arc<AtomicUsize>,
         competing_blob: Option<PathBuf>,
+        manifest_failures: Arc<parking_lot::Mutex<BTreeMap<String, (StatusCode, Duration)>>>,
+        manifest_failure_bytes: Arc<AtomicUsize>,
+        blob_head: Arc<parking_lot::Mutex<Option<(StatusCode, u64)>>>,
+        token_status: Arc<parking_lot::Mutex<Option<StatusCode>>>,
     }
 
     #[derive(Clone)]
@@ -2843,10 +3226,16 @@ mod tests {
                 component: Arc::new(component),
                 manifests: Arc::new(AtomicUsize::new(0)),
                 blobs: Arc::new(AtomicUsize::new(0)),
+                heads: Arc::new(AtomicUsize::new(0)),
                 competing_blob,
+                manifest_failures: Arc::default(),
+                manifest_failure_bytes: Arc::default(),
+                blob_head: Arc::default(),
+                token_status: Arc::default(),
             };
             let app = Router::new()
                 .route("/v2/{*path}", get(registry_response))
+                .route("/token", get(registry_token_response))
                 .with_state(state.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -2880,9 +3269,43 @@ mod tests {
     async fn registry_response(
         AxumPath(path): AxumPath<String>,
         State(state): State<RegistryState>,
+        method: Method,
+        headers: AxumHeaderMap,
     ) -> Response<Body> {
+        if state.token_status.lock().is_some()
+            && headers
+                .get(AUTHORIZATION)
+                .is_none_or(|value| value != "Bearer fixture")
+        {
+            let host = headers
+                .get(reqwest::header::HOST)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(
+                    WWW_AUTHENTICATE,
+                    format!("Bearer realm=\"http://{host}/token\""),
+                )
+                .body(Body::empty())
+                .unwrap();
+        }
         if path.contains("/manifests/") {
             state.manifests.fetch_add(1, Ordering::Relaxed);
+            let failure = state.manifest_failures.lock().get(&path).copied();
+            if let Some((status, delay)) = failure {
+                tokio::time::sleep(delay).await;
+                return Response::builder()
+                    .status(status)
+                    .body(Body::from(vec![
+                        0;
+                        state
+                            .manifest_failure_bytes
+                            .load(Ordering::Relaxed)
+                    ]))
+                    .unwrap();
+            }
             let mut response = Response::new(Body::from(state.manifest.as_ref().clone()));
             response.headers_mut().insert(
                 reqwest::header::CONTENT_TYPE,
@@ -2895,6 +3318,18 @@ mod tests {
             return response;
         }
         if path.contains("/blobs/") {
+            if method == Method::HEAD {
+                state.heads.fetch_add(1, Ordering::Relaxed);
+                let (status, length) = state
+                    .blob_head
+                    .lock()
+                    .unwrap_or((StatusCode::OK, state.component.len() as u64));
+                return Response::builder()
+                    .status(status)
+                    .header(CONTENT_LENGTH, length)
+                    .body(Body::empty())
+                    .unwrap();
+            }
             let previous = state.blobs.fetch_add(1, Ordering::Relaxed);
             if previous == 0
                 && let Some(path) = &state.competing_blob
@@ -2914,6 +3349,17 @@ mod tests {
             .status(StatusCode::NOT_FOUND)
             .body(Body::empty())
             .expect("404 fixture")
+    }
+
+    async fn registry_token_response(State(state): State<RegistryState>) -> Response<Body> {
+        let status = state
+            .token_status
+            .lock()
+            .unwrap_or(StatusCode::UNAUTHORIZED);
+        Response::builder()
+            .status(status)
+            .body(Body::from(r#"{"token":"fixture"}"#))
+            .unwrap()
     }
 
     fn cli_probe_component() -> Vec<u8> {
@@ -2967,7 +3413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_download_clears_abandoned_staging_and_refuses_a_competing_blob() {
+    async fn blob_download_clears_abandoned_staging_and_verifies_a_competing_blob() {
         let directory = tempfile::tempdir().expect("manager fixture");
         let store =
             ProviderStore::open(&directory.path().join("store"), socket::current_uid(), true)
@@ -2989,11 +3435,12 @@ mod tests {
         let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
         let source = format!("{}/test/provider:1.0.0", registry.authority);
 
-        assert!(matches!(
-            store.install_blob(&client, &source, &descriptor).await,
-            Err(ProviderManagerError::Io { path: Some(path), source, .. })
-                if path == destination && source.kind() == io::ErrorKind::AlreadyExists
-        ));
+        assert!(
+            !store
+                .install_blob(&client, &source, &descriptor)
+                .await
+                .unwrap()
+        );
         assert!(!abandoned.exists());
         assert_eq!(fs::read(&destination).unwrap(), component);
         assert!(
@@ -3014,6 +3461,241 @@ mod tests {
         assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o7777, 0o600);
         assert_eq!(fs::read_dir(&store.sha256).unwrap().count(), 1);
         registry.stop().await;
+    }
+
+    #[test]
+    fn rejected_blob_holds_its_slot_until_pending_writes_are_drained() {
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let directory = tempfile::tempdir().unwrap();
+                let store = ProviderStore::open(
+                    &directory.path().join("store"),
+                    socket::current_uid(),
+                    true,
+                )
+                .unwrap();
+                let _operation = store.lock().unwrap();
+                store.usage.lock().occupied = Some((HARD_MAX_PROVIDER_STORE_BLOBS - 1, 0));
+                let registry = TestRegistry::start(vec![0]).await;
+                let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
+                let source = format!("{}/test/provider:1.0.0", registry.authority);
+                let descriptor = LayerDescriptor {
+                    digest: prefixed_sha256(&[1]),
+                    size: 1,
+                };
+                let (started, wait_until_started) = oneshot::channel();
+                let (unblock, wait_until_unblocked) = oneshot::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    wait_until_unblocked.blocking_recv()
+                });
+                wait_until_started.await.unwrap();
+
+                let mut download =
+                    std::pin::pin!(store.install_blob(&client, &source, &descriptor));
+                let completion =
+                    tokio::time::timeout(Duration::from_secs(1), download.as_mut()).await;
+                let slot_reserved = store.ensure_capacity(1).unwrap().is_none();
+                unblock.send(()).unwrap();
+                blocker.await.unwrap().unwrap();
+
+                assert_eq!(registry.state.blobs.load(Ordering::Relaxed), 1);
+                assert!(completion.is_err(), "{completion:?}");
+                assert!(slot_reserved);
+                assert!(matches!(
+                    download.await,
+                    Err(ProviderManagerError::DigestMismatch {
+                        reason: BLOB_DIGEST_MISMATCH,
+                        ..
+                    })
+                ));
+                assert_eq!(fs::read_dir(&store.sha256).unwrap().count(), 0);
+                assert!(store.ensure_capacity(1).unwrap().is_some());
+                registry.stop().await;
+            });
+    }
+
+    #[tokio::test]
+    async fn sync_reports_all_fetch_failures_in_provider_set_order() {
+        let directory = tempfile::tempdir().expect("manager fixture");
+        let registry = TestRegistry::start(cli_probe_component()).await;
+        let sources = [
+            format!("{}/test/throttled:1.0.0", registry.authority),
+            format!("{}/test/missing:1.0.0", registry.authority),
+        ];
+        registry.state.manifest_failures.lock().extend([
+            (
+                "test/throttled/manifests/1.0.0".to_owned(),
+                (StatusCode::TOO_MANY_REQUESTS, Duration::from_millis(40)),
+            ),
+            (
+                "test/missing/manifests/1.0.0".to_owned(),
+                (StatusCode::NOT_FOUND, Duration::ZERO),
+            ),
+        ]);
+        let (manager, paths) = test_manager(directory.path(), &registry.authority, &sources).await;
+        let err = manager
+            .sync_for_check(NonZeroUsize::new(2).unwrap(), None)
+            .await
+            .unwrap_err();
+        let ProviderManagerError::SyncFailed { failures } = err else {
+            panic!("expected provider failures, got {err:?}");
+        };
+        assert_eq!(
+            failures
+                .iter()
+                .map(|(source, _)| source)
+                .collect::<Vec<_>>(),
+            sources.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(registry.state.manifests.load(Ordering::Relaxed), 2);
+        assert!(!paths.lock_file.exists());
+        registry.stop().await;
+    }
+
+    #[tokio::test]
+    async fn relaxed_probe_uses_head_and_refuses_a_size_mismatch() {
+        let registry = TestRegistry::start(cli_probe_component()).await;
+        let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
+        let source = format!("{}/test/provider:1.0.0", registry.authority);
+        client.probe(&source).await.unwrap();
+        *registry.state.blob_head.lock() = Some((StatusCode::OK, 1));
+        assert!(matches!(
+            client.probe(&source).await,
+            Err(ProviderManagerError::DigestMismatch {
+                reason: BLOB_SIZE_MISMATCH,
+                ..
+            })
+        ));
+        assert_eq!(registry.state.heads.load(Ordering::Relaxed), 2);
+        assert_eq!(registry.state.blobs.load(Ordering::Relaxed), 0);
+        registry.stop().await;
+    }
+
+    #[tokio::test]
+    async fn relaxed_probe_distinguishes_authenticated_missing_from_inconclusive_responses() {
+        let registry = TestRegistry::start(cli_probe_component()).await;
+        let source = format!("{}/test/provider:1.0.0", registry.authority);
+        let manifest = "test/provider/manifests/1.0.0".to_owned();
+        let oversized = HARD_MAX_REGISTRY_ERROR_BYTES + 1;
+        registry
+            .state
+            .manifest_failure_bytes
+            .store(oversized, Ordering::Relaxed);
+        for (token, failure, operation, authentication, outcome) in [
+            (
+                None,
+                StatusCode::NOT_FOUND,
+                RegistryOperation::Manifest,
+                RegistryAuthentication::Anonymous,
+                ProbeOutcome::Inconclusive,
+            ),
+            (
+                Some(StatusCode::UNAUTHORIZED),
+                StatusCode::UNAUTHORIZED,
+                RegistryOperation::Token,
+                RegistryAuthentication::Anonymous,
+                ProbeOutcome::Inconclusive,
+            ),
+            (
+                Some(StatusCode::FORBIDDEN),
+                StatusCode::FORBIDDEN,
+                RegistryOperation::Token,
+                RegistryAuthentication::Anonymous,
+                ProbeOutcome::Inconclusive,
+            ),
+            (
+                Some(StatusCode::OK),
+                StatusCode::NOT_FOUND,
+                RegistryOperation::Manifest,
+                RegistryAuthentication::Bearer,
+                ProbeOutcome::Missing,
+            ),
+            (
+                Some(StatusCode::OK),
+                StatusCode::NOT_FOUND,
+                RegistryOperation::Blob,
+                RegistryAuthentication::Bearer,
+                ProbeOutcome::Missing,
+            ),
+            (
+                Some(StatusCode::OK),
+                StatusCode::TOO_MANY_REQUESTS,
+                RegistryOperation::Blob,
+                RegistryAuthentication::Bearer,
+                ProbeOutcome::Inconclusive,
+            ),
+            (
+                Some(StatusCode::OK),
+                StatusCode::SERVICE_UNAVAILABLE,
+                RegistryOperation::Manifest,
+                RegistryAuthentication::Bearer,
+                ProbeOutcome::Inconclusive,
+            ),
+        ] {
+            *registry.state.token_status.lock() = token;
+            registry.state.manifest_failures.lock().clear();
+            *registry.state.blob_head.lock() = None;
+            match operation {
+                RegistryOperation::Manifest => {
+                    registry
+                        .state
+                        .manifest_failures
+                        .lock()
+                        .insert(manifest.clone(), (failure, Duration::ZERO));
+                }
+                RegistryOperation::Blob => {
+                    *registry.state.blob_head.lock() = Some((failure, oversized as u64))
+                }
+                RegistryOperation::Token => {}
+            }
+            let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
+            let error = client.probe(&source).await.unwrap_err().for_probe();
+            assert!(
+                matches!(
+                    &error,
+                    ProviderManagerError::Probe { outcome: result, source }
+                        if *result == outcome && matches!(
+                            &**source,
+                            ProviderManagerError::RegistryStatus {
+                                operation: actual_operation, status, authentication: actual_authentication, ..
+                            } if *actual_operation == operation && *status == failure && *actual_authentication == authentication
+                        )
+                ),
+                "{error:?}"
+            );
+        }
+        let client = RegistryClient::new(vec![registry.authority.clone()], None).unwrap();
+        registry.stop().await;
+        let probe = client.probe(&source).await.unwrap_err().for_probe();
+        let ProviderManagerError::Probe {
+            outcome: ProbeOutcome::Inconclusive,
+            source: transport,
+        } = probe
+        else {
+            panic!("expected an inconclusive transport failure, got {probe:?}");
+        };
+        assert!(matches!(
+            *transport,
+            ProviderManagerError::RegistryTransport { .. }
+        ));
+        let interrupted_404 = ProviderManagerError::RegistryStatus {
+            operation: RegistryOperation::Manifest,
+            status: StatusCode::NOT_FOUND,
+            authentication: RegistryAuthentication::Bearer,
+            source: Some(transport),
+        };
+        assert!(matches!(
+            interrupted_404.for_probe(),
+            ProviderManagerError::Probe {
+                outcome: ProbeOutcome::Inconclusive,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3442,6 +4124,80 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn check_loads_cached_components_and_compiles_only_when_needed() {
+        use crate::tests::write_owner_only;
+
+        for (seeded, compile_on_load, expected) in
+            [(2, false, [0, 0]), (1, false, [0, 1]), (2, true, [1, 1])]
+        {
+            let directory = tempfile::tempdir().expect("candidate store");
+            let (_, paths) =
+                local_precompile_fixture(directory.path(), &["cli-probe", "clock-probe"]).await;
+            let uid = socket::current_uid();
+            let lock = load_lock(&paths.lock_file, uid)
+                .await
+                .expect("fixture lock");
+            let provider_set = directory.path().join("providers.yaml");
+            write_set(
+                &provider_set,
+                &lock
+                    .providers
+                    .into_iter()
+                    .map(|provider| provider.source)
+                    .collect::<Vec<_>>(),
+            );
+            let sources = load_locked_sources(&paths.lock_file, &paths.store, uid)
+                .await
+                .expect("candidate sources");
+            dekopon_broker_host::precompile(sources[..seeded].to_vec(), paths.store.join("cwasm"))
+                .await
+                .expect("seed compiled cache");
+
+            let config = directory.path().join("broker.yaml");
+            write_owner_only(
+                &config,
+                &serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": crate::config::CONFIG_API_VERSION,
+                    "socketPath": "broker.sock",
+                    "providerSet": {"lockPath": "runtime.lock.yaml", "storePath": "runtime-store"},
+                    "compileOnLoad": compile_on_load,
+                }))
+                .expect("encode broker config"),
+            );
+            let probe = sync_compile_probe();
+            for source in &sources {
+                probe.lock().stages.insert(source.path().to_owned(), 0);
+            }
+            let report = crate::check(
+                &config,
+                Some(crate::CheckProviders {
+                    provider_set,
+                    store: directory.path().to_owned(),
+                    download_concurrency: crate::DEFAULT_DOWNLOAD_CONCURRENCY,
+                    verification: crate::ProviderVerification::Strict,
+                }),
+                None,
+            )
+            .await;
+            let counts = sources
+                .iter()
+                .map(|source| {
+                    probe
+                        .lock()
+                        .stages
+                        .remove(source.path())
+                        .expect("tracked source")
+                })
+                .collect::<Vec<_>>();
+            assert!(report.problems.is_empty(), "{report:?}");
+            assert_eq!(
+                counts, expected,
+                "seeded: {seeded}, compileOnLoad: {compile_on_load}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn precompile_repairs_a_truncated_object_and_a_dangling_index() {
         let directory = tempfile::tempdir().expect("fixture");
@@ -3631,7 +4387,7 @@ mod tests {
         let url = Url::parse(&format!("http://{authority}/{sentinel}?token={sentinel}"))
             .expect("request URL");
         let error = registry
-            .send_get(url, None, None, "manifest")
+            .send_request(Method::GET, url, None, None, RegistryOperation::Manifest)
             .await
             .expect_err("closed port refuses request");
         let mut rendered = error.to_string();
@@ -3704,11 +4460,12 @@ mod tests {
         )
         .expect("redirect client");
         let response = client
-            .send_get(
+            .send_request(
+                Method::GET,
                 Url::parse(&format!("http://{source_authority}/source")).expect("source URL"),
                 None,
                 Some(&RegistryToken("bearer-secret-sentinel".to_owned())),
-                "blob",
+                RegistryOperation::Blob,
             )
             .await
             .expect("approved cross-authority redirect follows");
@@ -3751,15 +4508,19 @@ mod tests {
         let client =
             RegistryClient::new(vec![loop_authority.to_string()], None).expect("loop client");
         let error = client
-            .send_get(
+            .send_request(
+                Method::GET,
                 Url::parse(&format!("http://{loop_authority}/loop")).expect("loop URL"),
                 None,
                 None,
-                "manifest",
+                RegistryOperation::Manifest,
             )
             .await
             .expect_err("redirect loop reaches the hard hop ceiling");
-        assert!(matches!(error, ProviderManagerError::Registry { .. }));
+        assert!(matches!(
+            error,
+            ProviderManagerError::RegistryTransport { .. }
+        ));
         loop_task.abort();
         assert!(
             loop_task
@@ -4095,6 +4856,29 @@ providers:
             store.ensure_capacity(1),
             Err(ProviderManagerError::StoreFull { .. })
         ));
+    }
+
+    #[test]
+    fn store_reserves_bytes_and_slots_until_downloads_publish_or_drop() {
+        let directory = tempfile::tempdir().expect("store fixture");
+        let store =
+            ProviderStore::open(&directory.path().join("store"), socket::current_uid(), true)
+                .expect("store opens");
+        let _operation = store.lock().unwrap();
+        for occupied in [
+            (0, HARD_MAX_PROVIDER_STORE_BYTES - 1),
+            (HARD_MAX_PROVIDER_STORE_BLOBS - 1, 0),
+        ] {
+            store.usage.lock().occupied = Some(occupied);
+            let first = store.ensure_capacity(1).unwrap().unwrap();
+            assert!(store.ensure_capacity(1).unwrap().is_none());
+            drop(first);
+            store.ensure_capacity(1).unwrap().unwrap().published();
+            assert!(matches!(
+                store.ensure_capacity(1),
+                Err(ProviderManagerError::StoreFull { .. })
+            ));
+        }
     }
 
     #[test]

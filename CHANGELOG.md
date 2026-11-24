@@ -7,9 +7,97 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.95.0] - 2026-11-23
+
+### Added
+
+- Broker check logs phase timings at INFO and reports them in JSON.
+- Broker check accepts --download-concurrency to bound provider fetches.
+- Broker check accepts --provider-verification relaxed to check pinned artifact availability.
+- `dekopon-brokerd check --materialized` validates local secret files and fails when a check is skipped.
+
 ### Changed
 
+- Raise default route and model output limits for longer tasks.
+
+## [dekopon-chart-0.82.0] - 2026-11-23
+
+### Changed
+
+- Chart 0.82.0 targets core v0.95.0 and renders the `v0.95.0` image tag.
+
+## [0.94.0] - 2026-11-22
+
+### Added
+
+- provider SDK enables clap suggestions so a mistyped flag gets a tip.
+
+### Fixed
+
+- A panicked configuration reload task now stops the gateway or broker with a non-zero exit that names the cause, instead of the gateway serving on without reloads.
+
+## [dekopon-chart-0.81.0] - 2026-11-22
+
+### Changed
+
+- Chart 0.81.0 targets core v0.94.0 and renders the `v0.94.0` image tag.
+
+## [0.93.0] - 2026-11-22
+
+### Added
+
+- Show WhatsApp message types, declared media formats, and admission decisions in receive traces.
+
+### Fixed
+
+- `check-broker` loads providers from the candidate store's compiled cache instead of compiling each component.
+
+## [dekopon-chart-0.80.0] - 2026-11-22
+
+### Changed
+
+- Chart 0.80.0 targets core v0.93.0 and renders the `v0.93.0` image tag.
+
+## [0.92.0] - 2026-11-22
+
+### Added
+
+- The learned-facts skill remembers durable facts and corrections about the person you are serving.
+- Instance-scoped provider storage follows a person across conversations and transports with the same agent.
+- Copy an agent database into a person’s instance with an offline broker command.
+
+### Changed
+
+- The learned-skills skill describes memory private to the agent and the person it serves.
+
+## [dekopon-chart-0.79.0] - 2026-11-22
+
+### Changed
+
+- Chart 0.79.0 targets core v0.92.0 and renders the `v0.92.0` image tag.
+
+## [0.91.0] - 2026-11-22
+
+### Added
+
+- Report daemon reload, storage sweep, and OAuth record recovery, and log ChatGPT credential loads once per committed change.
+
+### Changed
+
+- Slack transports default to `experience: agent`; an app installed from `examples/slack/manifest-legacy.yaml` must set `experience: classic`, and `check` refuses `indicators.cancelButton` on a transport that relied on the old default.
+- Dekopon identifies outbound chat, model, telemetry, and secret requests with a versioned User-Agent and disables automatic retries for telemetry and secret requests.
 - `examples/slack/manifest.yaml` is now the Agent profile, paired with `experience: agent`; the classic profile moved to `examples/slack/manifest-legacy.yaml`. Installed apps are unaffected until reinstalled.
+
+### Fixed
+
+- A successful `follow leave` on a Slack Agent thread releases the thread for every sender, so the original requester's unmentioned messages stop waking the agent until a fresh mention.
+- Preserve the gateway prompt cache key across power loss after it is saved.
+
+## [dekopon-chart-0.78.0] - 2026-11-22
+
+### Changed
+
+- Chart 0.78.0 targets core v0.91.0 and renders the `v0.91.0` image tag.
 
 ## [0.90.0] - 2026-11-20
 

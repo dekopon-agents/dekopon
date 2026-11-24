@@ -396,6 +396,7 @@ impl Delivery {
                     TransportError::Attachment(_)
                     | TransportError::AttachmentTask { .. }
                     | TransportError::AssetType { .. }
+                    | TransportError::MediaSend(_)
                     | TransportError::MissingCredential { .. }
                     | TransportError::EmptyCredential { .. }
                     | TransportError::NonUtf8Credential { .. }

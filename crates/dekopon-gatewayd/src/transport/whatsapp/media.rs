@@ -1,5 +1,8 @@
 use std::{net::IpAddr, time::Instant};
 
+use dekopon_agent::attachment::{
+    AttachmentReference, GeneratedImage, MediaSendRefusal, SendRefusal,
+};
 use tracing::Instrument as _;
 
 use crate::transport::{asset_buffer, floor_boundary, hydration::HydratedImage, reserve_for_chunk};
@@ -9,9 +12,13 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use super::*;
 
 pub(crate) const MAX_IMAGE_BYTES: usize = 5_000_000;
+const MAX_MEDIA_BYTES: usize = 16_000_000;
 pub(super) const MAX_CAPTION_CHARS: usize = 1024;
 const MAX_DOCUMENT_NAME_BYTES: usize = 128;
+const PNG: &str = "image/png";
+const JPEG: &str = "image/jpeg";
 const PDF: &str = "application/pdf";
+const HEIC: &str = "image/heic";
 const DOWNLOAD_HOST: &str = "lookaside.fbsbx.com";
 const DOWNLOAD_PATH: &str = "/whatsapp_business/attachments/";
 
@@ -19,63 +26,117 @@ fn media_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn photo(image: &Value) -> Option<PendingAsset> {
-    let id = image.get("id")?.as_str()?;
-    let mime = image.get("mime_type")?.as_str()?;
-    let extension = match mime {
-        "image/png" => "png",
-        "image/jpeg" => "jpg",
-        _ => return None,
-    };
-    if !media_id(id) {
-        return None;
+fn declared_media_id(media: &Value) -> Result<&str, ReceiveRefusal> {
+    media
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| media_id(id))
+        .ok_or(ReceiveRefusal::InvalidMediaId)
+}
+
+fn mime_type(media: &Value) -> Option<String> {
+    media
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .map(crate::asset::platform_mime)
+}
+
+pub(super) fn declared_mime(media: &Value) -> &'static str {
+    match mime_type(media).as_deref() {
+        Some(PNG) => PNG,
+        Some(JPEG) => JPEG,
+        Some(PDF) => PDF,
+        Some(HEIC) => HEIC,
+        Some("audio/ogg") => "audio/ogg",
+        Some("audio/mpeg") => "audio/mpeg",
+        Some("audio/mp4") => "audio/mp4",
+        Some("audio/aac") => "audio/aac",
+        Some("audio/amr") => "audio/amr",
+        Some("video/mp4") => "video/mp4",
+        Some("video/3gpp") => "video/3gpp",
+        _ => UNKNOWN,
     }
-    Some(PendingAsset {
+}
+
+fn photo(image: &Value) -> Result<PendingAsset, ReceiveRefusal> {
+    let id = declared_media_id(image)?;
+    let mime = mime_type(image).ok_or(ReceiveRefusal::UnsupportedMime)?;
+    let extension = match mime.as_str() {
+        PNG => "png",
+        JPEG => "jpg",
+        _ => return Err(ReceiveRefusal::UnsupportedMime),
+    };
+    Ok(PendingAsset {
         name: format!("photo.{extension}"),
-        mime: mime.to_owned(),
+        mime: mime.clone(),
         size: None,
         source: Some(AssetSourceRef::WhatsApp {
             media_id: id.to_owned(),
-            mime: mime.to_owned(),
+            mime,
         }),
     })
 }
 
-pub(super) fn inbound_image(image: &Value) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+pub(super) fn inbound_image(image: &Value) -> Admission<'_> {
     captioned(image, photo(image))
 }
 
-pub(super) fn inbound_document(
-    document: &Value,
-) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
+pub(super) fn inbound_document(document: &Value) -> Admission<'_> {
     captioned(document, pdf(document))
 }
 
-fn captioned(
-    media: &Value,
-    asset: Option<PendingAsset>,
-) -> (&str, Vec<PendingAsset>, Option<InputRefusal>) {
-    let caption = match media.get("caption") {
-        None => Some(""),
-        Some(Value::String(caption)) => Some(caption.as_str()),
-        Some(_) => None,
+pub(super) fn inbound_audio(audio: &Value) -> Admission<'_> {
+    let name = if audio["voice"].as_bool() == Some(true) {
+        crate::asset::VOICE_NOTE_NAME
+    } else {
+        "audio"
     };
-    match (caption, asset) {
-        (Some(caption), Some(asset)) => (caption, vec![asset], None),
-        (caption, _) => (
-            caption.unwrap_or_default(),
-            Vec::new(),
-            Some(InputRefusal::Unsupported),
-        ),
+    captioned(audio, command_media(audio, Media::Audio, name))
+}
+
+pub(super) fn inbound_video(video: &Value) -> Admission<'_> {
+    captioned(video, command_media(video, Media::Video, "video"))
+}
+
+fn command_media(media: &Value, kind: Media, name: &str) -> Result<PendingAsset, ReceiveRefusal> {
+    let id = declared_media_id(media)?;
+    let mime = mime_type(media)
+        .filter(|mime| Media::of(mime) == Some(kind))
+        .ok_or(ReceiveRefusal::UnsupportedMime)?;
+    Ok(PendingAsset {
+        name: name.to_owned(),
+        mime: mime.clone(),
+        size: None,
+        source: Some(AssetSourceRef::WhatsApp {
+            media_id: id.to_owned(),
+            mime,
+        }),
+    })
+}
+
+fn captioned(media: &Value, asset: Result<PendingAsset, ReceiveRefusal>) -> Admission<'_> {
+    let text = match media.get("caption") {
+        None => "",
+        Some(Value::String(caption)) => caption.as_str(),
+        Some(_) => {
+            return Admission {
+                text: "",
+                asset: Err(ReceiveRefusal::InvalidCaption),
+            };
+        }
+    };
+    Admission {
+        text,
+        asset: asset.map(Some),
     }
 }
 
-fn pdf(document: &Value) -> Option<PendingAsset> {
-    let id = document.get("id")?.as_str()?;
-    if document.get("mime_type")?.as_str()? != PDF || !media_id(id) {
-        return None;
+fn pdf(document: &Value) -> Result<PendingAsset, ReceiveRefusal> {
+    let id = declared_media_id(document)?;
+    if mime_type(document).as_deref() != Some(PDF) {
+        return Err(ReceiveRefusal::UnsupportedMime);
     }
-    Some(PendingAsset {
+    Ok(PendingAsset {
         name: document_name(document.get("filename").and_then(Value::as_str)),
         mime: PDF.to_owned(),
         size: None,
@@ -105,20 +166,32 @@ fn document_name(filename: Option<&str>) -> String {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Media {
     Png,
     Jpeg,
     Pdf,
+    Audio,
+    Video,
 }
 
 impl Media {
     fn of(mime: &str) -> Option<Self> {
         match mime {
-            "image/png" => Some(Self::Png),
-            "image/jpeg" => Some(Self::Jpeg),
+            PNG => Some(Self::Png),
+            JPEG => Some(Self::Jpeg),
             PDF => Some(Self::Pdf),
-            _ => None,
+            other => {
+                let parsed = other.parse::<mime::Mime>().ok()?;
+                if parsed.subtype() == mime::STAR {
+                    return None;
+                }
+                match parsed.type_() {
+                    mime::AUDIO => Some(Self::Audio),
+                    mime::VIDEO => Some(Self::Video),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -126,15 +199,22 @@ impl Media {
         match self {
             Self::Png | Self::Jpeg => max_bytes.min(MAX_IMAGE_BYTES as u64),
             Self::Pdf => max_bytes,
+            Self::Audio | Self::Video => {
+                max_bytes.min(dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64)
+            }
         }
     }
 
     fn oversized(self, size: u64) -> TransportError {
         match self {
             Self::Png | Self::Jpeg => failure("image-too-large"),
-            Self::Pdf if size == 0 => failure("media-size"),
-            Self::Pdf => {
-                refused("document-too-large");
+            Self::Pdf | Self::Audio | Self::Video if size == 0 => failure("media-size"),
+            Self::Pdf | Self::Audio | Self::Video => {
+                refused(if self == Self::Pdf {
+                    "document-too-large"
+                } else {
+                    "media-too-large"
+                });
                 TransportError::AssetTooLarge { size }
             }
         }
@@ -142,8 +222,10 @@ impl Media {
 
     fn body_failure(self, failure: BodyFailure) -> TransportError {
         match (self, failure) {
-            (Self::Pdf, BodyFailure::TooLarge { observed }) => self.oversized(observed),
-            (Self::Pdf, BodyFailure::Status(status)) => {
+            (Self::Pdf | Self::Audio | Self::Video, BodyFailure::TooLarge { observed }) => {
+                self.oversized(observed)
+            }
+            (Self::Pdf | Self::Audio | Self::Video, BodyFailure::Status(status)) => {
                 refused(&format!("http-{status}"));
                 TransportError::AssetRefused {
                     cause: match status {
@@ -152,18 +234,26 @@ impl Media {
                     },
                 }
             }
-            (Self::Png | Self::Jpeg | Self::Pdf, failure) => failure.into_service(),
+            (Self::Png | Self::Jpeg | Self::Pdf | Self::Audio | Self::Video, failure) => {
+                failure.into_service()
+            }
         }
     }
 
-    fn signature_failure(self) -> TransportError {
+    fn validate_signature(self, bytes: &[u8], mime: &str) -> Result<(), TransportError> {
         match self {
-            Self::Png | Self::Jpeg => failure("image-signature"),
+            Self::Audio | Self::Video => Ok(()),
+            Self::Png | Self::Jpeg | Self::Pdf
+                if crate::asset::signature_mime(bytes) == Some(mime) =>
+            {
+                Ok(())
+            }
+            Self::Png | Self::Jpeg => Err(failure("image-signature")),
             Self::Pdf => {
                 refused("document-signature");
-                TransportError::AssetRefused {
+                Err(TransportError::AssetRefused {
                     cause: MediaRefusal::Signature,
-                }
+                })
             }
         }
     }
@@ -269,6 +359,91 @@ async fn json_response(response: reqwest::Response) -> Result<Value, TransportEr
     })
 }
 
+#[derive(Clone, Copy)]
+enum UploadKind {
+    Image,
+    Audio,
+    Video,
+}
+
+impl UploadKind {
+    const TYPES: [(&'static str, Self); 8] = [
+        (PNG, Self::Image),
+        (JPEG, Self::Image),
+        ("audio/ogg", Self::Audio),
+        ("audio/mpeg", Self::Audio),
+        ("audio/mp4", Self::Audio),
+        ("audio/aac", Self::Audio),
+        ("audio/amr", Self::Audio),
+        ("video/mp4", Self::Video),
+    ];
+
+    fn field(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+}
+
+pub(super) struct Upload {
+    asset: AttachmentReference,
+    kind: UploadKind,
+}
+
+impl Upload {
+    pub(super) fn classify(
+        asset: AttachmentReference,
+        image: &GeneratedImage,
+    ) -> Result<Self, MediaSendRefusal> {
+        let kind = match image.media_type() {
+            "image/gif" => return Err(MediaSendRefusal::WhatsappGif { asset }),
+            "image/webp" => return Err(MediaSendRefusal::WhatsappWebp { asset }),
+            mime => UploadKind::TYPES
+                .iter()
+                .find_map(|(allowed, kind)| (*allowed == mime).then_some(*kind))
+                .ok_or_else(|| MediaSendRefusal::UnsupportedType {
+                    asset,
+                    platform: "WhatsApp",
+                    accepted: UploadKind::TYPES.map(|(mime, _)| mime).join(", "),
+                })?,
+        };
+        Ok(Self { asset, kind })
+    }
+
+    pub(super) fn check_size(&self, bytes: usize) -> Result<(), MediaSendRefusal> {
+        let (limit, media) = match self.kind {
+            UploadKind::Image => (MAX_IMAGE_BYTES, "images"),
+            UploadKind::Audio | UploadKind::Video => (MAX_MEDIA_BYTES, "audio and video"),
+        };
+        if bytes > limit {
+            return Err(MediaSendRefusal::WhatsappSize {
+                asset: self.asset,
+                media,
+                megabytes: limit / 1_000_000,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn preflight(
+        asset: AttachmentReference,
+        image: &GeneratedImage,
+    ) -> Result<(), SendRefusal> {
+        let upload = Self::classify(asset, image)?;
+        upload.check_size(image.decoded_len().map_err(SendRefusal::Storage)?)?;
+        Ok(())
+    }
+
+    pub(super) fn accepts_caption(&self) -> bool {
+        match self.kind {
+            UploadKind::Image | UploadKind::Video => true,
+            UploadKind::Audio => false,
+        }
+    }
+}
+
 impl WhatsappDriver {
     fn download_url(&self, value: &str) -> Result<reqwest::Url, TransportError> {
         let url = reqwest::Url::parse(value).map_err(|source| {
@@ -316,15 +491,18 @@ impl WhatsappDriver {
         }
     }
 
-    pub(super) async fn send_image(
+    pub(super) async fn send_media(
         &self,
         recipient: &str,
         caption: Option<&str>,
         image: HydratedImage,
+        upload_plan: Upload,
     ) -> Result<(), TransportError> {
         let bytes = image.bytes.len();
+        let kind = upload_plan.kind.field();
         let upload = tracing::info_span!(
             "whatsapp.image_upload",
+            media = kind,
             bytes,
             duration_ms = tracing::field::Empty,
             outcome = tracing::field::Empty,
@@ -365,6 +543,7 @@ impl WhatsappDriver {
         let id = result?;
         let send = tracing::info_span!(
             "whatsapp.image_send",
+            media = kind,
             bytes,
             duration_ms = tracing::field::Empty,
             outcome = tracing::field::Empty,
@@ -374,10 +553,11 @@ impl WhatsappDriver {
         let result = async {
             let mut payload = json!({
                 "messaging_product": "whatsapp", "recipient_type": "individual", "to": recipient,
-                "type": "image", "image": {"id": id}
+                "type": kind,
             });
+            payload[kind] = json!({"id": id});
             if let Some(caption) = caption {
-                payload["image"]["caption"] = json!(caption);
+                payload[kind]["caption"] = json!(caption);
             }
             let response = self
                 .http
@@ -450,7 +630,7 @@ impl AssetFetcher for WhatsappDriver {
             }
             let metadata = json_response(response).await?;
             if metadata.get("id").and_then(Value::as_str) != Some(&id)
-                || metadata.get("mime_type").and_then(Value::as_str) != Some(&mime)
+                || mime_type(&metadata).as_deref() != Some(mime.as_str())
             {
                 return Err(failure("asset-metadata"));
             }
@@ -480,9 +660,7 @@ impl AssetFetcher for WhatsappDriver {
             if bytes.len() as u64 != size {
                 return Err(failure("media-size-mismatch"));
             }
-            if crate::asset::signature_mime(&bytes) != Some(mime.as_str()) {
-                return Err(kind.signature_failure());
-            }
+            kind.validate_signature(&bytes, &mime)?;
             Ok(bytes)
         })
     }
