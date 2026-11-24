@@ -2,6 +2,7 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
 };
 
@@ -183,9 +184,6 @@ pub fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) -> Vec<Temporar
     };
     let mut prefix = OsString::from(name);
     prefix.push(".tmp-");
-    let Some(prefix) = prefix.to_str() else {
-        return Vec::new();
-    };
     let Ok(entries) = fs::read_dir(parent) else {
         return Vec::new();
     };
@@ -195,10 +193,10 @@ pub fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) -> Vec<Temporar
         if stale == path || Some(stale.as_path()) == keep {
             continue;
         }
-        let Some(name) = stale.file_name().and_then(|name| name.to_str()) else {
+        let Some(name) = stale.file_name() else {
             continue;
         };
-        if !name.starts_with(prefix) {
+        if !name.as_bytes().starts_with(prefix.as_bytes()) {
             continue;
         }
         match fs::remove_file(&stale) {
@@ -298,6 +296,23 @@ mod tests {
         );
         assert_eq!(fs::read(path).unwrap(), b"old");
         assert_eq!(fs::read(unrelated).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn a_non_utf8_filename_can_sweep_stale_staging_and_retry() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"record.\xff".to_vec()));
+        let temporary = temporary_path(&path);
+        fs::write(&path, b"old").unwrap();
+        fs::write(&temporary, b"partial").unwrap();
+        assert_eq!(sweep_stale_temporaries(&path, None).len(), 1);
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        replace_private_file(&path, PrivateFileContents::Bytes(b"new")).unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"new");
     }
 
     #[test]

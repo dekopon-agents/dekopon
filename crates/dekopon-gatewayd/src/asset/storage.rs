@@ -975,7 +975,9 @@ mod tests {
         retention.persisted = None;
         assert_eq!(
             retention.persist(),
-            Err(BlobError::Io(io::ErrorKind::FilesystemLoop))
+            Err(BlobError::Io(
+                io::Error::from_raw_os_error(libc::ELOOP).kind()
+            ))
         );
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(fs::read(&target).unwrap(), b"untouched");
