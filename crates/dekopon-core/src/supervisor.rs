@@ -3,7 +3,7 @@ use std::{collections::HashMap, future::Future, num::NonZeroUsize, time::Duratio
 use thiserror::Error;
 use tokio::{
     sync::watch,
-    task::{Id, JoinSet},
+    task::{AbortHandle, Id, JoinSet},
 };
 
 use crate::TaskOutcome;
@@ -82,7 +82,7 @@ pub struct ChildExit<E> {
 #[derive(Debug)]
 pub struct Supervisor<E> {
     children: JoinSet<Result<(), E>>,
-    names: HashMap<Id, (ChildName, OnShutdown)>,
+    names: HashMap<Id, (ChildName, OnShutdown, AbortHandle)>,
     shutdown: watch::Sender<bool>,
     max_children: NonZeroUsize,
 }

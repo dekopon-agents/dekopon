@@ -558,7 +558,7 @@ mod tests {
     #[test]
     #[ignore = "skeleton: daemon/durable-replace"]
     #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
-    fn a_mount_scoped_read_does_not_assert_the_mode() {
+    fn a_mount_scoped_read_refuses_a_group_or_world_writable_file() {
         todo!("skeleton: daemon/durable-replace")
     }
 
