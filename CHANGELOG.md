@@ -7,6 +7,28 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.96.0] - 2026-11-24
+
+After a journal records audio or video, rolling back to chart 0.82.0 can erase the affected
+conversation's journal. Core 0.95.0 treats the new asset kind as journal corruption. If the
+deployment needs a fix, roll forward.
+
+### Added
+
+- WhatsApp and Telegram voice notes and video arrive as command-only assets.
+- Telegram sends GIF, voice, audio and video replies.
+- WhatsApp sends audio and MP4 video replies.
+
+### Changed
+
+- WhatsApp GIF and WebP refusals tell the agent to ask for an MP4 copy.
+
+## [dekopon-chart-0.83.0] - 2026-11-24
+
+### Changed
+
+- Chart 0.83.0 targets core v0.96.0 and renders the `v0.96.0` image tag.
+
 ## [0.95.0] - 2026-11-23
 
 ### Added
