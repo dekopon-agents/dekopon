@@ -18,7 +18,7 @@ OutcomeAudit, unaudited_outcome, T04 and T05 stay untouched.
 
 Inventory at this baseline (line positions below are discovery anchors)
 
-F01 model-proxy/src/tests.rs:255 MeterRecords — KEEP. Its caller at :1131
+F01 model-proxy/src/tests.rs:255 MeterRecords — KEEP. Its caller at :1115
 compares the actual parent span ID to CallSpans::only_with_id; CaptureLayer
 records a parent name, not that identity. Merging requires a new capture API.
 F02 model-token-governor/src/tests.rs:425 MeterRecords — KEEP. Its Visit::record_i64
