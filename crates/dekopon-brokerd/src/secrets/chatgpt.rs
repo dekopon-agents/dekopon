@@ -1,9 +1,10 @@
 use std::{path::Path, sync::Arc};
 
-use dekopon_broker::SecretMaterial;
+use dekopon_broker::{PushedToken, SecretMaterial, TokenTarget};
 use dekopon_core::{FileTier, SecretDrn, error_chain, read_trusted_file};
 use dekopon_model::chatgpt::{
     ChatGptAuthStatus, ChatGptError, CredentialFile, RefreshClient, RefreshOutcome,
+    ResolvedCredential,
 };
 use sha2::{Digest as _, Sha256};
 use tracing::Instrument as _;
@@ -12,6 +13,7 @@ use super::{REAUTHORIZATION_CODES, REFRESH_TIMEOUT, RefreshError};
 use crate::socket;
 
 const HARD_MAX_CHATGPT_AUTH_BYTES: usize = 64 * 1024;
+const CHATGPT_BACKEND_HOST: &str = "chatgpt.com";
 
 pub(crate) struct ChatGptSubscription {
     drn: SecretDrn,
@@ -101,6 +103,23 @@ impl ChatGptSubscription {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn open_at_local_endpoints(
+        drn: &SecretDrn,
+        auth_file: &Path,
+        expected_uid: u32,
+        base: &str,
+    ) -> Result<Self, String> {
+        let opened = Self::open(drn, auth_file, expected_uid)?;
+        let bytes = std::fs::read(auth_file).map_err(|source| source.to_string())?;
+        let credential = CredentialFile::from_document_at_local_endpoints(auth_file, &bytes, base)
+            .map_err(|source| source.to_string())?;
+        Ok(Self {
+            credential: Arc::new(credential),
+            ..opened
+        })
+    }
+
     pub(super) fn auth_digest(&self) -> &[u8; 32] {
         &self.auth_digest
     }
@@ -125,6 +144,25 @@ impl ChatGptSubscription {
     }
 
     pub(crate) async fn resolve(&self) -> Result<SecretMaterial, RefreshError> {
+        let resolved = self.current().await?;
+        Ok(
+            SecretMaterial::new(resolved.access.expose().as_bytes().to_vec())
+                .with_chatgpt_account(dekopon_core::Redacted::new(resolved.account_id)),
+        )
+    }
+
+    pub(crate) async fn pushed_token(&self) -> Result<PushedToken, RefreshError> {
+        let resolved = self.current().await?;
+        Ok(PushedToken {
+            token: resolved.access,
+            on: vec![TokenTarget::Bearer {
+                host: CHATGPT_BACKEND_HOST.to_owned(),
+                paths: None,
+            }],
+        })
+    }
+
+    async fn current(&self) -> Result<ResolvedCredential, RefreshError> {
         let span = tracing::info_span!(
             target: "credential",
             "broker.credential.refresh",
@@ -151,10 +189,7 @@ impl ChatGptSubscription {
             "outcome",
             resolved.refresh.map_or("current", RefreshOutcome::label),
         );
-        Ok(
-            SecretMaterial::new(resolved.access.expose().as_bytes().to_vec())
-                .with_chatgpt_account(dekopon_core::Redacted::new(resolved.account_id)),
-        )
+        Ok(resolved)
     }
 
     #[expect(

@@ -1398,6 +1398,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     let catalog = ConstraintCatalog::new([(
         capability,
         ConstraintSet {
+            egress_profile: None,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "cli-probe".parse().expect("valid provider fixture"),

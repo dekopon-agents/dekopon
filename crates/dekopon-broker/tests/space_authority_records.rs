@@ -69,6 +69,7 @@ async fn broker_fixture() -> (Broker, Arc<InMemoryAuditLog>) {
         ConstraintCatalog::new([(
             "cli-probe.reverse".parse().expect("capability"),
             ConstraintSet {
+                egress_profile: None,
                 default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider: "cli-probe".parse().expect("provider"),

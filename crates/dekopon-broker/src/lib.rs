@@ -29,6 +29,7 @@ use std::{
 };
 
 mod continuity;
+mod egress;
 
 pub use continuity::{
     CandidateReport, ContinuityCandidate, ContinuityDigest, ContinuityDigestError,
@@ -36,6 +37,10 @@ pub use continuity::{
     OperationalOverrides, StorageOverrides,
 };
 use continuity::{ContinuityState, OperationalSnapshot};
+pub use egress::{
+    CookieEntry, CookieSet, EgressError, EgressHeaderValue, EgressProfile, EgressProfileMaterial,
+    EgressPush, EgressReturn, PushedToken, TokenTarget,
+};
 
 use async_trait::async_trait;
 use dekopon_broker_host::{
@@ -450,6 +455,8 @@ pub struct ConstraintSet {
         deserialize_with = "deserialize_default_secret_use"
     )]
     pub default_secret_use: Option<DefaultSecretUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_profile: Option<EgressProfile>,
     #[serde(default, skip_serializing_if = "CapabilityRoute::is_generic")]
     pub route: CapabilityRoute,
     pub provider: ProviderId,
@@ -591,14 +598,28 @@ impl ConstraintCatalog {
         actor: &Actor,
     ) -> Option<(&'a SecretDrn, SecretSinkKind)> {
         let default = set.default_secret_use.as_ref()?;
-        let swapped = match actor {
+        Some((self.swapped(&default.drn, actor), default.sink.sink()))
+    }
+
+    #[must_use]
+    pub fn effective_egress_profile<'a>(
+        &'a self,
+        set: &'a ConstraintSet,
+        actor: &Actor,
+    ) -> Option<&'a SecretDrn> {
+        let profile = set.egress_profile.as_ref()?;
+        Some(self.swapped(&profile.drn, actor))
+    }
+
+    fn swapped<'a>(&'a self, drn: &'a SecretDrn, actor: &Actor) -> &'a SecretDrn {
+        match actor {
             Actor::Agent { agent } => self
                 .agent_secrets
                 .get(agent)
-                .and_then(|swaps| swaps.get(&default.drn)),
-            Actor::Human { .. } | Actor::Service { .. } => None,
-        };
-        Some((swapped.unwrap_or(&default.drn), default.sink.sink()))
+                .and_then(|swaps| swaps.get(drn))
+                .unwrap_or(drn),
+            Actor::Human { .. } | Actor::Service { .. } => drn,
+        }
     }
 
     fn selectable_defaults<'a>(&'a self, set: &'a ConstraintSet) -> BTreeSet<&'a SecretDrn> {
@@ -862,24 +883,17 @@ impl SecretUseBinding {
         }
     }
 
-    fn proposal(&self) -> SecretUseProposal {
+    fn proposal(&self) -> Option<SecretUseProposal> {
+        let secret = self.secret.clone();
         match self.sink {
-            SecretSinkKind::HttpBearer => SecretUseProposal::HttpBearer {
-                secret: self.secret.clone(),
-            },
-            SecretSinkKind::HttpBasic => SecretUseProposal::HttpBasic {
-                secret: self.secret.clone(),
-                username: self
-                    .basic_username
-                    .clone()
-                    .expect("validated Basic binding always carries a username"),
-            },
-            SecretSinkKind::HttpBot => SecretUseProposal::HttpBot {
-                secret: self.secret.clone(),
-            },
-            SecretSinkKind::VmExecStdin => SecretUseProposal::VmExecStdin {
-                secret: self.secret.clone(),
-            },
+            SecretSinkKind::HttpBearer => Some(SecretUseProposal::HttpBearer { secret }),
+            SecretSinkKind::HttpBasic => Some(SecretUseProposal::HttpBasic {
+                secret,
+                username: self.basic_username.clone()?,
+            }),
+            SecretSinkKind::HttpBot => Some(SecretUseProposal::HttpBot { secret }),
+            SecretSinkKind::VmExecStdin => Some(SecretUseProposal::VmExecStdin { secret }),
+            SecretSinkKind::VmEgressProfile => None,
         }
     }
 
@@ -939,6 +953,15 @@ impl fmt::Debug for SecretMaterial {
 #[async_trait]
 pub trait SecretResolver: Send + Sync + fmt::Debug {
     async fn resolve(&self, secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError>;
+
+    async fn egress_profile(
+        &self,
+        _profile: &SecretDrn,
+    ) -> Result<EgressProfileMaterial, SecretResolutionError> {
+        Err(SecretResolutionError {
+            category: "missing",
+        })
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -2202,7 +2225,8 @@ where
         };
         self.secrets
             .default_binding(capability, secret, sink)
-            .map(|binding| Some(binding.proposal()))
+            .and_then(SecretUseBinding::proposal)
+            .map(Some)
             .ok_or_else(|| unevaluated_refusal("secret-denied"))
     }
 
@@ -2215,7 +2239,7 @@ where
         let (secret, sink) = self.constraints.effective_default(set, actor)?;
         self.secrets
             .default_binding(capability, secret, sink)
-            .map(SecretUseBinding::proposal)
+            .and_then(SecretUseBinding::proposal)
     }
 
     fn selection(
@@ -2256,7 +2280,7 @@ where
             SecretUseProposal::VmExecStdin { secret } => self
                 .secrets
                 .runner_binding(capability, secret)
-                .map(SecretUseBinding::proposal),
+                .and_then(SecretUseBinding::proposal),
             SecretUseProposal::HttpBearer { .. }
             | SecretUseProposal::HttpBasic { .. }
             | SecretUseProposal::HttpBot { .. } => None,
@@ -2405,15 +2429,32 @@ where
         proposal: &SecretUseProposal,
         selection: SecretSelection,
     ) -> EvaluatedDecision {
+        self.authorize_secret_sink(
+            context,
+            capability,
+            set,
+            (proposal.secret(), proposal.sink()),
+            selection,
+        )
+    }
+
+    fn authorize_secret_sink(
+        &self,
+        context: &AuthenticatedContext,
+        capability: &CapabilityId,
+        set: &ConstraintSet,
+        (secret, sink): (&SecretDrn, SecretSinkKind),
+        selection: SecretSelection,
+    ) -> EvaluatedDecision {
         Self::evaluate(
             &self.policy,
             PolicyRequest {
                 principal: context.principal().clone(),
                 target: PolicyTarget::SecretUse {
-                    secret: proposal.secret().clone(),
+                    secret: secret.clone(),
                     capability: capability.clone(),
                     provider: set.provider.clone(),
-                    sink: proposal.sink(),
+                    sink,
                     selection,
                 },
                 context: policy_context(context),
@@ -3212,7 +3253,9 @@ where
                     .map(move |capability| (binding, capability))
             })
             .filter(|(binding, capability)| {
-                let proposal = binding.proposal();
+                let Some(proposal) = binding.proposal() else {
+                    return false;
+                };
                 effective_capabilities.contains(*capability)
                     && self.constraints.get(capability).is_some_and(|set| {
                         self.authorize_secret_use(
@@ -3785,6 +3828,7 @@ where
                 BoundCredential::secret_bearer(bearer.bytes, &self.secrets.grant(runner))?
                     .with_vm_exec_stdin(bytes, jwt.jti, jwt.exp, grant)?
             }
+            SecretSinkKind::VmEgressProfile => return Err(CredentialFailure::Binding),
         };
         let credential = match chatgpt_account {
             Some(account) => credential.with_chatgpt_account(account.expose())?,
@@ -4223,6 +4267,13 @@ where
             )
             .await
         {
+            Ok(credential) => {
+                self.attach_egress_push(context, &capability, &set, None, credential)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let credential = match credential {
             Ok(credential) => credential,
             Err(error) => {
                 let code = match error {
@@ -4245,6 +4296,15 @@ where
                             "broker.secret.credential.failed"
                         );
                         "secret-credential"
+                    }
+                    CredentialFailure::Egress(source) => {
+                        tracing::warn!(
+                            event = "broker_egress_push_failed",
+                            invocation = %invocation_id,
+                            category = source.category(),
+                            "broker.egress.push.failed"
+                        );
+                        source.category()
                     }
                 };
                 return self
@@ -4532,6 +4592,9 @@ fn encode_capability_authority(
         encoded.text("defaultSecretDrn", default.secret().as_str());
         encoded.text("defaultSecretSink", &default.sink().to_string());
         encoded.optional_text("defaultSecretBasicUsername", default.username());
+    }
+    if let Some(profile) = &set.egress_profile {
+        encoded.text("egressProfileDrn", profile.drn.as_str());
     }
     encode_execution_constraints(encoded, &set.constraints);
     encoded.text("providerArtifactSha256", provider_artifact_sha256);
@@ -5051,6 +5114,8 @@ enum CredentialFailure {
     Binding,
     #[error("secret material could not be bound")]
     Material(#[from] dekopon_broker_host::HttpConfigurationError),
+    #[error("the egress profile could not be pushed")]
+    Egress(#[from] EgressError),
 }
 
 pub struct CapabilityDecision {
@@ -5831,6 +5896,9 @@ impl BrokerError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod egress_tests;
 
 fn storage_scope_permits(context: &AuthenticatedContext, set: &ConstraintSet) -> bool {
     match set

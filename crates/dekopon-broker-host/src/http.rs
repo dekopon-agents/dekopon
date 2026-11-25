@@ -11,8 +11,9 @@ use crate::bindings::dekopon::http1_1_0::client::{
 };
 
 pub use dekopon_http_host::{
-    BoundCredential, ConfigurationError as HttpConfigurationError, HttpCallEvidence,
-    NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts, destinations_cover,
+    BoundCredential, ConfigurationError as HttpConfigurationError, EgressPushHeaders,
+    HttpCallEvidence, NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts,
+    destinations_cover,
 };
 
 pub(crate) type HttpCeilings = HttpHostCeilings;

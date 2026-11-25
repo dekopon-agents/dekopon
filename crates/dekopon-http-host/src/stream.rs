@@ -588,6 +588,17 @@ impl BufferedHttpClient {
             &self.ceilings,
             grant.max_response_bytes,
         )?;
+        if self
+            .credential
+            .as_ref()
+            .is_some_and(super::BoundCredential::pushes_egress)
+            && let Some(value) = response.headers().get(super::EGRESS_RETURN_HEADER)
+        {
+            self.egress_returns.push(super::EgressReturnCapture {
+                call: index,
+                value: dekopon_core::SecretBytes::new(value.as_bytes().to_vec()),
+            });
+        }
         let mut headers = Vec::with_capacity(response.headers().len());
         for (name, value) in response.headers() {
             if !is_forbidden_response_header(name)

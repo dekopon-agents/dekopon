@@ -13,6 +13,9 @@ keywords = ["agents", "llm", "openai", "chatgpt", "oauth"]
 categories = ["api-bindings", "authentication"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
+[features]
+test-support = []
+
 [dependencies]
 bytes.workspace = true
 http-body.workspace = true

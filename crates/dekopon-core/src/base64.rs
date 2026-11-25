@@ -1,6 +1,9 @@
 pub use ::base64::{
-    DecodeError, Engine, display::Base64Display, engine::general_purpose::STANDARD,
-    read::DecoderReader, write::EncoderWriter,
+    DecodeError, Engine,
+    display::Base64Display,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    read::DecoderReader,
+    write::EncoderWriter,
 };
 use thiserror::Error;
 

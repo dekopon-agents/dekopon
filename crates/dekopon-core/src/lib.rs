@@ -390,6 +390,7 @@ pub enum SecretSinkKind {
     HttpBasic,
     HttpBot,
     VmExecStdin,
+    VmEgressProfile,
 }
 
 impl fmt::Display for SecretSinkKind {
@@ -399,6 +400,7 @@ impl fmt::Display for SecretSinkKind {
             Self::HttpBasic => "httpBasic",
             Self::HttpBot => "httpBot",
             Self::VmExecStdin => "vmExecStdin",
+            Self::VmEgressProfile => "vmEgressProfile",
         })
     }
 }
