@@ -247,10 +247,11 @@ jobs:
 
   # Release archives ship aarch64-apple-darwin, whose kernel passes SCM_RIGHTS differently from Linux:
   # run the one crate that owns recvmsg natively there.
+  # Run on PRs only because macOS runner starvation ejects merge-queue runs.
   macos_descriptors:
     name: broker-protocol descriptors (macOS)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.run_rust != 'false' }}
     runs-on: macos-15
     timeout-minutes: 20
     steps:
@@ -316,6 +317,7 @@ jobs:
       - name: Require stable quality lanes
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
           RUN_RUST: ${{ needs.changes.outputs.run_rust }}
           RUN_DOCS: ${{ needs.changes.outputs.run_docs }}
           CHECKS_RESULT: ${{ needs.quality_checks.result }}
@@ -329,7 +331,11 @@ jobs:
             test "$CHECKS_RESULT" = success
             test "$TESTS_RESULT" = success
             test "$ARM64_RESULT" = success
-            test "$MACOS_RESULT" = success
+            if [ "$EVENT_NAME" = merge_group ]; then
+              test "$MACOS_RESULT" = success || test "$MACOS_RESULT" = skipped
+            else
+              test "$MACOS_RESULT" = success
+            fi
           fi
           if [ "$RUN_DOCS" != false ]; then
             test "$DOCS_RESULT" = success
