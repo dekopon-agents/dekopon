@@ -827,6 +827,7 @@ Arguments: dict "ctx" $ "sidecar" bool
   {{- end }}
   image: {{ include "dekopon.image" $ }}
   imagePullPolicy: {{ $.Values.image.pullPolicy }}
+  terminationMessagePolicy: File
   # No ENTRYPOINT in the image: the command selects which of the four binaries runs.
   command: ["dekopon-brokerd"]
   args: ["--config", "{{ $.Values.paths.configDir }}/{{ if $.Values.broker.configDirectory.configMap }}broker.d{{ else }}broker.yaml{{ end }}"{{- range include "dekopon.runtimeArgs" (dict "ctx" $ "daemon" "broker") | fromJsonArray }}, {{ . | quote }}{{- end }}]
