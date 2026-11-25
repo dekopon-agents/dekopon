@@ -1,0 +1,20 @@
+[package]
+name = "dekopon-http-client"
+description = "Shared HTTP egress client defaults for Dekopon native clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+include = ["src/**", "Cargo.toml"]
+
+[dependencies]
+reqwest.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

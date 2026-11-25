@@ -54,6 +54,7 @@ pub const HARD_MAX_SECRETS: usize = 256;
 pub const HARD_MAX_SECRET_BYTES: usize = dekopon_http_host::MAX_CREDENTIAL_BYTES;
 pub const HARD_MAX_SOURCE_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+const MAX_SOURCE_TIMEOUT_MS: u64 = 120_000;
 const MAX_BOOTSTRAP_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_DOCUMENT_SCALAR_BYTES: usize = 64 * 1024;
 const MAX_SOURCE_RESPONSE_HEADERS: usize = 128;
@@ -1892,11 +1893,14 @@ async fn validate_map(
         .map_err(|_join| SecretMapError::Validation {
             problems: vec!["minted secret sources could not be opened".to_owned()],
         })??;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .build()
-        .map_err(|source| SecretMapError::Client { source })?;
+    let client = dekopon_http_client::client_builder(
+        reqwest::Client::builder(),
+        Duration::from_millis(MAX_SOURCE_TIMEOUT_MS),
+        None,
+        concat!("dekopon-brokerd/", env!("CARGO_PKG_VERSION")),
+    )
+    .and_then(reqwest::ClientBuilder::build)
+    .map_err(|source| SecretMapError::Client { source })?;
     let mut resolved_entries = BTreeMap::new();
     for (drn, (source, projection)) in entries {
         let minted_source = minted.sources.remove(&drn);
@@ -1904,8 +1908,9 @@ async fn validate_map(
             SecretSource::KubernetesTokenRequest {
                 bootstrap_root,
                 ca_key,
+                timeout_ms,
                 ..
-            } => kubernetes_client(bootstrap_root, ca_key)
+            } => kubernetes_client(bootstrap_root, ca_key, Duration::from_millis(*timeout_ms))
                 .await
                 .map_err(|source| SecretMapError::Source { source })?,
             _ => client.clone(),
@@ -2051,18 +2056,26 @@ fn open_github_app(
         .map_err(|source| format!("{drn} could not be built: {source}"))
 }
 
-async fn kubernetes_client(root: &Path, ca_key: &str) -> Result<reqwest::Client, SourceError> {
+async fn kubernetes_client(
+    root: &Path,
+    ca_key: &str,
+    timeout: Duration,
+) -> Result<reqwest::Client, SourceError> {
     let pem = read_kubernetes_projection(root, ca_key).await?;
     let certificates = reqwest::Certificate::from_pem_bundle(&pem)
         .map_err(|source| classified(SourceError::Config, &source))?;
     if certificates.is_empty() {
         return Err(SourceError::Config);
     }
-    let mut builder = reqwest::Client::builder()
-        .https_only(true)
-        .tls_built_in_root_certs(false)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy();
+    let mut builder = dekopon_http_client::client_builder(
+        reqwest::Client::builder(),
+        timeout,
+        None,
+        concat!("dekopon-brokerd/", env!("CARGO_PKG_VERSION")),
+    )
+    .map_err(|source| classified(SourceError::Config, &source))?
+    .https_only(true)
+    .tls_built_in_root_certs(false);
     for certificate in certificates {
         builder = builder.add_root_certificate(certificate);
     }
@@ -2072,7 +2085,7 @@ async fn kubernetes_client(root: &Path, ca_key: &str) -> Result<reqwest::Client,
 }
 
 fn validate_timeout(value: u64) -> Result<(), &'static str> {
-    (value > 0 && value <= 120_000)
+    (value > 0 && value <= MAX_SOURCE_TIMEOUT_MS)
         .then_some(())
         .ok_or("timeout must be between 1 and 120000 milliseconds")
 }

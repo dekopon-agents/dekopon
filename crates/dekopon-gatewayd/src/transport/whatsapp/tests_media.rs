@@ -106,7 +106,7 @@ fn driver(origin: &str) -> WhatsappDriver {
         phone_number_id: "456".to_owned(),
         access_token: Redacted::new("TOKEN_SENTINEL".to_owned()),
         http: credential_client(Duration::from_secs(1))
-            .build()
+            .and_then(reqwest::ClientBuilder::build)
             .expect("client"),
     }
 }
@@ -586,7 +586,7 @@ pub(crate) async fn admitted(origin: &str, webhook: &Value) -> (WhatsappTranspor
     let digest = hmac_sha256(b"secret", body.as_bytes());
     let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     let response = credential_client(Duration::from_secs(2))
-        .build()
+        .and_then(reqwest::ClientBuilder::build)
         .expect("webhook client")
         .post(format!("http://{address}/wa"))
         .header("x-hub-signature-256", format!("sha256={signature}"))
@@ -678,7 +678,7 @@ async fn a_stalled_download_times_out_without_exposing_the_signed_url() {
     .await;
     let mut driver = driver(&peer.origin);
     driver.http = credential_client(Duration::from_millis(30))
-        .build()
+        .and_then(reqwest::ClientBuilder::build)
         .expect("short deadline client");
     let error = driver
         .fetch(&source("image/png"), 8_000_000)

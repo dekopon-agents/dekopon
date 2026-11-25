@@ -1043,6 +1043,7 @@ dependencies = [
  "dekopon-broker-protocol",
  "dekopon-capability",
  "dekopon-core",
+ "dekopon-http-client",
  "dekopon-http-host",
  "dekopon-model",
  "dekopon-policy",
@@ -1158,6 +1159,7 @@ dependencies = [
  "dekopon-brokerd",
  "dekopon-config",
  "dekopon-core",
+ "dekopon-http-client",
  "dekopon-model",
  "dekopon-model-proxy",
  "dekopon-model-token-governor",
@@ -1197,6 +1199,15 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dekopon-http-client"
+version = "0.90.0"
+dependencies = [
+ "axum",
+ "reqwest",
+ "tokio",
 ]
 
 [[package]]
@@ -1240,6 +1251,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "dekopon-core",
+ "dekopon-http-client",
  "dekopon-model-token-governor",
  "futures-util",
  "http",
@@ -1428,6 +1440,7 @@ dependencies = [
  "async-trait",
  "clap",
  "dekopon-core",
+ "dekopon-http-client",
  "libc",
  "log",
  "opentelemetry",

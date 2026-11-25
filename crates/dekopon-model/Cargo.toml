@@ -14,6 +14,7 @@ categories = ["api-bindings", "authentication"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+dekopon-http-client.workspace = true
 bytes.workspace = true
 http-body.workspace = true
 parking_lot.workspace = true

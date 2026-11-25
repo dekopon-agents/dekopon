@@ -229,16 +229,12 @@ fn otlp_client_from(
     timeout: Duration,
     ca_certificate: Option<&[u8]>,
 ) -> Result<reqwest::ClientBuilder, reqwest::Error> {
-    let mut builder = builder
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy();
-    if let Some(pem) = ca_certificate {
-        for certificate in reqwest::Certificate::from_pem_bundle(pem)? {
-            builder = builder.add_root_certificate(certificate);
-        }
-    }
-    Ok(builder)
+    dekopon_http_client::client_builder(
+        builder,
+        timeout,
+        ca_certificate,
+        concat!("dekopon-telemetry/", env!("CARGO_PKG_VERSION")),
+    )
 }
 
 impl OtlpHttpClient {

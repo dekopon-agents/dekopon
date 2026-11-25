@@ -85,7 +85,7 @@ impl SlackTransport {
         experience: SlackExperience,
     ) -> Result<Self, TransportError> {
         let http = credential_client(SLACK_REQUEST_TIMEOUT)
-            .build()
+            .and_then(reqwest::ClientBuilder::build)
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         let thread_ownership = Arc::new(SlackThreadOwnership::new(OWNED_THREAD_CAPACITY));
         Ok(Self {
@@ -2838,7 +2838,7 @@ mod driver_tests {
             endpoint: endpoint.to_owned(),
             bot_token: Redacted::new("xoxb-test-bot-token".to_owned()),
             http: credential_client(SLACK_REQUEST_TIMEOUT)
-                .build()
+                .and_then(reqwest::ClientBuilder::build)
                 .expect("credential client builds"),
             experience,
             agent_status_available: AtomicBool::new(true),

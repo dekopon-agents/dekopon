@@ -815,19 +815,22 @@ pub(crate) fn credential_value(name: &str, value: String) -> Result<String, Tran
     Ok(value)
 }
 
-pub(crate) fn credential_client(timeout: Duration) -> reqwest::ClientBuilder {
+pub(crate) fn credential_client(
+    timeout: Duration,
+) -> Result<reqwest::ClientBuilder, reqwest::Error> {
     credential_client_from(reqwest::Client::builder(), timeout)
 }
 
 fn credential_client_from(
     builder: reqwest::ClientBuilder,
     timeout: Duration,
-) -> reqwest::ClientBuilder {
-    builder
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .retry(reqwest::retry::never())
-        .timeout(timeout)
+) -> Result<reqwest::ClientBuilder, reqwest::Error> {
+    dekopon_http_client::client_builder(
+        builder,
+        timeout,
+        None,
+        concat!("dekopon-gatewayd/", env!("CARGO_PKG_VERSION")),
+    )
 }
 
 pub(crate) fn bound_inbound(text: &str) -> String {
@@ -1226,7 +1229,7 @@ mod tests {
 
         let rendered = format!(
             "{:?}",
-            credential_client_from(proxied_builder(), Duration::from_secs(30))
+            credential_client_from(proxied_builder(), Duration::from_secs(30)).unwrap()
         );
 
         assert!(

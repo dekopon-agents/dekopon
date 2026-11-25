@@ -43,12 +43,15 @@ impl InferenceHttp {
         if timeout.is_zero() {
             return Err(RequestError::ZeroTimeout.into());
         }
-        let mut builder = builder
-            .use_rustls_tls()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(timeout.min(Duration::from_secs(10)));
+        let mut builder = dekopon_http_client::client_builder(
+            builder,
+            timeout,
+            None,
+            concat!("dekopon-model/", env!("CARGO_PKG_VERSION")),
+        )
+        .map_err(|source| http_failure(FailurePhase::BeforeSend, None, source))?
+        .use_rustls_tls()
+        .connect_timeout(timeout.min(Duration::from_secs(10)));
         for pem in extra_ca_bundles {
             let certificates = reqwest::Certificate::from_pem_bundle(pem.expose().as_bytes())
                 .map_err(|_error| RequestError::InvalidCaBundle)?;

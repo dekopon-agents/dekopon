@@ -80,7 +80,7 @@ impl TelegramTransport {
         liveness: LivenessSettings,
     ) -> Result<Self, TransportError> {
         let http = credential_client(POLL_TIMEOUT)
-            .build()
+            .and_then(reqwest::ClientBuilder::build)
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         Ok(Self {
             name,
@@ -1288,7 +1288,7 @@ mod tests {
             endpoint: base.to_owned(),
             token: Redacted::new("test-token".to_owned()),
             http: credential_client(Duration::from_secs(5))
-                .build()
+                .and_then(reqwest::ClientBuilder::build)
                 .expect("test client builds"),
             liveness_cooldown_until: parking_lot::Mutex::new(None),
         }

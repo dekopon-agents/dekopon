@@ -2201,12 +2201,15 @@ fn is_loopback_host(host: Option<&str>) -> bool {
 
 fn client() -> Result<reqwest::Client, TransportError> {
     credential_client(REST_TIMEOUT)
-        .user_agent(concat!(
-            "dekopon-gatewayd/",
-            env!("CARGO_PKG_VERSION"),
-            " (+https://github.com/dekopon-agents/dekopon)"
-        ))
-        .build()
+        .and_then(|builder| {
+            builder
+                .user_agent(concat!(
+                    "dekopon-gatewayd/",
+                    env!("CARGO_PKG_VERSION"),
+                    " (+https://github.com/dekopon-agents/dekopon)"
+                ))
+                .build()
+        })
         .map_err(|source| TransportError::Request(Box::new(source)))
 }
 

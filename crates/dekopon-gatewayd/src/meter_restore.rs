@@ -145,18 +145,14 @@ async fn query(
     ca_certificate: Option<Vec<u8>>,
     window: Window,
 ) -> Result<Vec<HistoryRow>, RestoreError> {
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .timeout(config.timeout());
-    if let Some(pem) = ca_certificate {
-        for certificate in
-            reqwest::Certificate::from_pem_bundle(&pem).map_err(RestoreError::Client)?
-        {
-            builder = builder.add_root_certificate(certificate);
-        }
-    }
-    let client = builder.build().map_err(RestoreError::Client)?;
+    let client = dekopon_http_client::client_builder(
+        reqwest::Client::builder(),
+        config.timeout(),
+        ca_certificate.as_deref(),
+        concat!("dekopon-gatewayd/", env!("CARGO_PKG_VERSION")),
+    )
+    .and_then(reqwest::ClientBuilder::build)
+    .map_err(RestoreError::Client)?;
     match config {
         RestoreConfig::Openobserve {
             endpoint,

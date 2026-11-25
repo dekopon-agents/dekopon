@@ -8,7 +8,6 @@ use dekopon_core::{Redacted, error_chain};
 use reqwest::{
     StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue},
-    redirect,
 };
 use ring::{
     rand::SystemRandom,
@@ -158,13 +157,14 @@ impl GithubAppCredential {
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|_serialize| GithubAppError::Client)?;
-        let client = reqwest::Client::builder()
-            .redirect(redirect::Policy::none())
-            .no_proxy()
-            .timeout(REFRESH_TIMEOUT)
-            .user_agent(concat!("dekopon-brokerd/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|_build| GithubAppError::Client)?;
+        let client = dekopon_http_client::client_builder(
+            reqwest::Client::builder(),
+            REFRESH_TIMEOUT,
+            None,
+            concat!("dekopon-brokerd/", env!("CARGO_PKG_VERSION")),
+        )
+        .and_then(reqwest::ClientBuilder::build)
+        .map_err(|_build| GithubAppError::Client)?;
         Ok(Self {
             name,
             app_id: installation.app_id,

@@ -188,8 +188,11 @@ impl WhatsappTransport {
     ) -> Result<Self, TransportError> {
         let (sender, receiver) = mpsc::channel(WEBHOOK_QUEUE);
         let http = credential_client(GRAPH_REQUEST_TIMEOUT)
-            .dns_resolver(Arc::new(media::WhatsappResolver))
-            .build()
+            .and_then(|builder| {
+                builder
+                    .dns_resolver(Arc::new(media::WhatsappResolver))
+                    .build()
+            })
             .map_err(|source| TransportError::Request(Box::new(source.without_url())))?;
         let driver = Arc::new(WhatsappDriver {
             transport: name.clone(),

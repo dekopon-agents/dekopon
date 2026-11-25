@@ -17,6 +17,7 @@ include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 fauxlack = []
 
 [dependencies]
+dekopon-http-client.workspace = true
 parking_lot.workspace = true
 arc-swap.workspace = true
 async-trait.workspace = true

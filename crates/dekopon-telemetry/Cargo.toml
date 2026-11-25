@@ -17,6 +17,7 @@ include = ["src/**", "README.md", "Cargo.toml"]
 cli = ["exporter", "dep:clap"]
 exporter = [
     "dep:async-trait",
+    "dep:dekopon-http-client",
     "dep:dekopon-core",
     "dep:libc",
     "dep:log",
@@ -32,6 +33,7 @@ exporter = [
 ]
 
 [dependencies]
+dekopon-http-client = { workspace = true, optional = true }
 parking_lot.workspace = true
 async-trait = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
