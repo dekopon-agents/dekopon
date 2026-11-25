@@ -2235,7 +2235,7 @@ mod unit_tests {
     use dekopon_agent::{CancelVia, attachment::GeneratedImage};
     use dekopon_broker_protocol::ChatTransportKind;
     use dekopon_core::Redacted;
-    use dekopon_test_support::CaptureLayer;
+    use dekopon_test_support::{CaptureLayer, Record};
     use serde_json::{Value, json};
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -3004,13 +3004,15 @@ mod unit_tests {
             assert!(routed.is_none(), "{dropped} routed");
             drop(span);
             assert_reason(&capture, reason);
-            let events = capture.events_text();
-            assert!(
-                events.contains(&format!("{level} dekopon_gatewayd::audit"))
-                    && events.contains("audit.event=\"gateway.message.dropped\"")
-                    && events.contains(&format!("drop.reason=\"{reason}\"")),
-                "expected a {level} gateway.message.dropped for {reason} in {events}"
+            let events = capture.events_where(
+                "dekopon_gatewayd::audit",
+                &[
+                    ("audit.event", "gateway.message.dropped"),
+                    ("drop.reason", reason),
+                ],
             );
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert!(matches!(&events[0], Record::Event { level: actual, .. } if *actual == level));
         }
 
         capture.clear();
@@ -3025,12 +3027,25 @@ mod unit_tests {
             .expect("a drop is not a transport failure");
         assert!(routed.is_none(), "a withheld role mention routed");
         drop(span);
-        assert!(capture.spans_text().contains("mention.roles=true"));
-        let events = capture.events_text();
-        assert!(
-            events.contains("mention.roles=true") && events.contains("subject="),
-            "{events}"
+        assert!(capture.records().iter().any(|record| {
+            matches!(
+                record,
+                Record::Span {
+                    name: "transport.receive",
+                    ..
+                }
+            ) && record.field("mention.roles") == Some("true")
+        }));
+        let events = capture.events_where(
+            "dekopon_gatewayd::audit",
+            &[
+                ("audit.event", "gateway.message.dropped"),
+                ("drop.reason", "content-withheld"),
+            ],
         );
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].field("mention.roles"), Some("true"));
+        assert_eq!(events[0].field("subject"), Some("drn:discord:user::42"));
 
         let span = receive_span(ChatTransportKind::Discord);
         assert!(
@@ -3116,10 +3131,17 @@ mod unit_tests {
     }
 
     fn assert_reason(capture: &CaptureLayer, reason: &str) {
-        let spans = capture.spans_text();
         assert!(
-            spans.contains(&format!("drop.reason=\"{reason}\"")),
-            "expected drop.reason={reason} in {spans}"
+            capture.records().iter().any(|record| {
+                matches!(
+                    record,
+                    Record::Span {
+                        name: "transport.receive",
+                        ..
+                    }
+                ) && record.field("drop.reason") == Some(reason)
+            }),
+            "expected drop.reason={reason}"
         );
     }
 
