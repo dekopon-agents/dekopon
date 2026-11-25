@@ -229,6 +229,31 @@ pub(crate) enum ThreadClaim {
 }
 
 impl ThreadClaim {
+    pub(crate) fn normalized(&self) -> Self {
+        match self {
+            Self::Slack {
+                team_id,
+                channel_id,
+                thread_ts,
+                user_id,
+            } => Self::Slack {
+                team_id: team_id.to_ascii_lowercase(),
+                channel_id: channel_id.to_ascii_lowercase(),
+                thread_ts: thread_ts.clone(),
+                user_id: user_id.to_ascii_lowercase(),
+            },
+        }
+    }
+
+    pub(crate) fn subject(&self) -> Option<dekopon_core::Subject> {
+        match self {
+            Self::Slack {
+                team_id, user_id, ..
+            } => dekopon_core::Subject::new(dekopon_core::SubjectKind::SlackUser, team_id, user_id)
+                .ok(),
+        }
+    }
+
     pub(crate) fn same_thread(&self, other: &Self) -> bool {
         match (self, other) {
             (

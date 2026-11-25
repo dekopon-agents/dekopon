@@ -143,6 +143,7 @@ pub(crate) enum Persistence {
 }
 
 pub(crate) struct DurableStore {
+    _owner: std::fs::File,
     connection: Mutex<rusqlite::Connection>,
     migrated: bool,
     fatal: StoreFatal,
@@ -225,6 +226,7 @@ impl DurableStore {
                 .mode(0o700)
                 .create(parent)?;
         }
+        let owner = lock::sidecar(path)?;
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -258,6 +260,7 @@ impl DurableStore {
         let (sender, receiver) = oneshot::channel();
         Ok(Acquired {
             store: Arc::new(Self {
+                _owner: owner,
                 connection: Mutex::new(connection),
                 migrated: migration.is_some(),
                 fatal: StoreFatal {

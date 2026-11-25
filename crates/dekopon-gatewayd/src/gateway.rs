@@ -1213,7 +1213,9 @@ impl Gateway {
     fn start_job_notice(&self, sessions: &mut JoinSet<()>, notice: wake::JobNotice) {
         let wake::JobNotice { row, ticket } = notice;
         let Some(anchor) = wake::Anchor::restored(row.anchor) else {
-            drop(ticket);
+            sessions.spawn(async move {
+                drop(offload(move || ticket.settle(wake::DeliveryDisposition::Orphaned)).await);
+            });
             return;
         };
         let deadline = humantime::format_rfc3339_seconds(

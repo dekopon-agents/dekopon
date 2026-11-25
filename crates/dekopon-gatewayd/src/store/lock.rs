@@ -1,4 +1,9 @@
-use std::{path::Path, time::Duration};
+use std::{
+    fs::{File, OpenOptions},
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    time::Duration,
+};
 
 use rusqlite::{ErrorCode, TransactionBehavior};
 
@@ -40,4 +45,26 @@ pub(super) fn own(
         .map_err(owned)?;
     transaction.commit().map_err(owned)?;
     Ok(())
+}
+
+// Two processes opening a fresh store at once can each see the other's SQLite lock and both
+// refuse; the sidecar lock decides ownership before SQLite is touched.
+pub(super) fn sidecar(path: &Path) -> Result<File, StoreError> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path.with_file_name(name))?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(rustix::io::Errno::WOULDBLOCK) => Err(StoreError::Owned {
+            path: path.to_path_buf(),
+        }),
+        Err(errno) => Err(StoreError::Io {
+            kind: std::io::Error::from(errno).kind(),
+        }),
+    }
 }

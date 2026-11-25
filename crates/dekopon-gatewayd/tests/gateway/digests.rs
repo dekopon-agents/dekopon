@@ -414,6 +414,10 @@ async fn another_mapped_participant_manages_all_channel_wake_actions_but_other_c
         "Outside."
     );
     assert_eq!(fixture.tool_result("outside-list"), "No pending wakes.");
+    assert_eq!(
+        fixture.tool_result("outside-cancel"),
+        "Not done: no pending wake has that id in this scope."
+    );
     let dm = server
         .user("ualice")
         .post("dalice", "list and cancel")
@@ -424,6 +428,10 @@ async fn another_mapped_participant_manages_all_channel_wake_actions_but_other_c
         "Private."
     );
     assert_eq!(fixture.tool_result("dm-list"), "No pending wakes.");
+    assert_eq!(
+        fixture.tool_result("dm-cancel"),
+        "Not done: no pending wake has that id in this scope."
+    );
     let bob = server
         .user("ubob")
         .post("cteam", "<@udekopon> list and cancel")

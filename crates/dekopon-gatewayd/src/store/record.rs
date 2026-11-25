@@ -32,6 +32,18 @@ impl ConversationKey {
         Self(key)
     }
 
+    pub(crate) fn conversation(&self) -> Option<Conversation> {
+        let (_, encoded) = self.0.split_once(':')?;
+        let (kind, container, id, thread): (String, Option<String>, String, Option<String>) =
+            serde_json::from_str(encoded).ok()?;
+        Some(Conversation {
+            kind: serde_json::from_value(serde_json::Value::String(kind)).ok()?,
+            container,
+            id,
+            thread,
+        })
+    }
+
     pub(crate) fn transport(&self) -> Option<TransportId> {
         self.0.split_once(':')?.0.parse().ok()
     }
@@ -100,11 +112,14 @@ impl Snapshot {
                 self.ownership.clear();
             }
             Change::Claim(claim) => {
-                if !self.ownership.contains(&claim) {
-                    self.ownership.push(claim);
-                }
+                let claim = claim.normalized();
+                self.ownership.retain(|owned| owned.normalized() != claim);
+                self.ownership.push(claim);
             }
-            Change::Revoke(claim) => self.ownership.retain(|owned| owned != &claim),
+            Change::Revoke(claim) => {
+                let claim = claim.normalized();
+                self.ownership.retain(|owned| owned.normalized() != claim);
+            }
             Change::Release(claim) => self.ownership.retain(|owned| !owned.same_thread(&claim)),
             Change::JobStarted(row) => {
                 self.jobs.retain(|job| job.id != row.id);

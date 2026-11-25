@@ -14,8 +14,8 @@ use crate::{
     follow::{FollowHome, FollowTable, FollowTicket},
     journal::FollowMarker,
     store::{
-        Acquired, Change, DurableSettings, DurableStore, FollowConversion, FollowRow, JobRow,
-        LegacyInputs, Persistence, StoreError, StoreFailed, SyncMode,
+        Acquired, Change, ConversationKey, DurableSettings, DurableStore, FollowConversion,
+        FollowRow, JobRow, LegacyInputs, Persistence, StoreError, StoreFailed, SyncMode,
         testing::{MigrationStep, STEPS, SchemaVersion, acquire_with},
     },
     transport::ThreadClaim,
@@ -932,7 +932,15 @@ fn durable_store_holder_child() {
     let Some(path) = std::env::var_os(HOLDER) else {
         return;
     };
-    let _owner = acquire(Path::new(&path));
+    let _owner = match DurableStore::acquire(&settings(Path::new(&path)), &LegacyInputs::default())
+    {
+        Ok(owner) => owner,
+        Err(StoreError::Owned { .. }) => {
+            println!("store-owned");
+            return;
+        }
+        Err(error) => panic!("the holder could not open the store: {error}"),
+    };
     println!("store-held");
     std::io::stdout().flush().unwrap();
     let mut line = String::new();
@@ -1355,4 +1363,153 @@ fn a_tick_result_keeps_its_wake_id_on_every_outcome() {
     );
     assert_eq!(gone.wake, id);
     assert!(matches!(gone.result, crate::wake::TickResult::Gone));
+}
+
+fn holder(path: &Path) -> std::process::Child {
+    Command::new(std::env::current_exe().unwrap())
+        .args([
+            "tests::durable_store::durable_store_holder_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HOLDER, path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+type ChildLines = std::io::Lines<BufReader<std::process::ChildStdout>>;
+
+fn outcome(child: &mut std::process::Child) -> (String, ChildLines) {
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let found = lines
+        .by_ref()
+        .map_while(Result::ok)
+        .find_map(|line| {
+            ["store-held", "store-owned"]
+                .into_iter()
+                .find(|outcome| line.ends_with(outcome))
+                .map(str::to_owned)
+        })
+        .expect("the holder reports its outcome");
+    (found, lines)
+}
+
+#[test]
+fn two_gateway_processes_started_at_once_leave_exactly_one_owner() {
+    for _ in 0..10 {
+        let directory = temporary();
+        let path = directory.path().join("state.sqlite");
+        let mut children = [holder(&path), holder(&path)];
+        let mut reports: Vec<(String, ChildLines)> = children.iter_mut().map(outcome).collect();
+        let mut outcomes: Vec<&str> = reports.iter().map(|(found, _)| found.as_str()).collect();
+        outcomes.sort_unstable();
+        assert_eq!(outcomes, ["store-held", "store-owned"]);
+        for (child, (_, lines)) in children.iter_mut().zip(&mut reports) {
+            drop(child.stdin.take());
+            lines.by_ref().for_each(drop);
+            assert!(child.wait().unwrap().success());
+        }
+    }
+}
+
+#[test]
+fn a_revoke_differing_only_in_case_removes_the_persisted_claim() {
+    let directory = temporary();
+    let acquired = acquire(&directory.path().join("state.sqlite"));
+    let key = anchor().key();
+    let claimed = ThreadClaim::Slack {
+        team_id: "T0123ABC".to_owned(),
+        channel_id: "C0123ABC".to_owned(),
+        thread_ts: "1700000000.000001".to_owned(),
+        user_id: "U0123ABC".to_owned(),
+    };
+    acquired
+        .store
+        .commit(vec![
+            (key.clone(), Change::Claim(claimed)),
+            (key.clone(), Change::Claim(claim("1700000000.000001"))),
+        ])
+        .unwrap();
+    assert_eq!(
+        acquired
+            .store
+            .snapshot_for_test(&key)
+            .unwrap()
+            .ownership
+            .len(),
+        1
+    );
+    acquired
+        .store
+        .commit(vec![(
+            key.clone(),
+            Change::Revoke(claim("1700000000.000001")),
+        )])
+        .unwrap();
+    assert!(acquired.store.snapshot_for_test(&key).is_none());
+}
+
+#[tokio::test]
+async fn restored_ownership_follows_the_recall_policy_of_its_conversations_route() {
+    for (memory, kept) in [
+        (json!({"mode": "oneShot"}), 0),
+        (
+            json!({"mode": "persistent", "recall": "journal", "summaries": "off"}),
+            1,
+        ),
+    ] {
+        let directory = temporary();
+        let path = directory.path().join("state").join("state.sqlite");
+        let key = ConversationKey::of(
+            &"dev".parse().unwrap(),
+            &dekopon_broker_protocol::Conversation {
+                kind: ConversationKind::DirectMessage,
+                container: None,
+                id: "d0123abc".to_owned(),
+                thread: None,
+            },
+        );
+        {
+            let acquired = acquire(&path);
+            acquired
+                .store
+                .commit(vec![(
+                    key.clone(),
+                    Change::Claim(claim("1700000000.000003")),
+                )])
+                .unwrap();
+        }
+        let mut input = document(directory.path());
+        input["routes"][0]["memory"] = memory;
+        input["sessions"] = json!({
+            "durable": {"path": path},
+            "journal": {"path": directory.path().join("journal")},
+            "assets": {"path": directory.path().join("assets")},
+        });
+        let config = resolved(directory.path(), &input).await;
+        let routes = RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap();
+        let (_durable, _fatal, restored) = crate::acquire_store(&config, &routes).await.unwrap();
+        assert_eq!(restored.ownership.len(), kept);
+    }
+}
+
+#[test]
+fn a_conversation_key_names_its_transport_and_conversation() {
+    let conversation = dekopon_broker_protocol::Conversation {
+        kind: ConversationKind::Thread,
+        container: Some("t0123abc".to_owned()),
+        id: "c0:12".to_owned(),
+        thread: Some("1700000000.000001".to_owned()),
+    };
+    let key = ConversationKey::of(&"workspace".parse().unwrap(), &conversation);
+    assert_eq!(
+        key.transport().map(|transport| transport.to_string()),
+        Some("workspace".to_owned())
+    );
+    assert_eq!(key.conversation(), Some(conversation));
 }
