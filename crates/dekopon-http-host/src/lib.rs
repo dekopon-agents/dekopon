@@ -3132,6 +3132,16 @@ mod tests {
         assert!(!error.message.contains("api.example.test"), "{error}");
     }
 
+    fn generated(label: &str) -> String {
+        use std::hash::{BuildHasher as _, RandomState};
+        let state = RandomState::new();
+        format!(
+            "{label}-{:016x}{:016x}",
+            state.hash_one(1_u8),
+            state.hash_one(2_u8)
+        )
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn the_egress_push_rides_each_vm_call_and_its_return_never_reaches_the_guest() {
         let returned = "v1.eyJhcHBsaWVkIjp0cnVlfQ";
@@ -3151,17 +3161,19 @@ mod tests {
             max_injections: 2,
             ..secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/v1/sessions")
         };
+        let every = generated("v1.every");
+        let exec = generated("v1.exec");
         let credential = BoundCredential::secret_bearer(
-            SecretBytes::new(b"runner-bearer-fixture".to_vec()),
+            SecretBytes::new(generated("runner").into_bytes()),
             &secret,
         )
         .expect("valid runner credential")
         .with_egress_push(
             EgressPushHeaders {
-                every: Redacted::new("v1.every-call-fixture".to_owned()),
-                exec: Redacted::new("v1.exec-call-fixture".to_owned()),
+                every: Redacted::new(every.clone()),
+                exec: Redacted::new(exec.clone()),
             },
-            vec![SecretBytes::new(b"pushed-token-fixture".to_vec())],
+            vec![SecretBytes::new(generated("pushed").into_bytes())],
         )
         .expect("valid push");
         let mut client = BufferedHttpClient::authorized_with_secret_credential(
@@ -3190,10 +3202,7 @@ mod tests {
             .expect_err("the guest cannot set the push header");
         assert_eq!(forged.code, ErrorCode::InvalidHeader);
 
-        for (path, push) in [
-            ("/v1/sessions", "v1.every-call-fixture"),
-            ("/v1/sessions/s-1/exec", "v1.exec-call-fixture"),
-        ] {
+        for (path, push) in [("/v1/sessions", &every), ("/v1/sessions/s-1/exec", &exec)] {
             let response = client
                 .send(Request {
                     method: "POST".to_owned(),
@@ -3233,7 +3242,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_response_reflecting_the_egress_push_is_refused() {
-        let push = "v1.reflected-push-fixture";
+        let push = &generated("v1.reflected");
         let server = LoopbackServer::once(
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{push}",
@@ -3247,14 +3256,14 @@ mod tests {
             ..secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/v1/sessions")
         };
         let credential = BoundCredential::secret_bearer(
-            SecretBytes::new(b"runner-bearer-fixture".to_vec()),
+            SecretBytes::new(generated("runner").into_bytes()),
             &secret,
         )
         .expect("valid runner credential")
         .with_egress_push(
             EgressPushHeaders {
-                every: Redacted::new(push.to_owned()),
-                exec: Redacted::new(push.to_owned()),
+                every: Redacted::new(push.clone()),
+                exec: Redacted::new(push.clone()),
             },
             Vec::new(),
         )

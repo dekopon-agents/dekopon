@@ -3854,6 +3854,7 @@ where
         policy_ids: &[String],
         policy_evidence: Evidence,
         reason: &'static str,
+        detail: Option<ProviderFailureDetail>,
     ) -> Result<InvocationResult, BrokerError> {
         let artifact = self
             .registry
@@ -3875,7 +3876,7 @@ where
             None,
             0,
             Some(reason.to_owned()),
-            None,
+            detail.clone(),
             Vec::new(),
             None,
             None,
@@ -3896,7 +3897,7 @@ where
             outcome: InvocationOutcome::Failed,
             exit_status: None,
             error: Some(reason.to_owned()),
-            detail: None,
+            detail,
             evidence: vec![policy_evidence],
         })
     }
@@ -4258,6 +4259,13 @@ where
                         &egress.policy.determining_policy_ids,
                         policy_evidence,
                         "egress-denied",
+                        Some(ProviderFailureDetail::new(
+                            "egress-denied",
+                            &format!(
+                                "policy does not permit pushing egress profile {}",
+                                egress.profile
+                            ),
+                        )),
                     )
                     .await;
             }
@@ -4302,7 +4310,7 @@ where
         let credential = match credential {
             Ok(credential) => credential,
             Err(error) => {
-                let code = match error {
+                let (code, detail) = match error {
                     CredentialFailure::Resolution(source) => {
                         tracing::warn!(
                             event = "broker_secret_resolution_failed",
@@ -4310,9 +4318,9 @@ where
                             category = source.category,
                             "broker.secret.resolution.failed"
                         );
-                        "secret-resolution"
+                        ("secret-resolution", None)
                     }
-                    CredentialFailure::Binding => "secret-authorization",
+                    CredentialFailure::Binding => ("secret-authorization", None),
                     CredentialFailure::Material(source) => {
                         tracing::warn!(
                             event = "broker_secret_credential_failed",
@@ -4321,16 +4329,23 @@ where
                             cause_type = std::any::type_name_of_val(&source),
                             "broker.secret.credential.failed"
                         );
-                        "secret-credential"
+                        ("secret-credential", None)
                     }
                     CredentialFailure::Egress(source) => {
                         tracing::warn!(
                             event = "broker_egress_push_failed",
                             invocation = %invocation_id,
                             category = source.category(),
+                            profile = source.profile().map(SecretDrn::as_str),
                             "broker.egress.push.failed"
                         );
-                        source.category()
+                        (
+                            source.category(),
+                            Some(ProviderFailureDetail::new(
+                                source.category(),
+                                &source.to_string(),
+                            )),
+                        )
                     }
                 };
                 return self
@@ -4345,6 +4360,7 @@ where
                         &policy_ids,
                         policy_evidence,
                         code,
+                        detail,
                     )
                     .await;
             }

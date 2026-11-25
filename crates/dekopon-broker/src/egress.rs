@@ -174,10 +174,10 @@ struct ReturnWire {
 impl EgressReturn {
     #[must_use]
     pub fn decode(value: &[u8]) -> Option<Self> {
-        let encoded = value.strip_prefix(WIRE_VERSION.as_bytes())?;
-        if encoded.len() > MAX_EGRESS_HEADER_BYTES {
+        if value.len() > MAX_EGRESS_HEADER_BYTES {
             return None;
         }
+        let encoded = value.strip_prefix(WIRE_VERSION.as_bytes())?;
         let json = URL_SAFE_NO_PAD.decode(encoded).ok()?;
         let wire: ReturnWire = serde_json::from_slice(&json).ok()?;
         Some(if wire.applied {
@@ -204,6 +204,14 @@ pub enum EgressError {
 }
 
 impl EgressError {
+    #[must_use]
+    pub const fn profile(&self) -> Option<&SecretDrn> {
+        match self {
+            Self::PushTooLarge { profile } => Some(profile),
+            Self::Unbound | Self::DuplicateCookie | Self::Encode => None,
+        }
+    }
+
     #[must_use]
     pub const fn category(&self) -> &'static str {
         match self {

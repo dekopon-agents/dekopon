@@ -3859,6 +3859,7 @@ async fn an_authorized_failure_before_the_provider_names_the_loaded_artifact() {
                 uri: None,
             },
             "storage-io",
+            None,
         )
         .await
         .expect("the failure is recorded");

@@ -36,12 +36,12 @@ const CAPABILITY: &str = "http-probe.fetch";
 const RUNNER: &str = "drn:secret:vm/runner";
 const PROFILE: &str = "drn:secret:vm/egress-default";
 const AGENT_PROFILE: &str = "drn:secret:vm/egress-agent";
-const RUNNER_TOKEN: &str = "runner-bearer-fixture-0123456789";
 const RETURN_HEADER: &str = "x-dekopon-egress-return";
 const PUSH_HEADER: &str = "x-dekopon-egress-push";
 
 #[derive(Debug)]
 struct ProfileResolver {
+    runner: String,
     tokens: BTreeMap<SecretDrn, String>,
     pushes: AtomicUsize,
 }
@@ -49,6 +49,7 @@ struct ProfileResolver {
 impl ProfileResolver {
     fn new(tokens: impl IntoIterator<Item = (&'static str, String)>) -> Arc<Self> {
         Arc::new(Self {
+            runner: generated_token("runner-bearer"),
             tokens: tokens
                 .into_iter()
                 .map(|(drn, token)| (drn.parse().expect("profile DRN"), token))
@@ -62,7 +63,7 @@ impl ProfileResolver {
 impl SecretResolver for ProfileResolver {
     async fn resolve(&self, secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError> {
         if secret.as_str() == RUNNER {
-            Ok(SecretMaterial::new(RUNNER_TOKEN.as_bytes().to_vec()))
+            Ok(SecretMaterial::new(self.runner.as_bytes().to_vec()))
         } else {
             Err(SecretResolutionError {
                 category: "missing",
@@ -315,6 +316,7 @@ async fn a_vm_exec_push_leaves_in_the_host_owned_header_and_never_in_provider_me
     let runner = LoopbackServer::once(&response(&format!("{RETURN_HEADER}: {returned}\r\n")));
     let authority = runner.authority().to_owned();
     let resolver = ProfileResolver::new([(PROFILE, token.clone())]);
+    let runner_token = resolver.runner.clone();
     let broker = vm_broker(&authority, resolver, &[], BTreeMap::new()).await;
 
     let (result, stdout) = invoke(
@@ -334,7 +336,7 @@ async fn a_vm_exec_push_leaves_in_the_host_owned_header_and_never_in_provider_me
         request.starts_with("POST /v1/sessions/s-1/exec HTTP/1.1\r\n"),
         "{request}"
     );
-    assert!(request.contains(&format!("authorization: Bearer {RUNNER_TOKEN}")));
+    assert!(request.contains(&format!("authorization: Bearer {runner_token}")));
     assert_eq!(
         pushed(&request),
         json!({
@@ -395,7 +397,7 @@ async fn an_oversized_push_is_refused_naming_the_profile() {
     let oversized = EgressPush {
         profile: profile.clone(),
         grant: None,
-        material: material(&"x".repeat(16 * 1024)),
+        material: material(&generated_token("oversized").repeat(600)),
     };
     assert!(matches!(
         oversized.encode(),
@@ -404,7 +406,7 @@ async fn an_oversized_push_is_refused_naming_the_profile() {
 
     let runner = LoopbackServer::stalled();
     let authority = runner.authority().to_owned();
-    let resolver = ProfileResolver::new([(PROFILE, "x".repeat(16 * 1024))]);
+    let resolver = ProfileResolver::new([(PROFILE, generated_token("oversized").repeat(600))]);
     let broker = vm_broker(&authority, resolver, &[], BTreeMap::new()).await;
     let (result, _) = invoke(
         &broker,
@@ -417,6 +419,13 @@ async fn an_oversized_push_is_refused_naming_the_profile() {
         result.result.error.as_deref(),
         Some("egress-push-too-large")
     );
+    let detail = result
+        .result
+        .detail
+        .as_ref()
+        .expect("the failure names its profile");
+    assert_eq!(detail.code, "egress-push-too-large");
+    assert!(detail.message.contains(PROFILE), "{detail}");
     assert!(
         runner.recorded().is_empty(),
         "no request reached the runner"
@@ -556,4 +565,16 @@ fn a_return_decodes_only_from_its_versioned_shape() {
     );
     assert_eq!(EgressReturn::decode(unknown.as_bytes()), None);
     assert_eq!(EgressReturn::decode(b"applied"), None);
+}
+
+#[test]
+fn the_return_bound_counts_the_version_prefix() {
+    let mut padded = json!({ "applied": true }).to_string();
+    padded.push_str(&" ".repeat(12_286 - padded.len()));
+    let encoded = URL_SAFE_NO_PAD.encode(padded);
+    assert_eq!(encoded.len(), 16_382);
+    assert_eq!(
+        EgressReturn::decode(format!("v1.{encoded}").as_bytes()),
+        None
+    );
 }
