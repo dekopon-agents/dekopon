@@ -31,6 +31,7 @@ use crate::{
 };
 
 const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
+const SPACE_SUBJECT: &str = "drn:slack:channel:t0123abc:c0123abc";
 const AGENT: &str = "provider-test";
 const CAPABILITY: &str = "http-probe.fetch";
 const RUNNER: &str = "drn:secret:vm/runner";
@@ -112,11 +113,11 @@ fn capability() -> CapabilityId {
 
 fn policy(forbidden_profiles: &[&str]) -> String {
     let mut policy = format!(
-        r#"@id("fetch") permit(principal == Dekopon::Principal::"caller",
+        r#"@id("fetch") permit(principal,
             action == Dekopon::Action::"{CAPABILITY}", resource == Dekopon::Provider::"http-probe");
-        @id("prompt") permit(principal == Dekopon::Principal::"caller",
+        @id("prompt") permit(principal,
             action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"{AGENT}");
-        @id("runner") permit(principal == Dekopon::Principal::"caller",
+        @id("runner") permit(principal,
             action == Dekopon::Action::"secret.use", resource == Dekopon::Secret::"{RUNNER}");
         "#
     );
@@ -188,13 +189,20 @@ async fn vm_broker(
     swaps: BTreeMap<AgentId, BTreeMap<SecretDrn, SecretDrn>>,
 ) -> Broker {
     let audit = AuditSink::TraceOnly(TraceOnlyAuditLog);
-    audited_vm_broker(authority, resolver, forbidden_profiles, swaps, audit).await
+    audited_vm_broker(
+        authority,
+        resolver,
+        &policy(forbidden_profiles),
+        swaps,
+        audit,
+    )
+    .await
 }
 
 async fn audited_vm_broker(
     authority: &str,
     resolver: Arc<ProfileResolver>,
-    forbidden_profiles: &[&str],
+    policy: &str,
     swaps: BTreeMap<AgentId, BTreeMap<SecretDrn, SecretDrn>>,
     audit: AuditSink,
 ) -> Broker {
@@ -206,7 +214,7 @@ async fn audited_vm_broker(
     .await
     .expect("HTTP provider fixture loads");
     let world = PolicyWorld::new(
-        [principal("caller")],
+        [principal("caller"), principal("space")],
         [(capability(), "http-probe".parse().expect("provider"))],
     )
     .expect("world")
@@ -214,12 +222,18 @@ async fn audited_vm_broker(
     Broker::new(
         registry,
         principal("broker-test"),
-        PolicyEngine::new(&policy(forbidden_profiles), &world).expect("policy"),
+        PolicyEngine::new(policy, &world).expect("policy"),
         ConstraintCatalog::new([(capability(), vm_set(authority))])
             .expect("catalog")
             .with_agent_secrets(swaps),
-        IdentityDirectory::new([(SUBJECT.parse().expect("subject"), principal("caller"))])
-            .expect("directory"),
+        IdentityDirectory::new([
+            (SUBJECT.parse().expect("subject"), principal("caller")),
+            (
+                SPACE_SUBJECT.parse().expect("space subject"),
+                principal("space"),
+            ),
+        ])
+        .expect("directory"),
         Arc::new(audit),
         BrokerLimits::default(),
     )
@@ -231,6 +245,15 @@ async fn audited_vm_broker(
 }
 
 async fn invoke(broker: &Broker, id: &str, input: Value) -> (AssetInvocationResult, String) {
+    invoke_scoped(broker, id, input, None).await
+}
+
+async fn invoke_scoped(
+    broker: &Broker,
+    id: &str,
+    input: Value,
+    scope: Option<dekopon_broker_protocol::ChatScopeClaim>,
+) -> (AssetInvocationResult, String) {
     let gateway = AuthenticatedContext::new(
         principal("gateway"),
         Actor::Service {
@@ -239,11 +262,13 @@ async fn invoke(broker: &Broker, id: &str, input: Value) -> (AssetInvocationResu
     )
     .expect("gateway context");
     let invocation = id.parse::<InvocationId>().expect("invocation id");
-    let attestation = Attestation::for_subject(
-        dekopon_core::AttestedSubject::one(SUBJECT.parse::<Subject>().expect("subject"))
-            .expect("one-form subject"),
-        AGENT.parse::<AgentId>().expect("agent"),
-    )
+    let subjects = dekopon_core::AttestedSubject::one(SUBJECT.parse::<Subject>().expect("subject"))
+        .expect("one-form subject");
+    let agent = AGENT.parse::<AgentId>().expect("agent");
+    let attestation = match scope {
+        Some(scope) => Attestation::for_chat(subjects, agent, scope),
+        None => Attestation::for_subject(subjects, agent),
+    }
     .bound_to(invocation.clone());
     let (host, mut stdout) = std::os::unix::net::UnixStream::pair().expect("stdout pipe");
     let capture = std::thread::spawn(move || {
@@ -471,7 +496,7 @@ async fn cedar_secret_use_chooses_the_pushed_set() {
     let broker = audited_vm_broker(
         &authority,
         Arc::clone(&resolver),
-        &[AGENT_PROFILE],
+        &policy(&[AGENT_PROFILE]),
         swaps,
         AuditSink::InMemory(Arc::clone(&audit)),
     )
@@ -484,6 +509,13 @@ async fn cedar_secret_use_chooses_the_pushed_set() {
     .await;
     assert_eq!(result.result.outcome, InvocationOutcome::Failed);
     assert_eq!(result.result.error.as_deref(), Some("egress-denied"));
+    let detail = result
+        .result
+        .detail
+        .as_ref()
+        .expect("the denial names its profile");
+    assert_eq!(detail.code, "egress-denied");
+    assert!(detail.message.contains(AGENT_PROFILE), "{detail}");
     assert_eq!(resolver.pushes.load(Ordering::SeqCst), 0);
     assert!(
         runner.recorded().is_empty(),
@@ -518,6 +550,85 @@ async fn cedar_secret_use_chooses_the_pushed_set() {
     assert_eq!(*secret_sink, Some(SecretSinkKind::VmEgressProfile));
     assert_eq!(policy_ids, &["profile-0"]);
     assert_eq!(failure_policy_ids, &["profile-0"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_space_denied_egress_push_keeps_the_space_decision_in_its_record() {
+    let runner = LoopbackServer::stalled();
+    let authority = runner.authority().to_owned();
+    let resolver = ProfileResolver::new([(PROFILE, generated_token("vm-access"))]);
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("audit bound"));
+    let space_forbid = format!(
+        r#"@id("space-forbid") forbid(principal == Dekopon::Principal::"space",
+            action == Dekopon::Action::"secret.use", resource == Dekopon::Secret::"{PROFILE}")
+            when {{ context.sink == "vmEgressProfile" }};"#
+    );
+    let broker = audited_vm_broker(
+        &authority,
+        Arc::clone(&resolver),
+        &(policy(&[]) + &space_forbid),
+        BTreeMap::new(),
+        AuditSink::InMemory(Arc::clone(&audit)),
+    )
+    .await;
+    let scope = dekopon_broker_protocol::ChatScopeClaim {
+        participant: None,
+        github: None,
+        transport: "chat".parse().expect("transport"),
+        kind: dekopon_broker_protocol::ChatTransportKind::Slack,
+        conversation: dekopon_broker_protocol::Conversation {
+            kind: dekopon_broker_protocol::ConversationKind::Thread,
+            container: Some("t0123abc".into()),
+            id: "c0123abc".into(),
+            thread: Some("1712345678.000100".into()),
+        },
+        trigger: dekopon_broker_protocol::Trigger::Message,
+        delivery: Some(dekopon_broker_protocol::DeliveryIdentity::Slack {
+            channel: "c0123abc".into(),
+            timestamp: "1712345678.000101".into(),
+        }),
+    };
+
+    let (result, _) = invoke_scoped(
+        &broker,
+        "vm-space-denied",
+        json!({ "uri": format!("http://{authority}/v1/sessions"), "method": "POST" }),
+        Some(scope),
+    )
+    .await;
+
+    assert_eq!(result.result.error.as_deref(), Some("egress-denied"));
+    assert_eq!(resolver.pushes.load(Ordering::SeqCst), 0);
+    assert!(
+        runner.recorded().is_empty(),
+        "no request reached the runner"
+    );
+    let records = audit.records();
+    let Some(AuditEvent::Decision {
+        authority,
+        provider,
+        allowed: false,
+        reason,
+        ..
+    }) = records.iter().find(|record| {
+        matches!(record, AuditEvent::Decision { decision_point, .. } if decision_point == "egress-profile")
+    })
+    else {
+        panic!("a denied egress decision: {records:?}");
+    };
+    let space = authority
+        .space
+        .as_ref()
+        .expect("the space decision is kept");
+    assert_eq!(space.id.as_str(), "space");
+    assert_eq!(space.asker_allowed, Some(true));
+    assert_eq!(space.allowed, Some(false));
+    assert_eq!(space.policy_ids, ["space-forbid"]);
+    assert_eq!(
+        provider.as_ref().map(dekopon_core::ProviderId::as_str),
+        Some("http-probe")
+    );
+    assert_eq!(reason.as_deref(), Some("egress-denied"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

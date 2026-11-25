@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use dekopon_broker_host::{BoundCredential, EgressPushHeaders};
 use dekopon_broker_protocol::{Grant, Tally};
 use dekopon_core::{
-    CapabilityId, InvocationId, PrincipalId, Redacted, SecretBytes, SecretDrn, SecretSinkKind,
-    TraceId,
+    CapabilityId, InvocationId, PrincipalId, ProviderId, Redacted, SecretBytes, SecretDrn,
+    SecretSinkKind, TraceId,
     base64::{Engine as _, URL_SAFE_NO_PAD},
 };
 use dekopon_policy::SecretSelection;
@@ -225,7 +225,14 @@ impl EgressError {
 
 pub(crate) struct EgressDecision<'a> {
     pub(crate) profile: &'a SecretDrn,
-    pub(crate) policy: dekopon_policy::PolicyDecision,
+    pub(crate) provider: &'a ProviderId,
+    pub(crate) decision: crate::EvaluatedDecision,
+}
+
+impl EgressDecision<'_> {
+    pub(crate) fn denial(&self) -> &'static str {
+        crate::denial_reason(&self.decision, "egress-denied")
+    }
 }
 
 #[derive(Serialize)]
@@ -235,11 +242,16 @@ struct EgressDecisionMaterial<'a> {
     trace: TraceId,
     principal: &'a PrincipalId,
     capability: &'a CapabilityId,
+    provider: &'a ProviderId,
     profile: &'a SecretDrn,
     sink: SecretSinkKind,
     policy_ids: &'a [String],
     policy_digest: &'a str,
     allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    space: Option<&'a crate::SpaceDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github_denial: Option<&'a crate::GithubDenial>,
 }
 
 impl<A> crate::Broker<A>
@@ -255,16 +267,18 @@ where
         let profile = self
             .constraints
             .effective_egress_profile(set, context.actor())?;
-        let policy = self
-            .authorize_secret_sink(
-                context,
-                capability,
-                set,
-                (profile, SecretSinkKind::VmEgressProfile),
-                SecretSelection::Default,
-            )
-            .policy;
-        Some(EgressDecision { profile, policy })
+        let decision = self.authorize_secret_sink(
+            context,
+            capability,
+            set,
+            (profile, SecretSinkKind::VmEgressProfile),
+            SecretSelection::Default,
+        );
+        Some(EgressDecision {
+            profile,
+            provider: &set.provider,
+            decision,
+        })
     }
 
     pub(crate) async fn record_egress_decision(
@@ -273,9 +287,9 @@ where
         invocation: &InvocationId,
         trace: TraceId,
         capability: &CapabilityId,
-        decision: &EgressDecision<'_>,
+        egress: &EgressDecision<'_>,
     ) -> Result<(), crate::BrokerError> {
-        let policy = &decision.policy;
+        let decision = &egress.decision;
         let decision_digest = crate::decision_evidence_digest(
             "policy-decision",
             &EgressDecisionMaterial {
@@ -283,19 +297,24 @@ where
                 trace,
                 principal: context.principal(),
                 capability,
-                profile: decision.profile,
+                provider: egress.provider,
+                profile: egress.profile,
                 sink: SecretSinkKind::VmEgressProfile,
-                policy_ids: &policy.determining_policy_ids,
+                policy_ids: &decision.determining_policy_ids,
                 policy_digest: &self.policy_digest,
-                allowed: policy.allowed,
+                allowed: decision.allowed,
+                space: decision.space.as_ref(),
+                github_denial: decision.github_denial.as_ref(),
             },
         )?;
+        let mut authority = crate::decision_authority(
+            context,
+            self.identities.principal_kind(context.principal()),
+            decision.space.clone(),
+        );
+        authority.github_denial = decision.github_denial.clone();
         self.record_audit(crate::AuditEvent::Decision {
-            authority: crate::decision_authority(
-                context,
-                self.identities.principal_kind(context.principal()),
-                None,
-            ),
+            authority,
             invocation: invocation.clone(),
             trace,
             principal: Some(context.principal().clone()),
@@ -303,24 +322,26 @@ where
             via: context.via().cloned(),
             attested_subject: context.attested_subject().cloned(),
             capability: capability.clone(),
-            secret: Some(decision.profile.clone()),
+            secret: Some(egress.profile.clone()),
             secret_sink: Some(SecretSinkKind::VmEgressProfile),
-            provider: None,
+            provider: Some(egress.provider.clone()),
             authorized_by: Some(self.broker_principal.clone()),
             decision_id: format!("egress-{invocation}"),
-            policy_ids: policy.determining_policy_ids.clone(),
-            policy_error_ids: policy.erroring_policy_ids.clone(),
-            policy_errors_present: Some(policy.errors_present),
+            policy_ids: decision.determining_policy_ids.clone(),
+            policy_error_ids: decision.erroring_policy_ids.clone(),
+            policy_errors_present: Some(decision.errors_present),
             decision_point: "egress-profile".to_owned(),
             policy_digest: Some(self.policy_digest.clone()),
-            allowed: policy.allowed,
-            reason: (!policy.allowed).then(|| "egress-denied".to_owned()),
+            allowed: decision.allowed,
+            reason: (!decision.allowed).then(|| egress.denial().to_owned()),
             decision_digest,
             storage_scope_commitment: None,
             storage: None,
         })
         .await
         .map_err(|source| {
+            tracing::Span::current().record("outcome", "decision-unaudited");
+            tracing::Span::current().record("error", source.category());
             crate::report_audit_failure("decision", invocation, &source);
             crate::BrokerError::DecisionAudit { source }
         })

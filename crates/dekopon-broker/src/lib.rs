@@ -4246,7 +4246,7 @@ where
         if let Some(egress) = &egress {
             self.record_egress_decision(context, &invocation_id, trace, &capability, egress)
                 .await?;
-            if !egress.policy.allowed {
+            if !egress.decision.allowed {
                 return self
                     .fail_authorized_before_provider(
                         context,
@@ -4256,11 +4256,11 @@ where
                         &decision_id,
                         decision,
                         &set,
-                        &egress.policy.determining_policy_ids,
+                        &egress.decision.determining_policy_ids,
                         policy_evidence,
-                        "egress-denied",
+                        egress.denial(),
                         Some(ProviderFailureDetail::new(
-                            "egress-denied",
+                            egress.denial(),
                             &format!(
                                 "policy does not permit pushing egress profile {}",
                                 egress.profile
