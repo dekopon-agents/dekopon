@@ -54,6 +54,7 @@ use crate::token_issuer::{SelfSignedIssuer, SignedJwtConfig, SignedJwtConfigErro
 
 pub(crate) mod chatgpt;
 pub(crate) mod oauth2;
+pub(crate) mod vault;
 
 pub const SECRET_MAP_API_VERSION: &str = "dekopon.dev/secret-map/v1alpha1";
 pub const HARD_MAX_SECRET_MAP_BYTES: usize = 1024 * 1024;
@@ -733,6 +734,29 @@ impl SecretResolver for MapResolver {
                     category: error.category(),
                 }
             })
+    }
+
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/push-contract fills this body"
+    )]
+    async fn egress_profile(
+        &self,
+        _profile: &SecretDrn,
+    ) -> Result<dekopon_broker::EgressProfileMaterial, SecretResolutionError> {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/vault-rotation fills this body"
+    )]
+    async fn store_rotations(
+        &self,
+        _profile: &SecretDrn,
+        _rotations: Vec<dekopon_broker::CookieEntry>,
+    ) -> Result<(), SecretResolutionError> {
+        todo!()
     }
 }
 
@@ -3221,6 +3245,8 @@ mod record_path_exclusivity;
 mod signed_jwt_tests;
 #[cfg(test)]
 mod token_request_tests;
+#[cfg(test)]
+mod vault_tests;
 
 #[cfg(test)]
 mod tests {

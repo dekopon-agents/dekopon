@@ -81,6 +81,8 @@ when { context.via == "caller" && context.agent == "chat-agent" };
 
 fn probe_constraint_set() -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "cli-probe"
@@ -1535,6 +1537,8 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let catalog = ConstraintCatalog::new([(
         capability.clone(),
         ConstraintSet {
+            egress_profile: None,
+            takes_grant: false,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider,

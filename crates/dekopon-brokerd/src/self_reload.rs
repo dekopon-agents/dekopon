@@ -65,3 +65,50 @@ async fn drain_reload(task: &mut JoinSet<BrokerStop>) -> Result<(), BrokerdError
     }
     ended
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload fills and calls these"
+)]
+pub(crate) struct GenerationDigest([u8; 32]);
+
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload fills and calls these"
+)]
+pub(crate) struct CommitSignal {
+    latest: tokio::sync::watch::Sender<GenerationDigest>,
+}
+
+#[expect(
+    clippy::todo,
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload fills and calls these"
+)]
+impl CommitSignal {
+    pub(crate) fn new(_boot: GenerationDigest) -> Self {
+        todo!()
+    }
+
+    pub(crate) fn publish(&self, _committed: GenerationDigest) {
+        todo!()
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<GenerationDigest> {
+        todo!()
+    }
+}
+
+#[expect(
+    clippy::todo,
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload fills and calls this"
+)]
+pub(crate) async fn check_lock_then_exit(
+    _lock: LoadedLock,
+    _uid: u32,
+    _deadline: ShutdownDeadline,
+) -> BrokerStop {
+    todo!()
+}

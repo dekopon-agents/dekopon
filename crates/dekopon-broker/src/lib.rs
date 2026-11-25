@@ -29,6 +29,7 @@ use std::{
 };
 
 mod continuity;
+mod egress;
 
 pub use continuity::{
     CandidateReport, ContinuityCandidate, ContinuityDigest, ContinuityDigestError,
@@ -36,6 +37,10 @@ pub use continuity::{
     OperationalOverrides, StorageOverrides,
 };
 use continuity::{ContinuityState, OperationalSnapshot};
+pub use egress::{
+    CookieEntry, CookieSet, EgressError, EgressHeaderValue, EgressProfile, EgressProfileMaterial,
+    EgressPush, EgressReturn, ExecWrite, PushedToken, TokenTarget, settle,
+};
 
 use async_trait::async_trait;
 use dekopon_broker_host::{
@@ -450,6 +455,10 @@ pub struct ConstraintSet {
         deserialize_with = "deserialize_default_secret_use"
     )]
     pub default_secret_use: Option<DefaultSecretUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_profile: Option<EgressProfile>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub takes_grant: bool,
     #[serde(default, skip_serializing_if = "CapabilityRoute::is_generic")]
     pub route: CapabilityRoute,
     pub provider: ProviderId,
@@ -939,6 +948,29 @@ impl fmt::Debug for SecretMaterial {
 #[async_trait]
 pub trait SecretResolver: Send + Sync + fmt::Debug {
     async fn resolve(&self, secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError>;
+
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/push-contract fills this body"
+    )]
+    async fn egress_profile(
+        &self,
+        _profile: &SecretDrn,
+    ) -> Result<EgressProfileMaterial, SecretResolutionError> {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/vault-rotation fills this body"
+    )]
+    async fn store_rotations(
+        &self,
+        _profile: &SecretDrn,
+        _rotations: Vec<CookieEntry>,
+    ) -> Result<(), SecretResolutionError> {
+        todo!()
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -4246,6 +4278,7 @@ where
                         );
                         "secret-credential"
                     }
+                    CredentialFailure::Egress(source) => source.category(),
                 };
                 return self
                     .fail_authorized_before_provider(
@@ -5051,6 +5084,8 @@ enum CredentialFailure {
     Binding,
     #[error("secret material could not be bound")]
     Material(#[from] dekopon_broker_host::HttpConfigurationError),
+    #[error("the egress profile could not be pushed")]
+    Egress(#[from] EgressError),
 }
 
 pub struct CapabilityDecision {
@@ -5831,6 +5866,9 @@ impl BrokerError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod egress_tests;
 
 fn storage_scope_permits(context: &AuthenticatedContext, set: &ConstraintSet) -> bool {
     match set

@@ -210,3 +210,20 @@ fn parent_is_owner_writable(parent: &Path) -> bool {
     std::fs::symlink_metadata(parent)
         .is_ok_and(|metadata| metadata.permissions().mode() & 0o200 != 0)
 }
+
+#[expect(
+    clippy::todo,
+    dead_code,
+    reason = "skeleton: egress/push-contract fills and calls this"
+)]
+impl ChatGptSubscription {
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "the signature states the Send bound the serving task needs"
+    )]
+    pub(crate) fn pushed_token(
+        &self,
+    ) -> impl Future<Output = Result<dekopon_broker::PushedToken, RefreshError>> + Send {
+        async { todo!() }
+    }
+}

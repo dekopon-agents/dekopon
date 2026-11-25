@@ -367,6 +367,8 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
         let constraints = ConstraintCatalog::new([(
             "vm.exec".parse().unwrap(),
             ConstraintSet {
+                egress_profile: None,
+                takes_grant: false,
                 default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider: "vm".parse().unwrap(),

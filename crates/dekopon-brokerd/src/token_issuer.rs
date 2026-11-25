@@ -202,3 +202,53 @@ impl SelfSignedIssuer {
         Ok(IssuedToken { token, jti, exp })
     }
 }
+
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls these"
+)]
+pub(crate) struct SignerKeys {
+    active: SelfSignedIssuer,
+    staged: Option<SelfSignedIssuer>,
+}
+
+#[expect(
+    clippy::todo,
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls these"
+)]
+impl SignerKeys {
+    pub(crate) fn new(_active: SelfSignedIssuer) -> Self {
+        todo!()
+    }
+
+    pub(crate) fn stage(&mut self, _candidate: SelfSignedIssuer) {
+        todo!()
+    }
+
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "the signature states the Send bound the serving task needs"
+    )]
+    pub(crate) fn confirm_staged(
+        &self,
+        _client: &reqwest::Client,
+    ) -> impl Future<Output = Result<StagedKid, IssueError>> + Send {
+        async { todo!() }
+    }
+
+    pub(crate) fn promote(&mut self, _confirmed: StagedKid) {
+        todo!()
+    }
+
+    pub(crate) fn active(&self) -> &SelfSignedIssuer {
+        todo!()
+    }
+}
+
+#[must_use]
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls these"
+)]
+pub(crate) struct StagedKid(String);

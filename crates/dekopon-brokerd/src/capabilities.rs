@@ -212,6 +212,8 @@ pub fn constraint_sets<'a>(
                     sets.insert(
                         capability.id.clone(),
                         ConstraintSet {
+                            egress_profile: None,
+                            takes_grant: false,
                             default_secret_use: listed
                                 .default_secret_use
                                 .clone()
