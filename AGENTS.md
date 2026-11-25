@@ -87,6 +87,7 @@ Audits and plans default to over-building, and the owner reels them back. Before
   registries, negative-fixture suites or per-boundary inventory docs. The exceptions are the
   dependency-boundary gates and the documentation word budget ([Documentation](#documentation)),
   which no compiler can enforce.
+  A report-only workflow that never fails a PR is not a checker script.
 - **Fail fast, one rich trace record, a reset path.** No quarantine, integrity MACs or detection
   that cannot fix anything ([non-goals](docs/design.md#non-goals)).
 - **Calibrate severity to the reference deployment:** the maintainer's Raspberry Pi, a small ARM64
