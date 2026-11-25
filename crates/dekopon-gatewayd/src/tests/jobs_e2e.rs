@@ -158,8 +158,7 @@ async fn a_job_run_seed_ends_its_nested_invoke_at_tree_deadline() {
     let jobs = Arc::new(Jobs::new(2, crate::threads::Owner::new(16)));
     let inbound = message("deadline");
     let owner = JobOwner::of(&inbound);
-    let anchor =
-        crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).expect("anchor");
+    let anchor = crate::wake::Anchor::for_job(&inbound, &journal_route()).expect("anchor");
     let limits = dekopon_process::Limits {
         timeout: Duration::from_secs(30),
         ..dekopon_process::Limits::default()
@@ -204,8 +203,7 @@ async fn a_probe_tick_ends_its_nested_invoke_at_tree_deadline() {
     let directory = temporary();
     let (broker, parked, server) = parked_nested_broker(directory.path()).await;
     let inbound = message("watch");
-    let anchor =
-        crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).expect("anchor");
+    let anchor = crate::wake::Anchor::for_job(&inbound, &journal_route()).expect("anchor");
     let client =
         BrokerClient::new(&broker.socket_path, broker.server_uid, broker.frame).expect("client");
     let leg = BrokerLeg::connect(client, Some(anchor.claim(Trigger::Probe)))
@@ -664,7 +662,7 @@ async fn a_notice_with_a_large_output_is_bounded_to_sixteen_kibibytes() {
 }
 
 fn notice_for(inbound: &InboundMessage, id: u64) -> InboundMessage {
-    let anchor = crate::wake::Anchor::for_job(inbound, &route(model_config()).agent).unwrap();
+    let anchor = crate::wake::Anchor::for_job(inbound, &journal_route()).unwrap();
     anchor.job_inbound(
         JobId::new(id),
         format!("[gateway: job {id} finished, exit 0, after 1s]\necho done\ndone"),
@@ -897,7 +895,7 @@ fn leftover_notices_and_person_steers_become_separate_followups() {
     let admission = match gate.admit(
         &route,
         original,
-        crate::collection::Dispositions(Vec::new()),
+        crate::collection::Dispositions::new(Vec::new()),
     ) {
         crate::session::Admit::Admitted(admission, _, _) => admission,
         crate::session::Admit::Steered(_)
@@ -907,14 +905,18 @@ fn leftover_notices_and_person_steers_become_separate_followups() {
     };
     let notice = notice_for(&message("person"), 11);
     assert!(matches!(
-        gate.admit(&route, notice, crate::collection::Dispositions(Vec::new())),
+        gate.admit(
+            &route,
+            notice,
+            crate::collection::Dispositions::new(Vec::new())
+        ),
         crate::session::Admit::Steered(_)
     ));
     assert!(matches!(
         gate.admit(
             &route,
             message("person's steer"),
-            crate::collection::Dispositions(Vec::new())
+            crate::collection::Dispositions::new(Vec::new())
         ),
         crate::session::Admit::Steered(_)
     ));
@@ -937,7 +939,7 @@ fn another_persons_notice_queues_behind_the_running_turn() {
     let admission = match gate.admit(
         &route,
         from("a", "running"),
-        crate::collection::Dispositions(Vec::new()),
+        crate::collection::Dispositions::new(Vec::new()),
     ) {
         crate::session::Admit::Admitted(admission, _, _) => admission,
         crate::session::Admit::Steered(_)
@@ -948,7 +950,11 @@ fn another_persons_notice_queues_behind_the_running_turn() {
     let second = from("b", "starting job");
     let notice = notice_for(&second, 12);
     assert!(matches!(
-        gate.admit(&route, notice, crate::collection::Dispositions(Vec::new())),
+        gate.admit(
+            &route,
+            notice,
+            crate::collection::Dispositions::new(Vec::new())
+        ),
         crate::session::Admit::Queued
     ));
     let (_, followup) = admission
@@ -1198,7 +1204,7 @@ async fn a_job_a_probe_starts_attests_as_a_probe() {
     let jobs = Arc::new(Jobs::new(2, crate::threads::Owner::new(16)));
     let inbound = message("watch");
     let route = route(model_config());
-    let anchor = crate::wake::Anchor::for_job(&inbound, &route.agent).expect("an anchor");
+    let anchor = crate::wake::Anchor::for_job(&inbound, &route).expect("an anchor");
     let context = JobContext::for_turn(
         Arc::clone(&jobs),
         &inbound,
@@ -1242,8 +1248,7 @@ fn admitted(
     let mut inbound = message(subject_text);
     inbound.subject =
         dekopon_core::AttestedSubject::one(subject_named(subject_text)).expect("one-form subject");
-    let anchor =
-        crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).expect("an anchor");
+    let anchor = crate::wake::Anchor::for_job(&inbound, &journal_route()).expect("an anchor");
     jobs.admit(
         JobOwner::of(&inbound),
         anchor,
@@ -1266,7 +1271,7 @@ async fn a_stop_word_with_only_jobs_replies_stopped_and_cancels_only_its_owner()
     let directory = temporary();
     let (runner, routes) = halting_routing_loop(directory.path()).await;
     let inbound = message("stop");
-    let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let anchor = crate::wake::Anchor::for_job(&inbound, &journal_route()).unwrap();
     let (run, signal) = runner
         .jobs
         .admit(
@@ -1420,7 +1425,7 @@ pub(super) async fn job_routes(directory: &Path, job_timeout_ms: Option<u64>) ->
         document["routes"][0]["limits"] = json!({ "jobTimeoutMs": milliseconds });
     }
     document["routes"][0]["wakes"] = json!(true);
-    document["sessions"] = json!({ "wakes": { "path": directory.join("wakes.jsonl") } });
+    document["sessions"] = json!({ "wakes": {} });
     let config = resolved(directory, &document).await;
     Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"))
 }
@@ -1449,7 +1454,7 @@ async fn a_stop_word_from_an_unrouted_conversation_still_cancels_its_persons_job
     let mut inbound = message("stop");
     inbound.conversation.kind = ConversationKind::Channel;
     assert!(routes.route(&inbound).is_none(), "the fixture is unrouted");
-    let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let anchor = crate::wake::Anchor::for_job(&inbound, &journal_route()).unwrap();
     let (run, signal) = runner
         .jobs
         .admit(
@@ -1674,7 +1679,13 @@ async fn tick_once(
         .expect("the watch is due");
     let mut ticks = tokio::task::JoinSet::new();
     crate::spawn_tick(runner, routes, store, &mut ticks, tick).expect("tick admitted");
-    assert!(matches!(ticks.join_next().await, Some(Ok(None))));
+    assert!(matches!(
+        ticks.join_next().await,
+        Some(Ok(crate::wake::TickEnd {
+            result: crate::wake::TickResult::Rearmed | crate::wake::TickResult::Gone,
+            ..
+        }))
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1948,7 +1959,7 @@ async fn a_job_started_after_shutdown_began_is_refused_from_a_turn_and_a_probe()
     assert!(runner.jobs.list(&owner).is_empty());
 
     let inbound = message("late");
-    let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let anchor = crate::wake::Anchor::for_job(&inbound, &journal_route()).unwrap();
     let probe = JobContext::for_turn(
         Arc::clone(&runner.jobs),
         &inbound,
@@ -1979,7 +1990,7 @@ async fn a_jobs_only_stop_reply_takes_a_refusal_permit_or_sends_nothing() {
     let directory = temporary();
     let (runner, routes) = halting_routing_loop(directory.path()).await;
     let inbound = message("stop");
-    let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let anchor = crate::wake::Anchor::for_job(&inbound, &journal_route()).unwrap();
     let (run, signal) = runner
         .jobs
         .admit(
@@ -2063,7 +2074,7 @@ async fn a_job_records_the_remaining_deadline_of_the_tree_it_runs_on() {
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
     let jobs = Arc::new(Jobs::new(4, crate::threads::Owner::new(16)));
     let inbound = message("deadline");
-    let anchor = || crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let anchor = || crate::wake::Anchor::for_job(&inbound, &journal_route()).unwrap();
     let limits = |seconds| dekopon_process::Limits {
         timeout: Duration::from_secs(seconds),
         ..dekopon_process::Limits::default()

@@ -548,7 +548,7 @@ fn with_jobs(
     if let Some((timeout, anchor)) = inputs
         .route
         .job_timeout
-        .zip(Anchor::for_job(message, &inputs.route.agent))
+        .zip(Anchor::for_job(message, &inputs.route))
     {
         leg = leg.with_job_control(Arc::new(
             JobContext::for_turn(

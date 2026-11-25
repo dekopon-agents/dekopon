@@ -213,7 +213,12 @@ pub(crate) struct CancelRequest {
     pub via: dekopon_agent::CancelVia,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum ThreadClaim {
     Slack {
         team_id: String,
@@ -221,6 +226,31 @@ pub(crate) enum ThreadClaim {
         thread_ts: String,
         user_id: String,
     },
+}
+
+impl ThreadClaim {
+    pub(crate) fn same_thread(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Slack {
+                    team_id,
+                    channel_id,
+                    thread_ts,
+                    ..
+                },
+                Self::Slack {
+                    team_id: other_team,
+                    channel_id: other_channel,
+                    thread_ts: other_thread,
+                    ..
+                },
+            ) => {
+                team_id.eq_ignore_ascii_case(other_team)
+                    && channel_id.eq_ignore_ascii_case(other_channel)
+                    && thread_ts == other_thread
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

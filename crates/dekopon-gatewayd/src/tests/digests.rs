@@ -1,5 +1,4 @@
 use super::*;
-use crate::config::ResolvedWakes;
 use crate::wake::{Anchor, Probe, Resolved, Verdict, WakeStore, store::Schedule};
 use dekopon_agent::wake::{WakeId, WakeRefusal};
 use std::time::SystemTime;
@@ -7,13 +6,10 @@ use std::time::SystemTime;
 const DAY: Duration = Duration::from_secs(86_400);
 
 fn space_anchor() -> Anchor {
-    Anchor::from_inbound(
-        &owned_slack_message("digest", false),
-        &route(model_config()).agent,
-    )
-    .unwrap()
-    .as_space()
-    .unwrap()
+    Anchor::from_inbound(&owned_slack_message("digest", false), &journal_route())
+        .unwrap()
+        .as_space()
+        .unwrap()
 }
 
 fn store(directory: &Path) -> Arc<WakeStore> {
@@ -48,19 +44,21 @@ fn a_second_digest_is_typed_and_refused_across_threads_agents_and_transport_alia
     let mut message = owned_slack_message("another digest", false);
     message.transport = "another-slack".into();
     message.conversation.thread = Some("1700000000.999999".into());
-    let other = Anchor::from_inbound(&message, &"another-agent".parse().unwrap())
-        .unwrap()
-        .as_space()
-        .unwrap();
+    let other = Anchor::from_inbound(
+        &message,
+        &journal_route_for(&"another-agent".parse().unwrap()),
+    )
+    .unwrap()
+    .as_space()
+    .unwrap();
     assert_eq!(
         digest(&store, other, now, DAY),
         Err(WakeRefusal::DigestExists)
     );
-    let rows = fs::read_to_string(directory.path().join("wakes/wakes.jsonl")).unwrap();
-    assert_eq!(rows.lines().count(), 1);
-    let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
-    assert_eq!(row["id"], first.id.0);
-    assert_eq!(row["run_as"], "space");
+    let rows = wakes::stored_wakes(&store);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], first.id.0);
+    assert_eq!(rows[0]["kind"]["type"], "digest");
 }
 
 #[test]
@@ -94,30 +92,40 @@ fn only_digests_have_the_daily_interval_and_quiet_recurring_lifecycle() {
         .pop()
         .unwrap();
     assert_eq!(tick.id(), ordinary);
-    assert!(matches!(
-        tick.resolve(
+    let Resolved::Fired(delivery) = tick
+        .resolve(
             &store,
             Verdict::Fire {
-                output: "ordinary".into()
+                output: "ordinary".into(),
             },
-            now + Duration::from_secs(600)
+            now + Duration::from_secs(600),
         )
-        .unwrap(),
-        Resolved::Fired(_)
-    ));
+        .unwrap()
+    else {
+        panic!("a terminal check fires");
+    };
+    delivery
+        .ticket
+        .settle(crate::wake::DeliveryDisposition::Handled)
+        .unwrap();
     let tick = store.take_due(now + DAY).unwrap().ticks.pop().unwrap();
     assert_eq!(tick.id(), id);
-    assert!(matches!(
-        tick.resolve(
+    let Resolved::Fired(delivery) = tick
+        .resolve(
             &store,
             Verdict::Fire {
-                output: "changed".into()
+                output: "changed".into(),
             },
-            now + DAY
+            now + DAY,
         )
-        .unwrap(),
-        Resolved::Fired(_)
-    ));
+        .unwrap()
+    else {
+        panic!("a changed digest fires");
+    };
+    delivery
+        .ticket
+        .settle(crate::wake::DeliveryDisposition::Handled)
+        .unwrap();
     assert!(
         store
             .take_due(now + DAY + DAY / 2)
@@ -174,15 +182,11 @@ fn cancelling_a_leased_digest_prevents_a_late_probe_from_resurrecting_it() {
 }
 
 #[test]
-fn legacy_personal_and_s5_subscription_rows_load_beside_distinct_space_watch_and_digest_rows() {
+fn personal_subscription_space_watch_and_digest_rows_restore_distinctly() {
     let directory = temporary();
     let store = store(directory.path());
     let now = SystemTime::now();
-    let person = Anchor::from_inbound(
-        &wakes::slack_message("legacy"),
-        &route(model_config()).agent,
-    )
-    .unwrap();
+    let person = Anchor::from_inbound(&wakes::slack_message("legacy"), &journal_route()).unwrap();
     let personal = store
         .register(
             person.clone(),
@@ -225,27 +229,9 @@ fn legacy_personal_and_s5_subscription_rows_load_beside_distinct_space_watch_and
         )
         .unwrap();
     digest(&store, space.clone(), now, DAY).unwrap();
-    let path = directory.path().join("wakes/wakes.jsonl");
-    let mut rows = fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .map(|row| serde_json::from_str::<Value>(row).unwrap())
-        .collect::<Vec<_>>();
-    rows[2].as_object_mut().unwrap().remove("run_as");
-    fs::write(
-        &path,
-        rows.iter()
-            .map(|row| format!("{row}\n"))
-            .collect::<String>(),
-    )
-    .unwrap();
     let bounds = store.bounds();
     drop(store);
-    let restored = WakeStore::open(&ResolvedWakes {
-        path: path.clone(),
-        bounds,
-    })
-    .unwrap();
+    let restored = wakes::restored_wakes(directory.path(), bounds);
     assert_eq!(restored.list(person.subject(), now).len(), 2);
     assert_eq!(restored.list_subscriptions(&space, now).unwrap().len(), 1);
     assert_eq!(restored.list_for(&space, Some(&space), now).len(), 2);
@@ -273,23 +259,6 @@ fn legacy_personal_and_s5_subscription_rows_load_beside_distinct_space_watch_and
         ));
     }
     assert_eq!(restored.list_for(&space, Some(&space), now).len(), 1);
-    let mut malformed = rows[4].clone();
-    malformed["unexpected"] = json!(true);
-    fs::write(&path, format!("{malformed}\n")).unwrap();
-    assert!(matches!(
-        WakeStore::open(&ResolvedWakes {
-            path: path.clone(),
-            bounds
-        }),
-        Err(crate::wake::WakeStoreError::Corrupt { line: 1 })
-    ));
-    malformed.as_object_mut().unwrap().remove("unexpected");
-    malformed["subject"] = rows[0]["subject"].clone();
-    fs::write(&path, format!("{malformed}\n")).unwrap();
-    assert!(matches!(
-        WakeStore::open(&ResolvedWakes { path, bounds }),
-        Err(crate::wake::WakeStoreError::Corrupt { line: 1 })
-    ));
 }
 
 #[tokio::test]

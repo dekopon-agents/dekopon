@@ -995,7 +995,6 @@ pub struct ResolvedRoute {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WakesConfig {
-    pub path: PathBuf,
     #[serde(default = "default_wake_max_per_subject")]
     pub max_per_subject: usize,
     #[serde(default = "default_wake_min_interval_ms")]
@@ -1037,9 +1036,20 @@ pub struct WakeBounds {
     pub subscription_expiry: Duration,
 }
 
+impl Default for WakeBounds {
+    fn default() -> Self {
+        Self {
+            max_per_subject: default_wake_max_per_subject(),
+            min_interval: Duration::from_millis(default_wake_min_interval_ms()),
+            max_horizon: Duration::from_millis(default_wake_max_horizon_ms()),
+            max_subscriptions_per_agent: default_max_subscriptions_per_agent(),
+            subscription_expiry: Duration::from_millis(default_subscription_expiry_ms()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedWakes {
-    pub path: PathBuf,
     pub bounds: WakeBounds,
 }
 
@@ -1086,6 +1096,16 @@ pub struct SessionsConfig {
     pub memory: MemorySettings,
     #[serde(default)]
     pub wakes: Option<WakesConfig>,
+    #[serde(default)]
+    pub durable: Option<DurableConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DurableConfig {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub sync: crate::store::SyncMode,
 }
 
 impl Default for SessionsConfig {
@@ -1101,6 +1121,7 @@ impl Default for SessionsConfig {
             assets: None,
             memory: MemorySettings::default(),
             wakes: None,
+            durable: None,
         }
     }
 }
@@ -1207,6 +1228,7 @@ pub struct ResolvedConfig {
     pub assets: Option<PathBuf>,
     pub memory: ResolvedSettings,
     pub wakes: Option<ResolvedWakes>,
+    pub(crate) durable: Option<crate::store::DurableSettings>,
     pub shutdown_grace: Duration,
     pub telemetry: Option<ResolvedTelemetry>,
     pub metering: crate::metering::ResolvedMetering,
@@ -2885,7 +2907,6 @@ fn resolve_with_service(
             problems.push(ConfigProblem::InvalidWakeBounds);
         }
         ResolvedWakes {
-            path: resolve_path(wakes.path.clone()),
             bounds: WakeBounds {
                 max_per_subject: wakes.max_per_subject,
                 min_interval: Duration::from_millis(wakes.min_interval_ms),
@@ -2895,6 +2916,14 @@ fn resolve_with_service(
             },
         }
     });
+    let durable = config
+        .sessions
+        .durable
+        .as_ref()
+        .map(|durable| crate::store::DurableSettings {
+            path: resolve_path(durable.path.clone()),
+            sync: durable.sync,
+        });
     let journal = config
         .sessions
         .journal
@@ -3005,6 +3034,7 @@ fn resolve_with_service(
                 assets,
                 memory: memory_settings.expect("memory settings validated before resolution"),
                 wakes,
+                durable,
                 shutdown_grace,
                 telemetry,
                 metering,

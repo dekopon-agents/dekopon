@@ -208,20 +208,15 @@ async fn wake_reason_counts_consumed_person_steers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn wake_reason_distinguishes_fresh_follow_messages_from_dequeued_admission() {
     let directory = temporary();
-    let journal_dir = temporary();
     let (broker, _observed) = stub_broker(directory.path(), principal_listings(&["ana"])).await;
     let models = ModelScript::new([call(), answer("done")]);
     let mut runner =
         Arc::into_inner(runner(broker, Arc::clone(&models), 1)).expect("runner is uniquely owned");
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            journal_dir.path(),
-            Duration::from_secs(86400),
-            Duration::from_secs(86400),
-        )
-        .unwrap(),
-    );
-    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        None,
+        Vec::new(),
+        SystemTime::now(),
+    ));
     let mut route = route(model_config());
     route.follow = true;
     let inbound = InboundMessage {
@@ -234,7 +229,9 @@ async fn wake_reason_distinguishes_fresh_follow_messages_from_dequeued_admission
         &route.conversation,
         &inbound.conversation.key(),
     );
-    table.stay_and_write(&key, SystemTime::now()).unwrap();
+    table
+        .stay_and_write(&key, crate::follow::FollowHome::Memory, SystemTime::now())
+        .unwrap();
     runner.follow = Some(table);
     run_session(
         Arc::new(runner),

@@ -1962,9 +1962,11 @@ fn followed(
     journal: &Path,
 ) -> (Arc<SessionRunner>, Arc<crate::follow::FollowTable>) {
     let mut runner = Arc::into_inner(journaled_runner(broker, models, journal)).unwrap();
-    let table = Arc::new(
-        crate::follow::FollowTable::load(Arc::clone(runner.journal.as_ref().unwrap())).unwrap(),
-    );
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        None,
+        Vec::new(),
+        SystemTime::now(),
+    ));
     runner.follow = Some(Arc::clone(&table));
     (Arc::new(runner), table)
 }
@@ -1982,10 +1984,6 @@ fn dev_follow_key(route: &crate::routes::BoundRoute) -> String {
         &route.conversation,
         &message("").conversation.key(),
     )
-}
-
-fn marker_path(journal: &Path, key: &str) -> PathBuf {
-    journal.join(format!("{key}.followed"))
 }
 
 struct Held {
@@ -2056,26 +2054,11 @@ async fn a_follow_left_mid_turn_is_not_revived() {
         table.ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Absent
     );
-    assert!(!marker_path(journal_dir.path(), &key).exists());
-    let reloaded = crate::follow::FollowTable::load(Arc::new(
-        crate::journal::Journal::open(
-            journal_dir.path(),
-            Duration::from_secs(3600),
-            Duration::from_secs(3600),
-        )
-        .unwrap(),
-    ))
-    .unwrap();
-    assert_eq!(
-        reloaded.ticket(&key, SystemTime::now()),
-        crate::follow::FollowTicket::Absent
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn no_journal_write_precedes_delivery() {
     let route = follow_route();
-    let key = dev_follow_key(&route);
     let stem = dev_stem();
 
     let directory = temporary();
@@ -2113,7 +2096,6 @@ async fn no_journal_write_precedes_delivery() {
     })
     .await;
     assert_eq!(fs::read(&path).unwrap(), before);
-    assert!(!marker_path(journal_dir.path(), &key).exists());
     held.release();
     session.await.unwrap();
     assert_eq!(driver.replies(), ["invited and pinned"]);
@@ -2123,7 +2105,6 @@ async fn no_journal_write_precedes_delivery() {
             .iter()
             .any(|line| line.get("p").is_some())
     );
-    assert!(marker_path(journal_dir.path(), &key).exists());
 
     let directory = temporary();
     let journal_dir = temporary();
@@ -2180,10 +2161,8 @@ async fn no_journal_write_precedes_delivery() {
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     ));
     until("the task failure delivered", || driver.replies().len() == 1).await;
-    assert!(!marker_path(journal_dir.path(), &key).exists());
     held.release();
     session.await.unwrap();
-    assert!(marker_path(journal_dir.path(), &key).exists());
     assert!(!journal_path(journal_dir.path(), &stem).exists());
 }
 
