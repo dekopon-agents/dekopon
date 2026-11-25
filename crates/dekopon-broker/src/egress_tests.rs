@@ -22,12 +22,12 @@ use dekopon_test_support::{LoopbackServer, provider_fixture};
 use serde_json::{Value, json};
 
 use crate::{
-    AssetInvocationResult, Attestation, AttestorGrant, AuditSink, AuthenticatedContext, Broker,
-    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CookieSet, DefaultSecretSink,
-    DefaultSecretUse, EgressError, EgressProfile, EgressProfileMaterial, EgressPush, EgressReturn,
-    IdentityDirectory, InvocationRequest, PolicyEngine, PolicyWorld, PushedToken, SecretCatalog,
-    SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding, TokenTarget,
-    TraceOnlyAuditLog,
+    AssetInvocationResult, Attestation, AttestorGrant, AuditEvent, AuditSink, AuthenticatedContext,
+    Broker, BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CookieSet,
+    DefaultSecretSink, DefaultSecretUse, EgressError, EgressProfile, EgressProfileMaterial,
+    EgressPush, EgressReturn, IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine,
+    PolicyWorld, PushedToken, SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver,
+    SecretUseBinding, TokenTarget, TraceOnlyAuditLog,
 };
 
 const SUBJECT: &str = "drn:slack:user:t0123abc:u9xyz";
@@ -186,6 +186,17 @@ async fn vm_broker(
     forbidden_profiles: &[&str],
     swaps: BTreeMap<AgentId, BTreeMap<SecretDrn, SecretDrn>>,
 ) -> Broker {
+    let audit = AuditSink::TraceOnly(TraceOnlyAuditLog);
+    audited_vm_broker(authority, resolver, forbidden_profiles, swaps, audit).await
+}
+
+async fn audited_vm_broker(
+    authority: &str,
+    resolver: Arc<ProfileResolver>,
+    forbidden_profiles: &[&str],
+    swaps: BTreeMap<AgentId, BTreeMap<SecretDrn, SecretDrn>>,
+    audit: AuditSink,
+) -> Broker {
     let _memoization = dekopon_broker_host::enable_test_component_memoization();
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("http-probe-provider.wasm")],
@@ -208,7 +219,7 @@ async fn vm_broker(
             .with_agent_secrets(swaps),
         IdentityDirectory::new([(SUBJECT.parse().expect("subject"), principal("caller"))])
             .expect("directory"),
-        Arc::new(AuditSink::TraceOnly(TraceOnlyAuditLog)),
+        Arc::new(audit),
         BrokerLimits::default(),
     )
     .expect("broker")
@@ -336,6 +347,7 @@ async fn a_vm_exec_push_leaves_in_the_host_owned_header_and_never_in_provider_me
     runner.join();
     let summary: Value = serde_json::from_str(stdout.trim()).expect("probe summary");
     assert_eq!(summary["status"], 200);
+    assert_eq!(summary["headerCount"], 2);
     assert!(!stdout.contains(&token));
     assert!(!stdout.contains(&returned));
     assert!(!stdout.contains("v1."));
@@ -446,7 +458,15 @@ async fn cedar_secret_use_chooses_the_pushed_set() {
     let runner = LoopbackServer::stalled();
     let authority = runner.authority().to_owned();
     let resolver = ProfileResolver::new([(PROFILE, default_token), (AGENT_PROFILE, agent_token)]);
-    let broker = vm_broker(&authority, Arc::clone(&resolver), &[AGENT_PROFILE], swaps).await;
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("audit bound"));
+    let broker = audited_vm_broker(
+        &authority,
+        Arc::clone(&resolver),
+        &[AGENT_PROFILE],
+        swaps,
+        AuditSink::InMemory(Arc::clone(&audit)),
+    )
+    .await;
     let (result, _) = invoke(
         &broker,
         "vm-denied",
@@ -460,6 +480,35 @@ async fn cedar_secret_use_chooses_the_pushed_set() {
         runner.recorded().is_empty(),
         "no request reached the runner"
     );
+    let records = audit.records();
+    let [
+        AuditEvent::Decision {
+            decision_point: invocation_point,
+            allowed: true,
+            ..
+        },
+        AuditEvent::Decision {
+            decision_point,
+            secret,
+            secret_sink,
+            policy_ids,
+            allowed: false,
+            ..
+        },
+        AuditEvent::Execution {
+            policy_ids: failure_policy_ids,
+            ..
+        },
+    ] = &records[..]
+    else {
+        panic!("an invocation decision, a denied egress decision and a failure: {records:?}");
+    };
+    assert_eq!(invocation_point, "invocation");
+    assert_eq!(decision_point, "egress-profile");
+    assert_eq!(secret.as_ref().map(SecretDrn::as_str), Some(AGENT_PROFILE));
+    assert_eq!(*secret_sink, Some(SecretSinkKind::VmEgressProfile));
+    assert_eq!(policy_ids, &["profile-0"]);
+    assert_eq!(failure_policy_ids, &["profile-0"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -468,25 +517,15 @@ async fn only_the_exec_push_carries_the_grant() {
     let authority = runner.authority().to_owned();
     let resolver = ProfileResolver::new([(PROFILE, generated_token("vm-access"))]);
     let broker = vm_broker(&authority, resolver, &[], BTreeMap::new()).await;
-    let context = AuthenticatedContext::attested(
-        principal("caller"),
-        Actor::Agent {
-            agent: AGENT.parse().expect("agent"),
-        },
-        principal("gateway"),
-        SUBJECT.parse().expect("subject"),
-    )
-    .expect("caller context");
     let grant = Grant {
         id: GrantId::new(NonZeroU64::MIN),
         amount: NonZeroU64::new(4_096).expect("nonzero amount"),
         weights: UsageClasses::default(),
     };
     let (headers, _) = broker
-        .egress_push(&context, &capability(), &vm_set(&authority), Some(grant))
+        .egress_push(&PROFILE.parse().expect("profile DRN"), Some(grant))
         .await
-        .expect("the push encodes")
-        .expect("the set names a profile");
+        .expect("the push encodes");
     let decode = |value: &Redacted<String>| -> Value {
         let encoded = value.expose().strip_prefix("v1.").expect("versioned");
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).expect("base64url")).expect("JSON")

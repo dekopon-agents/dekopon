@@ -719,6 +719,10 @@ impl BoundCredential {
             }
         }
         self.echo_values.extend(pushed_secrets);
+        self.echo_values.extend(
+            [&headers.every, &headers.exec]
+                .map(|value| SecretBytes::new(value.expose().as_bytes().to_vec())),
+        );
         self.egress_push = Some(headers);
         Ok(self)
     }
@@ -3224,6 +3228,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0, returned.as_bytes()), (1, returned.as_bytes())]
         );
+        server.join();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_reflecting_the_egress_push_is_refused() {
+        let push = "v1.reflected-push-fixture";
+        let server = LoopbackServer::once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{push}",
+                push.len()
+            )
+            .as_bytes(),
+        );
+        let authority = server.authority().to_owned();
+        let secret = SecretUseGrant {
+            allowed_methods: vec!["POST".to_owned()],
+            ..secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/v1/sessions")
+        };
+        let credential = BoundCredential::secret_bearer(
+            SecretBytes::new(b"runner-bearer-fixture".to_vec()),
+            &secret,
+        )
+        .expect("valid runner credential")
+        .with_egress_push(
+            EgressPushHeaders {
+                every: Redacted::new(push.to_owned()),
+                exec: Redacted::new(push.to_owned()),
+            },
+            Vec::new(),
+        )
+        .expect("valid push");
+        let mut client = BufferedHttpClient::authorized_with_secret_credential(
+            grant(authority.clone(), "POST"),
+            secret,
+            credential,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid secret authorization");
+
+        let error = client
+            .send(Request {
+                method: "POST".to_owned(),
+                uri: format!("http://{authority}/v1/sessions"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("a reflected push is refused");
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert!(!error.message.contains(push));
         server.join();
     }
 

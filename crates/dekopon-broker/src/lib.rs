@@ -4241,6 +4241,28 @@ where
             BrokerError::DecisionAudit { source }
         })?;
 
+        let egress = self.egress_decision(context, &capability, &set);
+        if let Some(egress) = &egress {
+            self.record_egress_decision(context, &invocation_id, trace, &capability, egress)
+                .await?;
+            if !egress.policy.allowed {
+                return self
+                    .fail_authorized_before_provider(
+                        context,
+                        &invocation_id,
+                        trace,
+                        &capability,
+                        &decision_id,
+                        decision,
+                        &set,
+                        &egress.policy.determining_policy_ids,
+                        policy_evidence,
+                        "egress-denied",
+                    )
+                    .await;
+            }
+        }
+
         let storage_grant = match storage_preparation.take() {
             None => None,
             Some(preparation) => {
@@ -4268,8 +4290,12 @@ where
             .await
         {
             Ok(credential) => {
-                self.attach_egress_push(context, &capability, &set, None, credential)
-                    .await
+                self.attach_egress_push(
+                    egress.as_ref().map(|egress| egress.profile),
+                    None,
+                    credential,
+                )
+                .await
             }
             Err(error) => Err(error),
         };

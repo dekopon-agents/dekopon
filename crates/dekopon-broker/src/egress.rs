@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use dekopon_broker_host::{BoundCredential, EgressPushHeaders};
 use dekopon_broker_protocol::{Grant, Tally};
 use dekopon_core::{
-    CapabilityId, Redacted, SecretBytes, SecretDrn, SecretSinkKind,
+    CapabilityId, InvocationId, PrincipalId, Redacted, SecretBytes, SecretDrn, SecretSinkKind,
+    TraceId,
     base64::{Engine as _, URL_SAFE_NO_PAD},
 };
 use dekopon_policy::SecretSelection;
@@ -194,8 +195,6 @@ impl EgressReturn {
 pub enum EgressError {
     #[error("the egress push for profile {profile} exceeds the header bound")]
     PushTooLarge { profile: SecretDrn },
-    #[error("policy does not permit pushing egress profile {profile}")]
-    Denied { profile: SecretDrn },
     #[error("an egress profile needs a secret-bound runner credential")]
     Unbound,
     #[error("a cookie set names one cookie twice")]
@@ -209,7 +208,6 @@ impl EgressError {
     pub const fn category(&self) -> &'static str {
         match self {
             Self::PushTooLarge { .. } => "egress-push-too-large",
-            Self::Denied { .. } => "egress-denied",
             Self::Unbound => "egress-unbound",
             Self::DuplicateCookie => "egress-duplicate-cookie",
             Self::Encode => "egress-encode",
@@ -217,24 +215,39 @@ impl EgressError {
     }
 }
 
+pub(crate) struct EgressDecision<'a> {
+    pub(crate) profile: &'a SecretDrn,
+    pub(crate) policy: dekopon_policy::PolicyDecision,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EgressDecisionMaterial<'a> {
+    invocation: &'a InvocationId,
+    trace: TraceId,
+    principal: &'a PrincipalId,
+    capability: &'a CapabilityId,
+    profile: &'a SecretDrn,
+    sink: SecretSinkKind,
+    policy_ids: &'a [String],
+    policy_digest: &'a str,
+    allowed: bool,
+}
+
 impl<A> crate::Broker<A>
 where
     A: crate::AuditLog,
 {
-    pub(crate) async fn egress_push(
-        &self,
+    pub(crate) fn egress_decision<'a>(
+        &'a self,
         context: &crate::AuthenticatedContext,
         capability: &CapabilityId,
-        set: &crate::ConstraintSet,
-        grant: Option<Grant>,
-    ) -> Result<Option<(EgressPushHeaders, Vec<SecretBytes>)>, crate::CredentialFailure> {
-        let Some(profile) = self
+        set: &'a crate::ConstraintSet,
+    ) -> Option<EgressDecision<'a>> {
+        let profile = self
             .constraints
-            .effective_egress_profile(set, context.actor())
-        else {
-            return Ok(None);
-        };
-        if !self
+            .effective_egress_profile(set, context.actor())?;
+        let policy = self
             .authorize_secret_sink(
                 context,
                 capability,
@@ -242,13 +255,74 @@ where
                 (profile, SecretSinkKind::VmEgressProfile),
                 SecretSelection::Default,
             )
-            .allowed
-        {
-            return Err(EgressError::Denied {
-                profile: profile.clone(),
-            }
-            .into());
-        }
+            .policy;
+        Some(EgressDecision { profile, policy })
+    }
+
+    pub(crate) async fn record_egress_decision(
+        &self,
+        context: &crate::AuthenticatedContext,
+        invocation: &InvocationId,
+        trace: TraceId,
+        capability: &CapabilityId,
+        decision: &EgressDecision<'_>,
+    ) -> Result<(), crate::BrokerError> {
+        let policy = &decision.policy;
+        let decision_digest = crate::decision_evidence_digest(
+            "policy-decision",
+            &EgressDecisionMaterial {
+                invocation,
+                trace,
+                principal: context.principal(),
+                capability,
+                profile: decision.profile,
+                sink: SecretSinkKind::VmEgressProfile,
+                policy_ids: &policy.determining_policy_ids,
+                policy_digest: &self.policy_digest,
+                allowed: policy.allowed,
+            },
+        )?;
+        self.record_audit(crate::AuditEvent::Decision {
+            authority: crate::decision_authority(
+                context,
+                self.identities.principal_kind(context.principal()),
+                None,
+            ),
+            invocation: invocation.clone(),
+            trace,
+            principal: Some(context.principal().clone()),
+            actor: Some(context.actor().clone()),
+            via: context.via().cloned(),
+            attested_subject: context.attested_subject().cloned(),
+            capability: capability.clone(),
+            secret: Some(decision.profile.clone()),
+            secret_sink: Some(SecretSinkKind::VmEgressProfile),
+            provider: None,
+            authorized_by: Some(self.broker_principal.clone()),
+            decision_id: format!("egress-{invocation}"),
+            policy_ids: policy.determining_policy_ids.clone(),
+            policy_error_ids: policy.erroring_policy_ids.clone(),
+            policy_errors_present: Some(policy.errors_present),
+            decision_point: "egress-profile".to_owned(),
+            policy_digest: Some(self.policy_digest.clone()),
+            allowed: policy.allowed,
+            reason: (!policy.allowed).then(|| "egress-denied".to_owned()),
+            decision_digest,
+            storage_scope_commitment: None,
+            storage: None,
+        })
+        .await
+        .map_err(|source| {
+            crate::report_audit_failure("decision", invocation, &source);
+            crate::BrokerError::DecisionAudit { source }
+        })
+    }
+
+    pub(crate) async fn egress_push(
+        &self,
+        profile: &SecretDrn,
+        grant: Option<Grant>,
+    ) -> Result<(EgressPushHeaders, Vec<SecretBytes>), crate::CredentialFailure> {
         let mut push = EgressPush {
             profile: profile.clone(),
             grant: None,
@@ -262,27 +336,25 @@ where
             }
             None => every.clone(),
         };
-        Ok(Some((
+        Ok((
             EgressPushHeaders {
                 every: every.0,
                 exec: exec.0,
             },
             push.material.pushed_secrets(),
-        )))
+        ))
     }
 
     pub(crate) async fn attach_egress_push(
         &self,
-        context: &crate::AuthenticatedContext,
-        capability: &CapabilityId,
-        set: &crate::ConstraintSet,
+        profile: Option<&SecretDrn>,
         grant: Option<Grant>,
         credential: Option<BoundCredential>,
     ) -> Result<Option<BoundCredential>, crate::CredentialFailure> {
-        let Some((headers, pushed)) = self.egress_push(context, capability, set, grant).await?
-        else {
+        let Some(profile) = profile else {
             return Ok(credential);
         };
+        let (headers, pushed) = self.egress_push(profile, grant).await?;
         let credential = credential.ok_or(EgressError::Unbound)?;
         Ok(Some(credential.with_egress_push(headers, pushed)?))
     }

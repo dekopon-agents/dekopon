@@ -238,13 +238,6 @@ impl CredentialFile {
                     ChatGptError::RefreshTask(io::Error::new(io::ErrorKind::TimedOut, source))
                 })?
                 .map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))?;
-        let credentials = self.snapshot();
-        let replaced = rejected
-            .as_ref()
-            .is_none_or(|token| credentials.access.expose() != token.expose());
-        if replaced && !needs_refresh(&credentials)? {
-            return Ok(resolved(credentials, Some(RefreshOutcome::Adopted)));
-        }
         let permit = Arc::new(permit);
         let lock = tokio::time::timeout(client.timeout, self.acquire_lock(&permit))
             .await
