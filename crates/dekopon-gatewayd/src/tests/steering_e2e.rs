@@ -47,7 +47,15 @@ async fn both_steering_flavors_consume_the_second_message_before_one_final_reply
             Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
-        assert!(capture.events_text().contains("outcome=\"steered\""));
+        assert_eq!(
+            capture
+                .events_where(
+                    "dekopon_gatewayd::audit",
+                    &[("audit.event", "gateway.admission"), ("outcome", "steered")]
+                )
+                .len(),
+            1
+        );
         if flavor == Steering::Boundary {
             assert_eq!(models.requests(), 1);
             models.release();
@@ -139,9 +147,12 @@ async fn oversized_steered_text_is_recorded_with_a_marked_prefix_and_the_exact_a
     let end = aggregate.floor_char_boundary(budget);
     assert_eq!(turn.user(), format!("{}[…]", &aggregate[..end]));
     assert!(
-        !capture
-            .events_text()
-            .contains("gateway_memory_record_failed")
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_memory_record_failed")]
+            )
+            .is_empty()
     );
     assert!(observed.try_recv().is_err(), "record once, without a retry");
 }
@@ -285,7 +296,15 @@ async fn input_during_terminal_delivery_queues_a_fresh_turn_without_busy() {
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
-    assert!(capture.events_text().contains("outcome=\"queued\""));
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd::audit",
+                &[("audit.event", "gateway.admission"), ("outcome", "queued")]
+            )
+            .len(),
+        1
+    );
     assert_eq!(models.requests(), 1);
     assert!(driver.recording.replies().is_empty());
     release.send(()).expect("reply waiting");
@@ -332,8 +351,23 @@ async fn another_sender_runs_under_its_own_leg_after_the_holders_receipts_finish
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
-    assert!(capture.events_text().contains("outcome=\"queued\""));
-    assert!(!capture.events_text().contains("gateway_input_disposition"));
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_gatewayd::audit",
+                &[("audit.event", "gateway.admission"), ("outcome", "queued")]
+            )
+            .len(),
+        1
+    );
+    assert!(
+        capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_input_disposition")]
+            )
+            .is_empty()
+    );
     assert_eq!(models.requests(), 1);
     models.release();
     finish_run(held).await;
