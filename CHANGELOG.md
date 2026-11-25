@@ -7,6 +7,22 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.97.0] - 2026-11-25
+
+### Added
+
+- Issue short-lived persona JWTs on authorized VM exec stdin.
+
+### Changed
+
+- dekopon-broker adds AuditSink and defaults Broker's audit parameter to it.
+
+## [dekopon-chart-0.84.0] - 2026-11-25
+
+### Changed
+
+- Chart 0.84.0 targets core v0.97.0 and renders the `v0.97.0` image tag.
+
 ## [0.96.0] - 2026-11-24
 
 After a journal records audio or video, rolling back to chart 0.82.0 can erase the affected
