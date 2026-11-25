@@ -459,7 +459,13 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
         .await
         .expect_err("retired cache setting is not ignored");
     assert!(
-        format!("{error:?}").contains("compileCachePath"),
+        matches!(
+            error,
+            config::ConfigError::Decode {
+                line: Some(1),
+                column: Some(_),
+            }
+        ),
         "{error:?}"
     );
 
