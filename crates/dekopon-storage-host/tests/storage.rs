@@ -737,9 +737,12 @@ fn namespace_housekeeping_quota_denial_precedes_every_mutation() {
     });
     assert!(matches!(result, Err(StorageHostError::QuotaExceeded)));
     assert!(
-        !events
-            .events_text()
-            .contains("storage_namespace_slot_refused")
+        events
+            .events_where(
+                "dekopon_storage_host",
+                &[("event", "storage_namespace_slot_refused")]
+            )
+            .is_empty()
     );
     assert_eq!(before, tree_snapshot(&root));
     assert_eq!(
@@ -852,10 +855,17 @@ fn startup_reports_physical_namespace_count_without_names() {
     let (_temporary, root) = fixture();
     let (host, startup) = captured(|| StorageHost::open(&root, StorageLimits::default()));
     let _host = host.expect("host opens");
-    let logged = startup.events_text();
-    assert!(logged.contains("storage_namespace_capacity"), "{logged}");
-    assert!(logged.contains("storage.namespace.count"), "{logged}");
-    assert!(logged.contains("storage.namespace.limit"), "{logged}");
+    let events = startup.events_where(
+        "dekopon_storage_host",
+        &[("event", "storage_namespace_capacity")],
+    );
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].field("storage.namespace.count"), Some("0"));
+    let limit = StorageLimits::default().max_namespaces.to_string();
+    assert_eq!(
+        events[0].field("storage.namespace.limit"),
+        Some(limit.as_str())
+    );
 }
 
 #[test]
@@ -892,10 +902,16 @@ fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
 
     let (host, startup) = captured(|| StorageHost::open(&root, StorageLimits::default()));
     let host = host.expect("one namespace's hard link does not stop the broker");
-    let logged = startup.events_text();
-    assert!(logged.contains("storage_root_entry_ignored"), "{logged}");
-    assert!(logged.contains("private-file"), "{logged}");
-    assert!(logged.contains(&*base.to_string_lossy()), "{logged}");
+    let events = startup.events_where(
+        "dekopon_storage_host",
+        &[("event", "storage_root_entry_ignored")],
+    );
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].field("storage.check"), Some("private-file"));
+    assert_eq!(
+        events[0].field("storage.path"),
+        Some(base.to_string_lossy().as_ref())
+    );
 
     let before = tree_snapshot(&root);
     let refused = host.grant(request(
@@ -1314,9 +1330,12 @@ fn slot_refusal_reports_present_plus_pending_and_byte_refusals_do_not() {
     drop(seed);
     let (host, startup) = captured(|| StorageHost::open(&root, limits));
     let host = host.expect("reopen");
-    let logged = startup.events_text();
-    assert!(logged.contains("storage_namespace_capacity"), "{logged}");
-    assert!(logged.contains("storage.namespace.count=1"), "{logged}");
+    let events = startup.events_where(
+        "dekopon_storage_host",
+        &[("event", "storage_namespace_capacity")],
+    );
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].field("storage.namespace.count"), Some("1"));
     let (result, refusal) = captured(|| {
         host.grant(scoped_request(
             b"authority",
@@ -1327,12 +1346,13 @@ fn slot_refusal_reports_present_plus_pending_and_byte_refusals_do_not() {
         ))
     });
     assert!(matches!(result, Err(StorageHostError::QuotaExceeded)));
-    let logged = refusal.events_text();
-    assert!(
-        logged.contains("storage_namespace_slot_refused"),
-        "{logged}"
+    let events = refusal.events_where(
+        "dekopon_storage_host",
+        &[("event", "storage_namespace_slot_refused")],
     );
-    assert!(logged.contains("storage.namespace.count=1"), "{logged}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].field("storage.namespace.count"), Some("1"));
+    let logged = refusal.events_text();
     assert!(!logged.contains("drn:slack:*:t0123abc:*"), "{logged}");
 }
 
@@ -1616,19 +1636,18 @@ fn corrupt_namespaces_reset_once_without_losing_the_previous_generation_or_neigh
                 );
             }
         }
-        let logged = log.events_text();
-        assert_eq!(
-            logged.matches("storage_namespace_reset").count(),
-            1,
-            "{logged}"
+        let events = log.events_where(
+            "dekopon_storage_host",
+            &[("event", "storage_namespace_reset")],
         );
-        for field in [
-            token.as_str(),
-            previous.as_str(),
-            fresh.as_str(),
-            expected_scope,
+        assert_eq!(events.len(), 1, "{events:?}");
+        for (field, value) in [
+            ("storage.namespace", token.as_str()),
+            ("storage.previous_generation", previous.as_str()),
+            ("storage.generation", fresh.as_str()),
+            ("storage.check", expected_scope),
         ] {
-            assert!(logged.contains(field), "{field} missing from {logged}");
+            assert_eq!(events[0].field(field), Some(value), "{field}: {events:?}");
         }
         let rendered = error_chain(&error);
         assert!(rendered.contains(&token), "{rendered}");
@@ -1649,7 +1668,14 @@ fn corrupt_namespaces_reset_once_without_losing_the_previous_generation_or_neigh
             matches!(retried, Err(StorageHostError::NotFound)),
             "{retried:?}"
         );
-        assert!(!log.saw("storage_namespace_reset"), "the reset repeated");
+        assert!(
+            log.events_where(
+                "dekopon_storage_host",
+                &[("event", "storage_namespace_reset")]
+            )
+            .is_empty(),
+            "the reset repeated"
+        );
         let kept = generations(&first_base);
         assert_eq!(kept.len(), 2, "{kept:?}");
         assert!(kept.contains(&previous) && kept.contains(fresh), "{kept:?}");
