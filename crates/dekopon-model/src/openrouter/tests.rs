@@ -68,6 +68,7 @@ fn requests_have_only_the_authored_headers(server: &MockServer) {
                         | "x-openrouter-cache"
                         | "content-length"
                         | "host"
+                        | "user-agent"
                 ),
                 "unexpected header: {name}"
             );
@@ -76,6 +77,9 @@ fn requests_have_only_the_authored_headers(server: &MockServer) {
         assert!(headers.contains("authorization: bearer synthetic-key"));
         assert!(headers.contains("content-type: application/json"));
         assert!(headers.contains("accept: text/event-stream"));
+        assert!(headers.lines().any(
+            |header| header == concat!("user-agent: dekopon-model/", env!("CARGO_PKG_VERSION"))
+        ));
         assert!(headers.contains(&format!(
             "content-length: {}",
             request.split_once("\r\n\r\n").unwrap().1.len()
