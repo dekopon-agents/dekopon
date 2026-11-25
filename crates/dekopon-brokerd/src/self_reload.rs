@@ -74,6 +74,17 @@ async fn drain_reload(task: &mut JoinSet<BrokerStop>) -> Result<(), BrokerdError
 pub(crate) struct GenerationDigest([u8; 32]);
 
 #[expect(
+    clippy::todo,
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload fills and calls this"
+)]
+impl GenerationDigest {
+    pub(crate) fn of(_candidate_digest: &str) -> Option<Self> {
+        todo!()
+    }
+}
+
+#[expect(
     dead_code,
     reason = "skeleton: daemon/broker-self-reload fills and calls these"
 )]
@@ -108,7 +119,7 @@ impl CommitSignal {
 pub(crate) async fn check_lock_then_exit(
     _lock: LoadedLock,
     _uid: u32,
-    _deadline: ShutdownDeadline,
+    _poll: Duration,
 ) -> BrokerStop {
     todo!()
 }

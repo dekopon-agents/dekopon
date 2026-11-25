@@ -142,6 +142,7 @@ pub(crate) async fn serve_on_commits<F, C>(
     _catalog: C,
     _commits: tokio::sync::watch::Receiver<crate::self_reload::GenerationDigest>,
     _deadline: ShutdownDeadline,
+    _now_seconds: Arc<dyn Fn() -> u64 + Send + Sync>,
 ) -> Result<(), BrokerdError>
 where
     F: Future<Output = Result<(), BrokerdError>>,

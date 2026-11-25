@@ -10,14 +10,11 @@ use dekopon_broker::{CookieEntry, CookieSet};
 use dekopon_core::SecretDrn;
 use thiserror::Error;
 
+// One vault per process, owned by Coordination across generations; the record file under its
+// PrivateFileLock is the only state, so seed and rev are re-read under the lock on every operation.
 pub(crate) struct CookieVault {
-    records: BTreeMap<SecretDrn, VaultRecord>,
+    records: BTreeMap<SecretDrn, PathBuf>,
     expected_uid: u32,
-}
-
-struct VaultRecord {
-    path: PathBuf,
-    seed: u64,
 }
 
 impl CookieVault {
@@ -34,6 +31,14 @@ impl CookieVault {
         _profile: &SecretDrn,
         _rotations: Vec<CookieEntry>,
     ) -> Result<StoredRotations, VaultError> {
+        todo!()
+    }
+
+    pub(crate) fn same_records(&self, _records: &BTreeMap<SecretDrn, PathBuf>) -> bool {
+        todo!()
+    }
+
+    pub(crate) async fn drain(&self) {
         todo!()
     }
 

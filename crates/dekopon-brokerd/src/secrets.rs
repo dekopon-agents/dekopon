@@ -3240,6 +3240,8 @@ fn secret_map_conflict_text(problems: &[String], jwt_problems: &[SignedJwtProble
 #[cfg(test)]
 mod oauth2_tests;
 #[cfg(test)]
+mod push_token_tests;
+#[cfg(test)]
 mod record_path_exclusivity;
 #[cfg(test)]
 mod signed_jwt_tests;

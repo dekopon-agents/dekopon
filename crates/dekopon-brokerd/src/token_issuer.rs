@@ -226,15 +226,8 @@ impl SignerKeys {
         todo!()
     }
 
-    #[expect(
-        clippy::manual_async_fn,
-        reason = "the signature states the Send bound the serving task needs"
-    )]
-    pub(crate) fn confirm_staged(
-        &self,
-        _client: &reqwest::Client,
-    ) -> impl Future<Output = Result<StagedKid, IssueError>> + Send {
-        async { todo!() }
+    pub(crate) fn staged(&self) -> Option<StagedCandidate> {
+        todo!()
     }
 
     pub(crate) fn promote(&mut self, _confirmed: StagedKid) {
@@ -252,3 +245,25 @@ impl SignerKeys {
     reason = "skeleton: daemon/signer-reload fills and calls these"
 )]
 pub(crate) struct StagedKid(String);
+
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls these"
+)]
+pub(crate) struct StagedCandidate {
+    kid: String,
+    jwks: Url,
+}
+
+// Runs over an owned snapshot so no lock on SignerKeys is held across the JWKS fetch.
+#[expect(
+    clippy::todo,
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls this"
+)]
+pub(crate) async fn confirm_kid(
+    _staged: StagedCandidate,
+    _client: &reqwest::Client,
+) -> Result<StagedKid, IssueError> {
+    todo!()
+}
