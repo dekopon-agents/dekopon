@@ -67,46 +67,64 @@ async fn drain_reload(task: &mut JoinSet<BrokerStop>) -> Result<(), BrokerdError
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[expect(
-    dead_code,
-    reason = "skeleton: daemon/broker-self-reload fills and calls these"
-)]
+#[expect(dead_code, reason = "skeleton: daemon/broker-self-reload calls this")]
 pub(crate) struct GenerationDigest([u8; 32]);
 
-#[expect(
-    clippy::todo,
-    dead_code,
-    reason = "skeleton: daemon/broker-self-reload fills and calls this"
-)]
 impl GenerationDigest {
+    #[expect(
+        clippy::todo,
+        dead_code,
+        reason = "skeleton: daemon/broker-self-reload fills this body"
+    )]
     pub(crate) fn of(_candidate_digest: &str) -> Option<Self> {
         todo!()
     }
 }
 
-#[expect(
-    dead_code,
-    reason = "skeleton: daemon/broker-self-reload fills and calls these"
-)]
+// The counter, not the digest, identifies a generation: a secrets-only or key-only reload commits
+// with the active candidate's config digest unchanged.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[expect(dead_code, reason = "skeleton: daemon/broker-self-reload calls this")]
+pub(crate) struct CommitGeneration(u64);
+
+#[derive(Clone, Debug)]
+#[expect(dead_code, reason = "skeleton: daemon/broker-self-reload calls this")]
+pub(crate) struct Committed {
+    pub(crate) generation: CommitGeneration,
+    pub(crate) digest: GenerationDigest,
+    pub(crate) provider_lock: Option<LoadedLock>,
+}
+
+#[expect(dead_code, reason = "skeleton: daemon/broker-self-reload calls this")]
 pub(crate) struct CommitSignal {
-    latest: tokio::sync::watch::Sender<GenerationDigest>,
+    latest: tokio::sync::watch::Sender<Committed>,
 }
 
-#[expect(
-    clippy::todo,
-    dead_code,
-    reason = "skeleton: daemon/broker-self-reload fills and calls these"
-)]
 impl CommitSignal {
-    pub(crate) fn new(_boot: GenerationDigest) -> Self {
+    #[expect(
+        clippy::todo,
+        dead_code,
+        reason = "skeleton: daemon/broker-self-reload fills this body"
+    )]
+    pub(crate) fn new(_boot: GenerationDigest, _provider_lock: Option<LoadedLock>) -> Self {
         todo!()
     }
 
-    pub(crate) fn publish(&self, _committed: GenerationDigest) {
+    #[expect(
+        clippy::todo,
+        dead_code,
+        reason = "skeleton: daemon/broker-self-reload fills this body"
+    )]
+    pub(crate) fn publish(&self, _digest: GenerationDigest, _provider_lock: Option<LoadedLock>) {
         todo!()
     }
 
-    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<GenerationDigest> {
+    #[expect(
+        clippy::todo,
+        dead_code,
+        reason = "skeleton: daemon/broker-self-reload fills this body"
+    )]
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<Committed> {
         todo!()
     }
 }
@@ -114,12 +132,13 @@ impl CommitSignal {
 #[expect(
     clippy::todo,
     dead_code,
-    reason = "skeleton: daemon/broker-self-reload fills and calls this"
+    reason = "skeleton: daemon/broker-self-reload fills this body"
 )]
 pub(crate) async fn check_lock_then_exit(
-    _lock: LoadedLock,
+    _lock_events: tokio::sync::mpsc::Receiver<()>,
+    _commits: tokio::sync::watch::Receiver<Committed>,
     _uid: u32,
-    _poll: Duration,
+    _read_timeout: Duration,
 ) -> BrokerStop {
     todo!()
 }

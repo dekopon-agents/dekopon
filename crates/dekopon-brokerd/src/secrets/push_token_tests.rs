@@ -13,3 +13,7 @@ async fn concurrent_pushes_share_one_vm_lane_refresh() {}
 #[tokio::test]
 #[ignore = "skeleton: egress/push-contract"]
 async fn a_restarted_broker_pushes_the_access_token_from_the_stored_record() {}
+
+#[tokio::test]
+#[ignore = "skeleton: egress/push-contract"]
+async fn a_queued_refresh_reuses_the_token_its_predecessor_installed() {}

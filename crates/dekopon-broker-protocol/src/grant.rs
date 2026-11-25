@@ -1,8 +1,3 @@
-#![expect(
-    clippy::todo,
-    reason = "skeleton: state/grant-settle fills these bodies"
-)]
-
 use std::num::NonZeroU64;
 
 use dekopon_core::VmSession;
@@ -77,11 +72,13 @@ pub struct GrantSettlement {
 
 impl GrantSettlement {
     #[must_use]
+    #[expect(clippy::todo, reason = "skeleton: state/grant-settle fills this body")]
     pub fn grant_used(&self) -> Option<GrantedSession> {
         todo!()
     }
 
     #[must_use]
+    #[expect(clippy::todo, reason = "skeleton: state/grant-settle fills this body")]
     pub fn grant_unused(&self) -> Option<GrantId> {
         todo!()
     }
@@ -89,11 +86,13 @@ impl GrantSettlement {
 
 impl RunOutcome {
     #[must_use]
+    #[expect(clippy::todo, reason = "skeleton: state/grant-settle fills this body")]
     pub fn grant_required() -> Self {
         todo!()
     }
 
     #[must_use]
+    #[expect(clippy::todo, reason = "skeleton: state/grant-settle fills this body")]
     pub fn is_grant_required(&self) -> bool {
         todo!()
     }

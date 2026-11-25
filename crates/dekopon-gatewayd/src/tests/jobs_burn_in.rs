@@ -479,6 +479,10 @@ async fn job_words_on_a_route_without_jobs_report_off_while_foreign_job_words_ar
         replies.push(ResponseEnvelope {
             api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2,
             response: dekopon_broker_protocol::BrokerResponse::Ran {
+                tallies: None,
+                grant_unused: None,
+                grant_used: None,
+                session_gone: None,
                 outcome: dekopon_broker_protocol::RunOutcome::NotFound,
             },
         });

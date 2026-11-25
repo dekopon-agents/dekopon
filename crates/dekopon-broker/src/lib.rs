@@ -39,7 +39,7 @@ pub use continuity::{
 use continuity::{ContinuityState, OperationalSnapshot};
 pub use egress::{
     CookieEntry, CookieSet, EgressError, EgressHeaderValue, EgressProfile, EgressProfileMaterial,
-    EgressPush, EgressReturn, ExecWrite, PushedToken, TokenTarget, settle,
+    EgressPush, EgressReturn, ExecWrite, GrantCheck, PushedToken, TokenTarget, settle,
 };
 
 use async_trait::async_trait;
@@ -949,27 +949,23 @@ impl fmt::Debug for SecretMaterial {
 pub trait SecretResolver: Send + Sync + fmt::Debug {
     async fn resolve(&self, secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError>;
 
-    #[expect(
-        clippy::todo,
-        reason = "skeleton: egress/push-contract fills this body"
-    )]
     async fn egress_profile(
         &self,
         _profile: &SecretDrn,
     ) -> Result<EgressProfileMaterial, SecretResolutionError> {
-        todo!()
+        Err(SecretResolutionError {
+            category: "missing",
+        })
     }
 
-    #[expect(
-        clippy::todo,
-        reason = "skeleton: egress/vault-rotation fills this body"
-    )]
     async fn store_rotations(
         &self,
         _profile: &SecretDrn,
         _rotations: Vec<CookieEntry>,
     ) -> Result<(), SecretResolutionError> {
-        todo!()
+        Err(SecretResolutionError {
+            category: "missing",
+        })
     }
 }
 
@@ -4278,7 +4274,15 @@ where
                         );
                         "secret-credential"
                     }
-                    CredentialFailure::Egress(source) => source.category(),
+                    CredentialFailure::Egress(source) => {
+                        tracing::warn!(
+                            event = "broker_egress_push_failed",
+                            invocation = %invocation_id,
+                            category = source.category(),
+                            "broker.egress.push.failed"
+                        );
+                        source.category()
+                    }
                 };
                 return self
                     .fail_authorized_before_provider(
@@ -4565,6 +4569,12 @@ fn encode_capability_authority(
         encoded.text("defaultSecretDrn", default.secret().as_str());
         encoded.text("defaultSecretSink", &default.sink().to_string());
         encoded.optional_text("defaultSecretBasicUsername", default.username());
+    }
+    if let Some(profile) = &set.egress_profile {
+        encoded.text("egressProfileDrn", profile.drn.as_str());
+    }
+    if set.takes_grant {
+        encoded.byte("takesGrant", 1);
     }
     encode_execution_constraints(encoded, &set.constraints);
     encoded.text("providerArtifactSha256", provider_artifact_sha256);

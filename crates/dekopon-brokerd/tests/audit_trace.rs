@@ -549,6 +549,7 @@ async fn command_parsing_stays_in_the_invocations_trace() {
         .run(
             Some(session()),
             RunRequest {
+                grant: None,
                 invocation: "run-traced".parse().unwrap(),
                 trace_parent: trace_parent(),
                 word: "probe".to_owned(),

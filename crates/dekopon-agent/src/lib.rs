@@ -827,7 +827,7 @@ impl BrokerLeg {
                     biased;
                     outcome = self.client.run(
                         self.attestation.clone(),
-                        RunRequest { invocation, trace_parent: self.identifiers.trace_parent(), word: call.word, argv },
+                        RunRequest { grant: None, invocation, trace_parent: self.identifiers.trace_parent(), word: call.word, argv },
                         assets,
                         async |upcall| self.answer(scope, upcall, tree, &dispatcher).await,
                     ) => Some(outcome),
@@ -1847,7 +1847,13 @@ mod tests {
             let directory = private_broker_directory();
             let response = ResponseEnvelope {
                 api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2,
-                response: dekopon_broker_protocol::BrokerResponse::Ran { outcome },
+                response: dekopon_broker_protocol::BrokerResponse::Ran {
+                    tallies: None,
+                    grant_unused: None,
+                    grant_used: None,
+                    session_gone: None,
+                    outcome,
+                },
             };
             let (leg, mut observed) =
                 stub_leg_observing(directory.path(), vec![response], None).await;
@@ -2313,6 +2319,10 @@ mod tests {
                                 ResponseEnvelope {
                                     api_version: ProtocolVersion::V1Alpha2,
                                     response: BrokerResponse::Ran {
+                                        tallies: None,
+                                        grant_unused: None,
+                                        grant_used: None,
+                                        session_gone: None,
                                         outcome: dekopon_broker_protocol::RunOutcome::Invoked {
                                             capability: CAPABILITY.parse().unwrap(),
                                             input: json!({"uri":self.uri}),

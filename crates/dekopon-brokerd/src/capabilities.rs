@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use dekopon_broker::{CapabilityRoute, ConstraintSet, DefaultSecretUse};
+use dekopon_broker::{CapabilityRoute, ConstraintSet, DefaultSecretUse, EgressProfile};
 use dekopon_capability::{
     AssetConstraints, EffectKind, ExecutionConstraints, HttpConstraints, RequestTemplate,
     SecretUseGrant, StorageConstraints,
@@ -24,6 +24,8 @@ pub struct CapabilityConfig {
     pub route: CapabilityRoute,
     #[serde(deserialize_with = "deserialize_default_secret_use")]
     pub default_secret_use: Option<DefaultSecretUse>,
+    pub egress_profile: Option<EgressProfile>,
+    pub takes_grant: bool,
     pub constraints: ConstraintsPatch,
 }
 
@@ -212,8 +214,8 @@ pub fn constraint_sets<'a>(
                     sets.insert(
                         capability.id.clone(),
                         ConstraintSet {
-                            egress_profile: None,
-                            takes_grant: false,
+                            egress_profile: listed.egress_profile.clone(),
+                            takes_grant: listed.takes_grant,
                             default_secret_use: listed
                                 .default_secret_use
                                 .clone()

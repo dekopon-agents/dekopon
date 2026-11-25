@@ -39,7 +39,7 @@ use conversation::{
 };
 use dekopon_core::{
     AgentId, AttestedSubject, CapabilityId, InvocationId, PrincipalId, ProviderId,
-    SecretUseProposal, TraceId, TraceIdError, TransportId,
+    SecretUseProposal, TraceId, TraceIdError, TransportId, VmSession,
 };
 use dekopon_provider_sdk::ProviderCapability;
 pub use dekopon_provider_sdk::{CommandRunOutcome, ComponentFailure};
@@ -818,6 +818,7 @@ impl RequestEnvelope {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
             request: BrokerRequest::Invoke {
+                grant: None,
                 attestation,
                 invocation,
                 assets,
@@ -870,6 +871,8 @@ pub enum BrokerRequest {
         #[serde(rename = "sendsRemaining")]
         sends_remaining: u8,
         streams: StreamDescriptors,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant: Option<Grant>,
     },
     Invoke {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -881,6 +884,8 @@ pub enum BrokerRequest {
         sends_remaining: u8,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         streams: Option<StreamDescriptors>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant: Option<Grant>,
     },
     RecordDeliveredTurn {
         attestation: Attestation,
@@ -968,6 +973,7 @@ pub struct RunRequest {
     pub trace_parent: TraceParent,
     pub word: String,
     pub argv: Vec<Arg>,
+    pub grant: Option<Grant>,
 }
 
 #[cfg(unix)]
@@ -1320,6 +1326,10 @@ impl ResponseEnvelope {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Invocation {
+                tallies: None,
+                grant_unused: None,
+                grant_used: None,
+                session_gone: None,
                 result,
                 attached,
                 removed,
@@ -1349,6 +1359,10 @@ impl ResponseEnvelope {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
             response: BrokerResponse::Error {
+                tallies: None,
+                grant_unused: None,
+                grant_used: None,
+                session_gone: None,
                 code: code.into(),
                 message: message.into(),
             },
@@ -1361,6 +1375,14 @@ impl ResponseEnvelope {
 pub enum BrokerResponse {
     Ran {
         outcome: RunOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_used: Option<GrantedSession>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_unused: Option<GrantId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tallies: Option<Vec<Tally>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_gone: Option<VmSession>,
     },
     Capabilities {
         capabilities: Vec<AvailableCapability>,
@@ -1383,6 +1405,14 @@ pub enum BrokerResponse {
         removed: Vec<u64>,
         #[serde(default)]
         sent: Vec<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_used: Option<GrantedSession>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_unused: Option<GrantId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tallies: Option<Vec<Tally>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_gone: Option<VmSession>,
     },
     CommandRun {
         result: CommandRunOutcome,
@@ -1401,6 +1431,14 @@ pub enum BrokerResponse {
     Error {
         code: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_used: Option<GrantedSession>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_unused: Option<GrantId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tallies: Option<Vec<Tally>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_gone: Option<VmSession>,
     },
     Generation {
         digest: String,
@@ -1830,7 +1868,7 @@ impl BrokerClient {
                 principal,
                 space,
             }),
-            BrokerResponse::Error { code, message } => {
+            BrokerResponse::Error { code, message, .. } => {
                 match SessionRefusal::from_error(&code, &message) {
                     Ok(SessionRefusal::Other) => Err(ClientError::Remote { code, message }),
                     Ok(
@@ -1884,6 +1922,7 @@ impl BrokerClient {
                 RequestEnvelope {
                     api_version: ProtocolVersion::V1Alpha2,
                     request: BrokerRequest::Run {
+                        grant: None,
                         attestation,
                         invocation: request.invocation,
                         trace_parent: request.trace_parent,
@@ -1932,11 +1971,13 @@ impl BrokerClient {
                 .map_err(response_failure)?;
         };
         match response {
-            BrokerResponse::Ran { outcome } => Ok(RunResponse {
+            BrokerResponse::Ran { outcome, .. } => Ok(RunResponse {
                 outcome,
                 descriptors,
             }),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Error { code, message, .. } => {
+                Err(ClientError::Remote { code, message })
+            }
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::CommandRun { .. }
@@ -2021,6 +2062,7 @@ impl BrokerClient {
                 attached,
                 removed,
                 sent,
+                ..
             } => Ok(AssetInvocationOutcome {
                 result,
                 attached,
@@ -2028,7 +2070,9 @@ impl BrokerClient {
                 sent,
                 descriptors,
             }),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Error { code, message, .. } => {
+                Err(ClientError::Remote { code, message })
+            }
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::Ran { .. }
             | BrokerResponse::CommandRun { .. }
@@ -2048,7 +2092,9 @@ impl BrokerClient {
             .await?
         {
             BrokerResponse::Invocation { result, .. } => Ok(result),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Error { code, message, .. } => {
+                Err(ClientError::Remote { code, message })
+            }
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::Ran { .. }
             | BrokerResponse::CommandRun { .. }
@@ -2071,7 +2117,9 @@ impl BrokerClient {
             .await?
         {
             BrokerResponse::Generation { digest, outcome } => Ok((digest, outcome)),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Error { code, message, .. } => {
+                Err(ClientError::Remote { code, message })
+            }
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
@@ -2102,7 +2150,9 @@ impl BrokerClient {
             .await?
         {
             BrokerResponse::Generation { digest, outcome } => Ok((digest, outcome)),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Error { code, message, .. } => {
+                Err(ClientError::Remote { code, message })
+            }
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::Ran { .. }
             | BrokerResponse::Invocation { .. }
@@ -2132,7 +2182,9 @@ impl BrokerClient {
             .await?
         {
             BrokerResponse::Generation { digest, outcome } if digest == expected => Ok(outcome),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
+            BrokerResponse::Error { code, message, .. } => {
+                Err(ClientError::Remote { code, message })
+            }
             BrokerResponse::Generation { .. }
             | BrokerResponse::Capabilities { .. }
             | BrokerResponse::Ran { .. }
@@ -2254,7 +2306,7 @@ async fn refusal_before_credentials(
     if source.kind() == io::ErrorKind::NotConnected
         && let Ok((
             ResponseEnvelope {
-                response: BrokerResponse::Error { code, message },
+                response: BrokerResponse::Error { code, message, .. },
                 ..
             },
             _,
@@ -2281,7 +2333,7 @@ async fn refusal_after_write_failure(
         )
         && let Ok((
             ResponseEnvelope {
-                response: BrokerResponse::Error { code, message },
+                response: BrokerResponse::Error { code, message, .. },
                 ..
             },
             _,
@@ -2309,6 +2361,7 @@ fn validate_response_descriptors(
         BrokerResponse::Invocation { attached, .. }
         | BrokerResponse::Ran {
             outcome: RunOutcome::Invoked { attached, .. },
+            ..
         } => {
             if attached.len() != count
                 || attached

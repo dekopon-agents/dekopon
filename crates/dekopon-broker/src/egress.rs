@@ -1,8 +1,3 @@
-#![expect(
-    clippy::todo,
-    reason = "skeleton: egress/push-contract, egress/vault-rotation and state/grant-settle fill these bodies"
-)]
-
 use dekopon_broker_protocol::{Grant, GrantId, GrantSettlement, Tally};
 use dekopon_core::{Redacted, SecretDrn, VmSession};
 use serde::{Deserialize, Serialize};
@@ -29,6 +24,10 @@ pub struct CookieEntry {
 pub struct CookieSet(Vec<CookieEntry>);
 
 impl CookieSet {
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/push-contract fills this body"
+    )]
     pub fn new(_entries: Vec<CookieEntry>) -> Result<Self, EgressError> {
         todo!()
     }
@@ -39,10 +38,18 @@ impl CookieSet {
     }
 
     #[must_use]
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/push-contract fills this body"
+    )]
     pub fn measured_bytes(&self) -> usize {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/vault-rotation fills this body"
+    )]
     pub fn storable(&self, _rotations: Vec<CookieEntry>) -> Result<Self, EgressError> {
         todo!()
     }
@@ -91,6 +98,10 @@ pub struct EgressPush {
 }
 
 impl EgressPush {
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/push-contract fills this body"
+    )]
     pub fn encode(&self) -> Result<EgressHeaderValue, EgressError> {
         todo!()
     }
@@ -117,9 +128,20 @@ pub enum EgressReturn {
 
 impl EgressReturn {
     #[must_use]
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/push-contract fills this body"
+    )]
     pub fn decode(_value: &[u8]) -> Option<Self> {
         todo!()
     }
+}
+
+#[must_use]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GrantCheck {
+    Proceed,
+    Required,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +151,7 @@ pub enum ExecWrite {
 }
 
 #[must_use]
+#[expect(clippy::todo, reason = "skeleton: state/grant-settle fills this body")]
 pub fn settle(
     _grant: Option<GrantId>,
     _session: Option<VmSession>,
@@ -170,11 +193,12 @@ where
         dead_code,
         reason = "skeleton: state/grant-settle calls it from the invoke path"
     )]
-    pub(crate) fn grant_refusal(
+    #[expect(clippy::todo, reason = "skeleton: state/grant-settle fills this body")]
+    pub(crate) fn grant_check(
         &self,
         _set: &crate::ConstraintSet,
         _grant: Option<&Grant>,
-    ) -> Option<dekopon_broker_protocol::RunOutcome> {
+    ) -> GrantCheck {
         todo!()
     }
 
@@ -186,9 +210,14 @@ where
         clippy::manual_async_fn,
         reason = "the signature states the Send bound the serving task needs"
     )]
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/push-contract fills this body"
+    )]
     pub(crate) fn egress_push(
         &self,
         _set: &crate::ConstraintSet,
+        _secret_use: Option<&dekopon_capability::SecretUseGrant>,
         _grant: Option<Grant>,
     ) -> impl Future<Output = Result<Option<EgressPush>, EgressError>> + Send {
         async { todo!() }

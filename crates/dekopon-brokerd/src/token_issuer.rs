@@ -213,27 +213,46 @@ pub(crate) struct SignerKeys {
 }
 
 #[expect(
-    clippy::todo,
     dead_code,
     reason = "skeleton: daemon/signer-reload fills and calls these"
 )]
 impl SignerKeys {
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
     pub(crate) fn new(_active: SelfSignedIssuer) -> Self {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
     pub(crate) fn stage(&mut self, _candidate: SelfSignedIssuer) {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
     pub(crate) fn staged(&self) -> Option<StagedCandidate> {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
     pub(crate) fn promote(&mut self, _confirmed: StagedKid) {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
     pub(crate) fn active(&self) -> &SelfSignedIssuer {
         todo!()
     }

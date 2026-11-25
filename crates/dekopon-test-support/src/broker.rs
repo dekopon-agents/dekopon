@@ -149,6 +149,7 @@ pub fn next_broker_reply(
                     attached,
                     removed,
                     sent,
+                    ..
                 } = response.response
                 else {
                     unreachable!();
@@ -157,6 +158,10 @@ pub fn next_broker_reply(
                     ResponseEnvelope {
                         api_version: ProtocolVersion::V1Alpha2,
                         response: BrokerResponse::Ran {
+                            tallies: None,
+                            grant_unused: None,
+                            grant_used: None,
+                            session_gone: None,
                             outcome: RunOutcome::Invoked {
                                 capability,
                                 input,
@@ -191,7 +196,13 @@ pub fn next_broker_reply(
     Some((
         ResponseEnvelope {
             api_version: ProtocolVersion::V1Alpha2,
-            response: BrokerResponse::Ran { outcome },
+            response: BrokerResponse::Ran {
+                tallies: None,
+                grant_unused: None,
+                grant_used: None,
+                session_gone: None,
+                outcome,
+            },
         },
         descriptors,
     ))

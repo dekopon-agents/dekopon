@@ -1,5 +1,4 @@
 #![expect(
-    clippy::todo,
     dead_code,
     reason = "skeleton: egress/vault-rotation fills and calls these"
 )]
@@ -18,14 +17,26 @@ pub(crate) struct CookieVault {
 }
 
 impl CookieVault {
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/vault-rotation fills this body"
+    )]
     pub(crate) fn open(_records: BTreeMap<SecretDrn, PathBuf>, _expected_uid: u32) -> Self {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/vault-rotation fills this body"
+    )]
     pub(crate) async fn cookie_set(&self, _profile: &SecretDrn) -> Result<CookieSet, VaultError> {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/vault-rotation fills this body"
+    )]
     pub(crate) async fn store_rotations(
         &self,
         _profile: &SecretDrn,
@@ -34,14 +45,26 @@ impl CookieVault {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/vault-rotation fills this body"
+    )]
     pub(crate) fn same_records(&self, _records: &BTreeMap<SecretDrn, PathBuf>) -> bool {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/vault-rotation fills this body"
+    )]
     pub(crate) async fn drain(&self) {
         todo!()
     }
 
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: egress/vault-rotation fills this body"
+    )]
     pub(crate) async fn reseed(
         &self,
         _profile: &SecretDrn,

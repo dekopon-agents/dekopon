@@ -21,3 +21,11 @@ async fn an_isolated_lock_replacement_ends_in_a_bounded_broker_exit() {}
 #[tokio::test]
 #[ignore = "skeleton: daemon/broker-self-reload"]
 async fn the_refresh_scheduler_rereads_the_catalog_on_each_commit() {}
+
+#[tokio::test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+async fn a_secret_map_only_commit_starts_a_new_scheduler_generation() {}
+
+#[tokio::test]
+#[ignore = "skeleton: daemon/broker-self-reload"]
+async fn the_lock_check_compares_against_the_committed_lock_after_a_commit() {}

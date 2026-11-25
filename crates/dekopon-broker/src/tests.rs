@@ -14,8 +14,8 @@ use dekopon_core::{
 use super::{
     AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuditSink, AuthenticatedContext,
     AuthorityEncoder, Broker, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ConstraintCatalog,
-    ConstraintSet, ContextError, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
-    encode_capability_authority, encode_execution_constraints, encode_host_limits,
+    ConstraintSet, ContextError, EgressProfile, IdentityDirectory, InMemoryAuditLog, PolicyEngine,
+    PolicyWorld, encode_capability_authority, encode_execution_constraints, encode_host_limits,
     encode_memory_config, encode_storage_limits, provider_exit_status, provider_failure_detail,
     public_host_error, render_chat_slots,
 };
@@ -626,6 +626,39 @@ fn capability_authority_commits_exactly_these_fields() {
             "providerArtifactSha256",
         ],
         "the storage authority surface gained or lost a field"
+    );
+
+    let mut egress = set.clone();
+    egress.egress_profile = Some(EgressProfile {
+        drn: "drn:secret:probe/egress".parse().expect("secret DRN"),
+    });
+    egress.takes_grant = true;
+    let mut encoded = AuthorityEncoder::new();
+    encode_capability_authority(
+        &mut encoded,
+        &"cli-probe.upper"
+            .parse::<CapabilityId>()
+            .expect("valid fixture"),
+        &egress,
+        None,
+        "sha256:artifact",
+    );
+    assert_eq!(
+        labels(&encoded.finish()),
+        vec![
+            "capability",
+            "provider",
+            "effect",
+            "risk",
+            "egressProfileDrn",
+            "takesGrant",
+            "execution.timeoutMs",
+            "execution.http.present",
+            "execution.storage.present",
+            "execution.asset.present",
+            "providerArtifactSha256",
+        ],
+        "an egress profile or grant flag must commit to the authority digest"
     );
 
     let mut shared = set.clone();

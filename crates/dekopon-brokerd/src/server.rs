@@ -594,6 +594,7 @@ where
             assets,
             sends_remaining,
             streams: _,
+            grant: _,
         } => {
             use dekopon_broker_protocol::{Arg, RunOutcome};
             if !claim_is_valid(attestation.as_ref(), Some(&invocation)) {
@@ -748,6 +749,10 @@ where
                     ResponseEnvelope {
                         api_version: ProtocolVersion::V1Alpha2,
                         response: dekopon_broker_protocol::BrokerResponse::Ran {
+                            tallies: None,
+                            grant_unused: None,
+                            grant_used: None,
+                            session_gone: None,
                             outcome: RunOutcome::Invoked {
                                 capability: reported.0,
                                 input: reported.1,
@@ -769,6 +774,7 @@ where
             assets,
             sends_remaining,
             streams: _,
+            grant: _,
         } => {
             if !claim_is_valid(attestation.as_ref(), Some(&invocation.id)) {
                 return refuse_invalid_claim(&mut stream, limits).await;
@@ -1169,7 +1175,13 @@ async fn answer_run(
         .write_frame(
             &ResponseEnvelope {
                 api_version: ProtocolVersion::V1Alpha2,
-                response: dekopon_broker_protocol::BrokerResponse::Ran { outcome },
+                response: dekopon_broker_protocol::BrokerResponse::Ran {
+                    tallies: None,
+                    grant_unused: None,
+                    grant_used: None,
+                    session_gone: None,
+                    outcome,
+                },
             },
             &[],
             limits,
@@ -1284,13 +1296,15 @@ mod generation_tests {
         let uid = client.peer_cred().unwrap().uid();
         let identities = BTreeMap::from([(uid, mapped), (uid + 1, other)]);
         let limits = FrameLimits::default();
-        let serve = handle(
+        // Boxed so each caller's async block does not inline the whole serving future; the
+        // debug-build frame otherwise outgrows the 2 MiB test-thread stack on ARM64.
+        let serve = Box::pin(handle(
             server,
             &active.ready.broker,
             &identities,
             limits,
             Some(coordination),
-        );
+        ));
         let transact = async {
             write_frame(
                 &mut client,

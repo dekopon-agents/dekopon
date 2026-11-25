@@ -2073,6 +2073,8 @@ fn render_errors(problems: &[BrokerdError]) -> String {
 }
 
 #[cfg(test)]
+mod grant_tests;
+#[cfg(test)]
 mod reload_tests;
 #[cfg(test)]
 mod self_reload_tests;

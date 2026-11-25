@@ -13,3 +13,7 @@ async fn the_signer_holds_at_most_one_staged_key() {}
 #[tokio::test]
 #[ignore = "skeleton: daemon/signer-reload"]
 async fn a_restarted_broker_signs_with_the_key_on_disk() {}
+
+#[tokio::test]
+#[ignore = "skeleton: daemon/signer-reload"]
+async fn promote_refuses_a_kid_that_is_not_the_staged_one() {}

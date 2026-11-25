@@ -507,6 +507,10 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             let ran = ResponseEnvelope {
                 api_version: ProtocolVersion::V1Alpha2,
                 response: BrokerResponse::Ran {
+                    tallies: None,
+                    grant_unused: None,
+                    grant_used: None,
+                    session_gone: None,
                     outcome: RunOutcome::Invoked {
                         capability: capability.clone(),
                         input: input.clone(),
