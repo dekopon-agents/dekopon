@@ -147,6 +147,7 @@ broker:
         # 256 MiB leaves the rest of the limit below to the broker process and Cranelift.
         maxTotalMemoryBytes: 268435456
     existingSecret: ""
+    # Key containing the complete broker.yaml document. Store bare tokens under separate keys.
     existingSecretKey: broker.yaml
 
   # The alternative to config and policies: a ConfigMap whose every *.yaml and *.cedar key becomes
