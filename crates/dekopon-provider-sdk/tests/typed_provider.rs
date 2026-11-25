@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use clap::{Parser, Subcommand};
 use dekopon_provider_sdk::provider::{
-    Capability, Code, Failure, ManifestError, NativeExit, NativeStdio, Proposal, Provider,
-    SchemaFault, SdkFailure, Stdout, Usage, command, invoke_native, manifest, stdin,
+    Capability, Code, Failure, ManifestError, NativeExit, NativeStdio, Port, Proposal, Provider,
+    SchemaFault, SdkFailure, Stdout, Usage, command, invoke_native, manifest, stdin, with_port,
 };
 use dekopon_provider_sdk::{
     CommandRunOutcome, ComponentFailure, EffectKind, RiskLevel, SecretUseProposal,
@@ -268,44 +268,78 @@ impl Capability for ClockRead {
     }
 }
 
-#[test]
-fn native_fake_port_reaches_typed_dispatch_and_restores_after_return() {
-    use dekopon_provider_sdk::provider::{Port, with_port};
-    struct Fake;
-    impl Port for Fake {
-        fn now_unix_millis(&mut self) -> u64 {
-            123
-        }
-        fn now_nanos(&mut self) -> u64 {
-            0
-        }
-        fn fill_random(&mut self, out: &mut [u8]) {
-            out.fill(0xa5);
-        }
-        fn settings(&mut self) -> Option<String> {
-            None
-        }
-        fn send(
-            &mut self,
-            _: dekopon_provider_sdk::provider::Request,
-        ) -> Result<
-            dekopon_provider_sdk::provider::Response,
-            dekopon_provider_sdk::provider::HttpError,
-        > {
-            unreachable!()
-        }
-        fn stream(
-            &mut self,
-            _: dekopon_provider_sdk::provider::StreamedRequest<'_>,
-        ) -> Result<
-            dekopon_provider_sdk::provider::StreamedResponse,
-            dekopon_provider_sdk::provider::HttpError,
-        > {
-            unreachable!()
+enum FakePort {
+    Clock,
+    Http,
+    Settings,
+}
+
+impl Port for FakePort {
+    fn now_unix_millis(&mut self) -> u64 {
+        match self {
+            Self::Clock | Self::Http => 123,
+            Self::Settings => unreachable!(),
         }
     }
+
+    fn now_nanos(&mut self) -> u64 {
+        match self {
+            Self::Clock | Self::Http => 0,
+            Self::Settings => unreachable!(),
+        }
+    }
+
+    fn fill_random(&mut self, out: &mut [u8]) {
+        match self {
+            Self::Clock | Self::Http => out.fill(0xa5),
+            Self::Settings => unreachable!(),
+        }
+    }
+
+    fn settings(&mut self) -> Option<String> {
+        match self {
+            Self::Clock | Self::Http => None,
+            Self::Settings => Some("\"valid\"".to_owned()),
+        }
+    }
+
+    fn send(
+        &mut self,
+        request: dekopon_provider_sdk::provider::Request,
+    ) -> Result<dekopon_provider_sdk::provider::Response, dekopon_provider_sdk::provider::HttpError>
+    {
+        match self {
+            Self::Http => {
+                assert_eq!(request.uri, "https://example.test/");
+                Ok(dekopon_provider_sdk::provider::Response {
+                    status: 202,
+                    headers: vec![],
+                    body: vec![],
+                })
+            }
+            Self::Clock | Self::Settings => unreachable!(),
+        }
+    }
+
+    fn stream(
+        &mut self,
+        _: dekopon_provider_sdk::provider::StreamedRequest<'_>,
+    ) -> Result<
+        dekopon_provider_sdk::provider::StreamedResponse,
+        dekopon_provider_sdk::provider::HttpError,
+    > {
+        unreachable!()
+    }
+}
+
+#[test]
+fn native_fake_port_reaches_typed_dispatch_and_restores_after_return() {
     assert_eq!(
-        with_port(Fake, || call::<ClockFixture>("clock-fixture.read", "{}")).stdout,
+        with_port(FakePort::Clock, || call::<ClockFixture>(
+            "clock-fixture.read",
+            "{}"
+        ))
+        .stdout,
         "123\n"
     );
 }
@@ -431,51 +465,20 @@ http_provider!(
 
 #[test]
 fn native_http_and_http_clock_tuple_reach_the_fake_port() {
-    use dekopon_provider_sdk::provider::{Port, with_port};
-    struct Fake;
-    impl Port for Fake {
-        fn now_unix_millis(&mut self) -> u64 {
-            123
-        }
-        fn now_nanos(&mut self) -> u64 {
-            0
-        }
-        fn fill_random(&mut self, out: &mut [u8]) {
-            out.fill(0xa5);
-        }
-        fn settings(&mut self) -> Option<String> {
-            None
-        }
-        fn send(
-            &mut self,
-            request: dekopon_provider_sdk::provider::Request,
-        ) -> Result<
-            dekopon_provider_sdk::provider::Response,
-            dekopon_provider_sdk::provider::HttpError,
-        > {
-            assert_eq!(request.uri, "https://example.test/");
-            Ok(dekopon_provider_sdk::provider::Response {
-                status: 202,
-                headers: vec![],
-                body: vec![],
-            })
-        }
-        fn stream(
-            &mut self,
-            _: dekopon_provider_sdk::provider::StreamedRequest<'_>,
-        ) -> Result<
-            dekopon_provider_sdk::provider::StreamedResponse,
-            dekopon_provider_sdk::provider::HttpError,
-        > {
-            unreachable!()
-        }
-    }
     assert_eq!(
-        with_port(Fake, || call::<HttpFixture>("native-http.send", "{}")).stdout,
+        with_port(FakePort::Http, || call::<HttpFixture>(
+            "native-http.send",
+            "{}"
+        ))
+        .stdout,
         "202\n"
     );
     assert_eq!(
-        with_port(Fake, || call::<HttpClockFixture>("native-http.send", "{}")).stdout,
+        with_port(FakePort::Http, || call::<HttpClockFixture>(
+            "native-http.send",
+            "{}"
+        ))
+        .stdout,
         "325\n"
     );
 }
@@ -494,41 +497,7 @@ fn native_storage_and_assets_require_the_real_component_harness_even_in_a_tuple(
     requires_harness::<DurableFixture>();
     requires_harness::<AssetsFixture>();
     requires_harness::<HttpAssetsFixture>();
-    use dekopon_provider_sdk::provider::{Port, with_port};
-    struct SettingsFake;
-    impl Port for SettingsFake {
-        fn now_unix_millis(&mut self) -> u64 {
-            unreachable!()
-        }
-        fn now_nanos(&mut self) -> u64 {
-            unreachable!()
-        }
-        fn fill_random(&mut self, _: &mut [u8]) {
-            unreachable!()
-        }
-        fn settings(&mut self) -> Option<String> {
-            Some("\"valid\"".to_owned())
-        }
-        fn send(
-            &mut self,
-            _: dekopon_provider_sdk::provider::Request,
-        ) -> Result<
-            dekopon_provider_sdk::provider::Response,
-            dekopon_provider_sdk::provider::HttpError,
-        > {
-            unreachable!()
-        }
-        fn stream(
-            &mut self,
-            _: dekopon_provider_sdk::provider::StreamedRequest<'_>,
-        ) -> Result<
-            dekopon_provider_sdk::provider::StreamedResponse,
-            dekopon_provider_sdk::provider::HttpError,
-        > {
-            unreachable!()
-        }
-    }
-    with_port(SettingsFake, requires_harness::<TupleFixture>);
+    with_port(FakePort::Settings, requires_harness::<TupleFixture>);
 }
 
 fn run(words: &[&str], stdin_piped: bool) -> CommandRunOutcome {
