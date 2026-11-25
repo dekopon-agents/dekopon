@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.98.0] - 2026-11-25
+
+### Added
+
+- Report core Rust line-count changes on same-repository pull requests.
+
+### Changed
+
+- The Helm chart explicitly keeps broker logs out of pod termination messages.
+
+## [dekopon-chart-0.85.0] - 2026-11-25
+
+### Changed
+
+- Chart 0.85.0 targets core v0.98.0 and renders the `v0.98.0` image tag.
+- The Helm chart explicitly keeps broker logs out of pod termination messages.
+
 ## [0.97.0] - 2026-11-25
 
 ### Added
