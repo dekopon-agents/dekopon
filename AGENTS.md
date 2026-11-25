@@ -398,8 +398,6 @@ whatever the path), the repository's own boundaries section, and three sections 
 a finding until the line that leaks is named. A claim in the editor's report ("mirrors
 `DiskBlob::reclaim`") is checked, not trusted.
 
-**Review budgets.** Per PR, Astra and the Claude reviewer each have their own budget: a reviewer's third `FIX REQUIRED` reports the lane as blocked with both verdicts side by side; the disagreement is the owner's. Fix passes before that need no owner input. Only `FIX REQUIRED` verdicts count against a budget.
-
 **The lane report** ends with one fixed heading, `Choices I made`: every place the editor read
 the brief's intent over its text and did something the text did not say, one line each with the
 sentence it overrode.
