@@ -22406,9 +22406,12 @@ async fn post_commit_maintenance_failure_does_not_report_an_append_failure() {
             .is_empty()
     );
     assert!(
-        capture
-            .events_text()
-            .contains("gateway.asset.reclaim.failed")
+        !capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("message", "gateway.asset.reclaim.failed")]
+            )
+            .is_empty()
     );
 }
 
