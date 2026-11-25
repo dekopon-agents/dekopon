@@ -21262,10 +21262,18 @@ async fn a_lost_commit_confirmation_requires_observation_before_gateway_publicat
                 outcome: GenerationOutcome::Prepared,
             },
             2 => BrokerResponse::Error {
+                tallies: None,
+                grant_unused: None,
+                grant_used: None,
+                session_gone: None,
                 code: "confirmation-lost".into(),
                 message: "unavailable".into(),
             },
             3 => BrokerResponse::Error {
+                tallies: None,
+                grant_unused: None,
+                grant_used: None,
+                session_gone: None,
                 code: "observation-lost".into(),
                 message: "unavailable".into(),
             },

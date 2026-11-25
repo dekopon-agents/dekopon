@@ -98,6 +98,8 @@ fn memory_constraints() -> ConstraintCatalog {
     entries.push((
         "storage-probe.run".parse().expect("capability"),
         ConstraintSet {
+            egress_profile: None,
+            takes_grant: false,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "storage-probe".parse().expect("provider"),
@@ -269,6 +271,8 @@ async fn smoke_memory_broker_with(
             (
                 name.parse().expect("capability"),
                 ConstraintSet {
+                    egress_profile: None,
+                    takes_grant: false,
                     default_secret_use: None,
                     provider: "memory".parse().expect("provider"),
                     ..memory_constraint(route, effect, risk, access)
@@ -664,6 +668,8 @@ async fn a_watch_probe_is_neither_shown_nor_granted_a_write() {
     let constraints = ConstraintCatalog::new([(
         "storage-probe.run".parse().expect("capability"),
         ConstraintSet {
+            egress_profile: None,
+            takes_grant: false,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "storage-probe".parse().expect("provider"),
@@ -961,6 +967,8 @@ async fn a_declared_memory_route_is_hidden_and_denied_regardless_of_provider_nam
             "storage-probe",
             "storage-probe.run",
             ConstraintSet {
+                egress_profile: None,
+                takes_grant: false,
                 default_secret_use: None,
                 provider: "storage-probe".parse().expect("provider"),
                 ..memory_constraint(
@@ -1160,6 +1168,8 @@ fn memory_constraint(
     access: StorageAccess,
 ) -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route,
         provider: "memory-chat".parse().expect("provider"),
@@ -1183,6 +1193,8 @@ fn memory_constraint(
 
 fn reserved_read_constraint() -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "memory-chat".parse().expect("provider"),
@@ -1215,6 +1227,8 @@ async fn chat_memory_without_routes_names_every_missing_role() {
     let constraints = ConstraintCatalog::new([(
         "storage-probe.run".parse().expect("capability"),
         ConstraintSet {
+            egress_profile: None,
+            takes_grant: false,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "storage-probe".parse().expect("provider"),
@@ -1291,6 +1305,8 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
     )
     .expect("policy world");
     let routed = |route, provider: &str, storage| ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route,
         provider: provider.parse().expect("provider"),

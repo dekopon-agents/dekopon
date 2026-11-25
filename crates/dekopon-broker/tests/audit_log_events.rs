@@ -229,6 +229,8 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
                 .parse::<CapabilityId>()
                 .expect("capability"),
             ConstraintSet {
+                egress_profile: None,
+                takes_grant: false,
                 route: CapabilityRoute::Generic,
                 provider: "http-probe".parse::<ProviderId>().expect("provider"),
                 effect: EffectKind::ReadOnly,

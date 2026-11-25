@@ -14,8 +14,8 @@ use dekopon_core::{
 use super::{
     AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuditSink, AuthenticatedContext,
     AuthorityEncoder, Broker, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ConstraintCatalog,
-    ConstraintSet, ContextError, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
-    encode_capability_authority, encode_execution_constraints, encode_host_limits,
+    ConstraintSet, ContextError, EgressProfile, IdentityDirectory, InMemoryAuditLog, PolicyEngine,
+    PolicyWorld, encode_capability_authority, encode_execution_constraints, encode_host_limits,
     encode_memory_config, encode_storage_limits, provider_exit_status, provider_failure_detail,
     public_host_error, render_chat_slots,
 };
@@ -72,6 +72,8 @@ async fn desired_pin_without_a_loaded_artifact_is_not_an_execution_digest() {
     let world = PolicyWorld::new([broker.clone()], []).expect("world");
     let policy = PolicyEngine::new("", &world).expect("policy");
     let set = ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: pin.provider_id().clone(),
@@ -585,6 +587,8 @@ fn capability_authority_commits_exactly_these_fields() {
     }
 
     let set = ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "cli-probe".parse().expect("valid provider fixture"),
@@ -622,6 +626,39 @@ fn capability_authority_commits_exactly_these_fields() {
             "providerArtifactSha256",
         ],
         "the storage authority surface gained or lost a field"
+    );
+
+    let mut egress = set.clone();
+    egress.egress_profile = Some(EgressProfile {
+        drn: "drn:secret:probe/egress".parse().expect("secret DRN"),
+    });
+    egress.takes_grant = true;
+    let mut encoded = AuthorityEncoder::new();
+    encode_capability_authority(
+        &mut encoded,
+        &"cli-probe.upper"
+            .parse::<CapabilityId>()
+            .expect("valid fixture"),
+        &egress,
+        None,
+        "sha256:artifact",
+    );
+    assert_eq!(
+        labels(&encoded.finish()),
+        vec![
+            "capability",
+            "provider",
+            "effect",
+            "risk",
+            "egressProfileDrn",
+            "takesGrant",
+            "execution.timeoutMs",
+            "execution.http.present",
+            "execution.storage.present",
+            "execution.asset.present",
+            "providerArtifactSha256",
+        ],
+        "an egress profile or grant flag must commit to the authority digest"
     );
 
     let mut shared = set.clone();
@@ -975,6 +1012,8 @@ async fn in_memory_audit_fails_closed_at_its_bound() {
 fn policy_http_scope_values_are_bounded() {
     fn constrain(http: dekopon_capability::HttpConstraints) -> ConstraintSet {
         ConstraintSet {
+            egress_profile: None,
+            takes_grant: false,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "cli-probe".parse().expect("provider"),
@@ -1073,6 +1112,8 @@ fn an_agent_swaps_only_the_default_its_set_already_names() {
     let named =
         serde_json::from_str::<super::ConstraintSet>(document).expect("authored set decodes");
     let unnamed = super::ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         ..named.clone()
     };
@@ -1333,6 +1374,8 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
         ConstraintCatalog::new([(
             capability.clone(),
             ConstraintSet {
+                egress_profile: None,
+                takes_grant: false,
                 default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider: provider_id,
@@ -1434,6 +1477,8 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
         StorageScope,
     };
     let mut set = ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "probe".parse().unwrap(),
@@ -1493,6 +1538,8 @@ fn storage_retention_policy_rejects_conflicts_for_one_resource_family() {
     use super::{BrokerBuildError, ConstraintCatalog};
     use dekopon_capability::{EffectKind, StorageRetention};
     let make = |retention| ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "storage-probe".parse().unwrap(),
@@ -1641,6 +1688,8 @@ fn storage_set(
     namespace: Option<&str>,
 ) -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: provider.parse().unwrap(),
@@ -1936,6 +1985,8 @@ fn a_host_redirect_refusal_records_no_provider_exit_code() {
     )
     .unwrap();
     let set = ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "gh".parse().unwrap(),
@@ -2538,6 +2589,8 @@ fn memory_route_sets() -> Vec<(CapabilityId, ConstraintSet)> {
 
 fn http_probe_set() -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "http-probe".parse().expect("provider"),
@@ -2565,6 +2618,8 @@ fn cli_probe_set(
     risk: dekopon_core::RiskLevel,
 ) -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "cli-probe".parse().expect("provider"),
@@ -3881,6 +3936,8 @@ async fn a_successful_provider_that_wrote_stderr_carries_it_as_detail() {
         ConstraintCatalog::new([(
             capability.clone(),
             ConstraintSet {
+                egress_profile: None,
+                takes_grant: false,
                 default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider: provider_id,

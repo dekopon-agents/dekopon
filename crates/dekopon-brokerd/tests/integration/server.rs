@@ -81,6 +81,8 @@ when { context.via == "caller" && context.agent == "chat-agent" };
 
 fn probe_constraint_set() -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "cli-probe"
@@ -429,7 +431,7 @@ async fn unmapped_peer_receives_no_capability_information() {
     let refusal = read_frame::<_, ResponseEnvelope>(&mut peer, limits.frame)
         .await
         .expect("an unmapped peer is answered before it asks for anything");
-    let BrokerResponse::Error { code, message } = refusal.response else {
+    let BrokerResponse::Error { code, message, .. } = refusal.response else {
         panic!("an unmapped peer must be refused rather than served");
     };
     assert_eq!(code, ERROR_UNAUTHENTICATED);
@@ -1535,6 +1537,8 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
     let catalog = ConstraintCatalog::new([(
         capability.clone(),
         ConstraintSet {
+            egress_profile: None,
+            takes_grant: false,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider,
@@ -1608,6 +1612,7 @@ permit(principal == Dekopon::Principal::"cpetersen", action == Dekopon::Action::
         .run(
             Some(session()),
             dekopon_broker_protocol::RunRequest {
+                grant: None,
                 invocation: "send-asset".parse().unwrap(),
                 trace_parent: TRACE_PARENT.parse().unwrap(),
                 word: "httpprobe".to_owned(),
@@ -2457,6 +2462,7 @@ async fn single_run(
         .run(
             Some(session()),
             dekopon_broker_protocol::RunRequest {
+                grant: None,
                 invocation: "single-run".parse().unwrap(),
                 trace_parent: TRACE_PARENT.parse().unwrap(),
                 word: word.to_owned(),
@@ -2652,6 +2658,7 @@ async fn a_console_scope_refusal_answers_before_the_guest_parses() {
         .run(
             Some(claim),
             RunRequest {
+                grant: None,
                 invocation: "console-run".parse().unwrap(),
                 trace_parent: TRACE_PARENT.parse().unwrap(),
                 word: "probe".to_owned(),

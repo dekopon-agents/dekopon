@@ -836,7 +836,13 @@ mod tests {
         let directory = crate::tests::temporary();
         let response = ResponseEnvelope {
             api_version: ProtocolVersion::V1Alpha2,
-            response: BrokerResponse::Ran { outcome },
+            response: BrokerResponse::Ran {
+                tallies: None,
+                grant_unused: None,
+                grant_used: None,
+                session_gone: None,
+                outcome,
+            },
         };
         let mut broker = dekopon_test_support::BrokerFixture::answering(
             directory.path(),

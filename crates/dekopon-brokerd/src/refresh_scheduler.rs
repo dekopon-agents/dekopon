@@ -131,3 +131,22 @@ where
         }
     }
 }
+
+#[expect(
+    clippy::todo,
+    dead_code,
+    reason = "skeleton: daemon/broker-self-reload replaces the tick's catalog read with this"
+)]
+pub(crate) async fn serve_on_commits<F, C>(
+    _server: F,
+    _catalog: C,
+    _commits: tokio::sync::watch::Receiver<crate::self_reload::Committed>,
+    _deadline: ShutdownDeadline,
+    _now_seconds: Arc<dyn Fn() -> u64 + Send + Sync>,
+) -> Result<(), BrokerdError>
+where
+    F: Future<Output = Result<(), BrokerdError>>,
+    C: Fn() -> secrets::ScheduledCatalog,
+{
+    todo!()
+}

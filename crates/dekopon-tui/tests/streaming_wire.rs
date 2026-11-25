@@ -84,7 +84,7 @@ async fn returned_asset_crosses_shell_legs_only_within_one_agent_entry() {
                 assert_eq!(bytes, [0, 1, 2, 255]);
                 ResponseEnvelope {
                     api_version: ProtocolVersion::V1Alpha2,
-                    response: BrokerResponse::Ran {
+                    response: BrokerResponse::Ran { tallies: None, grant_unused: None, grant_used: None, session_gone: None,
                         outcome: RunOutcome::Invoked {
                             capability: "probe.read".parse().unwrap(),
                             input: json!({"file":"chat-asset:1"}),
@@ -276,7 +276,7 @@ async fn console_forwards_attestation_secret_intent_and_descriptors_not_inline_s
                     })
                     .await
                     .unwrap();
-                    ResponseEnvelope { api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2, response: dekopon_broker_protocol::BrokerResponse::Ran { outcome: dekopon_broker_protocol::RunOutcome::Invoked {
+                    ResponseEnvelope { api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha2, response: dekopon_broker_protocol::BrokerResponse::Ran { tallies: None, grant_unused: None, grant_used: None, session_gone: None, outcome: dekopon_broker_protocol::RunOutcome::Invoked {
                         capability: "probe.upper".parse().unwrap(),
                         input: json!({"mode":"upper"}),
                         secret_use: Some(expected_secret.clone()),

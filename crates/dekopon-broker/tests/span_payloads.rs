@@ -41,6 +41,8 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
     (
         capability(),
         ConstraintSet {
+            egress_profile: None,
+            takes_grant: false,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "cli-probe"

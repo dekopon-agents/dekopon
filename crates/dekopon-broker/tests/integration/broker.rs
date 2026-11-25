@@ -149,6 +149,8 @@ fn set_with_metadata(
     constraints: ExecutionConstraints,
 ) -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: provider
@@ -1710,6 +1712,8 @@ fn secret_binding(id: &str, secret: &str, authority: &str, path: &str) -> Secret
 
 fn defaulted(authority: &str, secret: &str) -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
+        takes_grant: false,
         default_secret_use: Some(dekopon_broker::DefaultSecretUse {
             drn: secret.parse().expect("secret DRN"),
             sink: dekopon_broker::DefaultSecretSink::HttpBearer,

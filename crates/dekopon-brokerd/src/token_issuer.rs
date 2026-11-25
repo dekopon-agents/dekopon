@@ -202,3 +202,87 @@ impl SelfSignedIssuer {
         Ok(IssuedToken { token, jti, exp })
     }
 }
+
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls these"
+)]
+pub(crate) struct SignerKeys {
+    active: SelfSignedIssuer,
+    staged: Option<SelfSignedIssuer>,
+}
+
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls these"
+)]
+impl SignerKeys {
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
+    pub(crate) fn new(_active: SelfSignedIssuer) -> Self {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
+    pub(crate) fn stage(&mut self, _candidate: SelfSignedIssuer) {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
+    pub(crate) fn staged(&self) -> Option<StagedCandidate> {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
+    pub(crate) fn promote(&mut self, _confirmed: StagedKid) {
+        todo!()
+    }
+
+    #[expect(
+        clippy::todo,
+        reason = "skeleton: daemon/signer-reload fills this body"
+    )]
+    pub(crate) fn active(&self) -> &SelfSignedIssuer {
+        todo!()
+    }
+}
+
+#[must_use]
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls these"
+)]
+pub(crate) struct StagedKid(String);
+
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls these"
+)]
+pub(crate) struct StagedCandidate {
+    kid: String,
+    jwks: Url,
+}
+
+// Runs over an owned snapshot so no lock on SignerKeys is held across the JWKS fetch.
+#[expect(
+    clippy::todo,
+    dead_code,
+    reason = "skeleton: daemon/signer-reload fills and calls this"
+)]
+pub(crate) async fn confirm_kid(
+    _staged: StagedCandidate,
+    _client: &reqwest::Client,
+) -> Result<StagedKid, IssueError> {
+    todo!()
+}

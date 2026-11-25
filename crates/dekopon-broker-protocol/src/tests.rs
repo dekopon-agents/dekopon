@@ -3526,6 +3526,7 @@ async fn a_run_with_more_asset_descriptors_than_the_limit_is_refused_before_send
         .run(
             None,
             RunRequest {
+                grant: None,
                 invocation: "run-test".parse().expect("valid invocation fixture"),
                 trace_parent: sample_trace_parent(),
                 word: "probe".to_owned(),
@@ -3588,6 +3589,7 @@ fn a_run_with_more_asset_rows_than_the_limit_is_refused() {
         sent: false,
     };
     let run = BrokerRequest::Run {
+        grant: None,
         attestation: None,
         trace_parent: sample_trace_parent(),
         invocation: "run-test".parse().expect("valid invocation fixture"),

@@ -2073,9 +2073,15 @@ fn render_errors(problems: &[BrokerdError]) -> String {
 }
 
 #[cfg(test)]
+mod grant_tests;
+#[cfg(test)]
 mod reload_tests;
 #[cfg(test)]
+mod self_reload_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod token_issuer_tests;
 
 fn render_problems(problems: &[capabilities::CapabilityProblem]) -> String {
     problems

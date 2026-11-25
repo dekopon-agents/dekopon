@@ -129,6 +129,8 @@ pub(crate) async fn http_probe_broker(authority: &str) -> Broker {
         ConstraintCatalog::new([(
             "http-probe.fetch".parse().expect("capability"),
             ConstraintSet {
+                egress_profile: None,
+                takes_grant: false,
                 default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider: "http-probe".parse().expect("provider"),

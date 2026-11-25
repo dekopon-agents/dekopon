@@ -84,6 +84,8 @@ when { context.via == "gateway" && context.agent == "reviewer" };
         ConstraintCatalog::new([(
             capability,
             ConstraintSet {
+                egress_profile: None,
+                takes_grant: false,
                 default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider,
