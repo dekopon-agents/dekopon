@@ -27,6 +27,7 @@ pub(crate) fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSe
     (
         capability(capability_id),
         ConstraintSet {
+            egress_profile: None,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: provider(),

@@ -704,6 +704,7 @@ async fn two_invocations_of_one_record_share_one_refresh() {
     let constraints = ConstraintCatalog::new([(
         "http-probe.fetch".parse().unwrap(),
         ConstraintSet {
+            egress_profile: None,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "http-probe".parse().unwrap(),

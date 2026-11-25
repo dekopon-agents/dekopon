@@ -47,6 +47,8 @@ use vm_exec_stdin::VmExecStdin;
 
 const DEFAULT_HTTPS_PORT: u16 = 443;
 const CHATGPT_ACCOUNT_HEADER: &str = "chatgpt-account-id";
+const EGRESS_PUSH_HEADER: &str = "x-dekopon-egress-push";
+const EGRESS_RETURN_HEADER: &str = "x-dekopon-egress-return";
 const MAX_ERROR_MESSAGE_BYTES: usize = 256;
 const MAX_RESOLVED_ADDRESSES: usize = 16;
 const REQUEST_ENCODING_OVERHEAD_BYTES: u64 = 128;
@@ -439,7 +441,14 @@ pub struct BoundCredential {
     destinations: Vec<String>,
     secret_binding: Option<SecretBindingIdentity>,
     vm_exec_stdin: Option<VmExecStdin>,
+    egress_push: Option<EgressPushHeaders>,
     echo_values: Vec<SecretBytes>,
+}
+
+#[derive(Clone)]
+pub struct EgressPushHeaders {
+    pub every: Redacted<String>,
+    pub exec: Redacted<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -461,6 +470,7 @@ impl fmt::Debug for BoundCredential {
             )
             .field("destinations", &self.destinations)
             .field("secret_binding", &self.secret_binding.is_some())
+            .field("egress_push", &self.egress_push.is_some())
             .field("echo_values", &self.echo_values)
             .finish()
     }
@@ -509,6 +519,7 @@ impl BoundCredential {
             destinations,
             secret_binding: None,
             vm_exec_stdin: None,
+            egress_push: None,
             echo_values: vec![echo_value],
         })
     }
@@ -594,6 +605,7 @@ impl BoundCredential {
             companion_header: None,
             destinations: grant.allowed_hosts.clone(),
             vm_exec_stdin: None,
+            egress_push: None,
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
             }),
@@ -638,6 +650,7 @@ impl BoundCredential {
             companion_header: None,
             destinations: grant.allowed_hosts.clone(),
             vm_exec_stdin: None,
+            egress_push: None,
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
             }),
@@ -684,6 +697,33 @@ impl BoundCredential {
             });
         }
         self.vm_exec_stdin = Some(VmExecStdin::new(grant.clone(), token, jti, exp));
+        Ok(self)
+    }
+
+    pub fn with_egress_push(
+        mut self,
+        headers: EgressPushHeaders,
+        pushed_secrets: Vec<SecretBytes>,
+    ) -> Result<Self, ConfigurationError> {
+        if self.secret_binding.is_none() {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "an egress push rides only a secret-bound credential",
+            });
+        }
+        for value in [&headers.every, &headers.exec] {
+            let value = value.expose();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+                return Err(ConfigurationError::InvalidCredential {
+                    reason: "an egress push must be a printable ASCII token",
+                });
+            }
+        }
+        self.echo_values.extend(pushed_secrets);
+        self.echo_values.extend(
+            [&headers.every, &headers.exec]
+                .map(|value| SecretBytes::new(value.expose().as_bytes().to_vec())),
+        );
+        self.egress_push = Some(headers);
         Ok(self)
     }
 
@@ -751,6 +791,34 @@ impl BoundCredential {
         Ok(value)
     }
 
+    fn pushes_egress(&self) -> bool {
+        self.egress_push.is_some()
+    }
+
+    fn render_egress_push(
+        &self,
+        request: &PreparedRequest,
+    ) -> Option<Result<HeaderValue, HttpError>> {
+        let push = self.egress_push.as_ref()?;
+        let value = if is_vm_exec(request) {
+            &push.exec
+        } else {
+            &push.every
+        };
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "`InvalidHeaderValue` reports only that parsing failed, and the constructor \
+                      already restricted these bytes to ASCII graphic; nothing derived from a \
+                      pushed secret may be reported anyway"
+        )]
+        let rendered = HeaderValue::from_str(value.expose())
+            .map_err(|_| http_error(ErrorCode::Internal, "egress push could not be rendered"));
+        Some(rendered.map(|mut rendered| {
+            rendered.set_sensitive(true);
+            rendered
+        }))
+    }
+
     fn render_companion(&self) -> Option<Result<(HeaderName, HeaderValue), HttpError>> {
         let (name, value) = self.companion_header.as_ref()?;
         #[allow(
@@ -783,6 +851,12 @@ fn is_destination_scope(value: &str) -> bool {
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
         && !value.contains(['/', '?', '#', '@', '*'])
+}
+
+#[derive(Clone, Debug)]
+pub struct EgressReturnCapture {
+    pub call: usize,
+    pub value: SecretBytes,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -863,6 +937,7 @@ pub struct BufferedHttpClient {
     policy_violation: Option<PolicyViolation>,
     asset_over_budget: bool,
     evidence: Vec<HttpCallEvidence>,
+    egress_returns: Vec<EgressReturnCapture>,
     resolved: HashMap<String, Vec<SocketAddr>>,
     pinned_client: Option<PinnedClient>,
     #[cfg(feature = "native-test")]
@@ -970,6 +1045,7 @@ impl BufferedHttpClient {
             policy_violation: None,
             asset_over_budget: false,
             evidence: Vec::new(),
+            egress_returns: Vec::new(),
             resolved: HashMap::new(),
             pinned_client: None,
             #[cfg(feature = "native-test")]
@@ -1006,6 +1082,10 @@ impl BufferedHttpClient {
 
     pub fn policy_violation(&self) -> Option<PolicyViolation> {
         self.policy_violation
+    }
+
+    pub fn take_egress_returns(&mut self) -> Vec<EgressReturnCapture> {
+        std::mem::take(&mut self.egress_returns)
     }
 
     pub fn into_evidence(self) -> Vec<HttpCallEvidence> {
@@ -1210,6 +1290,15 @@ impl BufferedHttpClient {
             {
                 let (name, value) = companion?;
                 prepared.headers.insert(name, value);
+            }
+            if let Some(push) = self
+                .credential
+                .as_ref()
+                .and_then(|credential| credential.render_egress_push(&prepared))
+            {
+                prepared
+                    .headers
+                    .insert(HeaderName::from_static(EGRESS_PUSH_HEADER), push?);
             }
             self.evidence[evidence_index].credential_injected = true;
             if self.secret_grant.is_some() {
@@ -1964,6 +2053,8 @@ fn is_forbidden_request_header(name: &HeaderName) -> bool {
         name.as_str(),
         "authorization"
             | CHATGPT_ACCOUNT_HEADER
+            | EGRESS_PUSH_HEADER
+            | EGRESS_RETURN_HEADER
             | "connection"
             | "content-length"
             | "cookie"
@@ -1985,6 +2076,8 @@ fn is_forbidden_response_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
         "connection"
+            | EGRESS_PUSH_HEADER
+            | EGRESS_RETURN_HEADER
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
@@ -1995,6 +2088,15 @@ fn is_forbidden_response_header(name: &HeaderName) -> bool {
             | "upgrade"
             | "www-authenticate"
     )
+}
+
+fn is_vm_exec(request: &PreparedRequest) -> bool {
+    let mut segments = request.url.path().rsplit('/');
+    request.method == reqwest::Method::POST
+        && segments.next() == Some("exec")
+        && segments.next().is_some_and(|session| !session.is_empty())
+        && segments.next() == Some("sessions")
+        && segments.next() == Some("v1")
 }
 
 fn encoded_request_bytes(
@@ -2205,11 +2307,11 @@ mod tests {
     use dekopon_core::{Redacted, SecretBytes, SecretSinkKind};
 
     use super::{
-        BoundCredential, BufferedHttpClient, ConfigurationError, ErrorCode, Header,
-        HttpCallEvidence, HttpHostCeilings, MAX_RESOLVED_ADDRESSES, MIN_CREDENTIAL_BYTES,
-        PlaintextHostError, PlaintextHosts, PolicyViolation, Request, authority_matches,
-        bounded_addresses, bounded_message, is_forbidden_public_destination, map_reqwest_error,
-        plaintext_permitted,
+        BoundCredential, BufferedHttpClient, ConfigurationError, EGRESS_PUSH_HEADER,
+        EGRESS_RETURN_HEADER, EgressPushHeaders, ErrorCode, Header, HttpCallEvidence,
+        HttpHostCeilings, MAX_RESOLVED_ADDRESSES, MIN_CREDENTIAL_BYTES, PlaintextHostError,
+        PlaintextHosts, PolicyViolation, Request, authority_matches, bounded_addresses,
+        bounded_message, is_forbidden_public_destination, map_reqwest_error, plaintext_permitted,
     };
 
     fn grant(authority: String, method: &str) -> HttpConstraints {
@@ -3028,6 +3130,165 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InvalidUri);
         assert!(error.message.contains("invalid port number"), "{error}");
         assert!(!error.message.contains("api.example.test"), "{error}");
+    }
+
+    fn generated(label: &str) -> String {
+        use std::hash::{BuildHasher as _, RandomState};
+        let state = RandomState::new();
+        format!(
+            "{label}-{:016x}{:016x}",
+            state.hash_one(1_u8),
+            state.hash_one(2_u8)
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_egress_push_rides_each_vm_call_and_its_return_never_reaches_the_guest() {
+        let returned = "v1.eyJhcHBsaWVkIjp0cnVlfQ";
+        let server = LoopbackServer::serving(
+            format!(
+                "HTTP/1.1 200 OK\r\n{EGRESS_RETURN_HEADER}: {returned}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .as_bytes(),
+            2,
+        );
+        let authority = server.authority().to_owned();
+        let secret = SecretUseGrant {
+            allowed_methods: vec!["POST".to_owned()],
+            allowed_paths: vec![HttpPathRule::SegmentPrefix {
+                path: "/v1/sessions".to_owned(),
+            }],
+            max_injections: 2,
+            ..secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/v1/sessions")
+        };
+        let every = generated("v1.every");
+        let exec = generated("v1.exec");
+        let credential = BoundCredential::secret_bearer(
+            SecretBytes::new(generated("runner").into_bytes()),
+            &secret,
+        )
+        .expect("valid runner credential")
+        .with_egress_push(
+            EgressPushHeaders {
+                every: Redacted::new(every.clone()),
+                exec: Redacted::new(exec.clone()),
+            },
+            vec![SecretBytes::new(generated("pushed").into_bytes())],
+        )
+        .expect("valid push");
+        let mut client = BufferedHttpClient::authorized_with_secret_credential(
+            HttpConstraints {
+                max_requests: 3,
+                ..grant(authority.clone(), "POST")
+            },
+            secret,
+            credential,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid secret authorization");
+
+        let forged = client
+            .send(Request {
+                method: "POST".to_owned(),
+                uri: format!("http://{authority}/v1/sessions"),
+                headers: vec![Header {
+                    name: EGRESS_PUSH_HEADER.to_owned(),
+                    value: b"v1.guest".to_vec(),
+                }],
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("the guest cannot set the push header");
+        assert_eq!(forged.code, ErrorCode::InvalidHeader);
+
+        for (path, push) in [("/v1/sessions", &every), ("/v1/sessions/s-1/exec", &exec)] {
+            let response = client
+                .send(Request {
+                    method: "POST".to_owned(),
+                    uri: format!("http://{authority}{path}"),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+                .await
+                .expect("bounded request succeeds");
+            assert!(
+                response
+                    .headers
+                    .iter()
+                    .all(|header| header.name != EGRESS_RETURN_HEADER)
+            );
+            let request = String::from_utf8(server.request()).expect("request is UTF-8");
+            let pushes = request
+                .lines()
+                .filter(|line| line.starts_with(EGRESS_PUSH_HEADER))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                pushes,
+                [format!("{EGRESS_PUSH_HEADER}: {push}")],
+                "{request}"
+            );
+        }
+        let captured = client.take_egress_returns();
+        assert_eq!(
+            captured
+                .iter()
+                .map(|capture| (capture.call, capture.value.expose()))
+                .collect::<Vec<_>>(),
+            [(0, returned.as_bytes()), (1, returned.as_bytes())]
+        );
+        server.join();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_reflecting_the_egress_push_is_refused() {
+        let push = &generated("v1.reflected");
+        let server = LoopbackServer::once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{push}",
+                push.len()
+            )
+            .as_bytes(),
+        );
+        let authority = server.authority().to_owned();
+        let secret = SecretUseGrant {
+            allowed_methods: vec!["POST".to_owned()],
+            ..secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/v1/sessions")
+        };
+        let credential = BoundCredential::secret_bearer(
+            SecretBytes::new(generated("runner").into_bytes()),
+            &secret,
+        )
+        .expect("valid runner credential")
+        .with_egress_push(
+            EgressPushHeaders {
+                every: Redacted::new(push.clone()),
+                exec: Redacted::new(push.clone()),
+            },
+            Vec::new(),
+        )
+        .expect("valid push");
+        let mut client = BufferedHttpClient::authorized_with_secret_credential(
+            grant(authority.clone(), "POST"),
+            secret,
+            credential,
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid secret authorization");
+
+        let error = client
+            .send(Request {
+                method: "POST".to_owned(),
+                uri: format!("http://{authority}/v1/sessions"),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("a reflected push is refused");
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert!(!error.message.contains(push));
+        server.join();
     }
 
     fn secret_grant(

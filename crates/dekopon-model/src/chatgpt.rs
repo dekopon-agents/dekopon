@@ -120,6 +120,19 @@ impl CredentialFile {
         ))
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn from_document_at_local_endpoints(
+        auth_path: &Path,
+        bytes: &[u8],
+        base: &str,
+    ) -> Result<Self, ChatGptError> {
+        Ok(Self::with_credentials(
+            auth_path,
+            ChatGptEndpoints::local(base),
+            parse_credentials(auth_path, bytes)?,
+        ))
+    }
+
     pub(crate) fn with_endpoints(
         auth_path: &Path,
         endpoints: ChatGptEndpoints,
@@ -218,10 +231,13 @@ impl CredentialFile {
         if rejected.is_none() && !needs_refresh(&credentials)? {
             return Ok(resolved(credentials, None));
         }
-        let permit = Arc::clone(&self.admission)
-            .acquire_owned()
-            .await
-            .map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))?;
+        let permit =
+            tokio::time::timeout(client.timeout, Arc::clone(&self.admission).acquire_owned())
+                .await
+                .map_err(|source| {
+                    ChatGptError::RefreshTask(io::Error::new(io::ErrorKind::TimedOut, source))
+                })?
+                .map_err(|source| ChatGptError::RefreshTask(io::Error::other(source)))?;
         let permit = Arc::new(permit);
         let lock = tokio::time::timeout(client.timeout, self.acquire_lock(&permit))
             .await
@@ -521,7 +537,7 @@ impl ChatGptEndpoints {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn local(base: &str) -> Self {
         let base = base.trim_end_matches('/');
         Self {
@@ -529,6 +545,7 @@ impl ChatGptEndpoints {
             device_token: format!("{base}/device-token"),
             token: format!("{base}/token"),
             verification_url: format!("{base}/verify"),
+            #[cfg(test)]
             responses: format!("{base}/responses"),
         }
     }
