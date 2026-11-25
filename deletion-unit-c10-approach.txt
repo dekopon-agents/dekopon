@@ -1,0 +1,96 @@
+12-size/deletion-unit/c10 approach — coordinator note gate
+
+Steering first line: # Steering for GPT executors
+Baseline: 6f39e608d80eab4a932e5a77b5be9d043b336132 (main, includes 8808b651).
+This note is filed before C10 builds or source edits. Await coordinator-launched
+Astra note ACCEPT. This temporary approach artifact will leave the final source
+diff after acceptance; the note commit remains reviewable in branch history.
+The private campaign-trail checkout and tools/cloud-env/HELPER-RULES.md are not
+available here. The supplied brief governs. No journal or native-usage source
+was supplied; timestamps are UTC and usage references remain unavailable.
+
+Recorded choices
+
+Skeleton exemption follows the brief; no new runtime structure. No production
+changes in C10, no public item removal from a published crate, no dependency or
+API additions to make unrelated fakes share. Restore APIs, repair arms,
+OutcomeAudit, unaudited_outcome, T04 and T05 stay untouched.
+
+Inventory at this baseline (line positions below are discovery anchors)
+
+F01 model-proxy/src/tests.rs:255 MeterRecords — KEEP. Its caller at :1131
+compares the actual parent span ID to CallSpans::only_with_id; CaptureLayer
+records a parent name, not that identity. Merging requires a new capture API.
+F02 model-token-governor/src/tests.rs:425 MeterRecords — KEEP. Its Visit::record_i64
+prefix and assertions at :531-537 distinguish signed numeric fields from text.
+CaptureLayer flattens values; merging loses this witness or needs a typed API.
+F03 agent/src/prompt.rs:2199 ScriptedModel; gatewayd/src/tests.rs:3929
+ScriptedModel; test-support/src/model.rs:20 ScriptedStreamModel — KEEP with
+separate observations: request tools/messages/options and changing model keys;
+factory builds, image reads, cache keys and request counts; per-delta release,
+notifications and cancellation. No existing shared fake exposes all of these.
+Sharing requires a new support API and migration; the agent-runtime support
+feature also makes careless agent dependencies cyclic. No one-fake claim here.
+F04 shell/src/lib.rs:533 RecordingInvoker; tui/src/record.rs:124
+RecordingInvoker — KEEP. The first is a private fake; the latter is a published
+production forwarding adapter that emits SessionEvents. It is not a fake and
+is a forbidden production/public surface for this unit.
+F05 agent/src/prompt.rs:2313 RecordingRuntime; tui/src/record.rs:241
+RecordingRuntime — KEEP. Private scripted runtime versus published production
+forwarding adapter, with the same prohibition as F04.
+F06 test-support/src/driver.rs:188 RecordingProgress; tui/src/record.rs:298
+RecordingProgress — KEEP. Transport-driver fixture with failure injection versus
+published production ProgressSink adapter. Different seams and runtime duties.
+
+Conversion cut line: existing telemetry assertions reached through saw,
+events_text, and their local aliases in these files, plus direct adjacent
+formatted event/span assertions. Preserve the behavioral tests, their failure
+witnesses, secret-leak coverage and event cardinalities. Use existing
+CaptureLayer::events_where / Record::field / records APIs. Select exact target
+and event before asserting a field; missing events must fail positive checks.
+No deletion credit for conversions. Re-measure each implemented row from its
+own commit with git diff --numstat, recording command, exit, added/deleted and
+side. Production, test and test-support are never summed.
+
+T02 agent/src/prompt.rs:4133 — select dekopon_agent::audit accounting.model.turn,
+assert exactly one record and agent Some("reviewer"), then None.
+C10-01 brokerd/tests/failure_logging.rs:54,205-269 — structured polling and exact
+failure fields, preserving audit-full assertions and payload non-disclosure.
+C10-02 storage-host/tests/storage.rs:741,855,895,1317,1330,1619,1652 — structured
+capacity, refusal, ignored-entry and reset records; assert no repeated reset.
+C10-03 gatewayd/src/tests/steering_e2e.rs:50,143,288,335-336 — structured
+steered/queued disposition records and absent memory-record failure.
+C10-04 gatewayd/src/tests/jobs_e2e.rs:616,813,860,866,883 — structured notice
+presence, drop outcome, polling and exact record counts.
+C10-05 gatewayd/src/tests.rs:22410 and src/asset.rs:3044,3994 — reclaim failure,
+legacy-target exclusion and adjacent field assertions on selected records.
+C10-06 gatewayd/src/transport/discord.rs:3007,3029 — structured audit event,
+level, drop reason, role mention and subject assertions.
+C10-07 brokerd/src/secrets.rs:3269 and secrets/token_request_tests.rs:161 —
+structured hygiene/errno and rejection fields; preserve absence of secret bytes.
+C10-08 test-support/src/capture.rs:234 — remove unused saw only after its final
+caller is converted; this crate has publish=false. Test-support side only.
+
+Events-text uses that only provide assertion diagnostics need no conversion.
+Secret/sentinel absence checks in brokerd secrets/oauth2_tests.rs:869,993,
+secrets/token_request_tests.rs:219, broker/tests/audit_log_events.rs:330,
+gatewayd/src/tests/memory.rs:1791, gatewayd/src/asset.rs:3369 and
+broker-host/tests/asset_regressions.rs:226,234 scan payload contents rather than
+identify an event. Preserve that coverage, inspecting structured field values
+where changing them; do not claim these tests are deleted. Broader text/span
+telemetry leads in model and broker-host spans/memory/random tests are follow-up
+inventory beyond this cut line; no assertion that C10 exhausts all telemetry.
+
+Validation and delivery
+
+For each touched crate, before/after cargo check -p CRATE --tests --locked and
+cargo test -p CRATE --locked; agent targeted accounting test; fmt; workspace
+clippy and tests with --locked; cargo deny check; repository rustdoc and CI
+all-features checks as applicable. Name any blocked gate, never mark it passed.
+Fetch ignored external provider fixtures when needed. No live smoke or Pi.
+A ready PR requires observed passing gates, then coordinator-launched Astra
+review and a separate dekopon-review Opus child after ACCEPT; no self-review.
+
+Open-PR crate overlaps found through gh api pulls and file lists: #1015, #1014,
+#1013, #1012, #1006, #983, #982, #930 and #906 for planned C10 crates; #955 and
+#954 additionally overlap rows' broker-host crate. No production branch changes.
