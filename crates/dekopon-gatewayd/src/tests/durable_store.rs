@@ -1485,6 +1485,8 @@ async fn restored_ownership_follows_the_recall_policy_of_its_conversations_route
                 .unwrap();
         }
         let mut input = document(directory.path());
+        input["transports"][0] = json!({"name": "dev", "kind": "slackSocketMode", "appTokenEnv": "APP", "botTokenEnv": "BOT"});
+        input["routes"][0]["conversation"] = json!({"kind": ["thread"]});
         input["routes"][0]["memory"] = memory;
         input["sessions"] = json!({
             "durable": {"path": path},
@@ -1498,18 +1500,261 @@ async fn restored_ownership_follows_the_recall_policy_of_its_conversations_route
     }
 }
 
-#[test]
-fn a_conversation_key_names_its_transport_and_conversation() {
-    let conversation = dekopon_broker_protocol::Conversation {
-        kind: ConversationKind::Thread,
+fn slack_thread(kind: ConversationKind) -> dekopon_broker_protocol::Conversation {
+    dekopon_broker_protocol::Conversation {
+        kind,
         container: Some("t0123abc".to_owned()),
-        id: "c0:12".to_owned(),
+        id: "c0123abc".to_owned(),
         thread: Some("1700000000.000001".to_owned()),
-    };
-    let key = ConversationKey::of(&"workspace".parse().unwrap(), &conversation);
+    }
+}
+
+#[test]
+fn a_channel_opening_and_its_thread_replies_share_one_conversation_key() {
+    let transport = "workspace".parse().unwrap();
     assert_eq!(
-        key.transport().map(|transport| transport.to_string()),
-        Some("workspace".to_owned())
+        ConversationKey::of(&transport, &slack_thread(ConversationKind::Channel)),
+        ConversationKey::of(&transport, &slack_thread(ConversationKind::Thread)),
     );
-    assert_eq!(key.conversation(), Some(conversation));
+}
+
+#[test]
+fn a_claim_on_the_opening_revoked_from_a_reply_is_not_owned_after_a_restart() {
+    let directory = temporary();
+    let path = directory.path().join("state.sqlite");
+    let transport = "workspace".parse().unwrap();
+    let opening = ConversationKey::of(&transport, &slack_thread(ConversationKind::Channel));
+    let reply = ConversationKey::of(&transport, &slack_thread(ConversationKind::Thread));
+    {
+        let acquired = acquire(&path);
+        acquired
+            .store
+            .commit(vec![(opening, Change::Claim(claim("1700000000.000001")))])
+            .unwrap();
+        assert_eq!(acquired.store.records_for_test().len(), 1);
+        acquired
+            .store
+            .commit(vec![(reply, Change::Revoke(claim("1700000000.000001")))])
+            .unwrap();
+    }
+    let acquired = acquire(&path);
+    assert!(
+        acquired
+            .store
+            .restore(SystemTime::now())
+            .unwrap()
+            .ownership
+            .is_empty()
+    );
+    assert!(acquired.store.records_for_test().is_empty());
+}
+
+#[test]
+fn a_second_ticketed_job_notice_queues_and_replays_until_its_own_turn_settles() {
+    let directory = temporary();
+    let path = directory.path().join("state.sqlite");
+    let now = SystemTime::now();
+    let route = jobs_e2e::job_route(Duration::from_secs(10), Duration::from_secs(10));
+    let person = wakes::slack_message("person");
+    let anchor = Anchor::for_job(&person, &journal_route()).unwrap();
+    {
+        let acquired = acquire(&path);
+        acquired
+            .store
+            .commit(vec![
+                (
+                    anchor.key(),
+                    Change::JobStarted(job(&anchor, 21, crate::store::millis(now))),
+                ),
+                (
+                    anchor.key(),
+                    Change::JobStarted(job(&anchor, 22, crate::store::millis(now))),
+                ),
+            ])
+            .unwrap();
+    }
+    {
+        let acquired = acquire(&path);
+        let (_store, replay) = restored(&acquired, now);
+        let gate = crate::session::SessionGate::new(1);
+        let crate::session::Admit::Admitted(admission, _, _) = gate.admit(
+            &route,
+            person.clone(),
+            crate::collection::Dispositions::new(Vec::new()),
+        ) else {
+            panic!("the running turn is admitted");
+        };
+        let mut notices = replay.jobs;
+        notices.sort_by_key(|notice| notice.row.id.get());
+        for notice in notices {
+            let message = Anchor::restored(notice.row.anchor.clone())
+                .unwrap()
+                .job_inbound(notice.row.id, "interrupted".to_owned(), None);
+            assert!(matches!(
+                gate.admit(
+                    &route,
+                    message,
+                    crate::collection::Dispositions::new(Vec::new())
+                        .with_delivery(Some(notice.ticket)),
+                ),
+                crate::session::Admit::Queued
+            ));
+        }
+        let (admission, mut first) = admission
+            .next_or_release()
+            .expect("the first notice follows");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(first.receipts.settle(DeliveryDisposition::Handled));
+        drop((admission, gate));
+    }
+    let acquired = acquire(&path);
+    let (_store, replay) = restored(&acquired, now);
+    let replayed: Vec<u64> = replay
+        .jobs
+        .iter()
+        .map(|notice| notice.row.id.get())
+        .collect();
+    assert_eq!(replayed, [22]);
+}
+
+#[test]
+fn a_live_job_notice_without_a_ticket_still_steers_the_running_turn() {
+    let gate = crate::session::SessionGate::new(1);
+    let route = jobs_e2e::job_route(Duration::from_secs(10), Duration::from_secs(10));
+    let person = message("person");
+    let crate::session::Admit::Admitted(_admission, _, _) = gate.admit(
+        &route,
+        person.clone(),
+        crate::collection::Dispositions::new(Vec::new()),
+    ) else {
+        panic!("the running turn is admitted");
+    };
+    let notice = Anchor::for_job(&person, &journal_route())
+        .unwrap()
+        .job_inbound(JobId::new(5), "finished".to_owned(), None);
+    assert!(matches!(
+        gate.admit(
+            &route,
+            notice,
+            crate::collection::Dispositions::new(Vec::new())
+        ),
+        crate::session::Admit::Steered(_)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_job_whose_anchor_cannot_be_restored_settles_as_orphaned() {
+    let directory = temporary();
+    let path = directory.path().join("state.sqlite");
+    let now = SystemTime::now();
+    let mut local = job(&anchor(), 31, crate::store::millis(now));
+    local.anchor.reply = ReplyTarget::Local { connection: 0 };
+    let key = anchor().key();
+    {
+        let acquired = acquire(&path);
+        acquired
+            .store
+            .commit(vec![(key.clone(), Change::JobStarted(local))])
+            .unwrap();
+    }
+    let acquired = acquire(&path);
+    let (store, replay) = restored(&acquired, now);
+    assert_eq!(replay.jobs.len(), 1);
+    let mut runner = Arc::into_inner(runner(
+        ResolvedBroker {
+            socket_path: directory.path().join("absent.sock"),
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        },
+        ModelScript::forbidden(),
+        4,
+    ))
+    .unwrap();
+    runner.wakes = Some(Arc::clone(&store));
+    let (_sender, receiver) = mpsc::channel(4);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(
+        crate::gateway::Gateway::new(
+            Arc::new(runner),
+            Arc::new(crate::routes::RoutingTable::default()),
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+        )
+        .with_durable(Some(Arc::clone(&acquired.store)), None, Some(replay))
+        .serve(
+            receiver,
+            async move {
+                drop(shutdown_rx.await);
+            },
+            Duration::from_secs(1),
+            crate::collection::Collector::new(&[], 4),
+        ),
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while acquired.store.snapshot_for_test(&key).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the unrestorable notice settles as orphaned");
+    shutdown_tx.send(()).unwrap();
+    serving.await.unwrap();
+    assert!(store.next_at().is_none());
+}
+
+#[tokio::test]
+async fn restored_follows_keep_only_rows_a_journal_recall_follow_route_keyed() {
+    for (follow, kept) in [(false, 0), (true, 1)] {
+        let directory = temporary();
+        let path = directory.path().join("state").join("state.sqlite");
+        let mut input = document(directory.path());
+        input["transports"][0] = json!({"name": "discord", "kind": "discordGateway", "botTokenEnv": "DEKOPON_GATEWAYD_DISCORD_BOT_TOKEN", "messageContent": true});
+        input["routes"][0]["transport"] = json!("discord");
+        input["routes"][0]["conversation"] = json!({"kind": ["channel"]});
+        input["routes"][0]["memory"] =
+            json!({"mode": "persistent", "recall": "journal", "summaries": "off"});
+        input["routes"][0]["follow"] = json!(true);
+        input["sessions"] = json!({
+            "durable": {"path": path},
+            "journal": {"path": directory.path().join("journal")},
+            "assets": {"path": directory.path().join("assets")},
+        });
+        let config = resolved(directory.path(), &input).await;
+        let bound = RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap();
+        let route = &bound.routes()[0];
+        let conversation = dekopon_broker_protocol::Conversation {
+            kind: ConversationKind::Channel,
+            container: None,
+            id: "c0123abc".to_owned(),
+            thread: None,
+        };
+        let row_key = crate::follow::follow_key(
+            &route.transport,
+            route.agent.as_str(),
+            &route.conversation,
+            &conversation.key(),
+        );
+        let key = ConversationKey::of(&"discord".parse().unwrap(), &conversation);
+        {
+            let acquired = acquire(&path);
+            acquired
+                .store
+                .commit(vec![(
+                    key,
+                    Change::Follow(follow_row(&row_key, SystemTime::now())),
+                )])
+                .unwrap();
+        }
+        if !follow {
+            input["routes"][0]["follow"] = json!(false);
+        }
+        let config = resolved(directory.path(), &input).await;
+        let routes = RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap();
+        let (_durable, _fatal, restored) = crate::acquire_store(&config, &routes).await.unwrap();
+        assert_eq!(restored.follows.len(), kept);
+    }
 }

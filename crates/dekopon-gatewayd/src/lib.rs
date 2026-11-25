@@ -576,30 +576,6 @@ async fn acquire_store(
                     && store::Durability::of(route.memory) == store::Durability::Durable
             })
     };
-    let durable_conversation =
-        |key: &store::ConversationKey, subject: Option<&dekopon_core::Subject>| {
-            let (Some(transport), Some(conversation)) = (key.transport(), key.conversation())
-            else {
-                return Vec::new();
-            };
-            routes
-                .routes()
-                .iter()
-                .filter(|route| {
-                    route.transport == transport.as_str()
-                        && route.conversation.matches(&conversation)
-                        && subject.is_none_or(|subject| {
-                            route
-                                .subjects
-                                .as_ref()
-                                .is_none_or(|subjects| subjects.contains(subject))
-                        })
-                })
-                .take(if subject.is_some() { 1 } else { usize::MAX })
-                .filter(|route| store::Durability::of(route.memory) == store::Durability::Durable)
-                .map(|route| (route, conversation.key()))
-                .collect::<Vec<_>>()
-        };
     let mut skipped = 0usize;
     for (_, row) in rows.wakes {
         restored.reserved = restored.reserved.max(Some(row.id));
@@ -617,33 +593,43 @@ async fn acquire_store(
         }
     }
     for (key, row) in rows.follows {
+        let durable = key.as_ref().is_some_and(|key| {
+            let (Some(transport), Some(conversation)) = (key.transport(), key.conversation_id())
+            else {
+                return false;
+            };
+            routes.routes().iter().any(|route| {
+                route.follow
+                    && route.transport == transport.as_str()
+                    && store::Durability::of(route.memory) == store::Durability::Durable
+                    && follow::follow_key(
+                        &route.transport,
+                        route.agent.as_str(),
+                        &route.conversation,
+                        &conversation,
+                    ) == row.key
+            })
+        });
         match key {
-            Some(key)
-                if durable_conversation(&key, None)
-                    .iter()
-                    .any(|(route, conversation)| {
-                        route.follow
-                            && follow::follow_key(
-                                &route.transport,
-                                route.agent.as_str(),
-                                &route.conversation,
-                                conversation,
-                            ) == row.key
-                    }) =>
-            {
-                restored
-                    .follows
-                    .push((follow::FollowHome::Conversation(key), row));
-            }
+            Some(key) if durable => restored
+                .follows
+                .push((follow::FollowHome::Conversation(key), row)),
             Some(_) => skipped += 1,
             None => restored.follows.push((follow::FollowHome::Retained, row)),
         }
     }
     for (key, claim) in rows.ownership {
-        if claim
-            .subject()
-            .is_some_and(|subject| !durable_conversation(&key, Some(&subject)).is_empty())
-        {
+        let durable = key
+            .transport()
+            .zip(claim.subject())
+            .is_some_and(|(transport, subject)| {
+                routes
+                    .find(transport.as_str(), &claim.conversation(), &subject)
+                    .is_some_and(|(_, route)| {
+                        store::Durability::of(route.memory) == store::Durability::Durable
+                    })
+            });
+        if durable {
             restored.ownership.push((key, claim));
         } else {
             skipped += 1;

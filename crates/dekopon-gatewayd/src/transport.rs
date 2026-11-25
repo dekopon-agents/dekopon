@@ -245,6 +245,22 @@ impl ThreadClaim {
         }
     }
 
+    pub(crate) fn conversation(&self) -> dekopon_broker_protocol::Conversation {
+        match self {
+            Self::Slack {
+                team_id,
+                channel_id,
+                thread_ts,
+                ..
+            } => dekopon_broker_protocol::Conversation {
+                kind: dekopon_broker_protocol::ConversationKind::Thread,
+                container: Some(team_id.to_ascii_lowercase()),
+                id: channel_id.to_ascii_lowercase(),
+                thread: Some(thread_ts.clone()),
+            },
+        }
+    }
+
     pub(crate) fn subject(&self) -> Option<dekopon_core::Subject> {
         match self {
             Self::Slack {

@@ -19,7 +19,6 @@ pub struct ConversationKey(String);
 impl ConversationKey {
     pub(crate) fn of(transport: &TransportId, conversation: &Conversation) -> Self {
         let parts = (
-            conversation.kind.as_str(),
             conversation.container.as_deref(),
             conversation.id.as_str(),
             conversation.thread.as_deref(),
@@ -32,15 +31,13 @@ impl ConversationKey {
         Self(key)
     }
 
-    pub(crate) fn conversation(&self) -> Option<Conversation> {
+    pub(crate) fn conversation_id(&self) -> Option<String> {
         let (_, encoded) = self.0.split_once(':')?;
-        let (kind, container, id, thread): (String, Option<String>, String, Option<String>) =
+        let (_, id, thread): (Option<String>, String, Option<String>) =
             serde_json::from_str(encoded).ok()?;
-        Some(Conversation {
-            kind: serde_json::from_value(serde_json::Value::String(kind)).ok()?,
-            container,
-            id,
-            thread,
+        Some(match thread {
+            Some(thread) => format!("{id}:{thread}"),
+            None => id,
         })
     }
 

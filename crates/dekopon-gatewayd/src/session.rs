@@ -452,7 +452,6 @@ struct Running {
     steers: VecDeque<Queued>,
     follow_ups: VecDeque<FollowUp>,
     turn: VecDeque<TurnId>,
-    deliveries: Vec<crate::wake::DeliveryTicket>,
 }
 
 struct TurnId {
@@ -527,7 +526,6 @@ impl Running {
             authorizing: 0,
             steers: VecDeque::new(),
             follow_ups: VecDeque::new(),
-            deliveries: Vec::new(),
             turn: turn_ids(message),
         }
     }
@@ -722,13 +720,12 @@ impl SessionGate {
             if participant && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
             {
                 running.queue_request(message);
-                running.deliveries.append(&mut receipts.deliveries);
                 return Admit::Steered(receipts);
             }
             if message.subject.name() == &running.subject
                 && match message.message_id {
                     MessageId::Native(_) => participants::native_chat(&message),
-                    MessageId::Job { .. } => true,
+                    MessageId::Job { .. } => receipts.deliveries.is_empty(),
                     MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Follow(_) => false,
                 }
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
@@ -746,7 +743,6 @@ impl SessionGate {
                     running.aborts += 1;
                     running.cancellation.interrupt_model();
                 }
-                running.deliveries.append(&mut receipts.deliveries);
                 return Admit::Steered(receipts);
             }
             let kind = if running.participation == TurnParticipation::Ordinary
@@ -996,15 +992,6 @@ struct ResolvedFollowUp<T> {
 }
 
 impl SessionAdmission {
-    fn take_deliveries(&self) -> Vec<crate::wake::DeliveryTicket> {
-        match self.in_flight.lock().get_mut(&self.key) {
-            Some(Holder::Session(running)) if running.steers.is_empty() => {
-                std::mem::take(&mut running.deliveries)
-            }
-            Some(Holder::Session(_) | Holder::Probe) | None => Vec::new(),
-        }
-    }
-
     pub(crate) fn cancellation(&self) -> SessionCancellation {
         self.cancellation.clone()
     }
@@ -1063,9 +1050,6 @@ impl SessionAdmission {
                     receipts: crate::collection::Dispositions::new(message.constituents.clone()),
                     message,
                 });
-            }
-            if let Some(first) = leftovers.first_mut() {
-                first.receipts.deliveries.append(&mut running.deliveries);
             }
             for leftover in leftovers.into_iter().rev() {
                 running.follow_ups.push_front(leftover);
@@ -2112,7 +2096,6 @@ async fn run_admitted(
     if outcome.is_error() {
         span.record("otel.status_code", "error");
     }
-    receipts.deliveries.extend(admission.take_deliveries());
     receipts
         .settle(crate::wake::DeliveryDisposition::Handled)
         .await;
