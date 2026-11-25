@@ -1,9 +1,9 @@
 12-size/deletion-unit/c10 approach — coordinator note gate
 
 Steering first line: # Steering for GPT executors
-Baseline: 6f39e608d80eab4a932e5a77b5be9d043b336132 (main, includes 8808b651).
-This note is filed before C10 builds or source edits. Await coordinator-launched
-Astra note ACCEPT. This temporary approach artifact will leave the final source
+Baseline: 757d2fb54afc732cc1b9213cd168cf7c2eb9dda9 (current main, includes 8808b651).
+This note was filed before C10 builds or source edits. The coordinator reports
+Astra note ACCEPT with no blocking findings; its F04-F06 correction is applied. This temporary approach artifact will leave the final source
 diff after acceptance; the note commit remains reviewable in branch history.
 The private campaign-trail checkout and tools/cloud-env/HELPER-RULES.md are not
 available here. The supplied brief governs. No journal or native-usage source
@@ -32,15 +32,16 @@ notifications and cancellation. No existing shared fake exposes all of these.
 Sharing requires a new support API and migration; the agent-runtime support
 feature also makes careless agent dependencies cyclic. No one-fake claim here.
 F04 shell/src/lib.rs:533 RecordingInvoker; tui/src/record.rs:124
-RecordingInvoker — KEEP. The first is a private fake; the latter is a published
-production forwarding adapter that emits SessionEvents. It is not a fake and
-is a forbidden production/public surface for this unit.
+RecordingInvoker — KEEP. The first is a private fake; the latter is a public
+production adapter in an unpublished crate that emits SessionEvents. It is not
+a fake and remains outside this tests/test-support-only unit.
 F05 agent/src/prompt.rs:2313 RecordingRuntime; tui/src/record.rs:241
-RecordingRuntime — KEEP. Private scripted runtime versus published production
-forwarding adapter, with the same prohibition as F04.
+RecordingRuntime — KEEP. Private scripted runtime versus a public production
+adapter in an unpublished crate, with the same boundary as F04.
 F06 test-support/src/driver.rs:188 RecordingProgress; tui/src/record.rs:298
 RecordingProgress — KEEP. Transport-driver fixture with failure injection versus
-published production ProgressSink adapter. Different seams and runtime duties.
+a public production adapter in an unpublished crate implementing ProgressSink.
+Different seams and runtime duties.
 
 Conversion cut line: existing telemetry assertions reached through saw,
 events_text, and their local aliases in these files, plus direct adjacent
