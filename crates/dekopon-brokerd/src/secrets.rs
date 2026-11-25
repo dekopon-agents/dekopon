@@ -3266,13 +3266,18 @@ mod tests {
         });
 
         assert!(matches!(refused, super::SourceError::Io), "{refused:?}");
-        let events = capture.events_text();
-        assert!(events.contains("cause_type=\"file-hygiene\""), "{events}");
-        assert!(events.contains("error.check=\"io\""), "{events}");
-        assert!(
-            events.contains(&format!("error.errno={expected}")),
-            "the errno left the log again: {events}"
+        let records = capture.events_where(
+            "dekopon_brokerd::secrets",
+            &[("event", "secret_source_cause_classified")],
         );
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].field("cause_type"), Some("file-hygiene"));
+        assert_eq!(records[0].field("error.check"), Some("io"));
+        assert_eq!(
+            records[0].field("error.errno"),
+            Some(expected.to_string().as_str())
+        );
+        let events = capture.events_text();
         assert!(!events.contains("secret-bytes"), "{events}");
         assert!(!events.contains(&path.display().to_string()), "{events}");
     }
