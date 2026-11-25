@@ -12,23 +12,28 @@ use thiserror::Error;
 pub enum FileTier {
     Private,
     NotWorldWritable,
+    MountScoped,
 }
 
 impl FileTier {
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
     #[must_use]
     pub const fn forbidden_bits(self) -> u32 {
         match self {
             Self::Private => 0o077,
             Self::NotWorldWritable => 0o022,
+            Self::MountScoped => todo!(),
         }
     }
 }
 
 impl fmt::Display for FileTier {
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Private => "private",
             Self::NotWorldWritable => "not-world-writable",
+            Self::MountScoped => todo!("skeleton: daemon/durable-replace"),
         })
     }
 }
@@ -228,6 +233,31 @@ pub fn read_trusted_file(
     let metadata = file.metadata().map_err(io_error)?;
     check_trusted_metadata(path, &metadata, expected_uid, tier)?;
     read_bounded(path, file, metadata.len(), max_bytes)
+}
+
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/durable-replace wires it into read_trusted_file"
+)]
+#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+fn mount_owner(path: &Path, file: &fs::File, expected_uid: u32) -> Result<u32, FileHygieneError> {
+    let _owner = (
+        path,
+        file,
+        expected_uid,
+        rustix::fs::StatVfsMountFlags::RDONLY,
+    );
+    todo!("skeleton: daemon/durable-replace")
+}
+
+#[expect(
+    dead_code,
+    reason = "skeleton: daemon/durable-replace wires it into mount_owner"
+)]
+#[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+const fn permitted_owner(observed: u32, read_only: bool, expected_uid: u32) -> Option<u32> {
+    let _rule = (observed, read_only, expected_uid);
+    todo!()
 }
 
 fn read_bounded(
@@ -533,5 +563,19 @@ mod tests {
             read_bounded(&path, &b"12345678"[..], 4, 8).unwrap(),
             b"12345678"
         );
+    }
+
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    fn a_mount_scoped_read_refuses_a_group_or_world_writable_file() {
+        todo!("skeleton: daemon/durable-replace")
+    }
+
+    #[expect(clippy::todo, reason = "skeleton: daemon/durable-replace")]
+    #[test]
+    #[ignore = "skeleton: daemon/durable-replace"]
+    fn a_root_owned_file_counts_as_owned_only_on_a_read_only_mount() {
+        todo!("skeleton: daemon/durable-replace")
     }
 }

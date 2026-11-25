@@ -34,6 +34,8 @@ mod skill;
 mod space;
 pub mod standin;
 mod subject;
+#[cfg(feature = "tokio-task")]
+mod supervisor;
 mod task;
 mod trace;
 #[cfg(unix)]
@@ -67,6 +69,8 @@ pub use subject::{
     AttestedSubject, Namespace, PrincipalKind, Subject, SubjectError, SubjectField, SubjectKind,
     SubjectScope,
 };
+#[cfg(feature = "tokio-task")]
+pub use supervisor::{ChildExit, OnShutdown, Shutdown, ShutdownGrace, Supervisor, SupervisorError};
 pub use task::{TaskOutcome, install_panic_hook};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
