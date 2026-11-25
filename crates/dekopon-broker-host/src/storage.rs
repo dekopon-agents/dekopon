@@ -135,10 +135,6 @@ impl StorageState {
                 transaction.abort();
                 return Err(StorageHostError::Timeout);
             }
-            if commit && !rejected && Instant::now() >= deadline {
-                transaction.abort();
-                return Err(StorageHostError::Timeout);
-            }
             let result = if !commit || rejected {
                 transaction.abort()
             } else if transaction.access() == dekopon_capability::StorageAccess::ReadOnly {
