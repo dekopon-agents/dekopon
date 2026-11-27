@@ -333,3 +333,76 @@ fn gateway_diff_loads_single_files_and_refuses_an_unloadable_input() {
         );
     }
 }
+
+#[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test owns and shuts down its current-thread runtime"
+)]
+async fn gateway_diff_keeps_catalog_path_and_cause_without_document_values() {
+    use dekopon_config::{CatalogProblem, ConfigError};
+    use dekopon_gatewayd::{GatewaydError, check_diff};
+    use std::io::ErrorKind;
+
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = temporary.path().join("previous.yaml");
+    let proposed = temporary.path().join("proposed.yaml");
+    let catalog = temporary.path().join("proposed-catalog.yaml");
+    let gateway = read("gatewayd.yaml");
+    write_gateway_fixture(
+        &temporary.path().join("dekopon.yaml"),
+        &read("dekopon.yaml"),
+    );
+    write_gateway_fixture(&previous, &gateway);
+    write_gateway_fixture(
+        &proposed,
+        &gateway.replace(
+            "catalogPath: dekopon.yaml",
+            "catalogPath: proposed-catalog.yaml",
+        ),
+    );
+
+    let errors = check_diff(&proposed, &previous, None)
+        .await
+        .expect_err("missing catalog");
+    assert!(matches!(
+        errors.as_slice(),
+        [GatewaydError::Catalog(ConfigError::Read { path, source })]
+            if path == &catalog.to_string_lossy() && source.kind() == ErrorKind::NotFound
+    ));
+    let missing = gateway_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(missing.stderr).expect("catalog diagnostic"),
+        format!(
+            "dekopon-gatewayd: {}: could not read catalog ({})\n",
+            catalog.display(),
+            ErrorKind::NotFound
+        ),
+    );
+
+    write_gateway_fixture(
+        &catalog,
+        &read("dekopon.yaml").replace("enabled: true", "enabled: sensitive-catalog-value"),
+    );
+    let errors = check_diff(&proposed, &previous, None)
+        .await
+        .expect_err("invalid catalog");
+    assert!(matches!(
+        errors.as_slice(),
+        [GatewaydError::Catalog(ConfigError::Invalid { path, problems })]
+            if path == &catalog.to_string_lossy()
+                && matches!(problems.as_slice(), [CatalogProblem::Decode { kind: "Agent", .. }])
+    ));
+    let invalid = gateway_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(invalid.stderr).expect("catalog diagnostic"),
+        format!(
+            "dekopon-gatewayd: {}: document 1: invalid Agent resource\n",
+            catalog.display()
+        ),
+    );
+}

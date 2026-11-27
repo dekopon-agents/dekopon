@@ -311,23 +311,181 @@ async fn run_check_diff(check: &cli::CheckArgs, previous: &std::path::Path) -> E
 fn diff_problem(problem: &dekopon_gatewayd::GatewaydError) -> String {
     use dekopon_gatewayd::{ConfigError, GatewaydError};
 
-    if let GatewaydError::Config(
-        error @ (ConfigError::Decode { source, .. } | ConfigError::DecodeFragment { source, .. }),
-    ) = problem
-    {
-        return match source.location() {
-            Some(location) => format!(
-                "{error} (line {}, column {})",
-                location.line(),
-                location.column()
-            ),
-            None => error.to_string(),
-        };
+    match problem {
+        GatewaydError::Config(
+            error @ (ConfigError::Decode { source, .. }
+            | ConfigError::DecodeFragment { source, .. }),
+        ) => format!("{error}{}", yaml_location(source)),
+        GatewaydError::Catalog(error) => catalog_diff_problem(error),
+        GatewaydError::AssetStore { .. }
+        | GatewaydError::Config(_)
+        | GatewaydError::Route(_)
+        | GatewaydError::Startup { .. }
+        | GatewaydError::BrokerProbe(_)
+        | GatewaydError::BrokerGeneration
+        | GatewaydError::TransportConnect { .. }
+        | GatewaydError::TransportTask(_)
+        | GatewaydError::TransportsLost
+        | GatewaydError::Journal { .. }
+        | GatewaydError::CacheKeySecret(_)
+        | GatewaydError::WakeStore(_)
+        | GatewaydError::Proxy(_)
+        | GatewaydError::Probe(_)
+        | GatewaydError::Problems { .. }
+        | GatewaydError::ReloadTask(_) => error_chain(problem),
     }
-    if let GatewaydError::Catalog(_) = problem {
-        return problem.to_string();
+}
+
+#[cfg(unix)]
+fn yaml_location(error: &serde_yaml::Error) -> String {
+    error.location().map_or_else(String::new, |location| {
+        format!(" (line {}, column {})", location.line(), location.column())
+    })
+}
+
+#[cfg(unix)]
+fn catalog_diff_problem(error: &dekopon_config::ConfigError) -> String {
+    use dekopon_config::ConfigError;
+
+    match error {
+        ConfigError::Read { path, source } => {
+            format!("{path}: could not read catalog ({})", source.kind())
+        }
+        ConfigError::Candidate { path, source } => {
+            format!("{path}: could not examine catalog ({})", source.kind())
+        }
+        ConfigError::Parse { path, origin, .. } => {
+            format!("{path}: {origin}: invalid YAML or JSON")
+        }
+        ConfigError::Decode {
+            path,
+            origin,
+            source,
+            ..
+        } => {
+            format!(
+                "{path}: {origin}: invalid catalog resource{}",
+                yaml_location(source)
+            )
+        }
+        ConfigError::Invalid { path, problems } => {
+            let details = problems
+                .iter()
+                .map(catalog_validation_problem)
+                .collect::<Vec<_>>();
+            format!("{path}: {}", details.join("\n"))
+        }
+        ConfigError::Empty { .. } | ConfigError::NotFound { .. } => error.to_string(),
+        ConfigError::CurrentDirectory(source) => {
+            format!(
+                "could not resolve the catalog's working directory ({})",
+                source.kind()
+            )
+        }
     }
-    error_chain(problem)
+}
+
+#[cfg(unix)]
+fn catalog_validation_problem(problem: &dekopon_config::CatalogProblem) -> String {
+    use dekopon_config::CatalogProblem;
+
+    match problem {
+        CatalogProblem::MissingKind { origin } => {
+            format!("{origin}: resource is missing string field kind")
+        }
+        CatalogProblem::UnsupportedKind { origin, .. } => {
+            format!("{origin}: unsupported resource kind")
+        }
+        CatalogProblem::InstructionsTwice { .. } => {
+            "agent sets both instructions and instructionsFile".to_owned()
+        }
+        CatalogProblem::Instructions { path, source, .. } => {
+            format!(
+                "{path}: could not read instructionsFile ({})",
+                source.kind()
+            )
+        }
+        CatalogProblem::InstructionsTooLarge {
+            length, maximum, ..
+        } => {
+            format!("instructionsFile is {length} bytes, maximum {maximum}")
+        }
+        CatalogProblem::UnsupportedApiVersion { origin, .. } => {
+            format!("{origin}: unsupported API version")
+        }
+        CatalogProblem::Decode {
+            origin,
+            kind,
+            source,
+        } => {
+            format!("{origin}: invalid {kind} resource{}", yaml_location(source))
+        }
+        CatalogProblem::InvalidName { origin, kind, .. } => {
+            format!("{origin}: invalid {kind} name")
+        }
+        CatalogProblem::DuplicateResource {
+            kind,
+            first,
+            duplicate,
+            ..
+        } => {
+            format!("{duplicate}: duplicate {kind} name, first declared at {first}")
+        }
+        CatalogProblem::Skill { source, .. } => catalog_skill_problem(source),
+        CatalogProblem::DuplicateSkill {
+            first, duplicate, ..
+        } => {
+            format!("{duplicate}: duplicate skill mount, first declared at {first}")
+        }
+    }
+}
+
+#[cfg(unix)]
+fn catalog_skill_problem(error: &dekopon_config::SkillError) -> String {
+    use dekopon_config::SkillError;
+
+    match error {
+        SkillError::Read { path, source } => {
+            format!(
+                "{}: could not read skill ({})",
+                path.display(),
+                source.kind()
+            )
+        }
+        SkillError::FrontMatter { path, source } => {
+            format!(
+                "{}: invalid skill front matter{}",
+                path.display(),
+                yaml_location(source)
+            )
+        }
+        SkillError::InvalidName { path, .. } => format!("{}: invalid skill name", path.display()),
+        SkillError::NameMismatch { path, .. } => {
+            format!(
+                "{}: skill name must equal its directory name",
+                path.display()
+            )
+        }
+        SkillError::MetadataValue { path, .. } => {
+            format!("{}: skill metadata must be a scalar value", path.display())
+        }
+        SkillError::NotADirectory { .. }
+        | SkillError::TooLarge { .. }
+        | SkillError::NotUtf8 { .. }
+        | SkillError::NameNotUtf8 { .. }
+        | SkillError::OutsideRoot { .. }
+        | SkillError::Symlink { .. }
+        | SkillError::InsecureProjection { .. }
+        | SkillError::ChangedDuringLoad { .. }
+        | SkillError::NotRegular { .. }
+        | SkillError::TooDeep { .. }
+        | SkillError::TooManyResources { .. }
+        | SkillError::ResourcesTooLarge { .. }
+        | SkillError::MissingFrontMatter { .. }
+        | SkillError::UnterminatedFrontMatter { .. }
+        | SkillError::EmptyDescription { .. }
+        | SkillError::DescriptionTooLong { .. } => error.to_string(),
+    }
 }
 
 #[cfg(unix)]

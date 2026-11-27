@@ -453,6 +453,7 @@ pub async fn check<P: AsRef<Path>>(
 pub async fn check_diff(config: &Path, previous: &Path) -> Result<BrokerChanges, BrokerdError> {
     let mut problems = check(previous, None, None).await.problems;
     problems.extend(check(config, None, None).await.problems);
+    problems.retain(|problem| !matches!(problem, BrokerdError::ProviderSetRequired));
     if !problems.is_empty() {
         return Err(BrokerdError::from_problems(problems));
     }

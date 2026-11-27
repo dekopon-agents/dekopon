@@ -459,6 +459,32 @@ fn broker_diff_compares_relocated_provider_copies() {
 }
 
 #[test]
+fn broker_diff_compares_managed_sets_without_resolving_providers() {
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = temporary.path().join("previous.yaml");
+    let proposed = temporary.path().join("proposed.yaml");
+    let secret_map = temporary.path().join("secret-map.yaml");
+    let config = "apiVersion: dekopon.dev/brokerd/v1alpha1\n\
+                  socketPath: broker.sock\n\
+                  providerSet: {lockPath: providers.lock.yaml, storePath: store}\n\
+                  secretMapPath: secret-map.yaml\n\
+                  strict: true\n";
+    write_broker_fixture(&previous, config);
+    write_broker_fixture(&proposed, &config.replace("strict: true", "strict: false"));
+    write_broker_fixture(&secret_map, &read("secret-map.yaml.example"));
+
+    let swap = broker_diff(&proposed, &previous, &[]);
+    assert_eq!(swap.status.code(), Some(0), "{swap:?}");
+    assert_eq!(swap.stdout, b"swap\tstrict\n");
+    assert!(!temporary.path().join("store").exists());
+
+    write_broker_fixture(&secret_map, "secrets: [");
+    let refusal = broker_diff(&proposed, &previous, &[]);
+    assert_eq!(refusal.status.code(), Some(1), "{refusal:?}");
+    assert!(refusal.stdout.is_empty());
+}
+
+#[test]
 fn broker_diff_refuses_unparseable_policy_in_the_proposed_input() {
     let temporary = tempfile::tempdir().expect("fixture root");
     let previous = copy_broker_diff_example(temporary.path());
