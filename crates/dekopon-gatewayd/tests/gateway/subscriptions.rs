@@ -111,12 +111,8 @@ async fn boot_subscriptions(chat: &Fauxlack, responses: Vec<Value>, settings: Se
     fixture
 }
 
-pub(super) fn stored(fixture: &Fixture) -> Vec<Value> {
-    fs::read_to_string(fixture.directory.path().join("wakes.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+pub(super) fn stored(directory: &Path) -> Vec<Value> {
+    stored_wakes(directory)
 }
 
 pub(super) fn meta(id: &str, name: &str, arguments: Value) -> Value {
@@ -255,9 +251,9 @@ async fn a_matching_synchronize_fires_exactly_once_in_the_anchored_thread_as_the
     assert_eq!(reason["trigger"], "wake");
     assert!(reason["scheduledBy"].is_null());
     assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
-    assert_eq!(stored(&fixture).len(), 1);
+    let directory = fixture.shutdown().await;
+    assert_eq!(stored(directory.path()).len(), 1);
     assert_review_requests(&api);
-    fixture.shutdown().await;
     api.join();
 }
 
@@ -290,13 +286,7 @@ async fn unchanged_findings_refresh_the_real_github_review_and_post_nothing_to_c
     wait_event(&audit, "agent.reply.declined").await;
     let directory = fixture.shutdown().await;
     assert_eq!(root.thread().transcript().authors(), ["ualice"]);
-    assert_eq!(
-        fs::read_to_string(directory.path().join("wakes.jsonl"))
-            .unwrap()
-            .lines()
-            .count(),
-        1
-    );
+    assert_eq!(stored(directory.path()).len(), 1);
     assert_review_requests(&api);
     api.join();
 }
@@ -321,7 +311,6 @@ async fn an_unmapped_repository_or_one_outside_route_ids_fires_no_subscription()
     deliver(address, "unmapped", "synchronize", "unmapped-push").await;
     deliver(address, "outside", "synchronize", "outside-push").await;
     assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 0);
-    assert_eq!(stored(&fixture), rows);
     assert!(
         audit
             .capture
@@ -329,7 +318,8 @@ async fn an_unmapped_repository_or_one_outside_route_ids_fires_no_subscription()
             .is_empty()
     );
     assert_eq!(root.thread().transcript().authors(), ["ualice"]);
-    fixture.shutdown().await;
+    let directory = fixture.shutdown().await;
+    assert_eq!(stored(directory.path()), rows);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -346,9 +336,9 @@ async fn a_closed_delivery_removes_the_subscription_including_a_merged_pr() {
     let address = settings.address;
     let fixture = boot_subscriptions(&chat, vec![], settings).await;
     deliver(address, "widget", "closed", "closed-pr").await;
-    assert!(stored(&fixture).is_empty());
     assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 0);
-    fixture.shutdown().await;
+    let directory = fixture.shutdown().await;
+    assert!(stored(directory.path()).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -409,7 +399,6 @@ async fn another_mapped_participant_can_list_and_cancel_channel_subscriptions_bu
             "Not done: space wakes require an authorized participant in a mapped channel."
         );
     }
-    assert_eq!(stored(&fixture).len(), 1);
     let cancelled = server
         .user("ubob")
         .post("cteam", "<@udekopon> cancel subscription 1")
@@ -420,8 +409,8 @@ async fn another_mapped_participant_can_list_and_cancel_channel_subscriptions_bu
         "Cancelled."
     );
     assert_eq!(fixture.tool_result("cancel"), "Cancelled subscription 1.");
-    assert!(stored(&fixture).is_empty());
-    fixture.shutdown().await;
+    let directory = fixture.shutdown().await;
+    assert!(stored(directory.path()).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

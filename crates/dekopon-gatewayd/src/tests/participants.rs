@@ -326,14 +326,15 @@ fn mapping_resolution_promotes_pending_messages_and_keeps_unmapped_routes_queued
         let mut first = speaker(9, "first");
         first.receive_span = asker_receipt;
         let key = (first.transport.clone(), first.conversation.key());
-        let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(Vec::new()))
+        let Admit::Admitted(admission, _, _) =
+            gate.admit(&route, first, Dispositions::new(Vec::new()))
         else {
             panic!("first admitted")
         };
         let mut second = speaker(8, "second");
         second.receive_span = queued_receipt;
         assert!(matches!(
-            gate.admit(&route, second, Dispositions(Vec::new())),
+            gate.admit(&route, second, Dispositions::new(Vec::new())),
             Admit::Queued
         ));
         session.in_scope(|| gate.resolve_mapping(&key, &admission.cancellation(), mapped));
@@ -356,7 +357,7 @@ fn github_transport_never_steers_even_with_a_native_message_id_on_a_mapped_route
     let route = shared_route();
     let first = speaker(9, "first");
     let key = (first.transport.clone(), first.conversation.key());
-    let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(Vec::new()))
+    let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions::new(Vec::new()))
     else {
         panic!("first admitted")
     };
@@ -364,7 +365,7 @@ fn github_transport_never_steers_even_with_a_native_message_id_on_a_mapped_route
     let mut incoming = speaker(8, "github event");
     incoming.transport_kind = dekopon_broker_protocol::ChatTransportKind::Github;
     assert!(matches!(
-        gate.admit(&route, incoming, Dispositions(Vec::new())),
+        gate.admit(&route, incoming, Dispositions::new(Vec::new())),
         Admit::Queued
     ));
     assert!(gate.take_steers(&key).is_empty());
@@ -385,13 +386,14 @@ fn private_scope_and_direct_messages_keep_other_senders_as_followups() {
             second.conversation.kind = ConversationKind::DirectMessage;
         }
         let key = (first.transport.clone(), first.conversation.key());
-        let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(Vec::new()))
+        let Admit::Admitted(admission, _, _) =
+            gate.admit(&route, first, Dispositions::new(Vec::new()))
         else {
             panic!("first admitted")
         };
         gate.resolve_mapping(&key, &admission.cancellation(), true);
         assert!(matches!(
-            gate.admit(&route, second, Dispositions(Vec::new())),
+            gate.admit(&route, second, Dispositions::new(Vec::new())),
             Admit::Queued
         ));
         assert!(gate.take_steers(&key).is_empty());
@@ -405,7 +407,7 @@ fn only_the_askers_native_chat_steer_interrupts_a_mapped_turn() {
     let route = shared_route();
     let first = speaker(9, "first");
     let key = (first.transport.clone(), first.conversation.key());
-    let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(Vec::new()))
+    let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions::new(Vec::new()))
     else {
         panic!("first admitted")
     };
@@ -416,7 +418,7 @@ fn only_the_askers_native_chat_steer_interrupts_a_mapped_turn() {
         gate.admit(
             &route,
             speaker(8, "other participant"),
-            Dispositions(Vec::new())
+            Dispositions::new(Vec::new())
         ),
         Admit::Steered(_)
     ));
@@ -424,12 +426,16 @@ fn only_the_askers_native_chat_steer_interrupts_a_mapped_turn() {
     let mut github = speaker(9, "same subject Github");
     github.transport_kind = dekopon_broker_protocol::ChatTransportKind::Github;
     assert!(matches!(
-        gate.admit(&route, github, Dispositions(Vec::new())),
+        gate.admit(&route, github, Dispositions::new(Vec::new())),
         Admit::Queued
     ));
     assert!(!*model.borrow());
     assert!(matches!(
-        gate.admit(&route, speaker(9, "asker steer"), Dispositions(Vec::new())),
+        gate.admit(
+            &route,
+            speaker(9, "asker steer"),
+            Dispositions::new(Vec::new())
+        ),
         Admit::Steered(_)
     ));
     assert!(*model.borrow());

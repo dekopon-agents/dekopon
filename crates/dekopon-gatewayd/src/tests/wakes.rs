@@ -7,7 +7,7 @@ use dekopon_shell::ScriptOutcome;
 
 use super::*;
 use crate::{
-    config::{ResolvedWakes, WakeBounds},
+    config::WakeBounds,
     wake::{Anchor, Probe, Resolved, Verdict, WakeStore, run_tick, store::Schedule},
 };
 
@@ -33,19 +33,60 @@ pub(super) fn wake_store(directory: &Path) -> Arc<WakeStore> {
 }
 
 pub(super) fn wake_store_with_horizon(directory: &Path, horizon: Duration) -> Arc<WakeStore> {
-    Arc::new(
-        WakeStore::open(&ResolvedWakes {
-            path: directory.join("wakes").join("wakes.jsonl"),
-            bounds: WakeBounds {
-                max_per_subject: 4,
-                max_subscriptions_per_agent: 64,
-                subscription_expiry: Duration::from_secs(14 * 24 * 60 * 60),
-                min_interval: Duration::from_secs(1),
-                max_horizon: horizon,
-            },
-        })
-        .expect("the wake store opens"),
+    restored_wakes(
+        directory,
+        WakeBounds {
+            max_per_subject: 4,
+            max_subscriptions_per_agent: 64,
+            subscription_expiry: Duration::from_secs(14 * 24 * 60 * 60),
+            min_interval: Duration::from_secs(1),
+            max_horizon: horizon,
+        },
     )
+}
+
+pub(super) fn restored_wakes(directory: &Path, bounds: WakeBounds) -> Arc<WakeStore> {
+    let acquired = crate::store::DurableStore::acquire(
+        &crate::store::DurableSettings {
+            path: directory.join("wakes").join("state.sqlite"),
+            sync: crate::store::SyncMode::Normal,
+        },
+        &crate::store::LegacyInputs::default(),
+    )
+    .expect("the store opens");
+    let rows = acquired
+        .store
+        .restore(SystemTime::now())
+        .expect("the store restores");
+    let (store, replay) = WakeStore::restored(
+        Some(&acquired.store),
+        rows.wakes.into_iter().map(|(_, row)| row).collect(),
+        None,
+        rows.interrupted_jobs,
+        bounds,
+    );
+    drop(replay);
+    store
+}
+
+pub(super) fn delivered(end: crate::wake::TickEnd) -> Option<crate::wake::Delivery> {
+    match end.result {
+        crate::wake::TickResult::Fired(delivery) => Some(*delivery),
+        crate::wake::TickResult::Rearmed
+        | crate::wake::TickResult::Gone
+        | crate::wake::TickResult::Panicked => None,
+    }
+}
+
+pub(super) fn stored_wakes(store: &WakeStore) -> Vec<Value> {
+    let durable = store.durable_for_test().expect("durable");
+    durable
+        .records_for_test()
+        .iter()
+        .filter_map(|key| durable.snapshot_for_test(key))
+        .flat_map(|snapshot| snapshot.wakes)
+        .map(|row| serde_json::to_value(row).expect("encodes"))
+        .collect()
 }
 
 pub(super) fn slack_message(text: &str) -> InboundMessage {
@@ -59,8 +100,7 @@ pub(super) fn slack_message(text: &str) -> InboundMessage {
 }
 
 fn anchor() -> Anchor {
-    Anchor::from_inbound(&slack_message("anchor"), &route(model_config()).agent)
-        .expect("anchorable")
+    Anchor::from_inbound(&slack_message("anchor"), &journal_route()).expect("anchorable")
 }
 
 fn wake_route() -> crate::routes::BoundRoute {
@@ -309,7 +349,7 @@ fn checks_recipe_waits_on_pending_fires_with_one_word_and_stops_on_errors() {
     let Resolved::Fired(fired) = tick.resolve(&store, verdict, due).expect("resolved") else {
         panic!("a failed check must retire the watch")
     };
-    let inbound = fired.into_inbound();
+    let inbound = fired.fired.into_inbound();
     assert!(inbound.text.contains("stopped because its probe exited 2"));
     assert!(matches!(&inbound.message_id, MessageId::Wake { notice, .. }
         if notice.starts_with("check the PR") && !notice.ends_with("\n\npass") && !notice.ends_with("\n\nfail")));
@@ -320,7 +360,7 @@ fn checks_recipe_waits_on_pending_fires_with_one_word_and_stops_on_errors() {
 
 #[test]
 fn a_local_chat_cannot_anchor_a_wake() {
-    assert!(Anchor::from_inbound(&message("later"), &route(model_config()).agent).is_none());
+    assert!(Anchor::from_inbound(&message("later"), &journal_route()).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -415,18 +455,20 @@ fn a_one_shot_fires_once_and_only_after_its_row_is_gone() {
 
     assert!(store.take_due(now).expect("readable").fired.is_empty());
     let due = now + Duration::from_secs(2);
-    let fired = store.take_due(due).expect("readable").fired;
+    let mut fired = store.take_due(due).expect("readable").fired;
     assert_eq!(fired.len(), 1);
     assert!(store.take_due(due).expect("readable").fired.is_empty());
     assert!(store.list(anchor().subject(), due).is_empty());
+    let delivery = fired.pop().expect("one delivery");
+    delivery
+        .ticket
+        .settle(crate::wake::DeliveryDisposition::Handled)
+        .expect("settled");
+    drop(delivery.fired);
+    let bounds = store.bounds();
+    drop(store);
     assert!(
-        WakeStore::open(&ResolvedWakes {
-            path: directory.path().join("wakes").join("wakes.jsonl"),
-            bounds: store.bounds(),
-        })
-        .expect("reopens")
-        .next_at()
-        .is_none(),
+        restored_wakes(directory.path(), bounds).next_at().is_none(),
         "the retired row is gone from disk"
     );
 }
@@ -437,21 +479,17 @@ fn a_failed_write_fires_nothing_and_leaves_the_wake_pending() {
     let store = wake_store(directory.path());
     let now = SystemTime::now();
     once(&store, "call mom", now);
-    let folder = directory.path().join("wakes");
-    fs::set_permissions(&folder, fs::Permissions::from_mode(0o500)).expect("read-only");
+    let durable = store.durable_for_test().expect("durable");
+    durable.deny_writes_for_test(true);
 
     let result = store.take_due(now + Duration::from_secs(2));
 
-    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).expect("writable");
-    assert!(matches!(
-        result,
-        Err(crate::wake::WakeStoreError::Io { .. })
-    ));
+    assert!(matches!(result, Err(crate::store::StoreFailed)));
     assert_eq!(store.list(anchor().subject(), now).len(), 1);
 }
 
 #[test]
-fn pending_wakes_survive_a_restart_and_a_corrupt_store_refuses_to_start() {
+fn pending_wakes_survive_a_restart() {
     let directory = temporary();
     let now = SystemTime::now();
     {
@@ -469,18 +507,6 @@ fn pending_wakes_survive_a_restart_and_a_corrupt_store_refuses_to_start() {
         ["first", "second"]
     );
     assert_eq!(once(&store, "third", now), WakeId(3));
-
-    let path = directory.path().join("wakes").join("wakes.jsonl");
-    let mut text = fs::read_to_string(&path).expect("store text");
-    text.push_str("{\"id\":\n");
-    fs::write(&path, text).expect("corrupted");
-    assert!(matches!(
-        WakeStore::open(&ResolvedWakes {
-            path,
-            bounds: store.bounds(),
-        }),
-        Err(crate::wake::WakeStoreError::Corrupt { line: 4 })
-    ));
 }
 
 #[test]
@@ -535,7 +561,7 @@ fn a_pending_watch_restarts_with_its_probe_and_original_chat_anchor() {
     let Resolved::Fired(fired) = fired else {
         panic!("a terminal check must fire")
     };
-    let inbound = fired.into_inbound();
+    let inbound = fired.fired.into_inbound();
     assert_eq!(inbound.transport, anchor().transport().to_string());
     assert_eq!(
         inbound.subject,
@@ -601,7 +627,7 @@ echo "after $PREV""#;
             .expect("the watch is due");
         let (store, broker) = (Arc::clone(&store), runner.broker.clone());
         let runtime = tokio::runtime::Handle::current();
-        fired.extend(
+        fired.extend(delivered(
             tokio::task::spawn_blocking(move || {
                 run_tick(
                     tick,
@@ -617,11 +643,11 @@ echo "after $PREV""#;
             })
             .await
             .expect("tick joined"),
-        );
+        ));
     }
 
     assert_eq!(fired.len(), 1, "the first tick waits and the second fires");
-    let text = fired.pop().expect("fired").into_inbound().text;
+    let text = fired.pop().expect("fired").fired.into_inbound().text;
     assert!(text.contains("tell them it is green"), "{text}");
     assert!(text.contains("after two"), "{text}");
     assert!(store.list(anchor().subject(), now).is_empty());
@@ -656,7 +682,7 @@ async fn a_fired_wake_answers_in_its_conversation_attested_as_a_wake() {
     run_session(
         runner_with_wakes(broker, Arc::clone(&models), &store),
         wake_route(),
-        fired.into_inbound(),
+        fired.fired.into_inbound(),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
@@ -754,6 +780,7 @@ async fn a_wake_queues_until_the_running_conversation_finishes() {
         .fired
         .pop()
         .expect("due")
+        .fired
         .into_inbound();
     let models = BlockedModel::new("finished");
     let runner = runner_with(broker, Arc::new(Arc::clone(&models)), 4);
@@ -806,8 +833,7 @@ fn a_wake_or_job_from_a_github_turn_re_attests_the_stored_twin() {
     let directory = temporary();
     let now = SystemTime::now();
     let twin = github_message().subject;
-    let anchor =
-        Anchor::from_inbound(&github_message(), &route(model_config()).agent).expect("anchorable");
+    let anchor = Anchor::from_inbound(&github_message(), &journal_route()).expect("anchorable");
     assert_eq!(anchor.claim(Trigger::Job).subjects, twin);
     {
         let store = wake_store(directory.path());
@@ -829,50 +855,42 @@ fn a_wake_or_job_from_a_github_turn_re_attests_the_stored_twin() {
         .fired
         .pop()
         .expect("restored wake");
-    assert_eq!(fired.into_inbound().subject, twin);
+    assert_eq!(fired.fired.into_inbound().subject, twin);
 }
 
 #[test]
-fn a_drn_store_loads_unchanged_and_is_not_rewritten() {
+fn a_pre_drn_legacy_wake_line_refuses_conversion_naming_the_line() {
     let directory = temporary();
-    let now = SystemTime::now();
-    let path = directory.path().join("wakes").join("wakes.jsonl");
-    {
-        let store = wake_store(directory.path());
-        once(&store, "kept", now);
-    }
-    let stored = fs::read(&path).expect("store bytes");
-
-    let store = wake_store(directory.path());
-
-    assert_eq!(store.list(anchor().subject(), now).len(), 1);
-    assert_eq!(fs::read(&path).expect("store bytes"), stored);
-}
-
-#[test]
-fn a_pre_drn_wake_line_refuses_to_open_as_corrupt() {
-    let directory = temporary();
-    let now = SystemTime::now();
-    let path = directory.path().join("wakes").join("wakes.jsonl");
-    let bounds = {
-        let store = wake_store(directory.path());
-        once(&store, "kept", now);
-        store.bounds()
-    };
-    let mut line: serde_json::Value =
-        serde_json::from_str(fs::read_to_string(&path).expect("store text").trim())
-            .expect("one line");
+    let folder = directory.path().join("wakes");
+    fs::create_dir_all(&folder).expect("folder");
+    let path = folder.join("wakes.jsonl");
     for legacy in ["slack.t0123abc.w9xyz", "github.owner.repo"] {
-        line["subject"] = legacy.into();
+        let line = json!({
+            "id": 1,
+            "transport": "dev",
+            "kind": "slack",
+            "subject": legacy,
+            "conversation": {"kind": "directMessage", "id": "d0123abc"},
+            "reply": {"slack": {"channel": "d0123abc"}},
+            "agent": "reviewer",
+            "note": "kept",
+            "nextAtMs": 1,
+        });
         let text = format!("{line}\n");
         fs::write(&path, &text).expect("pre-DRN store");
 
         assert!(matches!(
-            WakeStore::open(&ResolvedWakes {
-                path: path.clone(),
-                bounds,
-            }),
-            Err(crate::wake::WakeStoreError::Corrupt { line: 1 })
+            crate::store::DurableStore::acquire(
+                &crate::store::DurableSettings {
+                    path: folder.join("state.sqlite"),
+                    sync: crate::store::SyncMode::Normal,
+                },
+                &crate::store::LegacyInputs {
+                    wakes: Some(path.clone()),
+                    journal: None,
+                },
+            ),
+            Err(crate::store::StoreError::LegacyWakes { line: 1, .. })
         ));
         assert_eq!(fs::read_to_string(&path).expect("store text"), text);
     }

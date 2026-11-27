@@ -89,7 +89,7 @@ async fn fixture_with_subscriptions(
         "release"
     ]);
     if !anchors.is_empty() {
-        doc["sessions"]["wakes"] = json!({"path":directory.path().join("wakes/wakes.jsonl")});
+        doc["sessions"]["wakes"] = json!({});
         doc["transports"].as_array_mut().unwrap().push(json!({"name":"scientist-slack","kind":"slackSocketMode","appTokenEnv":"APP","botTokenEnv":"BOT"}));
         doc["routes"].as_array_mut().unwrap().push(json!({"transport":"scientist-slack","agent":"reviewer","conversation":{"kind":["thread"]},"memory":{"mode":"oneShot"},"wakes":true}));
     }
@@ -128,10 +128,13 @@ async fn fixture_with_subscriptions(
         for message in anchors {
             store
                 .subscribe(
-                    crate::wake::Anchor::from_inbound(message, &"reviewer".parse().unwrap())
-                        .unwrap()
-                        .as_space()
-                        .unwrap(),
+                    crate::wake::Anchor::from_inbound(
+                        message,
+                        &journal_route_for(&"reviewer".parse().unwrap()),
+                    )
+                    .unwrap()
+                    .as_space()
+                    .unwrap(),
                     target.clone(),
                     SystemTime::now(),
                 )
@@ -838,7 +841,7 @@ async fn a_full_anchored_mailbox_returns_503_and_leaves_the_subscription_guid_re
         let Admit::Admitted(admission, ..) =
             fixture
                 .gate
-                .admit(&bound, message, Dispositions(Vec::new()))
+                .admit(&bound, message, Dispositions::new(Vec::new()))
         else {
             panic!("anchor admitted")
         };
@@ -849,7 +852,7 @@ async fn a_full_anchored_mailbox_returns_503_and_leaves_the_subscription_guid_re
             fixture.gate.admit(
                 &bound,
                 owned_slack_message("queued", false),
-                Dispositions(Vec::new())
+                Dispositions::new(Vec::new())
             ),
             Admit::Steered(_)
         ));

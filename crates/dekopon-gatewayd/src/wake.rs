@@ -18,14 +18,20 @@ use dekopon_shell::{CapabilityInvoker, Interpreter, ScriptOutcome};
 
 use crate::{
     config::{ResolvedBroker, WakeBounds},
+    routes::BoundRoute,
+    store::Durability,
     transport::{InboundMessage, MessageId, ReplyTarget, receive_span},
 };
 
+mod delivery;
 pub(crate) mod store;
 
-pub use store::WakeStoreError;
+pub(crate) use delivery::{
+    Delivery, DeliveryDisposition, DeliveryTicket, JobNotice, Replay, TickEnd, TickResult,
+};
 pub(crate) use store::{Fired, Resolved, Tick, WakeStore};
 
+pub(crate) const DIGEST_HEADER: &str = "# dekopon: daily-digest\n";
 const MAX_NOTE_BYTES: usize = 2 * 1024;
 const MAX_PROBE_OUTPUT_BYTES: usize = 8 * 1024;
 // Meta refuses free-form business-initiated text outside the 24-hour customer-service window.
@@ -204,6 +210,7 @@ pub(crate) struct Anchor {
     reply: ReplyTarget,
     agent: AgentId,
     scheduled_in: Option<TraceParent>,
+    durability: Durability,
 }
 
 impl Anchor {
@@ -244,23 +251,28 @@ impl Anchor {
     pub(crate) fn same_thread(&self, other: &Self) -> bool {
         self.same_channel(other) && self.conversation.thread == other.conversation.thread
     }
-    pub(crate) fn from_inbound(message: &InboundMessage, agent: &AgentId) -> Option<Self> {
+    pub(crate) fn from_inbound(message: &InboundMessage, route: &BoundRoute) -> Option<Self> {
         if matches!(message.reply, ReplyTarget::Local { .. }) {
             return None;
         }
-        Self::for_job(message, agent)
+        Self::for_job(message, route)
     }
 
-    pub(crate) fn for_job(message: &InboundMessage, agent: &AgentId) -> Option<Self> {
+    pub(crate) fn for_job(message: &InboundMessage, route: &BoundRoute) -> Option<Self> {
         Some(Self {
             transport: message.transport.parse().ok()?,
             kind: message.transport_kind,
             subject: message.subject.clone(),
             conversation: message.conversation.clone(),
             reply: message.reply.clone(),
-            agent: agent.clone(),
+            agent: route.agent.clone(),
             scheduled_in: current_trace_parent(),
+            durability: Durability::of(route.memory),
         })
+    }
+
+    pub(crate) const fn durability(&self) -> Durability {
+        self.durability
     }
 
     pub(crate) const fn subject(&self) -> &Subject {
@@ -408,7 +420,6 @@ enum WatchPurpose {
 }
 
 impl Probe {
-    const DIGEST_HEADER: &str = "# dekopon: daily-digest\n";
     const DIGEST_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
     pub(crate) fn into_digest(mut self) -> Self {
@@ -420,28 +431,6 @@ impl Probe {
         match self.purpose {
             WatchPurpose::Ordinary => configured,
             WatchPurpose::Digest => configured.max(Self::DIGEST_INTERVAL),
-        }
-    }
-
-    fn encoded_script(&self) -> String {
-        match self.purpose {
-            WatchPurpose::Ordinary => self.script.clone(),
-            WatchPurpose::Digest => format!("{}{}", Self::DIGEST_HEADER, self.script),
-        }
-    }
-
-    fn decode(script: String, prev: String, space: bool) -> Self {
-        if space && let Some(script) = script.strip_prefix(Self::DIGEST_HEADER) {
-            return Self {
-                script: script.to_owned(),
-                prev,
-                purpose: WatchPurpose::Digest,
-            };
-        }
-        Self {
-            script,
-            prev,
-            purpose: WatchPurpose::Ordinary,
         }
     }
 
@@ -459,7 +448,7 @@ impl Probe {
         leg: &dyn CapabilityInvoker,
         shell: &Interpreter,
     ) -> Result<Self, WakeRefusal> {
-        let script = if script.starts_with(Self::DIGEST_HEADER) {
+        let script = if script.starts_with(DIGEST_HEADER) {
             format!("\n{script}")
         } else {
             script
@@ -711,7 +700,8 @@ pub(crate) fn run_tick(
     runtime: &tokio::runtime::Handle,
     shell: Option<Interpreter>,
     job_control: Option<(Arc<crate::jobs::Jobs>, ShellLimits)>,
-) -> Option<Fired> {
+) -> TickEnd {
+    let wake = tick.id();
     let verdict = match shell {
         None => Verdict::Failed {
             exit: ExitCode::DENIED,
@@ -736,28 +726,25 @@ pub(crate) fn run_tick(
             },
         },
     };
-    let failed = matches!(verdict, Verdict::Failed { .. });
-    match tick.resolve(store, verdict, SystemTime::now()) {
-        Ok(Resolved::Rearmed | Resolved::Gone) => None,
-        Ok(Resolved::Fired(fired)) => {
+    let failed = match verdict {
+        Verdict::Failed { .. } => true,
+        Verdict::Fire { .. } | Verdict::Wait { .. } => false,
+    };
+    let result = match tick.resolve(store, verdict, SystemTime::now()) {
+        Ok(Resolved::Rearmed) => TickResult::Rearmed,
+        Ok(Resolved::Gone) | Err(crate::store::StoreFailed) => TickResult::Gone,
+        Ok(Resolved::Fired(delivery)) => {
             if failed {
                 tracing::warn!(
                     event = "gateway_wake_tick_failed",
-                    wake.id = %fired.id(),
+                    wake.id = %wake,
                     "gateway.wake.tick.failed"
                 );
             }
-            Some(*fired)
+            TickResult::Fired(delivery)
         }
-        Err(error) => {
-            tracing::error!(
-                event = "gateway_wake_store_failed",
-                error = %error,
-                "gateway.wake.store.failed"
-            );
-            None
-        }
-    }
+    };
+    TickEnd { wake, result }
 }
 
 pub(crate) fn digest_reply(text: &str) -> String {
