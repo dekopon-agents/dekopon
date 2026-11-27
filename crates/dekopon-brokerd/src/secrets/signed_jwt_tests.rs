@@ -17,16 +17,21 @@ use dekopon_core::{
     Actor, AttestedSubject, FileHygieneError, FileTier, RiskLevel, SecretUseProposal,
 };
 use dekopon_http_host::{Response, test_transport::Transport};
-use dekopon_test_support::{CaptureLayer, Record};
+use dekopon_test_support::{CaptureLayer, LoopbackServer, Record};
 use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use super::{SecretMapError, SignedJwtConfigError, load, tests::write};
-use crate::github_app::GithubAppKey;
+use crate::{
+    github_app::GithubAppKey,
+    token_issuer::{IssueError, SelfSignedIssuer, SignedJwtConfig, thumbprint},
+};
 
 const KEY: &[u8] = include_bytes!("../../tests/fixture/github-app-test-only.pem");
+const HELPER_BYTES: &[u8] = b"login helper fixture";
 const RUNNER: &str = "runner.example.test";
 const ISSUER: &str = "https://issuer.example.test";
 const SECOND_ISSUER: &str = "https://issuer.example.test/alternate";
@@ -35,11 +40,53 @@ const PERSONA: &str = "drn:secret:login/alpha";
 const SECOND_PERSONA: &str = "drn:secret:login/beta";
 const RUNNER_DRN: &str = "drn:secret:login/runner";
 const SESSION: &str = "fixture-session";
-const ARGV: &[&str] = &["login-fixture"];
+const UNREACHABLE_JWKS: &str = "http://127.0.0.1:1/jwks";
 const OK: &str =
     r#"{"outcome":"executed","stdout":"ok","stderr":"","exitCode":0,"truncated":false}"#;
 
+fn helper_path(directory: &Path) -> String {
+    directory.join("login-fixture").display().to_string()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn published() -> (String, Value) {
+    let key = GithubAppKey::from_pem(KEY).expect("fixture key");
+    let components = key.components();
+    let n = URL_SAFE_NO_PAD.encode(&components.n);
+    let e = URL_SAFE_NO_PAD.encode(&components.e);
+    let kid = thumbprint(&n, &e);
+    let jwks = json!({"keys": [{"kty": "RSA", "kid": kid, "n": n, "e": e, "use": "sig"}]});
+    (kid, jwks)
+}
+
+fn http_json(body: &Value) -> Vec<u8> {
+    let body = body.to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 async fn secret_map(directory: &Path, ttl: u32, aud: &str, mode: u32) -> std::path::PathBuf {
+    secret_map_with(directory, ttl, aud, mode, UNREACHABLE_JWKS).await
+}
+
+async fn secret_map_with(
+    directory: &Path,
+    ttl: u32,
+    aud: &str,
+    mode: u32,
+    jwks_uri: &str,
+) -> std::path::PathBuf {
+    let helper = directory.join("login-fixture");
+    write(&helper, HELPER_BYTES).await;
     let key = directory.join("signing.pem");
     write(&key, KEY).await;
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -52,7 +99,8 @@ async fn secret_map(directory: &Path, ttl: u32, aud: &str, mode: u32) -> std::pa
     source:
       kind: signedJwt
       privateKey: {key}
-      kid: receipt-key
+      jwksUri: "{jwks_uri}"
+      helper: {{ path: {helper}, sha256: {helper_sha} }}
       iss: "{iss}"
       aud: "{aud}"
       ttl: {ttl}
@@ -67,6 +115,8 @@ async fn secret_map(directory: &Path, ttl: u32, aud: &str, mode: u32) -> std::pa
         allowedPaths: [{{ match: exact, path: /prefix/v1/sessions/{SESSION}/exec }}]
 "#,
             key = key.display(),
+            helper = helper.display(),
+            helper_sha = sha256_hex(HELPER_BYTES),
         )
     };
     let document = format!(
@@ -266,7 +316,214 @@ async fn signed_jwt_requires_runner_coverage_for_each_configured_capability() {
     );
 }
 
-fn assert_jwt(token: &str, aud: &str, iss: &str) -> String {
+async fn issuer(directory: &Path, jwks_uri: &str) -> SelfSignedIssuer {
+    let key = directory.join("signing.pem");
+    write(&key, KEY).await;
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let helper = directory.join("login-fixture");
+    write(&helper, HELPER_BYTES).await;
+    let config: SignedJwtConfig = serde_json::from_value(json!({
+        "privateKey": key, "runnerSecret": RUNNER_DRN, "jwksUri": jwks_uri,
+        "helper": {"path": helper, "sha256": sha256_hex(HELPER_BYTES)},
+        "iss": ISSUER, "aud": "https://alpha.example.test", "ttl": 300,
+        "claims": {"sub": "s", "org": "o", "role": "r", "email": "e@example.test"},
+    }))
+    .unwrap();
+    SelfSignedIssuer::open(
+        config,
+        rustix::process::geteuid().as_raw(),
+        &mut Sha256::new(),
+    )
+    .unwrap()
+}
+
+fn header_kid(token: &str) -> String {
+    let header = token.split('.').next().unwrap();
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).unwrap()).unwrap();
+    header["kid"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn the_kid_is_the_rfc_7638_thumbprint() {
+    let n = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw";
+    assert_eq!(
+        thumbprint(n, "AQAB"),
+        "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+    );
+}
+
+#[tokio::test]
+async fn a_configured_kid_is_refused_naming_its_removal() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = secret_map(directory.path(), 300, "https://alpha.example.test", 0o600).await;
+    let document = tokio::fs::read_to_string(&path).await.unwrap();
+    let with_kid = document.replacen(
+        "      jwksUri:",
+        "      kid: receipt-key\n      jwksUri:",
+        1,
+    );
+    write(&path, with_kid.as_bytes()).await;
+    let error = load(&path, rustix::process::geteuid().as_raw())
+        .await
+        .unwrap_err();
+    let SecretMapError::SignedJwtValidation { jwt_problems, .. } = error else {
+        panic!("expected a typed kid error: {error}");
+    };
+    assert!(
+        jwt_problems
+            .iter()
+            .any(|problem| matches!(problem.source, SignedJwtConfigError::KidRemoved))
+    );
+}
+
+#[tokio::test]
+async fn a_signer_without_jwks_uri_or_helper_pin_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = secret_map(directory.path(), 300, "https://alpha.example.test", 0o600).await;
+    let document = tokio::fs::read_to_string(&path).await.unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    for (prefix, field) in [("      jwksUri:", "jwksUri"), ("      helper:", "helper")] {
+        let line = document
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap();
+        let missing = document.replacen(&format!("{line}\n"), "", 2);
+        write(&path, missing.as_bytes()).await;
+        let error = load(&path, uid).await.unwrap_err();
+        assert!(matches!(
+            error,
+            SecretMapError::Decode { diagnostic }
+                if diagnostic.starts_with("missing field") && diagnostic.ends_with(&format!("({field})"))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn an_unusable_jwks_uri_or_helper_pin_is_a_typed_config_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = secret_map(directory.path(), 300, "https://alpha.example.test", 0o600).await;
+    let document = tokio::fs::read_to_string(&path).await.unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let helper_sha = sha256_hex(HELPER_BYTES);
+    for (from, to, expected) in [
+        (UNREACHABLE_JWKS, "http://jwks.example.test/jwks", 0),
+        (UNREACHABLE_JWKS, "/jwks", 0),
+        (helper_sha.as_str(), "not-a-digest", 1),
+        (&helper_path(directory.path()), "login-fixture", 1),
+    ] {
+        let invalid = document.replace(from, to);
+        write(&path, invalid.as_bytes()).await;
+        let error = load(&path, uid).await.unwrap_err();
+        let SecretMapError::SignedJwtValidation { jwt_problems, .. } = error else {
+            panic!("expected a typed config error: {error}");
+        };
+        assert!(jwt_problems.iter().any(|problem| match expected {
+            0 => matches!(problem.source, SignedJwtConfigError::JwksUri),
+            _ => matches!(problem.source, SignedJwtConfigError::Helper),
+        }));
+    }
+}
+
+#[tokio::test]
+async fn signing_is_refused_while_the_jwks_is_unreachable() {
+    let directory = tempfile::tempdir().unwrap();
+    let unreachable = issuer(directory.path(), UNREACHABLE_JWKS).await;
+    assert!(matches!(
+        unreachable.issue().await,
+        Err(IssueError::JwksUnreachable)
+    ));
+    let missing = LoopbackServer::once(
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    let not_found = issuer(directory.path(), &format!("{}/jwks", missing.url())).await;
+    assert!(matches!(
+        not_found.issue().await,
+        Err(IssueError::JwksUnreachable)
+    ));
+}
+
+#[tokio::test]
+async fn signing_is_refused_while_the_jwks_serves_another_kid() {
+    let directory = tempfile::tempdir().unwrap();
+    let (_, ours) = published();
+    let mut jwks = ours.clone();
+    jwks["keys"][0]["kid"] = json!("stale-kid");
+    let stale = LoopbackServer::once(&http_json(&jwks));
+    let issuer_stale = issuer(directory.path(), &format!("{}/jwks", stale.url())).await;
+    assert!(matches!(
+        issuer_stale.issue().await,
+        Err(IssueError::JwksKidNotServed)
+    ));
+
+    let mut forged = ours;
+    forged["keys"][0]["n"] = json!("AQAB");
+    let forged = LoopbackServer::once(&http_json(&forged));
+    let issuer_forged = issuer(directory.path(), &format!("{}/jwks", forged.url())).await;
+    assert!(matches!(
+        issuer_forged.issue().await,
+        Err(IssueError::JwksKidNotServed)
+    ));
+
+    let empty = LoopbackServer::once(&http_json(&json!({"keys": []})));
+    let issuer_empty = issuer(directory.path(), &format!("{}/jwks", empty.url())).await;
+    assert!(matches!(
+        issuer_empty.issue().await,
+        Err(IssueError::JwksKidNotServed)
+    ));
+}
+
+#[tokio::test]
+async fn signing_is_refused_on_a_malformed_jwks() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = LoopbackServer::once(&http_json(&json!({"not": "a key set"})));
+    let issuer = issuer(directory.path(), &format!("{}/jwks", server.url())).await;
+    assert!(matches!(
+        issuer.issue().await,
+        Err(IssueError::JwksMalformed)
+    ));
+}
+
+#[tokio::test]
+async fn a_rotation_signs_only_after_the_new_kid_is_published() {
+    let directory = tempfile::tempdir().unwrap();
+    let (kid, jwks) = published();
+    let mut previous = jwks.clone();
+    previous["keys"][0]["kid"] = json!("previous-kid");
+    let server = LoopbackServer::sequence([http_json(&previous), http_json(&jwks)]);
+    let issuer = issuer(directory.path(), &format!("{}/jwks", server.url())).await;
+    assert!(matches!(
+        issuer.issue().await,
+        Err(IssueError::JwksKidNotServed)
+    ));
+    let issued = issuer.issue().await.ok().unwrap();
+    assert_eq!(
+        header_kid(std::str::from_utf8(issued.token.expose()).unwrap()),
+        kid
+    );
+}
+
+#[tokio::test]
+async fn signing_is_refused_when_the_helper_changes_or_disappears() {
+    let directory = tempfile::tempdir().unwrap();
+    let (_, jwks) = published();
+    let server = LoopbackServer::serving(&http_json(&jwks), 2);
+    let issuer = issuer(directory.path(), &format!("{}/jwks", server.url())).await;
+    let helper = directory.path().join("login-fixture");
+    write(&helper, b"a different helper").await;
+    assert!(matches!(
+        issuer.issue().await,
+        Err(IssueError::HelperMismatch)
+    ));
+    std::fs::remove_file(&helper).unwrap();
+    assert!(matches!(
+        issuer.issue().await,
+        Err(IssueError::HelperRead {
+            kind: std::io::ErrorKind::NotFound
+        })
+    ));
+}
+
+fn assert_jwt(token: &str, aud: &str, iss: &str, kid: &str) -> String {
     let (input, signature) = token.rsplit_once('.').expect("JWT signature");
     let key = GithubAppKey::from_pem(KEY).expect("fixture key");
     UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.public_key())
@@ -278,10 +535,7 @@ fn assert_jwt(token: &str, aud: &str, iss: &str) -> String {
     let (header, claims) = input.split_once('.').expect("JWT header and claims");
     let decode =
         |part| serde_json::from_slice::<Value>(&URL_SAFE_NO_PAD.decode(part).unwrap()).unwrap();
-    assert_eq!(
-        decode(header),
-        json!({"alg":"RS256","typ":"JWT","kid":"receipt-key"})
-    );
+    assert_eq!(decode(header), json!({"alg":"RS256","typ":"JWT","kid":kid}));
     let claims = decode(claims);
     let iat = claims["iat"].as_u64().unwrap();
     let exp = claims["exp"].as_u64().unwrap();
@@ -309,7 +563,17 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
     let subscriber = tracing_subscriber::registry().with(captured.clone());
     async {
         let directory = tempfile::tempdir().unwrap();
-        let map = secret_map(directory.path(), 300, "https://alpha.example.test", 0o600).await;
+        let (kid, jwks) = published();
+        let server = LoopbackServer::serving(&http_json(&jwks), 2);
+        let helper = helper_path(directory.path());
+        let map = secret_map_with(
+            directory.path(),
+            300,
+            "https://alpha.example.test",
+            0o600,
+            &format!("{}/jwks", server.url()),
+        )
+        .await;
         let catalog = load(&map, rustix::process::geteuid().as_raw())
             .await
             .unwrap();
@@ -334,7 +598,7 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             4,
         );
         let component = directory.path().join("vm.wasm");
-        std::fs::write(&component, vm_component()).unwrap();
+        std::fs::write(&component, vm_component(&helper)).unwrap();
         let registry = BrokerProviderRegistry::load([component], BrokerHostLimits::default())
             .await
             .unwrap()
@@ -414,7 +678,7 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             AttestedSubject::one(subject).unwrap(),
             "agent".parse().unwrap(),
         );
-        let argv = ARGV.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let argv = vec![helper.clone()];
         let propose = async |broker: &Broker| {
             broker
                 .run_command(
@@ -442,7 +706,7 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             panic!("expected the vm proposal")
         };
         assert_eq!(secret_use.secret().as_str(), PERSONA);
-        assert_eq!(input["argv"], json!(ARGV));
+        assert_eq!(input["argv"], json!([helper]));
 
         let mut execs = Vec::new();
         for (id, secret) in [
@@ -549,18 +813,17 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             assert_eq!(exec.sent.method, "POST");
             let guest: Value = serde_json::from_slice(&exec.guest.body).unwrap();
             let sent: Value = serde_json::from_slice(&exec.sent.body).unwrap();
-            assert_eq!(guest, json!({"argv": ARGV, "deadlineMs": 25000}));
+            assert_eq!(guest, json!({"argv": [helper], "deadlineMs": 25000}));
             assert_eq!(sent["argv"], guest["argv"]);
             assert_eq!(sent["deadlineMs"], guest["deadlineMs"]);
             let jwt = sent["stdin"].as_str().unwrap();
             assert!(!frame.contains(jwt) && !String::from_utf8(stdout).unwrap().contains(jwt));
-            let jti = assert_jwt(jwt, aud, iss);
+            let jti = assert_jwt(jwt, aud, iss, &kid);
             for record in captured.records() {
                 let (Record::Event { fields, .. } | Record::Span { fields, .. }) = &record;
                 for attribute in fields.values() {
                     for hidden in jwt.split('.').chain([
                         aud,
-                        "receipt-key",
                         "user-fixture",
                         "org-fixture",
                         "reviewer-fixture",
@@ -599,7 +862,7 @@ fn decode_command_proposal(bytes: &[u8]) -> CommandRunOutcome {
     result
 }
 
-fn vm_component() -> Vec<u8> {
+fn vm_component(helper: &str) -> Vec<u8> {
     let manifest = json!({
         "apiVersion": "dekopon.dev/provider/v1alpha1", "id": "vm",
         "description": "VM exec fixture", "commandWords": ["ssh"],
@@ -610,14 +873,14 @@ fn vm_component() -> Vec<u8> {
     }).to_string();
     let proposal = json!({
         "outcome": "proposed", "capability": "vm.exec",
-        "input": {"profile":"fixture","name":"default","argv":ARGV,"deadlineMs":25000},
+        "input": {"profile":"fixture","name":"default","argv":[helper],"deadlineMs":25000},
         "secretUse": {"kind":"vmExecStdin","secret": PERSONA}
     })
     .to_string();
     let create_uri = format!("https://{RUNNER}/prefix/v1/sessions");
     let exec_uri = format!("{create_uri}/{SESSION}/exec");
     let create = r#"{"profile":"fixture","name":"default"}"#;
-    let exec = json!({"argv":ARGV,"deadlineMs":25000}).to_string();
+    let exec = json!({"argv":[helper],"deadlineMs":25000}).to_string();
     let hex = |bytes: &[u8]| {
         bytes
             .iter()

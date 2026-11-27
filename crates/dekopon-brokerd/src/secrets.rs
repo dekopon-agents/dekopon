@@ -384,7 +384,10 @@ impl Minted {
                 .map(|token| SecretMaterial::new(token.into_inner().into_bytes())),
             Self::SignedJwt(source) => source
                 .issue()
-                .map(|issued| SecretMaterial::issued_jwt(issued.token, issued.jti, issued.exp))
+                .await
+                .map(|issued| {
+                    SecretMaterial::issued_jwt(issued.token, issued.jti, issued.exp, issued.helper)
+                })
                 .map_err(|error| RefreshError::Unavailable {
                     category: error.category(),
                 }),
@@ -1719,6 +1722,8 @@ fn sanitized_yaml_diagnostic(error: &serde_yaml::Error, bytes: &[u8]) -> String 
         "bindings",
         "projection",
         "iss",
+        "jwksUri",
+        "helper",
     ];
     let named_field = message
         .split_once("unknown field `")

@@ -916,6 +916,7 @@ pub struct SecretMaterial {
 struct IssuedJwt {
     jti: String,
     exp: u64,
+    helper: String,
 }
 
 impl SecretMaterial {
@@ -929,11 +930,11 @@ impl SecretMaterial {
     }
 
     #[must_use]
-    pub fn issued_jwt(token: SecretBytes, jti: String, exp: u64) -> Self {
+    pub fn issued_jwt(token: SecretBytes, jti: String, exp: u64, helper: String) -> Self {
         Self {
             bytes: token,
             chatgpt_account: None,
-            jwt: Some(IssuedJwt { jti, exp }),
+            jwt: Some(IssuedJwt { jti, exp, helper }),
         }
     }
 
@@ -3825,7 +3826,7 @@ where
                     .ok_or(CredentialFailure::Binding)?;
                 let bearer = self.secrets.resolver.resolve(&runner.secret).await?;
                 BoundCredential::secret_bearer(bearer.bytes, &self.secrets.grant(runner))?
-                    .with_vm_exec_stdin(bytes, jwt.jti, jwt.exp, grant)?
+                    .with_vm_exec_stdin(bytes, jwt.jti, jwt.exp, jwt.helper, grant)?
             }
             SecretSinkKind::VmEgressProfile => return Err(CredentialFailure::Binding),
         };

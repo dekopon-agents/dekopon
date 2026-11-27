@@ -679,6 +679,7 @@ impl BoundCredential {
         token: SecretBytes,
         jti: String,
         exp: u64,
+        helper: String,
         grant: &SecretUseGrant,
     ) -> Result<Self, ConfigurationError> {
         grant
@@ -696,7 +697,7 @@ impl BoundCredential {
                 reason: "signed exec requires a one-shot stdin grant and a bound runner bearer",
             });
         }
-        self.vm_exec_stdin = Some(VmExecStdin::new(grant.clone(), token, jti, exp));
+        self.vm_exec_stdin = Some(VmExecStdin::new(grant.clone(), token, jti, exp, helper));
         Ok(self)
     }
 
