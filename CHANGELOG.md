@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.101.0] - 2026-11-27
+
+### Added
+
+- Gateway and broker configuration checks can compare two configurations and report whether a restart is required.
+
+## [dekopon-chart-0.88.0] - 2026-11-27
+
+### Changed
+
+- Chart 0.88.0 targets core v0.101.0 and renders the `v0.101.0` image tag.
+
 ## [0.100.0] - 2026-11-27
 
 ### Changed
