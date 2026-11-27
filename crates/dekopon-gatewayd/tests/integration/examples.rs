@@ -269,6 +269,13 @@ fn gateway_diff_reports_model_swaps_and_slack_experience_restarts_in_directories
             json!({"restart_required": [], "swap": ["models"]}),
         ),
         (
+            classic
+                .replace("seen: off", "seen: on")
+                .replace("sessions:\n", "sessions:\n  indicators: { mode: off }\n"),
+            0,
+            json!({"restart_required": [], "swap": ["indicators"]}),
+        ),
+        (
             agent,
             3,
             json!({"restart_required": ["transports"], "swap": []}),
@@ -318,10 +325,11 @@ fn gateway_diff_loads_single_files_and_refuses_an_unloadable_input() {
                 .any(|window| window == b"deliberately-invalid-version")
         );
     }
-    assert_eq!(
-        gateway_diff(&proposed, &previous, &["--probe"])
-            .status
-            .code(),
-        Some(2)
-    );
+    for options in [&["--probe"][..], &["--against", "baseline.yaml"]] {
+        assert_eq!(
+            gateway_diff(&proposed, &previous, options).status.code(),
+            Some(2),
+            "{options:?}"
+        );
+    }
 }

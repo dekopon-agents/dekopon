@@ -70,7 +70,7 @@ pub struct CheckArgs {
     #[arg(
         long,
         value_name = "PREVIOUS",
-        conflicts_with = "probe",
+        conflicts_with_all = ["probe", "against"],
         help = "Compare reload dispositions against a previous configuration. Exit 0 if no restart is needed, 3 if a restart is required, or 1 on load or classification failure."
     )]
     pub diff: Option<PathBuf>,

@@ -136,7 +136,7 @@ struct CheckArgs {
     #[arg(
         long,
         value_name = "PREVIOUS",
-        conflicts_with_all = ["materialized", "provider_set"],
+        conflicts_with_all = ["materialized", "provider_set", "store"],
         help = "Compare reload dispositions against a previous configuration. Exit 0 if no restart is needed, 3 if a restart is required, or 1 on load failure."
     )]
     diff: Option<PathBuf>,
@@ -739,10 +739,23 @@ async fn execute_check_diff(
     previous: &std::path::Path,
     output: OutputFormat,
 ) -> ExitCode {
+    use dekopon_brokerd::BrokerdError;
+
     let changes = match dekopon_brokerd::check_diff(config, previous).await {
         Ok(changes) => changes,
         Err(error) => {
-            eprintln!("dekopon-brokerd: {}", error_chain(&error));
+            let problems = if let BrokerdError::Startup { problems } = &error {
+                problems.as_slice()
+            } else {
+                std::slice::from_ref(&error)
+            };
+            for problem in problems {
+                if let BrokerdError::Config(_) | BrokerdError::Secrets(_) = problem {
+                    eprintln!("dekopon-brokerd: {}", error_chain(problem));
+                } else {
+                    eprintln!("dekopon-brokerd: {problem}");
+                }
+            }
             return ExitCode::FAILURE;
         }
     };

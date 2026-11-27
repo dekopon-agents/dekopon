@@ -451,23 +451,29 @@ pub async fn check<P: AsRef<Path>>(
 }
 
 pub async fn check_diff(config: &Path, previous: &Path) -> Result<BrokerChanges, BrokerdError> {
-    let previous = load_diff_snapshot(previous).await?;
-    let proposed = load_diff_snapshot(config).await?;
-    Ok(previous.changes(&proposed))
+    let mut problems = check(previous, None, None).await.problems;
+    problems.extend(check(config, None, None).await.problems);
+    if !problems.is_empty() {
+        return Err(BrokerdError::from_problems(problems));
+    }
+    let mut previous = load_diff_config(previous).await?;
+    let mut proposed = load_diff_config(config).await?;
+    previous.relativize_provider_artifacts(&proposed.providers)?;
+    proposed.relativize_provider_artifacts(&previous.providers)?;
+    Ok(previous.snapshot.changes(&proposed.snapshot))
 }
 
-async fn load_diff_snapshot(path: &Path) -> Result<config::ConfigSnapshot, BrokerdError> {
+async fn load_diff_config(path: &Path) -> Result<ResolvedConfig, BrokerdError> {
     let uid = current_uid();
     let (mut config, refusal) = config::load_in(path, uid, LoadMode::Check).await?;
     if let Some(error) = refusal {
         return Err(error.into());
     }
-    config.server_limits.frame_limits()?;
     if let Some(path) = &config.secret_map_path {
         let (_, bytes) = secrets::load_shapes(path, uid, None).await?;
         config.snapshot.record_authority_references(Some(&bytes))?;
     }
-    Ok(config.snapshot)
+    Ok(config)
 }
 
 pub async fn load_storage_config(path: &Path) -> Result<Option<StorageConfig>, ConfigError> {

@@ -596,6 +596,39 @@ pub struct ResolvedConfig {
     pub telemetry: Option<ResolvedTelemetry>,
 }
 
+impl ResolvedConfig {
+    pub(crate) fn relativize_provider_artifacts(
+        &mut self,
+        other_providers: &[PathBuf],
+    ) -> Result<(), ConfigError> {
+        let base = self.source.parent().ok_or(ConfigError::MissingParent)?;
+        let Some((_, serde_yaml::Value::Sequence(artifacts))) =
+            self.snapshot.0.get_mut("providerArtifacts")
+        else {
+            return Ok(());
+        };
+        for (path, artifact) in self.providers.iter().zip(artifacts) {
+            if other_providers.contains(path) {
+                continue;
+            }
+            if let serde_yaml::Value::String(artifact) = artifact
+                && let Some((_, hash)) = artifact.rsplit_once(':')
+                && let Some((levels, suffix)) =
+                    base.ancestors().enumerate().find_map(|(levels, ancestor)| {
+                        path.strip_prefix(ancestor)
+                            .ok()
+                            .map(|suffix| (levels, suffix))
+                    })
+            {
+                let mut relative: PathBuf = std::iter::repeat_n("..", levels).collect();
+                relative.push(suffix);
+                *artifact = format!("{}:{hash}", relative.display());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum LoadMode<'a> {
     Boot,

@@ -671,10 +671,13 @@ pub async fn check_diff(
             proposed
                 .sources
                 .relativize_catalog(catalog.unwrap_or(&proposed.config.catalog_path));
-            previous
+            let mut changes = previous
                 .sources
                 .changes(&proposed.sources)
-                .map_err(|error| vec![error.into()])
+                .map_err(|error| vec![error.into()])?;
+            let mut seen = std::collections::BTreeSet::new();
+            changes.swap.retain(|category| seen.insert(*category));
+            Ok(changes)
         }
         ((_, mut previous), (_, proposed)) => {
             previous.problems.extend(proposed.problems);

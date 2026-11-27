@@ -419,6 +419,69 @@ fn broker_diff(
         .expect("run broker diff")
 }
 
+fn copy_broker_diff_example(root: &std::path::Path) -> PathBuf {
+    let config_dir = root.join("conditional-write");
+    let providers = root.join("providers");
+    std::fs::create_dir_all(&config_dir).expect("create example config directory");
+    std::fs::create_dir(&providers).expect("create example provider directory");
+    std::fs::copy(
+        repository_root().join("examples/providers/http-probe-provider.wasm"),
+        providers.join("http-probe-provider.wasm"),
+    )
+    .expect("copy example provider");
+    write_broker_fixture(&config_dir.join("policies.cedar"), &read("policies.cedar"));
+    write_broker_fixture(
+        &config_dir.join("secret-map.yaml"),
+        &read("secret-map.yaml.example"),
+    );
+    let config = config_dir.join("broker.yaml");
+    write_broker_fixture(&config, &read("broker.yaml"));
+    config
+}
+
+#[test]
+fn broker_diff_compares_relocated_provider_copies() {
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = copy_broker_diff_example(&temporary.path().join("previous"));
+    let proposed = copy_broker_diff_example(&temporary.path().join("proposed"));
+
+    let unchanged = broker_diff(&proposed, &previous, &[]);
+    assert_eq!(unchanged.status.code(), Some(0), "{unchanged:?}");
+    assert_eq!(unchanged.stdout, b"ok\n");
+
+    write_broker_fixture(
+        &proposed,
+        &read("broker.yaml").replace("strict: true", "strict: false"),
+    );
+    let swap = broker_diff(&proposed, &previous, &[]);
+    assert_eq!(swap.status.code(), Some(0), "{swap:?}");
+    assert_eq!(swap.stdout, b"swap\tstrict\n");
+}
+
+#[test]
+fn broker_diff_refuses_unparseable_policy_in_the_proposed_input() {
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = copy_broker_diff_example(temporary.path());
+    let proposed = previous.with_file_name("proposed.yaml");
+    write_broker_fixture(
+        &previous.with_file_name("baseline.cedar"),
+        &read("policies.cedar"),
+    );
+    write_broker_fixture(
+        &previous,
+        &read("broker.yaml").replace(
+            "policiesPath: policies.cedar",
+            "policiesPath: baseline.cedar",
+        ),
+    );
+    write_broker_fixture(&proposed, &read("broker.yaml"));
+    write_broker_fixture(&proposed.with_file_name("policies.cedar"), "permit(");
+
+    let output = broker_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty());
+}
+
 #[test]
 fn broker_diff_reports_key_policy_and_secret_map_dispositions_in_directories() {
     use serde_json::{Value, json};
@@ -524,10 +587,11 @@ fn broker_diff_loads_single_files_and_refuses_an_unloadable_input() {
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert!(output.stdout.is_empty());
     }
-    assert_eq!(
-        broker_diff(&proposed, &previous, &["--materialized"])
-            .status
-            .code(),
-        Some(2)
-    );
+    for options in [&["--materialized"][..], &["--store", "store"]] {
+        assert_eq!(
+            broker_diff(&proposed, &previous, options).status.code(),
+            Some(2),
+            "{options:?}"
+        );
+    }
 }
