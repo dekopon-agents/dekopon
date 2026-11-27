@@ -1015,8 +1015,9 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     };
     let digest = config.snapshot.digest();
     if config.managed_set_validation_skipped {
-        // Ruling R permits classification when both managed artifacts are absent.
-        // campaign-trail: store/epochs/eleemosynary-mnemosyne/09-daemon/restart-story/check-diff/evidence/third-fix-ruling-fixer.md
+        // Both managed artifacts may be absent. In that case, skip managed-set validation
+        // and report the limit in table and JSON output. If only one artifact is present,
+        // return an error.
         if let Err(source) = PolicyEngine::validate_source(&config.policies) {
             report.problems.push(BrokerdError::Policy {
                 path: config.policies_path.map(PathBuf::into_boxed_path),
