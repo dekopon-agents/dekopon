@@ -218,6 +218,9 @@ struct CheckOutput {
 
 #[cfg(unix)]
 async fn run_check(check: &cli::CheckArgs) -> ExitCode {
+    if let Some(previous) = &check.diff {
+        return run_check_diff(check, previous).await;
+    }
     let scope = check.probe.then(|| match &check.against {
         Some(against) => dekopon_gatewayd::ProbeScope::ChangedFrom(against.clone()),
         None => dekopon_gatewayd::ProbeScope::Every,
@@ -262,6 +265,69 @@ async fn run_check(check: &cli::CheckArgs) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+#[cfg(unix)]
+async fn run_check_diff(check: &cli::CheckArgs, previous: &std::path::Path) -> ExitCode {
+    let changes =
+        match dekopon_gatewayd::check_diff(&check.config, previous, check.catalog.as_deref()).await
+        {
+            Ok(changes) => changes,
+            Err(problems) => {
+                for problem in &problems {
+                    eprintln!("dekopon-gatewayd: {}", diff_problem(problem));
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+    match check.output {
+        cli::CheckFormat::Table => {
+            for category in &changes.restart_required {
+                println!("restart_required\t{category}");
+            }
+            for category in &changes.swap {
+                println!("swap\t{category}");
+            }
+            if changes.restart_required.is_empty() && changes.swap.is_empty() {
+                println!("ok");
+            }
+        }
+        cli::CheckFormat::Json => match serde_json::to_string_pretty(&changes) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("dekopon-gatewayd: could not render check output: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+    }
+    if changes.restart_required.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(3)
+    }
+}
+
+#[cfg(unix)]
+fn diff_problem(problem: &dekopon_gatewayd::GatewaydError) -> String {
+    use dekopon_gatewayd::{ConfigError, GatewaydError};
+
+    if let GatewaydError::Config(
+        error @ (ConfigError::Decode { source, .. } | ConfigError::DecodeFragment { source, .. }),
+    ) = problem
+    {
+        return match source.location() {
+            Some(location) => format!(
+                "{error} (line {}, column {})",
+                location.line(),
+                location.column()
+            ),
+            None => error.to_string(),
+        };
+    }
+    if let GatewaydError::Catalog(_) = problem {
+        return problem.to_string();
+    }
+    error_chain(problem)
 }
 
 #[cfg(unix)]

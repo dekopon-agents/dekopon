@@ -133,6 +133,13 @@ struct CheckArgs {
     /// and policy.
     #[arg(long, value_name = "DIR", requires = "provider_set")]
     workflows: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PREVIOUS",
+        conflicts_with_all = ["materialized", "provider_set"],
+        help = "Compare reload dispositions against a previous configuration. Exit 0 if no restart is needed, 3 if a restart is required, or 1 on load failure."
+    )]
+    diff: Option<PathBuf>,
     /// Validate local secret material and fail when a check cannot run.
     #[arg(long)]
     materialized: bool,
@@ -151,7 +158,7 @@ struct CheckArgs {
         help = "Run full validation (strict) or check pinned artifact availability only (relaxed)"
     )]
     provider_verification: dekopon_brokerd::ProviderVerification,
-    /// Render problems and warnings as a table or JSON.
+    /// Render the check or diff as a table or JSON.
     #[arg(long, value_enum, default_value_t)]
     output: OutputFormat,
 }
@@ -438,6 +445,9 @@ async fn execute(cli: Cli, log: Option<dekopon_telemetry::LogFile>) -> ExitCode 
             observed(operator_console(), execute_provider(provider), None).await
         }
         Some(Command::Check(check)) => {
+            if let Some(previous) = &check.diff {
+                return execute_check_diff(&check.config, previous, check.output).await;
+            }
             let install = Install::new(Console {
                 format: ConsoleFormat::Text {
                     ansi: None,
@@ -720,6 +730,47 @@ impl From<dekopon_broker::ContinuityReport> for ContinuityOutput {
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(unix)]
+async fn execute_check_diff(
+    config: &std::path::Path,
+    previous: &std::path::Path,
+    output: OutputFormat,
+) -> ExitCode {
+    let changes = match dekopon_brokerd::check_diff(config, previous).await {
+        Ok(changes) => changes,
+        Err(error) => {
+            eprintln!("dekopon-brokerd: {}", error_chain(&error));
+            return ExitCode::FAILURE;
+        }
+    };
+    let rendered = render(output, &changes, || {
+        if changes.restart_required.is_empty() && changes.swap.is_empty() {
+            return "ok".to_owned();
+        }
+        changes
+            .restart_required
+            .iter()
+            .map(|category| format!("restart_required\t{category}"))
+            .chain(
+                changes
+                    .swap
+                    .iter()
+                    .map(|category| format!("swap\t{category}")),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    if let Err(error) = rendered {
+        eprintln!("dekopon-brokerd: {}", error_chain(&error));
+        return ExitCode::FAILURE;
+    }
+    if changes.restart_required.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(3)
     }
 }
 

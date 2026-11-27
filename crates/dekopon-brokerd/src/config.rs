@@ -299,6 +299,12 @@ pub(crate) enum Resident {
     Assets,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct BrokerChanges {
+    pub restart_required: Vec<String>,
+    pub swap: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ConfigSnapshot(BTreeMap<String, (Disposition, serde_yaml::Value)>);
 
@@ -467,23 +473,29 @@ impl ConfigSnapshot {
             .collect())
     }
 
-    pub(crate) fn changed_categories(&self, next: &Self) -> Vec<String> {
-        let null = serde_yaml::Value::Null;
+    fn changed_sources<'a>(
+        &'a self,
+        next: &'a Self,
+    ) -> impl Iterator<Item = (&'a str, Disposition)> {
         self.0
             .keys()
             .chain(next.0.keys())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter(|category| {
-                self.0
-                    .get(category.as_str())
-                    .map_or(&null, |(_, value)| value)
-                    != next
-                        .0
-                        .get(category.as_str())
-                        .map_or(&null, |(_, value)| value)
+            .filter_map(move |category| {
+                let null = serde_yaml::Value::Null;
+                let current = self.0.get(category);
+                let proposed = next.0.get(category);
+                let (disposition, _) = current.or(proposed)?;
+                let old = current.map_or(&null, |(_, value)| value);
+                let new = proposed.map_or(&null, |(_, value)| value);
+                (old != new).then_some((category.as_str(), *disposition))
             })
-            .cloned()
+    }
+
+    pub(crate) fn changed_categories(&self, next: &Self) -> Vec<String> {
+        self.changed_sources(next)
+            .map(|(category, _)| category.to_owned())
             .collect()
     }
 
@@ -498,31 +510,28 @@ impl ConfigSnapshot {
     }
 
     pub(crate) fn restart_required(&self, next: &Self) -> Vec<String> {
-        let null = serde_yaml::Value::Null;
-        self.0
-            .keys()
-            .chain(next.0.keys())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter_map(|category| {
-                let current = self.0.get(category.as_str());
-                let proposed = next.0.get(category.as_str());
-                let disposition = current.or(proposed).map(|(disposition, _)| disposition)?;
-                let old = current.map_or(&null, |(_, value)| value);
-                let new = proposed.map_or(&null, |(_, value)| value);
-                match disposition {
-                    Disposition::Swap => None,
-                    Disposition::Restart if old == new => None,
-                    Disposition::Restart => Some(match category.as_str() {
-                        "providerArtifacts" => "providers".to_owned(),
-                        "caBundles" => "http".to_owned(),
-                        _ => category.clone(),
-                    }),
+        self.changes(next).restart_required
+    }
+
+    pub(crate) fn changes(&self, next: &Self) -> BrokerChanges {
+        let mut restart_required = BTreeSet::new();
+        let mut swap = Vec::new();
+        for (category, disposition) in self.changed_sources(next) {
+            match disposition {
+                Disposition::Swap => swap.push(category.to_owned()),
+                Disposition::Restart => {
+                    restart_required.insert(match category {
+                        "providerArtifacts" => "providers",
+                        "caBundles" => "http",
+                        other => other,
+                    });
                 }
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
+            }
+        }
+        BrokerChanges {
+            restart_required: restart_required.into_iter().map(str::to_owned).collect(),
+            swap,
+        }
     }
 }
 

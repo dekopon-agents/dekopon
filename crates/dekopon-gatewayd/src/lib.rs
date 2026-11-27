@@ -52,12 +52,12 @@ use tokio::{sync::mpsc, task::JoinSet};
 
 pub use config::{
     CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationMatchConfig,
-    DEFAULT_FORGET_AFTER, DEFAULT_STOP_WORDS, GatewaydConfig, HARD_MAX_CONFIG_BYTES,
-    IndicatorSurface, JournalConfig, KeepAliveConfig, LivenessConfig, LivenessMode,
-    LivenessOverride, LivenessSettings, MemoryConfig, MemoryPolicy, MemoryScope, MemoryWindow,
-    ProgressSurface, ReactionConfig, RecallSource, ResolvedConfig, ResolvedJournal, ResolvedRoute,
-    ResolvedTelemetry, SeenReaction, SlackExperience, TelemetryConfig, TemplateOverrides,
-    TransportConfig, WorkingReaction,
+    DEFAULT_FORGET_AFTER, DEFAULT_STOP_WORDS, GatewayChanges, GatewaydConfig,
+    HARD_MAX_CONFIG_BYTES, IndicatorSurface, JournalConfig, KeepAliveConfig, LivenessConfig,
+    LivenessMode, LivenessOverride, LivenessSettings, MemoryConfig, MemoryPolicy, MemoryScope,
+    MemoryWindow, ProgressSurface, ReactionConfig, RecallSource, ResolvedConfig, ResolvedJournal,
+    ResolvedRoute, ResolvedTelemetry, SeenReaction, SlackExperience, TelemetryConfig,
+    TemplateOverrides, TransportConfig, WorkingReaction,
 };
 pub use probe::{NotProbed, ProbeError, ProbeProblem, ProbeScope};
 pub use routes::{RouteError, RouteProblem};
@@ -652,6 +652,35 @@ pub async fn check(
     )
     .await
     .1
+}
+
+pub async fn check_diff(
+    config: &Path,
+    previous: &Path,
+    catalog: Option<&Path>,
+) -> Result<GatewayChanges, Vec<GatewaydError>> {
+    let (previous, proposed) = tokio::join!(
+        load_candidate(previous, catalog, config::LoadMode::Check, None),
+        load_candidate(config, catalog, config::LoadMode::Check, None),
+    );
+    match (previous, proposed) {
+        ((Some(mut previous), _), (Some(mut proposed), _)) => {
+            previous
+                .sources
+                .relativize_catalog(catalog.unwrap_or(&previous.config.catalog_path));
+            proposed
+                .sources
+                .relativize_catalog(catalog.unwrap_or(&proposed.config.catalog_path));
+            previous
+                .sources
+                .changes(&proposed.sources)
+                .map_err(|error| vec![error.into()])
+        }
+        ((_, mut previous), (_, proposed)) => {
+            previous.problems.extend(proposed.problems);
+            Err(previous.problems)
+        }
+    }
 }
 
 pub(crate) struct Candidate {

@@ -396,3 +396,138 @@ fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
     assert_eq!(principal.as_str(), PRINCIPAL);
     assert_eq!(identity.principal.as_str(), GATEWAY);
 }
+
+fn write_broker_fixture(path: &std::path::Path, contents: &str) {
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    fs::write(path, contents).expect("write fixture");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
+}
+
+fn broker_diff(
+    proposed: &std::path::Path,
+    previous: &std::path::Path,
+    options: &[&str],
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_dekopon-brokerd"))
+        .arg("check")
+        .arg(proposed)
+        .arg("--diff")
+        .arg(previous)
+        .args(options)
+        .output()
+        .expect("run broker diff")
+}
+
+#[test]
+fn broker_diff_reports_key_policy_and_secret_map_dispositions_in_directories() {
+    use serde_json::{Value, json};
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = temporary.path().join("previous.d");
+    let proposed = temporary.path().join("proposed.d");
+    let config = read("broker.yaml")
+        .replace("policiesPath: policies.cedar\n", "")
+        .replace(
+            "secretMapPath: secret-map.yaml",
+            "secretMapPath: secret-map.yaml.example",
+        )
+        .replace(
+            "../providers/http-probe-provider.wasm",
+            &repository_root()
+                .join("examples/providers/http-probe-provider.wasm")
+                .display()
+                .to_string(),
+        );
+    let policies = read("policies.cedar");
+    let secret_map = read("secret-map.yaml.example").replace(
+        "/home/you/.config/dekopon/api-token",
+        &temporary
+            .path()
+            .join("absent-credential")
+            .display()
+            .to_string(),
+    );
+    for root in [&previous, &proposed] {
+        fs::create_dir(root).expect("create config directory");
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+            .expect("secure config directory");
+        write_broker_fixture(&root.join("broker.yaml"), &config);
+        write_broker_fixture(&root.join("policies.cedar"), &policies);
+        write_broker_fixture(&root.join("secret-map.yaml.example"), &secret_map);
+    }
+
+    let unchanged = broker_diff(&proposed, &previous, &[]);
+    assert_eq!(unchanged.status.code(), Some(0), "{unchanged:?}");
+    assert_eq!(unchanged.stdout, b"ok\n");
+
+    let swap = config.replace("strict: true", "strict: false");
+    write_broker_fixture(&proposed.join("broker.yaml"), &swap);
+    write_broker_fixture(
+        &proposed.join("policies.cedar"),
+        &policies.replace("conditional-writer-surface", "changed-policy-name"),
+    );
+    write_broker_fixture(
+        &proposed.join("secret-map.yaml.example"),
+        &secret_map.replace("mapRevision: example-1", "mapRevision: example-2"),
+    );
+    let output = broker_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).expect("diff JSON"),
+        json!({"restart_required": [], "swap": ["policies", "secretMapReferences", "strict"]})
+    );
+
+    write_broker_fixture(
+        &proposed.join("broker.yaml"),
+        &config.replace("/home/you/.local/run/dekopon/broker.sock", "other.sock"),
+    );
+    let output = broker_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).expect("diff JSON"),
+        json!({"restart_required": ["socketPath"], "swap": ["policies", "secretMapReferences"]})
+    );
+}
+
+#[test]
+fn broker_diff_loads_single_files_and_refuses_an_unloadable_input() {
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = temporary.path().join("previous.yaml");
+    let proposed = temporary.path().join("proposed.yaml");
+    let invalid = temporary.path().join("invalid.yaml");
+    let broker = read("broker.yaml").replace(
+        "../providers/http-probe-provider.wasm",
+        &repository_root()
+            .join("examples/providers/http-probe-provider.wasm")
+            .display()
+            .to_string(),
+    );
+    write_broker_fixture(
+        &temporary.path().join("policies.cedar"),
+        &read("policies.cedar"),
+    );
+    write_broker_fixture(
+        &temporary.path().join("secret-map.yaml"),
+        &read("secret-map.yaml.example"),
+    );
+    write_broker_fixture(&previous, &broker);
+    write_broker_fixture(&proposed, &broker.replace("strict: true", "strict: false"));
+    write_broker_fixture(&invalid, "apiVersion: deliberately-invalid-version\n");
+
+    let output = broker_diff(&proposed, &previous, &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"swap\tstrict\n");
+    for (current, baseline) in [(&proposed, &invalid), (&invalid, &previous)] {
+        let output = broker_diff(current, baseline, &[]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
+    assert_eq!(
+        broker_diff(&proposed, &previous, &["--materialized"])
+            .status
+            .code(),
+        Some(2)
+    );
+}

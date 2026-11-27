@@ -52,9 +52,10 @@ use dekopon_core::{SecretDrn, bounded_problems, error_chain, offload};
 use thiserror::Error;
 
 pub use config::{
-    AgentBindingConfig, AssetsConfig, BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion,
-    ConfigError, HostLimitsConfig, ManagedProviderSetConfig, PeerIdentity, PrincipalConfig,
-    ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig, StorageConfig, TelemetryConfig,
+    AgentBindingConfig, AssetsConfig, BrokerChanges, BrokerdConfig, CONFIG_API_VERSION,
+    ConfigApiVersion, ConfigError, HostLimitsConfig, ManagedProviderSetConfig, PeerIdentity,
+    PrincipalConfig, ResolvedConfig, ResolvedTelemetry, ServerLimitsConfig, StorageConfig,
+    TelemetryConfig,
 };
 pub use dekopon_broker::MAX_SECRET_BINDINGS as HARD_MAX_SECRET_BINDINGS;
 pub use provider_manager::{
@@ -447,6 +448,26 @@ pub async fn check<P: AsRef<Path>>(
         "broker check finished"
     );
     report
+}
+
+pub async fn check_diff(config: &Path, previous: &Path) -> Result<BrokerChanges, BrokerdError> {
+    let previous = load_diff_snapshot(previous).await?;
+    let proposed = load_diff_snapshot(config).await?;
+    Ok(previous.changes(&proposed))
+}
+
+async fn load_diff_snapshot(path: &Path) -> Result<config::ConfigSnapshot, BrokerdError> {
+    let uid = current_uid();
+    let (mut config, refusal) = config::load_in(path, uid, LoadMode::Check).await?;
+    if let Some(error) = refusal {
+        return Err(error.into());
+    }
+    config.server_limits.frame_limits()?;
+    if let Some(path) = &config.secret_map_path {
+        let (_, bytes) = secrets::load_shapes(path, uid, None).await?;
+        config.snapshot.record_authority_references(Some(&bytes))?;
+    }
+    Ok(config.snapshot)
 }
 
 pub async fn load_storage_config(path: &Path) -> Result<Option<StorageConfig>, ConfigError> {
@@ -1095,7 +1116,7 @@ async fn check_secrets(path: Option<&Path>, uid: u32, report: &mut CheckReport) 
         .problems
         .extend(material_problems.into_iter().map(BrokerdError::from));
     match shapes {
-        Ok(catalog) => Some(Secrets::Shapes(catalog)),
+        Ok((catalog, _)) => Some(Secrets::Shapes(catalog)),
         Err(SecretMapError::Read { .. }) if !report.materialized => Some(Secrets::Unchecked),
         Err(error) => {
             report.problems.push(error.into());
