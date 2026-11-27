@@ -28,10 +28,11 @@ explicit script timeout.
 ## Files
 
 Each daemon [refuses](../crates/dekopon-core/src/trusted_file.rs) a symlink, a second hard link,
-or a file another UID owns (on a read-only mount the gateway also takes root's file or a
-projection). Configuration and policy must not be group- or world-writable;
-the secret map, credential files and `--env-file` must be `0600`. Directories above the socket,
-providers and storage must not be group- or world-writable unless sticky, and above `--env-file`
+or a file another UID owns. The daemons accept read-only projections for configuration sources.
+The gateway also accepts root-owned files on a read-only mount. Configuration and policy must
+clear group and world write bits. Local secret maps, credential files and `--env-file` must be
+`0600`. Directories above the socket, providers and storage must clear group and world write bits
+unless sticky. Directories above `--env-file`
 and `--log-file` must belong to root or the daemon. macOS refuses a socket path of 104 bytes or more.
 
 ## Kubernetes
@@ -49,11 +50,10 @@ and credentials shown in [`examples/conditional-write`](../examples/conditional-
   grant. Inline configuration writes it into the broker's `identities` itself and sets the gateway's
   `broker.socketPath: /run/dekopon/broker.sock` and `broker.serverUid: 65532`; otherwise the broker
   refuses the gateway.
-- **An init container copies the broker's files.** No volume passes the [file checks](#files): a
-  projected Secret key is a symlink and a `subPath` file is root-owned. The `prepare-files` init
-  container, root with only `CHOWN` and `FOWNER`, copies each into a memory volume as a fresh `0600`
-  file. The namespace must admit it: Pod Security `baseline`, not
-  `restricted`. A changed existing Secret reaches the broker only when you restart the pod.
+- **Broker file updates.** The broker reloads projected configuration, policy and secret-map
+  edits through the gateway. Restart the pod for changes the broker refuses as restart-required,
+  edits to a `broker.d` ConfigMap, or updates to credentials copied by init. `prepare-files` needs
+  `CHOWN` and `FOWNER` to create owner-only credential files. Admit it with Pod Security `baseline`.
 - **The image's providers belong to `65532`**, and the broker loads only components it owns.
 - **A hook Job syncs the provider set.** With `broker.providerSet` and `broker.providerSync`, a
   pre-install and pre-upgrade Job runs `dekopon-brokerd provider sync` onto the state claim, and a

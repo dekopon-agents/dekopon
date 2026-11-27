@@ -52,8 +52,7 @@ podSecurityContext:
     # SIGSEGV/SIGBUS handlers for guard-page traps. RuntimeDefault permits all of that. Do not
     # narrow this to a hand-written profile without proving a provider still loads.
     type: RuntimeDefault
-  # fsGroup is deliberately absent, and setting it breaks the broker. It makes mounted files
-  # group-readable, and 0o040 trips the secret map's `mode & 0o077 != 0` refusal.
+  # fsGroup is deliberately absent. It can make projected credentials group-readable.
 
 securityContext:
   allowPrivilegeEscalation: false
@@ -84,9 +83,9 @@ initSecurityContext:
 # These are the directories the chart creates and hands to the daemons. Your broker.yaml and
 # gatewayd.yaml must name files inside them — the chart places files, it does not rewrite configs.
 #
-#   <configDir>/broker.yaml               0600 65532  (Tier B: mode & 0o022, uid, nlink, O_NOFOLLOW)
-#   <configDir>/policies.cedar            0600 65532  (Tier B)
-#   <configDir>/secret-map.yaml           0600 65532  (Tier A: mode & 0o077, uid, nlink)
+#   <configDir>/broker.yaml               root-owned read-only Secret projection (0444)
+#   <configDir>/policies.cedar            root-owned read-only Secret projection (0444)
+#   <configDir>/secret-map.yaml           root-owned read-only Secret projection (0444)
 #   <gatewayConfigDir>/gatewayd.yaml      root-owned read-only Secret projection (gateway only)
 #   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
 #   <stateDir>/<chatgpt.subdir>/          0700 dir owned by its daemon; seed-once ChatGPT credential
@@ -259,9 +258,8 @@ broker:
     #   argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
     annotations: {}
 
-  # Optional owner-only public-DRN/private-source map. The map contains no values but does contain
-  # sensitive physical inventory. Prefer an existing Secret. The init container copies it into the
-  # broker-only 0600 config directory; it is never mounted into the gateway.
+  # The map contains credential references. Prefer an existing Secret for sensitive inventory.
+  # The projection is inside the broker's 0700 config directory.
   secretMap:
     inline: ""
     existingSecret: ""

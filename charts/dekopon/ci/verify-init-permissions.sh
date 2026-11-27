@@ -112,9 +112,9 @@ assert volumes["broker-assets"]["emptyDir"]=={"sizeLimit":"1152Mi"}
 assert "broker-assets" not in gm
 assert bm["broker-assets"]["mountPath"]=="/var/lib/dekopon-assets"
 assert "config-source" not in gm and "config-source" not in bm
-expected={"config-source":"/dekopon-source", "config":"/etc/dekopon",
-          "runtime":"/run/dekopon",
-          "state":"/var/lib/dekopon"}
+expected={"config":"/etc/dekopon", "runtime":"/run/dekopon", "state":"/var/lib/dekopon"}
+if "config-source" in volumes:
+    expected["config-source"]="/dekopon-source"
 expected.update({"broker-assets": "/var/lib/dekopon-assets"})
 if "skills" in volumes:
     assert volumes["skills"]["configMap"]["defaultMode"] & 0o022 == 0
@@ -227,7 +227,7 @@ assert_eq() {
   fi
 }
 
-for suffix in src etc gateway-etc run state storage assets asset-probe; do
+for suffix in src live etc gateway-etc run state storage assets asset-probe; do
   v="$resource-$suffix"
   if docker volume inspect "$v" >/dev/null 2>&1; then
     echo "refusing preexisting test volume $v" >&2
@@ -240,29 +240,38 @@ done
 
 echo "==> building a projected-volume fixture (symlink farm, root-owned, 0400)"
 python3 "$chart_dir/ci/check-init-cleanup.py" "$0"
-docker run --rm -i --platform "$platform" -v "${resource}-src":/dekopon-source "$busybox" sh -s <<'FIXTURE'
+docker run --rm -i --platform "$platform" -v "${resource}-src":/dekopon-source \
+  -v "${resource}-live":/live "$busybox" sh -s <<'FIXTURE'
 set -eu
-cd /dekopon-source
 stamp=..2026_08_18_00_00_00.000000000
-mkdir -p "$stamp"
+cd /live
+mkdir "$stamp"
 printf 'apiVersion: dekopon.dev/brokerd/v1alpha1\n' > "$stamp/broker.yaml"
 printf '@id("x") permit(principal, action, resource);\n' > "$stamp/policies.cedar"
 printf 'apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: ci\nsecrets: []\n' > "$stamp/secret-map.yaml"
+chmod 0444 "$stamp"/*
+ln -s "$stamp" ..data
+for k in broker.yaml policies.cedar secret-map.yaml; do
+  ln -s "..data/$k" "$k"
+done
+cd /dekopon-source
+mkdir "$stamp"
+printf 'BOOTSTRAP-TOKEN\n' > "$stamp/vault-token"
 printf '{"refresh":"SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/chatgpt-auth.json"
 printf '{"refresh":"BROKER-SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/broker-chatgpt-auth.json"
 printf 'PRIVATE-APP-KEY\n' > "$stamp/private-app-key.pem"
 chmod 0400 "$stamp"/*
 ln -sfn "$stamp" ..data
-for k in broker.yaml policies.cedar secret-map.yaml chatgpt-auth.json broker-chatgpt-auth.json private-app-key.pem; do
+for k in vault-token chatgpt-auth.json broker-chatgpt-auth.json private-app-key.pem; do
   ln -sfn "..data/$k" "$k"
 done
 chmod 0755 /dekopon-source
 FIXTURE
 
 # --------------------------------------------------------------------------------------------
-# Part 1: the copy-every-start files
+# Part 1: broker projections, bootstrap copy and filesystem permissions
 # --------------------------------------------------------------------------------------------
-render_init "$work/init.sh"
+render_init "$work/init.sh" --set-json 'broker.secretBootstrapFiles=[{"file":"vault-token","existingSecret":"vault","existingSecretKey":"token"}]'
 
 echo "==> (a) cold start"
 reset_mounts
@@ -350,11 +359,15 @@ def ancestors(d):
             break
         p = os.path.dirname(p) or "/"
 
-print("== Tier A: secret map (mode & 0o077) ==")
-owned_file("/etc/dekopon/secret-map.yaml", 0o077, "secret map")
-print("== Tier B: broker.yaml, policies.cedar (mode & 0o022) ==")
-for f in ("broker.yaml", "policies.cedar"):
-    owned_file(f"/etc/dekopon/{f}", 0o022, "config")
+owned_file("/etc/dekopon/vault-token", 0o077, "bootstrap credential")
+root = "/etc/dekopon/.@live"
+ok(os.statvfs(root).f_flag & os.ST_RDONLY, "broker projection is read-only")
+for name in ("broker.yaml", "policies.cedar", "secret-map.yaml"):
+    alias = f"/etc/dekopon/{name}"
+    st = os.stat(alias)
+    ok(os.readlink(alias) == f".@live/{name}" and os.readlink(f"{root}/{name}") == f"..data/{name}"
+       and stat.S_ISREG(st.st_mode) and st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o444
+       and st.st_nlink == 1, f"{name} resolves to the root-owned 0444 projection")
 print("== Tier D: the IPC parent and every ancestor ==")
 ancestors("/run/dekopon")
 st = os.lstat("/run/dekopon")
@@ -366,8 +379,8 @@ sys.exit(1 if fail else 0)
 CHECK
 docker run --rm -i --platform "$platform" --user 65532:65532 --group-add=65534 --cap-drop=ALL \
   --security-opt=no-new-privileges \
-  -v "${resource}-etc":/etc/dekopon -v "${resource}-run":/run/dekopon \
-  "$python_image" python3 - < "$work/check.py"
+  -v "${resource}-etc":/etc/dekopon:ro -v "${resource}-run":/run/dekopon \
+  -v "${resource}-live":/etc/dekopon/.@live:ro "$python_image" python3 - < "$work/check.py"
 
 # --------------------------------------------------------------------------------------------
 # Part 2: the ChatGPT credential, which is seeded once and then owned by the daemon
@@ -564,7 +577,8 @@ docker run --rm --platform "$platform" -v "${resource}-gateway-etc":/s "$busybox
 docker run --rm -i --platform "$platform" --user 0:0 \
   --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID \
   --security-opt=no-new-privileges --read-only \
-  -v "${resource}-etc":/etc/dekopon -v "${resource}-gateway-etc":/etc/dekopon-gateway:ro \
+  -v "${resource}-etc":/etc/dekopon:ro -v "${resource}-gateway-etc":/etc/dekopon-gateway:ro \
+  -v "${resource}-live":/etc/dekopon/.@live:ro \
   -v "${resource}-run":/run/dekopon \
   --mount "type=volume,src=${resource}-state,dst=/gateway-state,volume-subpath=chatgpt" \
   -v "${resource}-storage":/var/lib/dekopon-provider-storage \

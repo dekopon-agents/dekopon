@@ -1983,12 +1983,24 @@ async fn read_map<T: serde::de::DeserializeOwned>(
     path: &Path,
     expected_uid: u32,
 ) -> Result<(T, Vec<u8>), SecretMapError> {
-    let bytes = read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
-        .await
-        .map_err(|source| SecretMapError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let bytes =
+        match crate::config::read_broker_source(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
+            .await?
+        {
+            Some(bytes) => bytes,
+            None => read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
+                .await
+                .map_err(|source| SecretMapError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                })?,
+        };
+    decode_map(bytes)
+}
+
+fn decode_map<T: serde::de::DeserializeOwned>(
+    bytes: Vec<u8>,
+) -> Result<(T, Vec<u8>), SecretMapError> {
     let file = serde_yaml::from_slice::<T>(&bytes).map_err(|source| SecretMapError::Decode {
         diagnostic: sanitized_yaml_diagnostic(&source, &bytes),
     })?;
@@ -3186,6 +3198,8 @@ impl SourceError {
 
 #[derive(Debug, Error)]
 pub enum SecretMapError {
+    #[error("could not load projected secret map")]
+    Projection(#[from] crate::config::ConfigError),
     #[error("could not read private secret map at {path}")]
     Read {
         path: PathBuf,
@@ -4082,6 +4096,48 @@ secrets:
                 .any(|problem| problem.contains("bootstrap credential")),
             "{problems:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn projected_map_loads_while_projected_credential_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join(".@live");
+        let generation = root.join("..generation");
+        tokio::fs::create_dir_all(&generation)
+            .await
+            .expect("generation");
+        let map = generation.join("secret-map.yaml");
+        write(
+            &map,
+            b"apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: projected\nsecrets: []\n",
+        )
+        .await;
+        tokio::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o444))
+            .await
+            .expect("projection mode");
+        write(&generation.join("token"), b"fixture").await;
+        symlink("..generation", root.join("..data")).expect("generation link");
+        symlink("..data/secret-map.yaml", root.join("secret-map.yaml")).expect("map link");
+        symlink("..data/token", root.join("token")).expect("credential link");
+        let alias = directory.path().join("secret-map.yaml");
+        symlink(".@live/secret-map.yaml", &alias).expect("chart path");
+
+        let owner = uid();
+        let maximum = super::HARD_MAX_SECRET_MAP_BYTES;
+        let bytes =
+            crate::config::read_broker_source_with(&alias, owner, maximum, |path, owner| {
+                dekopon_core::projection::Projection::verify(path, owner, true)
+            })
+            .expect("read from projection")
+            .expect("projection detected");
+        let (map, _) = super::decode_map::<super::SecretMapFile>(bytes).expect("decode map");
+        assert_eq!(map.map_revision, "projected");
+        assert!(matches!(
+            super::read_private_file(&root.join("token"), owner, 4096).await,
+            Err(super::SourceError::Io)
+        ));
     }
 
     #[tokio::test]

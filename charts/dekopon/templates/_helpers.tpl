@@ -234,12 +234,7 @@ logic.
 {{- end }}
 {{- end -}}
 
-{{/*
-The files the init container turns into real owner-only regular files, as a YAML list of
-{file, secret, key}. The projected source volume and the init script both iterate this, so they
-cannot drift apart.
-*/}}
-{{- define "dekopon.managedFiles" -}}
+{{- define "dekopon.brokerProjectedFiles" -}}
 {{- if not .Values.broker.configDirectory.configMap }}
 - file: broker.yaml
   secret: {{ default (include "dekopon.configSecretName" .) .Values.broker.config.existingSecret }}
@@ -255,6 +250,23 @@ cannot drift apart.
   secret: {{ default (include "dekopon.configSecretName" .) .Values.broker.secretMap.existingSecret }}
   key: {{ if .Values.broker.secretMap.existingSecret }}{{ .Values.broker.secretMap.existingSecretKey }}{{ else }}secret-map.yaml{{ end }}
 {{- end }}
+{{- end -}}
+
+{{- define "dekopon.brokerProjectionVolume" -}}
+{{- $names := list -}}
+{{- range .Values.broker.secretSourceVolumes -}}
+{{- $names = append $names .name -}}
+{{- end -}}
+{{- range $index := until (int (add1 (len $names))) -}}
+{{- $name := ternary "broker-config-projection" (printf "broker-config-projection-%d" $index) (eq $index 0) -}}
+{{- if not (has $name $names) -}}
+{{- $name -}}
+{{- break -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dekopon.bootstrapFiles" -}}
 {{- range .Values.broker.secretBootstrapFiles }}
 - file: {{ .file }}
   secret: {{ .existingSecret }}
@@ -861,6 +873,11 @@ Arguments: dict "ctx" $ "sidecar" bool
     - name: config
       mountPath: {{ $.Values.paths.configDir }}
       readOnly: true
+{{- if include "dekopon.brokerProjectedFiles" $ }}
+    - name: {{ include "dekopon.brokerProjectionVolume" $ }}
+      mountPath: {{ $.Values.paths.configDir }}/.@live
+      readOnly: true
+{{- end }}
     - name: runtime
       mountPath: {{ $.Values.paths.runtimeDir }}
 {{- if include "dekopon.brokerChatgptEnabled" $ }}

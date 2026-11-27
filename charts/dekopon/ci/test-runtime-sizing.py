@@ -122,12 +122,12 @@ def test_broker_reads_the_selected_secret_key_as_the_complete_config_file():
         )
         deployment = next(doc for doc in docs if doc["kind"] == "Deployment")
         pod = deployment["spec"]["template"]["spec"]
-        source = next(volume for volume in pod["volumes"] if volume["name"] == "config-source")
+        source = next(volume for volume in pod["volumes"] if volume["name"] == "broker-config-projection")
         assert source["projected"]["sources"] == [
             {"secret": {"name": "broker-config", "items": [{"key": key, "path": "broker.yaml"}]}}
         ]
         rendered = containers(docs)
-        assert '"/dekopon-source/broker.yaml" "/etc/dekopon/broker.yaml"' in rendered["prepare-files"]["args"][0]
+        assert 'ln -s ".@live/broker.yaml" "/etc/dekopon/broker.yaml"' in rendered["prepare-files"]["args"][0]
         assert rendered["broker"]["args"] == ["--config", "/etc/dekopon/broker.yaml"]
 
 
