@@ -7,6 +7,28 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.99.0] - 2026-11-27
+
+### Added
+
+- A capability's egressProfile pushes the profile's short-lived tokens to the VM runner in a broker-owned header on every call, after a Cedar secret.use decision on the vmEgressProfile sink.
+
+### Fixed
+
+- Broker configuration and provider state YAML errors no longer expose document contents.
+
+  **Breaking Rust API.** `dekopon_brokerd::ConfigError::Decode` replaces `source`
+  with `line` and `column`. `dekopon_brokerd::ConfigError::DecodeFragment` replaces
+  `path` and `source` with `line` and `column`.
+
+- Keep macOS descriptor tests on pull requests so merge-queue runs do not wait for macOS runners.
+
+## [dekopon-chart-0.86.0] - 2026-11-27
+
+### Changed
+
+- Chart 0.86.0 targets core v0.99.0 and renders the `v0.99.0` image tag.
+
 ## [0.98.0] - 2026-11-25
 
 ### Added
