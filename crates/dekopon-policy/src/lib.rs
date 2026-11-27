@@ -603,10 +603,6 @@ impl PolicyEngine {
         Self::build(policy_text, world, Handling::Tolerate)
     }
 
-    pub fn validate_source(policy_text: &str) -> Result<(), PolicyBuildError> {
-        Self::prepare_source(policy_text).map(drop)
-    }
-
     fn prepare_source(policy_text: &str) -> Result<PreparedPolicies, PolicyBuildError> {
         if policy_text.len() > MAX_POLICY_BYTES {
             return Err(PolicyBuildError::PolicyTooLarge {

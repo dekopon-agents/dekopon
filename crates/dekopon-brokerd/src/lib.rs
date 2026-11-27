@@ -48,7 +48,7 @@ pub use dekopon_broker_host::enable_test_component_memoization;
 use dekopon_broker_host::{BrokerProviderRegistry, CompiledCacheCounts};
 use dekopon_broker_protocol::ResponseEnvelope;
 use dekopon_capability::EffectKind;
-use dekopon_core::{SecretDrn, bounded_problems, error_chain, offload};
+use dekopon_core::{PrincipalId, SecretDrn, bounded_problems, error_chain, offload};
 use thiserror::Error;
 
 pub use config::{
@@ -1015,10 +1015,14 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     };
     let digest = config.snapshot.digest();
     if config.managed_set_validation_skipped {
-        // Both managed artifacts may be absent. In that case, skip managed-set validation
-        // and report the limit in table and JSON output. If only one artifact is present,
-        // return an error.
-        if let Err(source) = PolicyEngine::validate_source(&config.policies) {
+        let policy = policy_world(
+            &config.identities,
+            &config.principals,
+            &runtime.secrets,
+            None,
+        )
+        .and_then(|world| PolicyEngine::new_lenient(&config.policies, &world));
+        if let Err(source) = policy {
             report.problems.push(BrokerdError::Policy {
                 path: config.policies_path.map(PathBuf::into_boxed_path),
                 source,
@@ -1705,45 +1709,14 @@ async fn prepare(
     );
     let world = keep(
         &mut problems,
-        PolicyWorld::new(
-            config
-                .identities
-                .iter()
-                .map(|identity| identity.principal.clone())
-                .chain(config.principals.keys().cloned()),
-            registry
-                .capabilities()
-                .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+        policy_world(
+            &config.identities,
+            &config.principals,
+            &runtime.secrets,
+            Some(&registry),
         )
-        .map(|world| {
-            world
-                .with_subjects(config.principals.iter().flat_map(|(principal, entry)| {
-                    entry
-                        .subjects
-                        .iter()
-                        .map(|subject| (subject.clone(), principal.clone()))
-                }))
-                .with_group_members(config.principals.iter().flat_map(|(principal, entry)| {
-                    entry
-                        .groups
-                        .iter()
-                        .map(|group| (principal.clone(), group.clone()))
-                }))
-                .with_read_only(
-                    registry
-                        .capabilities()
-                        .filter(|(_, capability)| capability.effect == EffectKind::ReadOnly)
-                        .map(|(_, capability)| capability.id.clone()),
-                )
-        })
         .map_err(|source| BrokerdError::Policy { path: None, source }),
     );
-    let world = world.map(|world| match &runtime.secrets {
-        Secrets::Loaded(catalog, _) | Secrets::Shapes(catalog) => {
-            world.with_secrets(catalog.drns().cloned())
-        }
-        Secrets::Unchecked => world,
-    });
     let secrets_unchecked = match &runtime.secrets {
         Secrets::Loaded(_, _) | Secrets::Shapes(_) => false,
         Secrets::Unchecked => true,
@@ -1894,6 +1867,49 @@ async fn prepare(
 
 fn keep<T>(problems: &mut Vec<BrokerdError>, result: Result<T, BrokerdError>) -> Option<T> {
     result.map_err(|error| problems.push(error)).ok()
+}
+
+fn policy_world(
+    identities: &[PeerIdentity],
+    principals: &BTreeMap<PrincipalId, PrincipalConfig>,
+    secrets: &Secrets,
+    registry: Option<&BrokerProviderRegistry>,
+) -> Result<PolicyWorld, PolicyBuildError> {
+    let capabilities = || {
+        registry
+            .into_iter()
+            .flat_map(BrokerProviderRegistry::capabilities)
+    };
+    let world = PolicyWorld::new(
+        identities
+            .iter()
+            .map(|identity| identity.principal.clone())
+            .chain(principals.keys().cloned()),
+        capabilities().map(|(provider, capability)| (capability.id.clone(), provider.clone())),
+    )?
+    .with_subjects(principals.iter().flat_map(|(principal, entry)| {
+        entry
+            .subjects
+            .iter()
+            .map(|subject| (subject.clone(), principal.clone()))
+    }))
+    .with_group_members(principals.iter().flat_map(|(principal, entry)| {
+        entry
+            .groups
+            .iter()
+            .map(|group| (principal.clone(), group.clone()))
+    }))
+    .with_read_only(
+        capabilities()
+            .filter(|(_, capability)| capability.effect == EffectKind::ReadOnly)
+            .map(|(_, capability)| capability.id.clone()),
+    );
+    Ok(match secrets {
+        Secrets::Loaded(catalog, _) | Secrets::Shapes(catalog) => {
+            world.with_secrets(catalog.drns().cloned())
+        }
+        Secrets::Unchecked => world,
+    })
 }
 
 fn build_policy(

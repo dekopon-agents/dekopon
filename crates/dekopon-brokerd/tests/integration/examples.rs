@@ -616,9 +616,10 @@ fn broker_diff_reports_skipped_validation_for_absent_managed_artifacts() {
 }
 
 #[tokio::test]
-async fn broker_diff_validates_policy_source_without_managed_artifacts() {
+async fn broker_diff_validates_policy_without_managed_artifacts() {
     use dekopon_broker::PolicyBuildError;
     use dekopon_brokerd::BrokerdError;
+    use dekopon_core::IdentifierError;
 
     let temporary = tempfile::tempdir().expect("fixture root");
     let previous = managed_broker_diff_config(&temporary.path().join("previous"), false);
@@ -654,6 +655,42 @@ async fn broker_diff_validates_policy_source_without_managed_artifacts() {
                when { context.request.method == "POST" };"#,
             PolicyBuildError::InvalidRequestShapes {
                 policies: vec!["request-permit".to_owned()],
+            },
+        ),
+        (
+            r#"@id("unknown-principal")
+               permit(principal == Dekopon::Principal::"nobody", action, resource);"#,
+            PolicyBuildError::UnknownPrincipal {
+                policy: "unknown-principal".to_owned(),
+                principal: "nobody".to_owned(),
+            },
+        ),
+        (
+            r#"@id("malformed-principal")
+               permit(principal == Dekopon::Principal::"Ops Team", action, resource);"#,
+            PolicyBuildError::MalformedPrincipal {
+                policy: "malformed-principal".to_owned(),
+                principal: "Ops Team".to_owned(),
+                source: IdentifierError::InvalidStart {
+                    kind: "principal",
+                    character: 'O',
+                },
+            },
+        ),
+        (
+            r#"@id("unknown-group")
+               permit(principal in Dekopon::Group::"operators", action, resource);"#,
+            PolicyBuildError::UnknownGroup {
+                policy: "unknown-group".to_owned(),
+                group: "operators".to_owned(),
+            },
+        ),
+        (
+            r#"@id("unknown-type")
+               permit(principal == Dekopon::Unsupported::"alice", action, resource);"#,
+            PolicyBuildError::UnknownEntityType {
+                policy: "unknown-type".to_owned(),
+                entity_type: "Dekopon::Unsupported".to_owned(),
             },
         ),
     ] {
