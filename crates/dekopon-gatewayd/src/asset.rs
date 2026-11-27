@@ -3040,9 +3040,12 @@ pub(crate) mod retention_tests {
             Ok(Some(_))
         ));
         assert!(
-            capture
-                .events_text()
-                .contains("gateway.asset.reclaim.failed")
+            !capture
+                .events_where(
+                    "dekopon_gatewayd",
+                    &[("message", "gateway.asset.reclaim.failed")]
+                )
+                .is_empty()
         );
         pending.finish_blocking();
         assert_eq!(
@@ -3981,9 +3984,12 @@ pub(crate) mod retention_tests {
             assert_eq!(Retention::new(3).check_size(7, 4), Err(BlobError::TooLarge));
             tracing::info!(target: "legacy_gateway::audit", "wrong audit target");
         });
-        assert!(capture.records().iter().any(|record| matches!(record,
-            dekopon_test_support::Record::Event { target, parent: Some(parent), .. }
-            if target == "dekopon_gatewayd::audit" && record.field("audit.event") == Some("gateway.asset.retention_miss") && parent == "gateway.session")));
+        let events = capture.events_where(
+            "dekopon_gatewayd::audit",
+            &[("audit.event", "gateway.asset.retention_miss")],
+        );
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].parent(), Some("gateway.session"));
         assert!(capture.records().iter().any(|record| matches!(
             record,
             dekopon_test_support::Record::Span {
@@ -3991,15 +3997,19 @@ pub(crate) mod retention_tests {
                 ..
             }
         )));
-        assert!(!capture.events_text().contains("wrong audit target"));
-        let text = capture.text();
-        assert!(text.contains("gateway.asset.retention_miss"), "{text}");
         assert!(
-            text.contains("asset.id=7")
-                && text.contains("asset.bytes=4")
-                && text.contains("asset.budget=3"),
-            "{text}"
+            capture
+                .events_where("legacy_gateway::audit", &[])
+                .is_empty()
         );
+        for (field, value) in [
+            ("asset.id", "7"),
+            ("asset.bytes", "4"),
+            ("asset.budget", "3"),
+        ] {
+            assert_eq!(events[0].field(field), Some(value), "{field}: {events:?}");
+        }
+        let text = capture.text();
         assert!(!text.contains("dekopon-assets-") && !text.contains("base64"));
     }
 

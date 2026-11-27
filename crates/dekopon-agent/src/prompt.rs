@@ -4150,11 +4150,12 @@ mod tests {
             },
         );
         with_agent.expect("prompt session succeeds");
-        assert!(
-            capture.saw(r#"agent="reviewer""#),
-            "{}",
-            capture.events_text()
+        let events = capture.events_where(
+            "dekopon_agent::audit",
+            &[("audit.event", "accounting.model.turn")],
         );
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].field("agent"), Some("reviewer"));
 
         capture.clear();
         let model = ScriptedModel::new([answer("done")]);
@@ -4171,11 +4172,12 @@ mod tests {
             },
         );
         without_agent.expect("prompt session succeeds");
-        assert!(
-            !capture.saw("agent="),
-            "no agent supplied should mean no field: {}",
-            capture.events_text()
+        let events = capture.events_where(
+            "dekopon_agent::audit",
+            &[("audit.event", "accounting.model.turn")],
         );
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].field("agent"), None);
     }
 
     #[test]

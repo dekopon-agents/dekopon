@@ -230,11 +230,6 @@ impl CaptureLayer {
         )
     }
 
-    #[must_use]
-    pub fn saw(&self, marker: &str) -> bool {
-        self.events_text().contains(marker)
-    }
-
     pub fn clear(&self) {
         self.records.lock().clear();
     }

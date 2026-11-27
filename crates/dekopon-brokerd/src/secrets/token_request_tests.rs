@@ -158,8 +158,15 @@ async fn each_resolution_mints_the_fixed_subject_and_audience_with_the_current_b
             })
         );
     }
+    let records = capture.events_where(
+        "dekopon_brokerd::secrets",
+        &[
+            ("event", "secret_source_resolution_failed"),
+            ("category", "rejected"),
+        ],
+    );
+    assert_eq!(records.len(), 1, "{records:?}");
     let events = capture.events_text();
-    assert!(events.contains("rejected"), "{events}");
     for secret in [
         BOOTSTRAP,
         MINTED,

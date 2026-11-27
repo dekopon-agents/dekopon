@@ -25,7 +25,7 @@ use dekopon_capability::{EffectKind, ExecutionConstraints};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, Subject,
 };
-use dekopon_test_support::{CaptureLayer, provider_fixture, shutdown_on};
+use dekopon_test_support::{CaptureLayer, Record, provider_fixture, shutdown_on};
 use serde_json::json;
 use tokio::{
     io::AsyncWriteExt as _,
@@ -51,14 +51,15 @@ permit(principal == Dekopon::Principal::"cpetersen",
 when { context.agent == "chat-agent" };
 "#;
 
-async fn take_after(captured: &CaptureLayer, marker: &str) -> String {
+async fn events_after(captured: &CaptureLayer, marker: &str) -> Vec<Record> {
     for _ in 0..200 {
-        if captured.saw(marker) {
-            return captured.take_events();
+        let events = captured.events_where("dekopon_brokerd", &[("event", marker)]);
+        if !events.is_empty() {
+            return events;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("no {marker} event arrived: {}", captured.take_events());
+    panic!("no {marker} event arrived: {}", captured.events_text());
 }
 
 fn context() -> AuthenticatedContext {
@@ -203,18 +204,23 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     )
     .await;
     assert_eq!(code, ERROR_INVALID_REQUEST);
-    let unreadable = take_after(&captured, "broker_request_frame_invalid").await;
-    assert!(unreadable.contains("deserialize"), "{unreadable}");
-    assert!(
-        !unreadable.contains("this is not protocol json"),
-        "{unreadable}"
-    );
+    let unreadable = events_after(&captured, "broker_request_frame_invalid").await;
+    assert_eq!(unreadable.len(), 1, "{unreadable:?}");
+    assert_eq!(unreadable[0].field("error.kind"), Some("deserialize"));
+    let logged = captured.events_text();
+    assert!(!logged.contains("this is not protocol json"), "{logged}");
+    captured.clear();
 
     let oversized_code = write_raw(&socket_path, 128 * 1024, b"", limits().frame).await;
     assert_eq!(oversized_code, ERROR_INVALID_REQUEST);
-    let oversized = take_after(&captured, "broker_request_frame_invalid").await;
-    assert!(oversized.contains("frame-too-large"), "{oversized}");
-    assert!(oversized.contains("65536"), "{oversized}");
+    let oversized = events_after(&captured, "broker_request_frame_invalid").await;
+    assert_eq!(oversized.len(), 1, "{oversized:?}");
+    assert_eq!(oversized[0].field("error.kind"), Some("frame-too-large"));
+    assert_eq!(
+        oversized[0].field("error"),
+        Some("broker frame is 131072 bytes; maximum is 65536")
+    );
+    captured.clear();
 
     let client = BrokerClient::new(&socket_path, uid, limits().frame).expect("client starts");
     let request = InvocationRequest {
@@ -243,18 +249,23 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
         )
         .await
         .expect_err("a terminal audit failure is not a successful invocation");
-    let unaudited = take_after(&captured, "broker_outcome_unaudited").await;
-    assert!(
-        unaudited.contains("broker_audit_append_failed"),
-        "{unaudited}"
+    let unaudited = events_after(&captured, "broker_outcome_unaudited").await;
+    assert_eq!(unaudited.len(), 1, "{unaudited:?}");
+    assert_eq!(
+        unaudited[0].field("invocation.id"),
+        Some("invoke-unaudited")
     );
-    assert!(unaudited.contains("\"full\""), "{unaudited}");
-    assert!(unaudited.contains("\"outcome\""), "{unaudited}");
-    assert!(unaudited.contains("invoke-unaudited"), "{unaudited}");
-    assert!(
-        unaudited.contains("audit log reached its 1-record bound"),
-        "{unaudited}"
+    let failed =
+        captured.events_where("dekopon_broker", &[("event", "broker_audit_append_failed")]);
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].field("category"), Some("full"));
+    assert_eq!(failed[0].field("audit.stage"), Some("outcome"));
+    assert_eq!(failed[0].field("invocation"), Some("invoke-unaudited"));
+    assert_eq!(
+        failed[0].field("error"),
+        Some("audit log reached its 1-record bound")
     );
+    captured.clear();
 
     let unmapped_path = directory.path().join("unmapped.sock");
     let unmapped_listener = bind_fixture(&unmapped_path);
@@ -266,8 +277,12 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     let _unmapped_peer = UnixStream::connect(&unmapped_path)
         .await
         .expect("connect as an unmapped peer");
-    let unmapped = take_after(&captured, "broker_peer_unmapped").await;
-    assert!(unmapped.contains(&format!("peer.uid={uid}")), "{unmapped}");
+    let unmapped = events_after(&captured, "broker_peer_unmapped").await;
+    assert_eq!(unmapped.len(), 1, "{unmapped:?}");
+    assert_eq!(
+        unmapped[0].field("peer.uid"),
+        Some(uid.to_string().as_str())
+    );
     stop_unmapped.send(()).expect("signal clean shutdown");
     unmapped_task
         .await

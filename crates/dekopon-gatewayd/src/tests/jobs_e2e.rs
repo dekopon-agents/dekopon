@@ -611,9 +611,9 @@ async fn a_killed_or_stopped_job_sends_nothing_after_its_reply_and_keeps_its_out
     );
     assert_eq!(models.requests(), 6);
     assert!(
-        !capture.events_text().contains("job.notice"),
-        "{}",
-        capture.events_text()
+        capture
+            .events_where("job", &[("message", "job.notice")])
+            .is_empty()
     );
     sender
         .send(TransportEvent::Message(Box::new(message("list"))))
@@ -808,12 +808,14 @@ async fn a_busy_notice_drops_without_a_busy_reply() {
     )
     .await;
     assert!(driver.replies().is_empty());
-    let records = capture.events_text();
-    assert_eq!(
-        records.matches("job.notice.delivery=\"dropped\"").count(),
-        1,
-        "{records}"
+    let records = capture.events_where(
+        "job",
+        &[
+            ("message", "job.notice"),
+            ("job.notice.delivery", "dropped"),
+        ],
     );
+    assert_eq!(records.len(), 1, "{records:?}");
     models.release();
     held.await.unwrap();
     assert_eq!(driver.replies(), ["done"]);
@@ -854,16 +856,27 @@ async fn a_route_without_job_opt_in_drops_the_notice_once() {
     );
     drop(admitted(&runner.jobs, "a", "job").unwrap());
     until(Duration::from_secs(2), || {
-        capture
-            .events_text()
-            .contains("job.notice.delivery=\"dropped\"")
+        !capture
+            .events_where(
+                "job",
+                &[
+                    ("message", "job.notice"),
+                    ("job.notice.delivery", "dropped"),
+                ],
+            )
+            .is_empty()
     })
     .await;
     assert_eq!(
         capture
-            .events_text()
-            .matches("job.notice.delivery=\"dropped\"")
-            .count(),
+            .events_where(
+                "job",
+                &[
+                    ("message", "job.notice"),
+                    ("job.notice.delivery", "dropped")
+                ]
+            )
+            .len(),
         1
     );
     assert!(driver.replies().is_empty());
@@ -878,12 +891,14 @@ fn a_full_notice_channel_drops_once_without_blocking_job_completion() {
     let jobs = Arc::new(Jobs::new(1, crate::threads::Owner::new(16)));
     drop(admitted(&jobs, "a", "first").unwrap());
     drop(admitted(&jobs, "a", "second").unwrap());
-    let text = capture.events_text();
-    assert_eq!(
-        text.matches("job.notice.delivery=\"dropped\"").count(),
-        1,
-        "{text}"
+    let records = capture.events_where(
+        "job",
+        &[
+            ("message", "job.notice"),
+            ("job.notice.delivery", "dropped"),
+        ],
     );
+    assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(jobs.free_permits(), 1);
 }
 
