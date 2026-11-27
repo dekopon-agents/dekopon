@@ -137,7 +137,7 @@ struct CheckArgs {
         long,
         value_name = "PREVIOUS",
         conflicts_with_all = ["materialized", "provider_set", "store"],
-        help = "Compare reload dispositions against a previous configuration. Exit 0 if no restart is needed, 3 if a restart is required, or 1 on load failure."
+        help = "Compare reload dispositions against a previous configuration. Report skipped managed-set validation when both local artifacts are absent. Exit 0 if no restart is needed, 3 if a restart is required, or 1 on load failure."
     )]
     diff: Option<PathBuf>,
     /// Validate local secret material and fail when a check cannot run.
@@ -891,10 +891,7 @@ async fn execute_check_diff(
         }
     };
     let rendered = render(output, &changes, || {
-        if changes.restart_required.is_empty() && changes.swap.is_empty() {
-            return "ok".to_owned();
-        }
-        changes
+        let mut rows = changes
             .restart_required
             .iter()
             .map(|category| format!("restart_required\t{category}"))
@@ -904,8 +901,14 @@ async fn execute_check_diff(
                     .iter()
                     .map(|category| format!("swap\t{category}")),
             )
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            rows.push("ok".to_owned());
+        }
+        rows.extend(changes.managed_set_validation_skipped.iter().map(|input| {
+            format!("managed_set_validation_skipped\t{input} (local lock and store absent)")
+        }));
+        rows.join("\n")
     });
     if let Err(error) = rendered {
         eprintln!("dekopon-brokerd: {}", error_chain(&error));

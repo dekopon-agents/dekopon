@@ -1014,6 +1014,27 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
         return (None, report);
     };
     let digest = config.snapshot.digest();
+    if config.managed_set_validation_skipped {
+        if let Err(source) = PolicyEngine::validate_source(&config.policies) {
+            report.problems.push(BrokerdError::Policy {
+                path: config.policies_path.map(PathBuf::into_boxed_path),
+                source,
+            });
+        }
+        if let Err(source) = digest {
+            report.problems.push(BrokerdError::Snapshot { source });
+        }
+        let loaded = report
+            .problems
+            .is_empty()
+            .then_some(Loaded::Diff(DiffSnapshot {
+                source: config.source,
+                providers: config.providers,
+                snapshot: config.snapshot,
+                managed_set_validation_skipped: true,
+            }));
+        return (loaded, report);
+    }
     match residents {
         Residents::Borrow(active)
             if report.problems.is_empty()
@@ -1106,6 +1127,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                         source,
                         providers,
                         snapshot,
+                        managed_set_validation_skipped: false,
                     })),
                     report,
                 );

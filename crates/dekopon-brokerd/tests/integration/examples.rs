@@ -515,8 +515,13 @@ fn write_managed_diff_lock(root: &std::path::Path, providers: &[&str]) {
 }
 
 fn managed_broker_diff_example(root: &std::path::Path, directory: bool) -> PathBuf {
-    let config = copy_broker_diff_example(root);
+    let config = managed_broker_diff_config(root, directory);
     write_managed_diff_lock(root, &["http-probe"]);
+    config
+}
+
+fn managed_broker_diff_config(root: &std::path::Path, directory: bool) -> PathBuf {
+    let config = copy_broker_diff_example(root);
     std::fs::rename(
         config.with_file_name("secret-map.yaml"),
         config.with_file_name("secret-map.yaml.example"),
@@ -535,6 +540,79 @@ fn managed_broker_diff_example(root: &std::path::Path, directory: bool) -> PathB
     document["secretMapPath"] = serde_json::json!("secret-map.yaml.example");
     write_broker_fixture(&config, &document.to_string());
     config
+}
+
+#[test]
+fn broker_diff_reports_skipped_validation_for_absent_managed_artifacts() {
+    use serde_json::{Value, json};
+
+    let temporary = tempfile::tempdir().expect("fixture root");
+    for (name, directory) in [("single", false), ("directory", true)] {
+        let root = temporary.path().join(name);
+        let previous_root = root.join("previous");
+        let proposed_root = root.join("proposed");
+        let previous_config = managed_broker_diff_config(&previous_root, directory);
+        let proposed_config = managed_broker_diff_config(&proposed_root, directory);
+        let input = |config: &std::path::Path| {
+            if directory {
+                config.parent().expect("config directory").to_path_buf()
+            } else {
+                config.to_path_buf()
+            }
+        };
+        let previous = input(&previous_config);
+        let proposed = input(&proposed_config);
+        let original = std::fs::read_to_string(&proposed_config).expect("proposed config");
+        for (document, swap, row) in [
+            (original.clone(), json!([]), "ok"),
+            (
+                original.replace("\"strict\":true", "\"strict\":false"),
+                json!(["strict"]),
+                "swap\tstrict",
+            ),
+        ] {
+            write_broker_fixture(&proposed_config, &document);
+            let output = broker_diff(&proposed, &previous, &[]);
+            assert_eq!(output.status.code(), Some(0), "{name}: {output:?}");
+            assert_eq!(
+                String::from_utf8(output.stdout).expect("diff table"),
+                format!(
+                    "{row}\nmanaged_set_validation_skipped\tprevious (local lock and store absent)\nmanaged_set_validation_skipped\tproposed (local lock and store absent)\n"
+                )
+            );
+            let output = broker_diff(&proposed, &previous, &["--output", "json"]);
+            assert_eq!(output.status.code(), Some(0), "{name}: {output:?}");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).expect("diff JSON"),
+                json!({
+                    "restart_required": [],
+                    "swap": swap,
+                    "managed_set_validation_skipped": ["previous", "proposed"],
+                })
+            );
+        }
+        assert!(!previous_root.join("providers.lock.yaml").exists());
+        assert!(!previous_root.join("store").exists());
+        assert!(!proposed_root.join("providers.lock.yaml").exists());
+        assert!(!proposed_root.join("store").exists());
+
+        write_managed_diff_lock(&previous_root, &["http-probe"]);
+        let mixed = broker_diff(&proposed, &previous, &["--output", "json"]);
+        assert_eq!(mixed.status.code(), Some(0), "{name}: {mixed:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&mixed.stdout).expect("mixed diff JSON"),
+            json!({
+                "restart_required": [],
+                "swap": ["strict"],
+                "managed_set_validation_skipped": ["proposed"],
+            })
+        );
+
+        write_broker_fixture(&proposed_config.with_file_name("policies.cedar"), "permit(");
+        let invalid = broker_diff(&proposed, &proposed, &["--output", "json"]);
+        assert_eq!(invalid.status.code(), Some(1), "{name}: {invalid:?}");
+        assert!(invalid.stdout.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -565,19 +643,88 @@ async fn broker_diff_compares_managed_sets_from_local_artifacts() {
         assert!(!root.join("store/.provider-manager.lock").exists());
     }
 
-    std::fs::remove_dir_all(proposed_root.join("store")).expect("remove the local provider store");
+    for missing in ["providers.lock.yaml", "store"] {
+        let artifact = proposed_root.join(missing);
+        let saved = proposed_root.join("saved-artifact");
+        std::fs::rename(&artifact, &saved).expect("hide one local artifact");
+        let error = dekopon_brokerd::check_diff(&proposed, &previous)
+            .await
+            .expect_err("diff requires both or neither artifact");
+        assert!(matches!(
+            error,
+            BrokerdError::Config(ConfigError::ResolvePath { path, source })
+                if path.ends_with(missing) && source.kind() == std::io::ErrorKind::NotFound
+        ));
+        let refusal = broker_diff(&proposed, &previous, &["--output", "json"]);
+        assert_eq!(refusal.status.code(), Some(1), "{refusal:?}");
+        assert!(refusal.stdout.is_empty());
+        assert!(!artifact.exists());
+        std::fs::rename(&saved, &artifact).expect("restore the local artifact");
+    }
+}
+
+#[tokio::test]
+async fn broker_diff_refuses_present_but_broken_managed_artifacts() {
+    use dekopon_brokerd::{BrokerdError, ConfigError, ProviderManagerError};
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt as _, symlink},
+    };
+
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let proposed_root = temporary.path().join("broken");
+    let previous = managed_broker_diff_config(&temporary.path().join("absent"), false);
+    let proposed = managed_broker_diff_config(&proposed_root, false);
+    let lock = proposed_root.join("providers.lock.yaml");
+    let store = proposed_root.join("store");
+    symlink("missing-lock", &lock).expect("dangling lock entry");
+    symlink("missing-store", &store).expect("dangling store entry");
+
     let error = dekopon_brokerd::check_diff(&proposed, &previous)
         .await
-        .expect_err("diff requires existing local artifacts");
+        .expect_err("dangling entries count as present");
     assert!(matches!(
         error,
         BrokerdError::Config(ConfigError::ResolvePath { path, source })
-            if path.ends_with("store") && source.kind() == std::io::ErrorKind::NotFound
+            if path.ends_with("providers.lock.yaml") && source.kind() == std::io::ErrorKind::NotFound
     ));
-    let refusal = broker_diff(&proposed, &previous, &["--output", "json"]);
-    assert_eq!(refusal.status.code(), Some(1), "{refusal:?}");
-    assert!(refusal.stdout.is_empty());
-    assert!(!proposed_root.join("store").exists());
+    let dangling = broker_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(dangling.status.code(), Some(1), "{dangling:?}");
+    assert!(dangling.stdout.is_empty());
+
+    fs::remove_file(&lock).expect("remove lock symlink");
+    fs::remove_file(&store).expect("remove store symlink");
+    write_managed_diff_lock(&proposed_root, &["http-probe"]);
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).expect("insecure lock mode");
+    let insecure = dekopon_brokerd::check_diff(&proposed, &previous)
+        .await
+        .expect_err("present insecure lock must fail");
+    assert!(matches!(
+        insecure,
+        BrokerdError::Config(ConfigError::ProviderLock {
+            source: ProviderManagerError::FileSecurity { .. },
+            ..
+        })
+    ));
+    let insecure = broker_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(insecure.status.code(), Some(1), "{insecure:?}");
+    assert!(insecure.stdout.is_empty());
+
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).expect("restore lock mode");
+    write_broker_fixture(&lock, "providers: [");
+    let corrupt = dekopon_brokerd::check_diff(&proposed, &previous)
+        .await
+        .expect_err("present corrupt lock must fail");
+    assert!(matches!(
+        corrupt,
+        BrokerdError::Config(ConfigError::ProviderLock {
+            source: ProviderManagerError::Configuration { .. },
+            ..
+        })
+    ));
+    let corrupt = broker_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(corrupt.status.code(), Some(1), "{corrupt:?}");
+    assert!(corrupt.stdout.is_empty());
 }
 
 #[test]

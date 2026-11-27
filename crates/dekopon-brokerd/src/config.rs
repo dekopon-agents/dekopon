@@ -303,7 +303,11 @@ pub(crate) enum Resident {
 pub struct BrokerChanges {
     pub restart_required: Vec<String>,
     pub swap: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub managed_set_validation_skipped: Vec<&'static str>,
 }
+
+const PROVIDER_LOCK_DIGEST: &str = "providerLockDigest";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ConfigSnapshot(BTreeMap<String, (Disposition, serde_yaml::Value)>);
@@ -444,7 +448,7 @@ impl ConfigSnapshot {
     pub(crate) fn record_lock(&mut self, lock: Option<&LoadedLock>) {
         if let Some(lock) = lock {
             self.0.insert(
-                "providerLockDigest".to_owned(),
+                PROVIDER_LOCK_DIGEST.to_owned(),
                 (
                     Disposition::Restart,
                     serde_yaml::Value::String(lock.digest.clone()),
@@ -531,6 +535,7 @@ impl ConfigSnapshot {
         BrokerChanges {
             restart_required: restart_required.into_iter().map(str::to_owned).collect(),
             swap,
+            managed_set_validation_skipped: Vec::new(),
         }
     }
 }
@@ -577,6 +582,7 @@ pub struct ResolvedConfig {
     pub providers: Vec<PathBuf>,
     pub locked_providers: Option<Vec<LockedProviderSource>>,
     pub provider_lock: Option<LoadedLock>,
+    pub(crate) managed_set_validation_skipped: bool,
     pub strict: bool,
     pub identities: Vec<PeerIdentity>,
     pub principals: BTreeMap<PrincipalId, PrincipalConfig>,
@@ -600,13 +606,27 @@ pub(crate) struct DiffSnapshot {
     pub(crate) source: PathBuf,
     pub(crate) providers: Vec<PathBuf>,
     pub(crate) snapshot: ConfigSnapshot,
+    pub(crate) managed_set_validation_skipped: bool,
 }
 
 impl DiffSnapshot {
     pub(crate) fn changes(mut self, mut next: Self) -> Result<BrokerChanges, ConfigError> {
         self.relativize_provider_artifacts(&next.providers)?;
         next.relativize_provider_artifacts(&self.providers)?;
-        Ok(self.snapshot.changes(&next.snapshot))
+        let skipped: Vec<_> = [
+            self.managed_set_validation_skipped.then_some("previous"),
+            next.managed_set_validation_skipped.then_some("proposed"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !skipped.is_empty() {
+            self.snapshot.0.remove(PROVIDER_LOCK_DIGEST);
+            next.snapshot.0.remove(PROVIDER_LOCK_DIGEST);
+        }
+        let mut changes = self.snapshot.changes(&next.snapshot);
+        changes.managed_set_validation_skipped = skipped;
+        Ok(changes)
     }
 
     fn relativize_provider_artifacts(
@@ -1018,22 +1038,22 @@ async fn resolve(
             .validate(&storage.limits)
             .map_err(|_| ConfigError::InvalidChatMemory)?;
     }
+    let mut managed_set_validation_skipped = false;
     let managed_provider_paths = config
         .provider_set
         .map(|managed| {
-            let provider_path = |path| {
-                let unresolved = resolve_path(path);
-                match mode {
-                    LoadMode::Check => Ok(unresolved),
-                    LoadMode::Boot | LoadMode::Reload { .. } | LoadMode::Diff => {
-                        std::fs::canonicalize(&unresolved).map_err(|source| {
-                            ConfigError::ResolvePath {
-                                path: unresolved,
-                                source,
-                            }
-                        })
-                    }
+            let lock_path = resolve_path(managed.lock_path);
+            let store_path = resolve_path(managed.store_path);
+            managed_set_validation_skipped = matches!(mode, LoadMode::Diff)
+                && managed_artifacts_absent(&lock_path, &store_path)?;
+            let provider_path = |unresolved| {
+                if matches!(mode, LoadMode::Check) || managed_set_validation_skipped {
+                    return Ok(unresolved);
                 }
+                std::fs::canonicalize(&unresolved).map_err(|source| ConfigError::ResolvePath {
+                    path: unresolved,
+                    source,
+                })
             };
             let lock_path = match mode {
                 LoadMode::Reload {
@@ -1041,15 +1061,16 @@ async fn resolve(
                     ..
                 } => lock.path.clone(),
                 LoadMode::Boot | LoadMode::Reload { .. } | LoadMode::Check | LoadMode::Diff => {
-                    provider_path(managed.lock_path)?
+                    provider_path(lock_path)?
                 }
             };
-            let store_path = provider_path(managed.store_path)?;
+            let store_path = provider_path(store_path)?;
             Ok::<_, ConfigError>((lock_path, store_path))
         })
         .transpose()?;
     let (locked_providers, provider_lock) = match (&managed_provider_paths, mode) {
         (None, _) | (Some(_), LoadMode::Check) => (None, None),
+        (Some(_), LoadMode::Diff) if managed_set_validation_skipped => (None, None),
         (
             Some(_),
             LoadMode::Reload {
@@ -1111,7 +1132,8 @@ async fn resolve(
         });
     }
     let require_providers = match mode {
-        LoadMode::Boot | LoadMode::Diff => true,
+        LoadMode::Boot => true,
+        LoadMode::Diff => !managed_set_validation_skipped,
         LoadMode::Reload { .. } | LoadMode::Check => managed_provider_paths.is_none(),
     };
     if providers.is_empty() && require_providers {
@@ -1370,6 +1392,7 @@ async fn resolve(
         providers,
         locked_providers,
         provider_lock,
+        managed_set_validation_skipped,
         strict: config.strict,
         identities: config.identities,
         principals: config.principals,
@@ -1407,6 +1430,24 @@ async fn resolve(
         chat_memory,
         telemetry,
     })
+}
+
+fn managed_artifacts_absent(lock_path: &Path, store_path: &Path) -> Result<bool, ConfigError> {
+    let paths = [lock_path, store_path];
+    let metadata = paths.map(std::fs::symlink_metadata);
+    if metadata
+        .iter()
+        .all(|result| matches!(result, Err(error) if error.kind() == io::ErrorKind::NotFound))
+    {
+        return Ok(true);
+    }
+    for (path, result) in paths.into_iter().zip(metadata) {
+        result.map_err(|source| ConfigError::ResolvePath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Error)]

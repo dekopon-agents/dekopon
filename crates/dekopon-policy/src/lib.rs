@@ -597,11 +597,11 @@ impl PolicyEngine {
         Self::build(policy_text, world, Handling::Tolerate)
     }
 
-    fn build(
-        policy_text: &str,
-        world: &PolicyWorld,
-        handling: Handling,
-    ) -> Result<(Self, Vec<UnresolvedName>), PolicyBuildError> {
+    pub fn validate_source(policy_text: &str) -> Result<(), PolicyBuildError> {
+        Self::parse_source(policy_text).map(drop)
+    }
+
+    fn parse_source(policy_text: &str) -> Result<PolicySet, PolicyBuildError> {
         if policy_text.len() > MAX_POLICY_BYTES {
             return Err(PolicyBuildError::PolicyTooLarge {
                 length: policy_text.len(),
@@ -628,6 +628,15 @@ impl PolicyEngine {
                 maximum: MAX_POLICIES,
             });
         }
+        Ok(policies)
+    }
+
+    fn build(
+        policy_text: &str,
+        world: &PolicyWorld,
+        handling: Handling,
+    ) -> Result<(Self, Vec<UnresolvedName>), PolicyBuildError> {
+        let policies = Self::parse_source(policy_text)?;
         let mut policies = apply_annotated_ids(&policies)?;
         refuse_non_canonical_literals(&policies)?;
         let policy_count = policies.num_of_policies();
