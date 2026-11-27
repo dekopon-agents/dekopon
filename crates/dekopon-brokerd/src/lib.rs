@@ -1015,6 +1015,8 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     };
     let digest = config.snapshot.digest();
     if config.managed_set_validation_skipped {
+        // Ruling R permits classification when both managed artifacts are absent.
+        // campaign-trail: store/epochs/eleemosynary-mnemosyne/09-daemon/restart-story/check-diff/evidence/third-fix-ruling-fixer.md
         if let Err(source) = PolicyEngine::validate_source(&config.policies) {
             report.problems.push(BrokerdError::Policy {
                 path: config.policies_path.map(PathBuf::into_boxed_path),
@@ -1061,8 +1063,12 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     let socket_path = std::mem::take(&mut config.socket_path);
     let provider_lock = config.provider_lock.take();
     let locked_providers = config.locked_providers.clone();
-    let diff_paths = matches!(residents, Residents::Check(CheckStorage::ReadOnly))
-        .then(|| (config.source.clone(), config.providers.clone()));
+    let diff_paths = match residents {
+        Residents::Check(CheckStorage::ReadOnly) => {
+            Some((config.source.clone(), config.providers.clone()))
+        }
+        Residents::Open | Residents::Borrow(_) | Residents::Check(CheckStorage::Scratch) => None,
+    };
     let reuse_registry = provider_lock.is_some() || restart_categories.is_empty();
     let storage = runtime.storage.clone();
     let assets = runtime.assets.clone();
@@ -1193,9 +1199,13 @@ async fn check_secrets(
     report
         .problems
         .extend(material_problems.into_iter().map(BrokerdError::from));
+    let (record_references, allow_unreadable) = match storage {
+        CheckStorage::Scratch => (false, !report.materialized),
+        CheckStorage::ReadOnly => (true, false),
+    };
     match shapes {
         Ok((catalog, bytes)) => {
-            if matches!(storage, CheckStorage::ReadOnly) {
+            if record_references {
                 keep(
                     &mut report.problems,
                     config
@@ -1206,11 +1216,7 @@ async fn check_secrets(
             }
             Some(Secrets::Shapes(catalog))
         }
-        Err(SecretMapError::Read { .. })
-            if !report.materialized && matches!(storage, CheckStorage::Scratch) =>
-        {
-            Some(Secrets::Unchecked)
-        }
+        Err(SecretMapError::Read { .. }) if allow_unreadable => Some(Secrets::Unchecked),
         Err(error) => {
             report.problems.push(error.into());
             None

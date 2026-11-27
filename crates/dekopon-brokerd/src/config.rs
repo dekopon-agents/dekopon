@@ -1044,16 +1044,19 @@ async fn resolve(
         .map(|managed| {
             let lock_path = resolve_path(managed.lock_path);
             let store_path = resolve_path(managed.store_path);
-            managed_set_validation_skipped = matches!(mode, LoadMode::Diff)
-                && managed_artifacts_absent(&lock_path, &store_path)?;
-            let provider_path = |unresolved| {
-                if matches!(mode, LoadMode::Check) || managed_set_validation_skipped {
-                    return Ok(unresolved);
+            managed_set_validation_skipped = match mode {
+                LoadMode::Diff => managed_artifacts_absent(&lock_path, &store_path)?,
+                LoadMode::Boot | LoadMode::Reload { .. } | LoadMode::Check => false,
+            };
+            let provider_path = |unresolved| match mode {
+                LoadMode::Check => Ok(unresolved),
+                LoadMode::Diff if managed_set_validation_skipped => Ok(unresolved),
+                LoadMode::Boot | LoadMode::Reload { .. } | LoadMode::Diff => {
+                    std::fs::canonicalize(&unresolved).map_err(|source| ConfigError::ResolvePath {
+                        path: unresolved,
+                        source,
+                    })
                 }
-                std::fs::canonicalize(&unresolved).map_err(|source| ConfigError::ResolvePath {
-                    path: unresolved,
-                    source,
-                })
             };
             let lock_path = match mode {
                 LoadMode::Reload {
