@@ -7,6 +7,25 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.100.0] - 2026-11-27
+
+### Changed
+
+- gatewayd: `sessions.durable.path` (with `sync`) replaces `sessions.wakes.path`; wakes, follows, Slack thread ownership and job records persist in one SQLite store, and `wakes.jsonl` beside it converts once at first boot.
+
+  **Breaking Rust API.** `dekopon_gatewayd::WakeStoreError` is removed and `GatewaydError::WakeStore` becomes `GatewaydError::Store(StoreError)`. The wakes configuration loses `path` (`WakesConfig.path`, `ResolvedWakes.path`); the store path is `DurableConfig.path`.
+  The conversion is one-way: `wakes.jsonl` becomes `wakes.jsonl.converted`, and gatewayd 0.99.0 reads neither the store nor `sessions.durable`, so a downgrade needs the pre-upgrade `wakes.jsonl` and `sessions.wakes.path` restored.
+
+### Fixed
+
+- gatewayd: sealing a journal conversation fsyncs the directory after the rename.
+
+## [dekopon-chart-0.87.0] - 2026-11-27
+
+### Changed
+
+- Chart 0.87.0 targets core v0.100.0 and renders the `v0.100.0` image tag.
+
 ## [0.99.0] - 2026-11-27
 
 ### Added

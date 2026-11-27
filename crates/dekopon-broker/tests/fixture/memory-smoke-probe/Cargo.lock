@@ -67,7 +67,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "dekopon-capability"
-version = "0.99.0"
+version = "0.100.0"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.99.0"
+version = "0.100.0"
 dependencies = [
  "libc",
  "rustix",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.99.0"
+version = "0.100.0"
 dependencies = [
  "clap",
  "dekopon-capability",
