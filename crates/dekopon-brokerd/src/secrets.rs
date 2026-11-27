@@ -20,6 +20,7 @@ use dekopon_capability::{HttpPathRule, SecretUseGrantError};
 use dekopon_core::OffloadTrace;
 use dekopon_core::{
     CapabilityId, FileHygieneError, FileTier, Redacted, SecretDrn, SecretSinkKind, offload,
+    projection::{Projection as MountedFile, ProjectionError},
     read_trusted_file,
 };
 use dekopon_telemetry::egress::{Timeout, client_builder};
@@ -1785,7 +1786,15 @@ pub(crate) async fn load_with_bytes(
     path: &Path,
     expected_uid: u32,
 ) -> Result<LoadedMap, SecretMapError> {
-    let (file, bytes) = read_map::<SecretMapFile>(path, expected_uid).await?;
+    load_with_bytes_resolving(path, expected_uid, MountedFile::resolve).await
+}
+
+async fn load_with_bytes_resolving(
+    path: &Path,
+    expected_uid: u32,
+    resolve: impl FnOnce(&Path, u32) -> Result<MountedFile, ProjectionError> + Send + 'static,
+) -> Result<LoadedMap, SecretMapError> {
+    let (file, bytes) = read_map_resolving::<SecretMapFile>(path, expected_uid, resolve).await?;
     let validated = validate_map(file, path, expected_uid).await?;
     Ok(LoadedMap {
         catalog: validated.catalog,
@@ -1983,18 +1992,30 @@ async fn read_map<T: serde::de::DeserializeOwned>(
     path: &Path,
     expected_uid: u32,
 ) -> Result<(T, Vec<u8>), SecretMapError> {
-    let bytes =
-        match crate::config::read_broker_source(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
-            .await?
-        {
-            Some(bytes) => bytes,
-            None => read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
-                .await
-                .map_err(|source| SecretMapError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                })?,
-        };
+    read_map_resolving(path, expected_uid, MountedFile::resolve).await
+}
+
+async fn read_map_resolving<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    expected_uid: u32,
+    resolve: impl FnOnce(&Path, u32) -> Result<MountedFile, ProjectionError> + Send + 'static,
+) -> Result<(T, Vec<u8>), SecretMapError> {
+    let bytes = match crate::config::read_broker_source(
+        path,
+        expected_uid,
+        HARD_MAX_SECRET_MAP_BYTES,
+        resolve,
+    )
+    .await?
+    {
+        Some(bytes) => bytes,
+        None => read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
+            .await
+            .map_err(|source| SecretMapError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?,
+    };
     decode_map(bytes)
 }
 
@@ -4108,10 +4129,16 @@ secrets:
         tokio::fs::create_dir_all(&generation)
             .await
             .expect("generation");
+        let material = directory.path().join("value");
+        write(&material, b"fixture").await;
         let map = generation.join("secret-map.yaml");
         write(
             &map,
-            b"apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: projected\nsecrets: []\n",
+            format!(
+                "apiVersion: dekopon.dev/secret-map/v1alpha1\nmapRevision: projected\nsecrets:\n  - drn: drn:secret:file/value\n    destinations: [example.com]\n    source: {{ kind: secureFile, path: {} }}\n    bindings:\n      - id: file\n        capabilities: [http-probe.fetch]\n        sink: httpBearer\n        allowedHosts: [example.com]\n        allowedMethods: [GET]\n        allowedPaths: [{{ match: exact, path: /v1 }}]\n",
+                material.display()
+            )
+            .as_bytes(),
         )
         .await;
         tokio::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o444))
@@ -4125,15 +4152,12 @@ secrets:
         symlink(".@live/secret-map.yaml", &alias).expect("chart path");
 
         let owner = uid();
-        let maximum = super::HARD_MAX_SECRET_MAP_BYTES;
-        let bytes =
-            crate::config::read_broker_source_with(&alias, owner, maximum, |path, owner| {
-                dekopon_core::projection::Projection::verify(path, owner, true)
-            })
-            .expect("read from projection")
-            .expect("projection detected");
-        let (map, _) = super::decode_map::<super::SecretMapFile>(bytes).expect("decode map");
-        assert_eq!(map.map_revision, "projected");
+        let loaded = super::load_with_bytes_resolving(&alias, owner, |path, owner| {
+            dekopon_core::projection::Projection::verify(path, owner, true)
+        })
+        .await
+        .expect("map loads through the projection");
+        assert_eq!(loaded.catalog.drns().count(), 1);
         assert!(matches!(
             super::read_private_file(&root.join("token"), owner, 4096).await,
             Err(super::SourceError::Io)

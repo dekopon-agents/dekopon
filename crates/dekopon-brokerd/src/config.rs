@@ -831,7 +831,9 @@ async fn read_config_source(
     expected_uid: u32,
     maximum: usize,
 ) -> Result<Vec<u8>, ConfigError> {
-    if let Some(bytes) = read_broker_source(path, expected_uid, maximum).await? {
+    if let Some(bytes) =
+        read_broker_source(path, expected_uid, maximum, Projection::resolve).await?
+    {
         return Ok(bytes);
     }
     read_owner_only(path, expected_uid, maximum).await
@@ -852,9 +854,10 @@ pub(crate) async fn read_broker_source(
     path: &Path,
     expected_uid: u32,
     maximum: usize,
+    resolve: impl FnOnce(&Path, u32) -> Result<Projection, ProjectionError> + Send + 'static,
 ) -> Result<Option<Vec<u8>>, ConfigError> {
     let owned = path.to_path_buf();
-    offload(move || read_broker_source_with(&owned, expected_uid, maximum, Projection::resolve))
+    offload(move || read_broker_source_with(&owned, expected_uid, maximum, resolve))
         .await
         .map_err(|join| ConfigError::Read {
             path: path.to_path_buf(),
@@ -862,7 +865,7 @@ pub(crate) async fn read_broker_source(
         })?
 }
 
-pub(crate) fn read_broker_source_with(
+fn read_broker_source_with(
     path: &Path,
     expected_uid: u32,
     maximum: usize,

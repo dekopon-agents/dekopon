@@ -45,11 +45,15 @@ spec:
     metadata:
       annotations:
         {{- /*
-          checksum/config is for inline files copied by init. Projected configuration content
-          reaches the daemon through the existing mount, so a checksum would bypass live reload.
+          Projected broker content is reloaded by gateway reconciliation, so a checksum would
+          bypass live reload. With the gateway disabled nothing drives that reconciliation, and
+          an inline source changes only through a pod roll.
           Neither ChatGPT seed contributes a checksum because the Secret goes stale at the first
           refresh. Reseed values change the init arguments and roll the pod themselves.
         */}}
+        {{- if and (not .Values.gateway.enabled) (include "dekopon.hasInlineConfig" .) }}
+        checksum/config: {{ include (print $.Template.BasePath "/secret-config.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

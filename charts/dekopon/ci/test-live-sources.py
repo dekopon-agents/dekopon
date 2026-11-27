@@ -25,8 +25,8 @@ def render(*args):
     deployment = next(d for d in docs if d["kind"] == "Deployment")
     pod = deployment["spec"]["template"]
     volumes = {v["name"]: v for v in pod["spec"]["volumes"]}
-    gateway = next(c for c in pod["spec"]["containers"] if c["name"] == "gateway")
-    broker = next(c for c in pod["spec"]["initContainers"] if c["name"] == "broker")
+    gateway = next((c for c in pod["spec"]["containers"] if c["name"] == "gateway"), None)
+    broker = next((c for c in pod["spec"]["initContainers"] if c["name"] == "broker"), None)
     init = next(c for c in pod["spec"]["initContainers"] if c["name"] == "prepare-files")
     return docs, deployment, pod, volumes, gateway, broker, init
 
@@ -120,6 +120,26 @@ def test_inline_gateway_source_changes_without_broker_roll():
     catalog_changed = render("--set", "gateway.enabled=true", "--set", "gateway.catalog.inline=agent-b", "--set", "gateway.config.inline=broker: {serverUid: 65532}")
     assert "checksum/catalog" not in (catalog_changed[2]["metadata"].get("annotations") or {})
     assert catalog_changed[2]["metadata"].get("annotations") == first[2]["metadata"].get("annotations")
+
+
+def test_inline_broker_checksum_follows_the_reload_driver():
+    gateway = ("--set", "gateway.enabled=true", "--set", "gateway.config.existingSecret=g", "--set", "gateway.catalog.existingConfigMap=agents")
+    inline = (
+        ("broker.config.inline", "apiVersion: dekopon.dev/brokerd/v1alpha1\nidentities: [{uid: 65532}]"),
+        ("broker.policies.inline", "permit(principal\\, action\\, resource);"),
+        ("broker.secretMap.inline", "secrets: {}"),
+    )
+    for key, value in inline:
+        base = ("--set", f"{key}={value}")
+        for enabled, extra in ((False, ()), (True, gateway)):
+            annotations = render(*base, *extra)[2]["metadata"].get("annotations") or {}
+            assert ("checksum/config" in annotations) is (not enabled), (key, enabled)
+            if not enabled:
+                changed = render(*base, *extra, "--set", f"{key}={value} ")[2]["metadata"]["annotations"]
+                assert changed["checksum/config"] != annotations["checksum/config"], key
+    existing = ("--set", "broker.config.inline=", "--set", "broker.config.existingSecret=broker-authored")
+    assert "rollout restart" in notes(*existing)
+    assert "rollout restart" not in notes(*existing, *gateway)
 
 
 def test_restart_notice_names_only_copied_sources():
@@ -282,6 +302,7 @@ def test_against_config_mounts_the_live_catalog_from_the_deployment_source():
 if __name__ == "__main__":
     test_live_gateway_directory_and_nested_skills()
     test_inline_gateway_source_changes_without_broker_roll()
+    test_inline_broker_checksum_follows_the_reload_driver()
     test_restart_notice_names_only_copied_sources()
     test_broker_projections_and_init_copies()
     test_retired_source_names_and_paths_are_not_reserved()
