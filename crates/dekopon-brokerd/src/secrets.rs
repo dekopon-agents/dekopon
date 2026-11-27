@@ -1800,8 +1800,8 @@ pub(crate) async fn load_shapes(
     path: &Path,
     expected_uid: u32,
     mut material_problems: Option<&mut Vec<SecretMapError>>,
-) -> Result<SecretCatalog, SecretMapError> {
-    let (file, _) = read_map::<SecretMapFile>(path, expected_uid).await?;
+) -> Result<(SecretCatalog, Vec<u8>), SecretMapError> {
+    let (file, bytes) = read_map::<SecretMapFile>(path, expected_uid).await?;
     let mut problems = Vec::new();
     let runners =
         signed_jwt_runners(file.secrets.iter().map(|entry| (&entry.drn, &entry.source))).collect();
@@ -1819,7 +1819,7 @@ pub(crate) async fn load_shapes(
         return Err(SecretMapError::Validation { problems });
     }
     SecretCatalog::unresolved(bindings)
-        .map(|catalog| catalog.with_signed_jwt_runners(runners))
+        .map(|catalog| (catalog.with_signed_jwt_runners(runners), bytes))
         .map_err(|source| SecretMapError::Catalog { source })
 }
 

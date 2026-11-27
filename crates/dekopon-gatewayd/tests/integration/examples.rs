@@ -211,3 +211,198 @@ fn whatsapp_example_uses_the_typed_default_media_collection_window() {
         }
     ));
 }
+
+fn write_gateway_fixture(path: &std::path::Path, contents: &str) {
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    fs::write(path, contents).expect("write fixture");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
+}
+
+fn gateway_diff(
+    proposed: &std::path::Path,
+    previous: &std::path::Path,
+    options: &[&str],
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_dekopon-gatewayd"))
+        .arg("check")
+        .arg(proposed)
+        .arg("--diff")
+        .arg(previous)
+        .args(options)
+        .output()
+        .expect("run gateway diff")
+}
+
+#[test]
+fn gateway_diff_reports_model_swaps_and_slack_experience_restarts_in_directories() {
+    use serde_json::{Value, json};
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = temporary.path().join("previous");
+    let proposed = temporary.path().join("proposed");
+    for root in [&previous, &proposed] {
+        let directory = root.join("gateway.d");
+        fs::create_dir_all(&directory).expect("create config directory");
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("secure config directory");
+        write_gateway_fixture(&root.join("dekopon.yaml"), &read("dekopon.yaml"));
+    }
+    let agent = read("gatewayd.yaml")
+        .replace("catalogPath: dekopon.yaml", "catalogPath: ../dekopon.yaml")
+        .replace("mode: native", "mode: off");
+    let classic = agent.replace("experience: agent", "experience: classic");
+    let previous = previous.join("gateway.d");
+    let proposed = proposed.join("gateway.d");
+    write_gateway_fixture(&previous.join("gateway.yaml"), &classic);
+
+    for (contents, status, expected) in [
+        (
+            classic.clone(),
+            0,
+            json!({"restart_required": [], "swap": []}),
+        ),
+        (
+            classic.replace("model: qwen3", "model: qwen3-updated"),
+            0,
+            json!({"restart_required": [], "swap": ["models"]}),
+        ),
+        (
+            classic
+                .replace("seen: off", "seen: on")
+                .replace("sessions:\n", "sessions:\n  indicators: { mode: off }\n"),
+            0,
+            json!({"restart_required": [], "swap": ["indicators"]}),
+        ),
+        (
+            agent,
+            3,
+            json!({"restart_required": ["transports"], "swap": []}),
+        ),
+    ] {
+        write_gateway_fixture(&proposed.join("gateway.yaml"), &contents);
+        let output = gateway_diff(&proposed, &previous, &["--output", "json"]);
+        assert_eq!(output.status.code(), Some(status), "{output:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).expect("diff JSON"),
+            expected
+        );
+    }
+    let output = gateway_diff(&proposed, &previous, &[]);
+    assert_eq!(output.stdout, b"restart_required\ttransports\n");
+}
+
+#[test]
+fn gateway_diff_loads_single_files_and_refuses_an_unloadable_input() {
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = temporary.path().join("previous.yaml");
+    let proposed = temporary.path().join("proposed.yaml");
+    let invalid = temporary.path().join("invalid.yaml");
+    let gateway = read("gatewayd.yaml");
+    write_gateway_fixture(
+        &temporary.path().join("dekopon.yaml"),
+        &read("dekopon.yaml"),
+    );
+    write_gateway_fixture(&previous, &gateway);
+    write_gateway_fixture(
+        &proposed,
+        &gateway.replace("model: qwen3", "model: qwen3-updated"),
+    );
+    write_gateway_fixture(&invalid, "apiVersion: deliberately-invalid-version\n");
+
+    let output = gateway_diff(&proposed, &previous, &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"swap\tmodels\n");
+    for (current, baseline) in [(&proposed, &invalid), (&invalid, &previous)] {
+        let output = gateway_diff(current, baseline, &[]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            !output
+                .stderr
+                .windows(b"deliberately-invalid-version".len())
+                .any(|window| window == b"deliberately-invalid-version")
+        );
+    }
+    for options in [&["--probe"][..], &["--against", "baseline.yaml"]] {
+        assert_eq!(
+            gateway_diff(&proposed, &previous, options).status.code(),
+            Some(2),
+            "{options:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test owns and shuts down its current-thread runtime"
+)]
+async fn gateway_diff_keeps_catalog_path_and_cause_without_document_values() {
+    use dekopon_config::{CatalogProblem, ConfigError};
+    use dekopon_gatewayd::{GatewaydError, check_diff};
+    use std::io::ErrorKind;
+
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = temporary.path().join("previous.yaml");
+    let proposed = temporary.path().join("proposed.yaml");
+    let catalog = temporary.path().join("proposed-catalog.yaml");
+    let gateway = read("gatewayd.yaml");
+    write_gateway_fixture(
+        &temporary.path().join("dekopon.yaml"),
+        &read("dekopon.yaml"),
+    );
+    write_gateway_fixture(&previous, &gateway);
+    write_gateway_fixture(
+        &proposed,
+        &gateway.replace(
+            "catalogPath: dekopon.yaml",
+            "catalogPath: proposed-catalog.yaml",
+        ),
+    );
+
+    let errors = check_diff(&proposed, &previous, None)
+        .await
+        .expect_err("missing catalog");
+    assert!(matches!(
+        errors.as_slice(),
+        [GatewaydError::Catalog(ConfigError::Read { path, source })]
+            if path == &catalog.to_string_lossy() && source.kind() == ErrorKind::NotFound
+    ));
+    let missing = gateway_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(missing.stderr).expect("catalog diagnostic"),
+        format!(
+            "dekopon-gatewayd: {}: could not read catalog ({})\n",
+            catalog.display(),
+            ErrorKind::NotFound
+        ),
+    );
+
+    write_gateway_fixture(
+        &catalog,
+        &read("dekopon.yaml").replace("enabled: true", "enabled: sensitive-catalog-value"),
+    );
+    let errors = check_diff(&proposed, &previous, None)
+        .await
+        .expect_err("invalid catalog");
+    assert!(matches!(
+        errors.as_slice(),
+        [GatewaydError::Catalog(ConfigError::Invalid { path, problems })]
+            if path == &catalog.to_string_lossy()
+                && matches!(problems.as_slice(), [CatalogProblem::Decode { kind: "Agent", .. }])
+    ));
+    let invalid = gateway_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(invalid.stderr).expect("catalog diagnostic"),
+        format!(
+            "dekopon-gatewayd: {}: document 1: invalid Agent resource\n",
+            catalog.display()
+        ),
+    );
+}

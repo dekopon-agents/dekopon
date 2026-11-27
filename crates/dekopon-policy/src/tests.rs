@@ -459,7 +459,7 @@ fn a_parse_failure_has_a_cedar_diagnostic_and_no_invented_policy_ids() {
         PolicyEngine::new(malformed, &world()).expect_err("strict parse fails"),
         PolicyEngine::new_lenient(malformed, &world()).expect_err("lenient parse fails"),
     ] {
-        assert!(matches!(error, PolicyBuildError::Parse { messages }
+        assert!(matches!(error, PolicyBuildError::Parse { messages, .. }
             if !messages.is_empty() && messages.iter().all(|message| !message.is_empty() && !message.contains("policy0") && !message.contains("InvalidRequestShapes"))));
     }
 }
@@ -471,7 +471,7 @@ fn every_cedar_parse_error_is_reported_in_both_modes() {
         PolicyEngine::new(malformed, &world()).expect_err("strict parse fails"),
         PolicyEngine::new_lenient(malformed, &world()).expect_err("lenient parse fails"),
     ] {
-        assert!(matches!(error, PolicyBuildError::Parse { messages } if messages.len() == 2));
+        assert!(matches!(error, PolicyBuildError::Parse { messages, .. } if messages.len() == 2));
     }
 }
 

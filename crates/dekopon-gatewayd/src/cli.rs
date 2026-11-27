@@ -67,7 +67,14 @@ pub struct CheckArgs {
     /// its parsed settings differ. Without it, every model is probed.
     #[arg(long, value_name = "CONFIG", requires = "probe")]
     pub against: Option<PathBuf>,
-    /// Render problems and warnings as a table or JSON.
+    #[arg(
+        long,
+        value_name = "PREVIOUS",
+        conflicts_with_all = ["probe", "against"],
+        help = "Compare reload dispositions against a previous configuration. Exit 0 if no restart is needed, 3 if a restart is required, or 1 on load or classification failure."
+    )]
+    pub diff: Option<PathBuf>,
+    /// Render the check or diff as a table or JSON.
     #[arg(long, value_enum, default_value_t = CheckFormat::Table, value_name = "FORMAT")]
     pub output: CheckFormat,
 }
@@ -76,9 +83,11 @@ pub struct CheckArgs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum CheckFormat {
-    /// One line per problem or warning.
+    #[value(help = "One line per problem, warning, or changed category.")]
     Table,
-    /// `{ "ok", "problems", "warnings" }`.
+    #[value(
+        help = r#"Check returns "ok", "problems", and "warnings". Diff returns "restart_required" and "swap"."#
+    )]
     Json,
 }
 

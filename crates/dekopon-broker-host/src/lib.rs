@@ -23,7 +23,7 @@ use dekopon_core::{CapabilityId, ProviderId, offload};
 pub use dekopon_provider_sdk::{
     CommandRunOutcome, ComponentFailure, ProviderApiVersion, ProviderCapability, ProviderManifest,
 };
-use dekopon_storage_host::{StorageEvidence, StorageGrant, StorageHost};
+use dekopon_storage_host::{StorageEvidence, StorageGrant, StorageHost, StorageLimits};
 pub use host::ProviderConflicts;
 use host::{
     CommandExport, CommandExportProblem, ConflictScan, EngineError, RUN_COMMAND_EXPORT,
@@ -1408,10 +1408,16 @@ impl BrokerWasmProvider {
 }
 
 #[derive(Clone, Debug)]
+enum Storage {
+    Host(StorageHost),
+    Validation(StorageLimits),
+}
+
+#[derive(Clone, Debug)]
 pub struct BrokerProviderRegistry {
     providers: Vec<BrokerWasmProvider>,
     routes: BTreeMap<CapabilityId, usize>,
-    storage_host: Option<StorageHost>,
+    storage: Option<Storage>,
     assets: Option<dekopon_http_host::asset::AssetDirectory>,
     #[cfg(feature = "native-test")]
     test_imports: Option<TestImports>,
@@ -1523,12 +1529,44 @@ impl BrokerProviderRegistry {
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
+        Self::load_paths(sources, limits, storage_host.map(Storage::Host), options).await
+    }
+
+    pub async fn load_for_validation<I, P>(
+        sources: I,
+        limits: BrokerHostLimits,
+        storage_limits: StorageLimits,
+        options: &BrokerHostOptions,
+    ) -> Result<Self, BrokerHostError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        Self::load_paths(
+            sources,
+            limits,
+            Some(Storage::Validation(storage_limits)),
+            options,
+        )
+        .await
+    }
+
+    async fn load_paths<I, P>(
+        sources: I,
+        limits: BrokerHostLimits,
+        storage: Option<Storage>,
+        options: &BrokerHostOptions,
+    ) -> Result<Self, BrokerHostError>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
         Self::load_sources(
             sources
                 .into_iter()
                 .map(|source| ProviderSource::from(source.into())),
             limits,
-            storage_host,
+            storage,
             options,
         )
         .await
@@ -1546,7 +1584,25 @@ impl BrokerProviderRegistry {
         Self::load_sources(
             sources.into_iter().map(ProviderSource::from),
             limits,
-            storage_host,
+            storage_host.map(Storage::Host),
+            options,
+        )
+        .await
+    }
+
+    pub async fn load_locked_for_validation<I>(
+        sources: I,
+        limits: BrokerHostLimits,
+        storage_limits: StorageLimits,
+        options: &BrokerHostOptions,
+    ) -> Result<Self, BrokerHostError>
+    where
+        I: IntoIterator<Item = LockedProviderSource>,
+    {
+        Self::load_sources(
+            sources.into_iter().map(ProviderSource::from),
+            limits,
+            Some(Storage::Validation(storage_limits)),
             options,
         )
         .await
@@ -1555,7 +1611,7 @@ impl BrokerProviderRegistry {
     async fn load_sources<I>(
         sources: I,
         limits: BrokerHostLimits,
-        storage_host: Option<StorageHost>,
+        storage: Option<Storage>,
         options: &BrokerHostOptions,
     ) -> Result<Self, BrokerHostError>
     where
@@ -1609,7 +1665,7 @@ impl BrokerProviderRegistry {
             Ok(Self {
                 providers,
                 routes,
-                storage_host,
+                storage,
                 assets: None,
                 #[cfg(feature = "native-test")]
                 test_imports: None,
@@ -1783,7 +1839,19 @@ impl BrokerProviderRegistry {
 
     #[must_use]
     pub fn storage_host(&self) -> Option<StorageHost> {
-        self.storage_host.clone()
+        match &self.storage {
+            Some(Storage::Host(host)) => Some(host.clone()),
+            Some(Storage::Validation(_)) | None => None,
+        }
+    }
+
+    #[must_use]
+    pub fn storage_limits(&self) -> Option<&StorageLimits> {
+        match &self.storage {
+            Some(Storage::Host(host)) => Some(host.limits()),
+            Some(Storage::Validation(limits)) => Some(limits),
+            None => None,
+        }
     }
 
     #[must_use]
@@ -1818,7 +1886,7 @@ impl BrokerProviderRegistry {
         &self,
         constraints: &ExecutionConstraints,
     ) -> Result<(), BrokerHostError> {
-        if constraints.storage.is_some() && self.storage_host.is_none() {
+        if constraints.storage.is_some() && self.storage.is_none() {
             return Err(BrokerHostError::StorageDisabled);
         }
         let runtime = &self
@@ -1969,10 +2037,8 @@ impl BrokerProviderRegistry {
                     return Err(BrokerHostError::StorageGrantMismatch.into());
                 }
                 let host = self
-                    .storage_host
-                    .as_ref()
-                    .ok_or(BrokerHostError::StorageDisabled)?
-                    .clone();
+                    .storage_host()
+                    .ok_or(BrokerHostError::StorageDisabled)?;
                 Some(
                     offload(move || host.begin(grant))
                         .await

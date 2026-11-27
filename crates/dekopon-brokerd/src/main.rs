@@ -133,6 +133,13 @@ struct CheckArgs {
     /// and policy.
     #[arg(long, value_name = "DIR", requires = "provider_set")]
     workflows: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PREVIOUS",
+        conflicts_with_all = ["materialized", "provider_set", "store"],
+        help = "Compare reload dispositions against a previous configuration. Report skipped managed-set validation when both local artifacts are absent. Exit 0 if no restart is needed, 3 if a restart is required, or 1 on load failure."
+    )]
+    diff: Option<PathBuf>,
     /// Validate local secret material and fail when a check cannot run.
     #[arg(long)]
     materialized: bool,
@@ -151,7 +158,7 @@ struct CheckArgs {
         help = "Run full validation (strict) or check pinned artifact availability only (relaxed)"
     )]
     provider_verification: dekopon_brokerd::ProviderVerification,
-    /// Render problems and warnings as a table or JSON.
+    /// Render the check or diff as a table or JSON.
     #[arg(long, value_enum, default_value_t)]
     output: OutputFormat,
 }
@@ -438,6 +445,9 @@ async fn execute(cli: Cli, log: Option<dekopon_telemetry::LogFile>) -> ExitCode 
             observed(operator_console(), execute_provider(provider), None).await
         }
         Some(Command::Check(check)) => {
+            if let Some(previous) = &check.diff {
+                return execute_check_diff(&check.config, previous, check.output).await;
+            }
             let install = Install::new(Console {
                 format: ConsoleFormat::Text {
                     ansi: None,
@@ -720,6 +730,194 @@ impl From<dekopon_broker::ContinuityReport> for ContinuityOutput {
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(unix)]
+fn diff_problem(problem: &dekopon_brokerd::BrokerdError) -> String {
+    use dekopon_broker_host::BrokerHostError;
+    use dekopon_brokerd::{BrokerdError, ConfigError, ProviderManagerError};
+
+    match problem {
+        BrokerdError::Config(ConfigError::ProviderLock { path, source }) => {
+            let cause = if let ProviderManagerError::Configuration { reason, .. }
+            | ProviderManagerError::LockMismatch { reason, .. } = source
+            {
+                (*reason).to_owned()
+            } else if let ProviderManagerError::StateConflicts { problems } = source {
+                format!("provider lock has {} conflict(s)", problems.len())
+            } else {
+                error_chain(source)
+            };
+            format!("{}: {cause}", path.display())
+        }
+        BrokerdError::Config(_) | BrokerdError::Secrets(_) | BrokerdError::Socket(_) => {
+            error_chain(problem)
+        }
+        BrokerdError::Host(BrokerHostError::ArtifactMetadata { path, source }) => {
+            format!(
+                "{}: could not inspect provider artifact ({})",
+                path.display(),
+                source.kind()
+            )
+        }
+        BrokerdError::Host(BrokerHostError::InvalidManifest { path, source }) => {
+            format!(
+                "{}: invalid provider manifest (line {}, column {})",
+                path.display(),
+                source.line(),
+                source.column()
+            )
+        }
+        BrokerdError::Host(BrokerHostError::Manifest { path, .. }) => {
+            format!("{}: invalid provider manifest", path.display())
+        }
+        BrokerdError::Host(BrokerHostError::CommandExportSignature { path, .. }) => {
+            format!(
+                "{}: provider run-command export has an invalid signature",
+                path.display()
+            )
+        }
+        BrokerdError::Host(error) => error.to_string(),
+        BrokerdError::Policy { path, source } => {
+            let cause = diff_policy_cause(source);
+            match path {
+                Some(path) => format!("{}: {cause}", path.display()),
+                None => cause,
+            }
+        }
+        BrokerdError::Storage(error @ dekopon_storage_host::StorageHostError::QuotaExceeded) => {
+            format!("{problem}: {error}")
+        }
+        BrokerdError::Capabilities { .. }
+        | BrokerdError::Storage(_)
+        | BrokerdError::StorageReaper(_)
+        | BrokerdError::Assets(_)
+        | BrokerdError::Snapshot { .. }
+        | BrokerdError::ManifestMetadata { .. }
+        | BrokerdError::ManifestMetadataTooLarge { .. }
+        | BrokerdError::CapabilityResponse { .. }
+        | BrokerdError::CapabilityResponseTooLarge { .. }
+        | BrokerdError::CapabilityCeilingTooLarge { .. }
+        | BrokerdError::Broker(_)
+        | BrokerdError::Context(_)
+        | BrokerdError::UnreachablePeerUids { .. }
+        | BrokerdError::Server(_)
+        | BrokerdError::Startup { .. }
+        | BrokerdError::RestartRequired { .. }
+        | BrokerdError::DiffIncomplete { .. }
+        | BrokerdError::ProviderSetRequired
+        | BrokerdError::ProviderSetUnused
+        | BrokerdError::ProviderSet(_)
+        | BrokerdError::ProviderLockUnsettled
+        | BrokerdError::ReloadTask(_)
+        | BrokerdError::CheckSkipped { .. }
+        | BrokerdError::RelaxedVerificationSkipped { .. }
+        | BrokerdError::DefaultSecretsUnchecked
+        | BrokerdError::CheckDirectory { .. }
+        | BrokerdError::WorkflowFile(_)
+        | BrokerdError::Workflow(_) => problem.to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn diff_policy_cause(error: &dekopon_broker::PolicyBuildError) -> String {
+    use dekopon_broker::PolicyBuildError;
+
+    let cause = match error {
+        PolicyBuildError::Parse { offsets, .. } if !offsets.is_empty() => {
+            let offsets = offsets
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("policy source could not be parsed (byte offsets {offsets})");
+        }
+        PolicyBuildError::Parse { .. } => "policy source could not be parsed",
+        PolicyBuildError::Schema { .. } => "policy schema could not be generated",
+        PolicyBuildError::Validation { .. } => "policy set failed strict validation",
+        PolicyBuildError::InvalidRequestShapes { .. } => "invalid request policy shape",
+        PolicyBuildError::UnknownPrincipal { .. } => "policy names an undeclared principal",
+        PolicyBuildError::MalformedPrincipal { .. } => "policy names a malformed principal",
+        PolicyBuildError::UnknownSecret { .. } => "policy names an undeclared secret",
+        PolicyBuildError::MalformedSecret { .. } => "policy names a malformed secret DRN",
+        PolicyBuildError::UnknownGroup { .. } => "policy names a group with no principal members",
+        PolicyBuildError::MalformedGroup { .. } => "policy names a malformed group",
+        PolicyBuildError::UnknownProvider { .. } => "policy names an undeclared provider",
+        PolicyBuildError::UnknownAction { .. } => "policy names an undeclared action",
+        PolicyBuildError::NonCanonicalDrn { .. } => "policy compares a non-canonical DRN",
+        PolicyBuildError::NonCanonicalPattern { .. } => "policy uses a non-canonical DRN pattern",
+        PolicyBuildError::NonCanonicalSecret { .. } => "policy names a non-canonical secret",
+        PolicyBuildError::IdFormSubject { .. } => {
+            "policy compares context.subject with the id form"
+        }
+        PolicyBuildError::ReservedPolicyId { .. } => "policy identifier uses a reserved prefix",
+        PolicyBuildError::UnknownEntityType { .. } => "policy names an unknown entity type",
+        PolicyBuildError::InvalidPolicyId { .. } => "policy has an invalid @id annotation",
+        PolicyBuildError::MissingPolicyId { .. } => "policy is missing an @id annotation",
+        PolicyBuildError::DuplicatePolicyId { .. } => "policy identifier is duplicated",
+        PolicyBuildError::WorldConflicts { .. } => {
+            "policy world has conflicting actions or capabilities"
+        }
+        PolicyBuildError::Entities { .. } => "policy entity store could not be built",
+        PolicyBuildError::Digest { .. } => "policy could not be canonicalized",
+        PolicyBuildError::PolicyTooLarge { .. }
+        | PolicyBuildError::TooManyPolicies { .. }
+        | PolicyBuildError::TemplateUnsupported => return error.to_string(),
+    };
+    cause.to_owned()
+}
+
+#[cfg(unix)]
+async fn execute_check_diff(
+    config: &std::path::Path,
+    previous: &std::path::Path,
+    output: OutputFormat,
+) -> ExitCode {
+    use dekopon_brokerd::BrokerdError;
+
+    let changes = match dekopon_brokerd::check_diff(config, previous).await {
+        Ok(changes) => changes,
+        Err(error) => {
+            let problems = if let BrokerdError::Startup { problems } = &error {
+                problems.as_slice()
+            } else {
+                std::slice::from_ref(&error)
+            };
+            for problem in problems {
+                eprintln!("dekopon-brokerd: {}", diff_problem(problem));
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    let rendered = render(output, &changes, || {
+        let mut rows = changes
+            .restart_required
+            .iter()
+            .map(|category| format!("restart_required\t{category}"))
+            .chain(
+                changes
+                    .swap
+                    .iter()
+                    .map(|category| format!("swap\t{category}")),
+            )
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            rows.push("ok".to_owned());
+        }
+        rows.extend(changes.managed_set_validation_skipped.iter().map(|input| {
+            format!("managed_set_validation_skipped\t{input} (local lock and store absent)")
+        }));
+        rows.join("\n")
+    });
+    if let Err(error) = rendered {
+        eprintln!("dekopon-brokerd: {}", error_chain(&error));
+        return ExitCode::FAILURE;
+    }
+    if changes.restart_required.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(3)
     }
 }
 

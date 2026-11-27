@@ -1564,13 +1564,28 @@ pub(crate) struct GatewaySources {
     pub(crate) ca_bundles: BTreeMap<PathBuf, RawCandidate>,
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
-pub(crate) struct GatewayChanges {
-    pub(crate) swap: Vec<&'static str>,
-    pub(crate) restart_required: Vec<&'static str>,
+#[derive(Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct GatewayChanges {
+    pub restart_required: Vec<&'static str>,
+    pub swap: Vec<&'static str>,
 }
 
 impl GatewaySources {
+    pub(crate) fn relativize_catalog(&mut self, path: &Path) {
+        let base = if self.catalog.0.contains_key(path) {
+            path.parent().unwrap_or(Path::new(""))
+        } else {
+            path
+        };
+        self.catalog.0 = std::mem::take(&mut self.catalog.0)
+            .into_iter()
+            .map(|(path, bytes)| {
+                let relative = path.strip_prefix(base).map_or(path.as_path(), |path| path);
+                (relative.to_path_buf(), bytes)
+            })
+            .collect();
+    }
+
     pub(crate) async fn still_current(
         &self,
         config_path: &Path,

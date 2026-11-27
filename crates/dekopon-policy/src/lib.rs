@@ -62,6 +62,7 @@ use dekopon_core::{
     AgentId, CapabilityId, GroupId, IdentifierError, PrincipalId, PrincipalKind, ProviderId,
     RiskLevel, SecretDrn, SecretSinkKind, Subject,
 };
+use miette::Diagnostic as _;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -579,6 +580,12 @@ impl fmt::Debug for PolicyEngine {
     }
 }
 
+struct PreparedPolicies {
+    policies: PolicySet,
+    ordinary_policies: PolicySet,
+    policy_count: usize,
+}
+
 impl PolicyEngine {
     pub fn new(policy_text: &str, world: &PolicyWorld) -> Result<Self, PolicyBuildError> {
         let (engine, unresolved) = Self::build(policy_text, world, Handling::Refuse)?;
@@ -596,11 +603,7 @@ impl PolicyEngine {
         Self::build(policy_text, world, Handling::Tolerate)
     }
 
-    fn build(
-        policy_text: &str,
-        world: &PolicyWorld,
-        handling: Handling,
-    ) -> Result<(Self, Vec<UnresolvedName>), PolicyBuildError> {
+    fn prepare_source(policy_text: &str) -> Result<PreparedPolicies, PolicyBuildError> {
         if policy_text.len() > MAX_POLICY_BYTES {
             return Err(PolicyBuildError::PolicyTooLarge {
                 length: policy_text.len(),
@@ -612,6 +615,10 @@ impl PolicyEngine {
         } else {
             PolicySet::from_str(policy_text).map_err(|source| PolicyBuildError::Parse {
                 messages: source.iter().map(ToString::to_string).collect(),
+                offsets: source
+                    .iter()
+                    .filter_map(|error| error.labels()?.next().map(|label| label.offset()))
+                    .collect(),
             })?
         };
         if policies.num_of_templates() > 0 {
@@ -633,6 +640,23 @@ impl PolicyEngine {
                 policies: invalid_request_shapes,
             });
         }
+        Ok(PreparedPolicies {
+            policies,
+            ordinary_policies,
+            policy_count,
+        })
+    }
+
+    fn build(
+        policy_text: &str,
+        world: &PolicyWorld,
+        handling: Handling,
+    ) -> Result<(Self, Vec<UnresolvedName>), PolicyBuildError> {
+        let PreparedPolicies {
+            policies,
+            ordinary_policies,
+            policy_count,
+        } = Self::prepare_source(policy_text)?;
 
         // Classification must run before schema generation; a tolerated name needs to already be in
         // the schema before Cedar's strict validator runs.
@@ -937,6 +961,7 @@ fn apply_annotated_ids(policies: &PolicySet) -> Result<PolicySet, PolicyBuildErr
             .add(policy.new_id(id))
             .map_err(|source| PolicyBuildError::Parse {
                 messages: vec![source.to_string()],
+                offsets: Vec::new(),
             })?;
     }
     Ok(renamed)
@@ -953,7 +978,10 @@ fn add_default_secret_use_permit(policies: &mut PolicySet) -> Result<(), PolicyB
             policy: policy.id().to_string(),
         });
     }
-    let parse = |messages: Vec<String>| PolicyBuildError::Parse { messages };
+    let parse = |messages: Vec<String>| PolicyBuildError::Parse {
+        messages,
+        offsets: Vec::new(),
+    };
     let builtin = PolicySet::from_str(DEFAULT_SECRET_USE_POLICY)
         .map_err(|source| parse(source.iter().map(ToString::to_string).collect()))?;
     for policy in apply_annotated_ids(&builtin)?.policies() {
@@ -972,12 +1000,14 @@ fn inspect_request_shapes(
     for policy in policies.policies() {
         let est = policy.to_json().map_err(|source| PolicyBuildError::Parse {
             messages: vec![source.to_string()],
+            offsets: Vec::new(),
         })?;
         if !references_request(&est) {
             ordinary
                 .add(policy.clone())
                 .map_err(|source| PolicyBuildError::Parse {
                     messages: vec![source.to_string()],
+                    offsets: Vec::new(),
                 })?;
             continue;
         }
@@ -1020,6 +1050,7 @@ fn refuse_non_canonical_literals(policies: &PolicySet) -> Result<(), PolicyBuild
     for policy in policies.policies() {
         let est = policy.to_json().map_err(|source| PolicyBuildError::Parse {
             messages: vec![source.to_string()],
+            offsets: Vec::new(),
         })?;
         let id = policy.id().to_string();
         literal_walk(&est, &id)?;
@@ -1526,7 +1557,10 @@ pub enum PolicyBuildError {
     #[error("policy set contains {count} policies; maximum is {maximum}")]
     TooManyPolicies { count: usize, maximum: usize },
     #[error("policy source could not be parsed: {}", messages.join("; "))]
-    Parse { messages: Vec<String> },
+    Parse {
+        messages: Vec<String>,
+        offsets: Vec<usize>,
+    },
     #[error("policy templates are not supported; write static policies instead")]
     TemplateUnsupported,
     #[error("policy schema could not be generated: {message}")]
