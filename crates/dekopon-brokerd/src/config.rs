@@ -596,8 +596,20 @@ pub struct ResolvedConfig {
     pub telemetry: Option<ResolvedTelemetry>,
 }
 
-impl ResolvedConfig {
-    pub(crate) fn relativize_provider_artifacts(
+pub(crate) struct DiffSnapshot {
+    pub(crate) source: PathBuf,
+    pub(crate) providers: Vec<PathBuf>,
+    pub(crate) snapshot: ConfigSnapshot,
+}
+
+impl DiffSnapshot {
+    pub(crate) fn changes(mut self, mut next: Self) -> Result<BrokerChanges, ConfigError> {
+        self.relativize_provider_artifacts(&next.providers)?;
+        next.relativize_provider_artifacts(&self.providers)?;
+        Ok(self.snapshot.changes(&next.snapshot))
+    }
+
+    fn relativize_provider_artifacts(
         &mut self,
         other_providers: &[PathBuf],
     ) -> Result<(), ConfigError> {
@@ -637,6 +649,7 @@ pub enum LoadMode<'a> {
         provider_lock: Option<&'a LoadedLock>,
     },
     Check,
+    Diff,
 }
 
 impl LoadMode<'_> {
@@ -647,7 +660,7 @@ impl LoadMode<'_> {
     ) -> Result<PathBuf, ConfigError> {
         match self {
             Self::Boot | Self::Reload { .. } => boot(path),
-            Self::Check => Ok(path),
+            Self::Check | Self::Diff => Ok(path),
         }
     }
 }
@@ -928,7 +941,7 @@ async fn resolve(
     if config.identities.is_empty()
         && match mode {
             LoadMode::Boot | LoadMode::Reload { .. } => true,
-            LoadMode::Check => false,
+            LoadMode::Check | LoadMode::Diff => false,
         }
     {
         return Err(ConfigError::NoIdentities);
@@ -1008,22 +1021,30 @@ async fn resolve(
     let managed_provider_paths = config
         .provider_set
         .map(|managed| {
-            let canonical = |unresolved: PathBuf| {
-                std::fs::canonicalize(&unresolved).map_err(|source| ConfigError::ResolvePath {
-                    path: unresolved,
-                    source,
-                })
+            let provider_path = |path| {
+                let unresolved = resolve_path(path);
+                match mode {
+                    LoadMode::Check => Ok(unresolved),
+                    LoadMode::Boot | LoadMode::Reload { .. } | LoadMode::Diff => {
+                        std::fs::canonicalize(&unresolved).map_err(|source| {
+                            ConfigError::ResolvePath {
+                                path: unresolved,
+                                source,
+                            }
+                        })
+                    }
+                }
             };
             let lock_path = match mode {
                 LoadMode::Reload {
                     provider_lock: Some(lock),
                     ..
                 } => lock.path.clone(),
-                LoadMode::Boot | LoadMode::Reload { .. } | LoadMode::Check => {
-                    mode.runtime_path(resolve_path(managed.lock_path), canonical)?
+                LoadMode::Boot | LoadMode::Reload { .. } | LoadMode::Check | LoadMode::Diff => {
+                    provider_path(managed.lock_path)?
                 }
             };
-            let store_path = mode.runtime_path(resolve_path(managed.store_path), canonical)?;
+            let store_path = provider_path(managed.store_path)?;
             Ok::<_, ConfigError>((lock_path, store_path))
         })
         .transpose()?;
@@ -1043,11 +1064,14 @@ async fn resolve(
             },
             provider_lock.cloned(),
         ),
-        (Some((lock_path, store_path)), LoadMode::Boot) => {
+        (Some((lock_path, store_path)), LoadMode::Boot | LoadMode::Diff) => {
             let (sources, digest) =
                 provider_manager::load_locked_digest(lock_path, store_path, expected_uid)
                     .await
-                    .map_err(|source| ConfigError::ProviderLock { source })?;
+                    .map_err(|source| ConfigError::ProviderLock {
+                        path: lock_path.as_path().into(),
+                        source,
+                    })?;
             (
                 Some(sources),
                 Some(LoadedLock {
@@ -1087,7 +1111,7 @@ async fn resolve(
         });
     }
     let require_providers = match mode {
-        LoadMode::Boot => true,
+        LoadMode::Boot | LoadMode::Diff => true,
         LoadMode::Reload { .. } | LoadMode::Check => managed_provider_paths.is_none(),
     };
     if providers.is_empty() && require_providers {
@@ -1211,7 +1235,7 @@ async fn resolve(
             return Err(ConfigError::InvalidHttpsConfiguration);
         }
         match mode {
-            LoadMode::Check => continue,
+            LoadMode::Check | LoadMode::Diff => continue,
             LoadMode::Boot | LoadMode::Reload { .. } => {}
         }
         let metadata =
@@ -1362,7 +1386,7 @@ async fn resolve(
                     !config.compile_on_load
                         && match mode {
                             LoadMode::Boot | LoadMode::Reload { .. } => true,
-                            LoadMode::Check => false,
+                            LoadMode::Check | LoadMode::Diff => false,
                         }
                 })
                 .map(|(_, store)| store.join("cwasm")),
@@ -1437,6 +1461,7 @@ pub enum ConfigError {
     MixedProviderSources,
     #[error("managed provider lock or store is invalid")]
     ProviderLock {
+        path: Box<Path>,
         #[source]
         source: provider_manager::ProviderManagerError,
     },

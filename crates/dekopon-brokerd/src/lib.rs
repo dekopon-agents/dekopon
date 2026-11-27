@@ -39,7 +39,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use config::{LoadMode, Resident};
+use config::{DiffSnapshot, LoadMode, Resident};
 use dekopon_broker::{
     AuditLog, AuditSink, Broker, ConstraintCatalog, IdentityDirectory, Leniency, PolicyBuildError,
     PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
@@ -203,7 +203,7 @@ where
     }
     let candidate = match candidate {
         Some(Loaded::Candidate(candidate)) => *candidate,
-        Some(Loaded::Unchanged) | None => {
+        Some(Loaded::Unchanged | Loaded::Diff(_)) | None => {
             return Err(BrokerdError::from_problems(report.problems));
         }
     };
@@ -451,32 +451,31 @@ pub async fn check<P: AsRef<Path>>(
 }
 
 pub async fn check_diff(config: &Path, previous: &Path) -> Result<BrokerChanges, BrokerdError> {
-    let mut problems = Vec::new();
-    for path in [previous, config] {
-        let (_, report) = load_candidate(path, Mode::Diff).await;
-        problems.extend(report.problems);
+    let previous = load_diff_snapshot(previous).await;
+    let proposed = load_diff_snapshot(config).await;
+    match (previous, proposed) {
+        (Ok(previous), Ok(proposed)) => Ok(previous.changes(proposed)?),
+        (Err(mut previous), Err(proposed)) => {
+            previous.extend(proposed);
+            Err(BrokerdError::from_problems(previous))
+        }
+        (Err(problems), Ok(_)) | (Ok(_), Err(problems)) => {
+            Err(BrokerdError::from_problems(problems))
+        }
     }
-    if !problems.is_empty() {
-        return Err(BrokerdError::from_problems(problems));
-    }
-    let mut previous = load_diff_config(previous).await?;
-    let mut proposed = load_diff_config(config).await?;
-    previous.relativize_provider_artifacts(&proposed.providers)?;
-    proposed.relativize_provider_artifacts(&previous.providers)?;
-    Ok(previous.snapshot.changes(&proposed.snapshot))
 }
 
-async fn load_diff_config(path: &Path) -> Result<ResolvedConfig, BrokerdError> {
-    let uid = current_uid();
-    let (mut config, refusal) = config::load_in(path, uid, LoadMode::Check).await?;
-    if let Some(error) = refusal {
-        return Err(error.into());
+async fn load_diff_snapshot(path: &Path) -> Result<DiffSnapshot, Vec<BrokerdError>> {
+    let (loaded, report) = load_candidate(path, Mode::Diff).await;
+    if !report.problems.is_empty() {
+        return Err(report.problems);
     }
-    if let Some(path) = &config.secret_map_path {
-        let (_, bytes) = secrets::load_shapes(path, uid, None).await?;
-        config.snapshot.record_authority_references(Some(&bytes))?;
+    if let Some(Loaded::Diff(snapshot)) = loaded {
+        return Ok(snapshot);
     }
-    Ok(config)
+    Err(vec![BrokerdError::DiffIncomplete {
+        path: path.to_path_buf(),
+    }])
 }
 
 pub async fn load_storage_config(path: &Path) -> Result<Option<StorageConfig>, ConfigError> {
@@ -547,6 +546,7 @@ struct Candidate {
 enum Loaded {
     Candidate(Box<Candidate>),
     Unchanged,
+    Diff(DiffSnapshot),
 }
 
 struct Coordination {
@@ -727,6 +727,7 @@ impl Coordination {
                     state.record_recovery();
                     return (active.digest.clone(), GenerationOutcome::Active);
                 }
+                Loaded::Diff(_) => return (active.digest.clone(), GenerationOutcome::Refused),
                 Loaded::Candidate(next) => {
                     next.ready.scheduled.inherit_record_markers(
                         &active.ready.scheduled,
@@ -846,7 +847,8 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             locked_providers: active.locked_providers.as_deref(),
             provider_lock: active.provider_lock.as_ref(),
         },
-        Mode::Check { .. } | Mode::Diff => LoadMode::Check,
+        Mode::Check { .. } => LoadMode::Check,
+        Mode::Diff => LoadMode::Diff,
     };
     let essential = match &mode {
         Mode::Check {
@@ -892,10 +894,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     let (providers_resolved, residents) = match mode {
         Mode::Boot => (true, Residents::Open),
         Mode::Reload(active) => (true, Residents::Borrow(active)),
-        Mode::Diff => (
-            !config.providers.is_empty(),
-            Residents::Check(CheckStorage::ReadOnly),
-        ),
+        Mode::Diff => (true, Residents::Check(CheckStorage::ReadOnly)),
         Mode::Check { providers, .. } => {
             if config.identities.is_empty() {
                 report.warnings.push(StartupWarning::IdentitiesRequired);
@@ -979,7 +978,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             reload_runtime(&mut config, uid, active, &mut scratch, &mut report.problems).await
         }
         Residents::Check(storage) => {
-            let secrets = check_secrets(config.secret_map_path.as_deref(), uid, &mut report).await;
+            let secrets = check_secrets(&mut config, uid, &mut report, storage).await;
             let storage = match (storage, &config.storage) {
                 (CheckStorage::Scratch, _) => scratch_host(&config, &mut scratch),
                 (CheckStorage::ReadOnly, Some(storage)) => {
@@ -1041,6 +1040,8 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     let socket_path = std::mem::take(&mut config.socket_path);
     let provider_lock = config.provider_lock.take();
     let locked_providers = config.locked_providers.clone();
+    let diff_paths = matches!(residents, Residents::Check(CheckStorage::ReadOnly))
+        .then(|| (config.source.clone(), config.providers.clone()));
     let reuse_registry = provider_lock.is_some() || restart_categories.is_empty();
     let storage = runtime.storage.clone();
     let assets = runtime.assets.clone();
@@ -1099,6 +1100,16 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                     return (None, report);
                 }
             };
+            if let Some((source, providers)) = diff_paths {
+                return (
+                    Some(Loaded::Diff(DiffSnapshot {
+                        source,
+                        providers,
+                        snapshot,
+                    })),
+                    report,
+                );
+            }
             (
                 Some(Loaded::Candidate(Box::new(Candidate {
                     digest,
@@ -1141,8 +1152,13 @@ impl CheckReport {
     }
 }
 
-async fn check_secrets(path: Option<&Path>, uid: u32, report: &mut CheckReport) -> Option<Secrets> {
-    let Some(path) = path else {
+async fn check_secrets(
+    config: &mut ResolvedConfig,
+    uid: u32,
+    report: &mut CheckReport,
+    storage: CheckStorage,
+) -> Option<Secrets> {
+    let Some(path) = config.secret_map_path.as_deref() else {
         return Some(Secrets::Shapes(dekopon_broker::SecretCatalog::empty()));
     };
     let mut material_problems = Vec::new();
@@ -1156,8 +1172,23 @@ async fn check_secrets(path: Option<&Path>, uid: u32, report: &mut CheckReport) 
         .problems
         .extend(material_problems.into_iter().map(BrokerdError::from));
     match shapes {
-        Ok((catalog, _)) => Some(Secrets::Shapes(catalog)),
-        Err(SecretMapError::Read { .. }) if !report.materialized => Some(Secrets::Unchecked),
+        Ok((catalog, bytes)) => {
+            if matches!(storage, CheckStorage::ReadOnly) {
+                keep(
+                    &mut report.problems,
+                    config
+                        .snapshot
+                        .record_authority_references(Some(&bytes))
+                        .map_err(BrokerdError::from),
+                )?;
+            }
+            Some(Secrets::Shapes(catalog))
+        }
+        Err(SecretMapError::Read { .. })
+            if !report.materialized && matches!(storage, CheckStorage::Scratch) =>
+        {
+            Some(Secrets::Unchecked)
+        }
         Err(error) => {
             report.problems.push(error.into());
             None
@@ -1570,7 +1601,16 @@ async fn prepare(
         Ok(registry)
     } else {
         match (config.locked_providers, validation_storage) {
-            (Some(sources), _) => {
+            (Some(sources), Some(limits)) => {
+                BrokerProviderRegistry::load_locked_for_validation(
+                    sources,
+                    config.host_limits,
+                    limits,
+                    &config.host_options,
+                )
+                .await
+            }
+            (Some(sources), None) => {
                 BrokerProviderRegistry::load_locked_with_options(
                     sources,
                     config.host_limits,
@@ -2077,6 +2117,8 @@ pub enum BrokerdError {
     Startup { problems: Vec<BrokerdError> },
     #[error("broker configuration changed restart-required categories: {categories:?}")]
     RestartRequired { categories: Vec<String> },
+    #[error("configuration validation did not complete for {}", path.display())]
+    DiffIncomplete { path: PathBuf },
     #[error("the configuration names a providerSet; check it with --provider-set and --store")]
     ProviderSetRequired,
     #[error("the configuration names provider paths; --provider-set does not apply to it")]

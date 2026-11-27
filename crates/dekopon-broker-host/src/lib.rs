@@ -1590,6 +1590,24 @@ impl BrokerProviderRegistry {
         .await
     }
 
+    pub async fn load_locked_for_validation<I>(
+        sources: I,
+        limits: BrokerHostLimits,
+        storage_limits: StorageLimits,
+        options: &BrokerHostOptions,
+    ) -> Result<Self, BrokerHostError>
+    where
+        I: IntoIterator<Item = LockedProviderSource>,
+    {
+        Self::load_sources(
+            sources.into_iter().map(ProviderSource::from),
+            limits,
+            Some(Storage::Validation(storage_limits)),
+            options,
+        )
+        .await
+    }
+
     async fn load_sources<I>(
         sources: I,
         limits: BrokerHostLimits,

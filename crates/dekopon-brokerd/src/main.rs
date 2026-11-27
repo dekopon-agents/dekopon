@@ -736,9 +736,21 @@ impl From<dekopon_broker::ContinuityReport> for ContinuityOutput {
 #[cfg(unix)]
 fn diff_problem(problem: &dekopon_brokerd::BrokerdError) -> String {
     use dekopon_broker_host::BrokerHostError;
-    use dekopon_brokerd::BrokerdError;
+    use dekopon_brokerd::{BrokerdError, ConfigError, ProviderManagerError};
 
     match problem {
+        BrokerdError::Config(ConfigError::ProviderLock { path, source }) => {
+            let cause = if let ProviderManagerError::Configuration { reason, .. }
+            | ProviderManagerError::LockMismatch { reason, .. } = source
+            {
+                (*reason).to_owned()
+            } else if let ProviderManagerError::StateConflicts { problems } = source {
+                format!("provider lock has {} conflict(s)", problems.len())
+            } else {
+                error_chain(source)
+            };
+            format!("{}: {cause}", path.display())
+        }
         BrokerdError::Config(_) | BrokerdError::Secrets(_) | BrokerdError::Socket(_) => {
             error_chain(problem)
         }
@@ -793,6 +805,7 @@ fn diff_problem(problem: &dekopon_brokerd::BrokerdError) -> String {
         | BrokerdError::Server(_)
         | BrokerdError::Startup { .. }
         | BrokerdError::RestartRequired { .. }
+        | BrokerdError::DiffIncomplete { .. }
         | BrokerdError::ProviderSetRequired
         | BrokerdError::ProviderSetUnused
         | BrokerdError::ProviderSet(_)

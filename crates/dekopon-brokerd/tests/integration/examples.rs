@@ -467,30 +467,214 @@ fn broker_diff_compares_relocated_provider_copies() {
     assert_eq!(swap.stdout, b"swap\tstrict\n");
 }
 
-#[test]
-fn broker_diff_compares_managed_sets_without_resolving_providers() {
+fn write_managed_diff_lock(root: &std::path::Path, providers: &[&str]) {
+    use dekopon_brokerd::ProviderLockApiVersion;
+    use serde_json::json;
+    use sha2::{Digest as _, Sha256};
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    let store = root.join("store");
+    let blobs = store.join("blobs");
+    let sha256 = blobs.join("sha256");
+    for directory in [&store, &blobs, &sha256] {
+        fs::create_dir(directory).expect("create store directory");
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .expect("secure store directory");
+    }
+    let providers: Vec<_> = providers
+        .iter()
+        .map(|provider| {
+            let component = fs::read(
+                repository_root().join(format!("examples/providers/{provider}-provider.wasm")),
+            )
+            .expect("read example provider");
+            let digest: String = Sha256::digest(&component)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            fs::write(sha256.join(format!("{digest}.wasm")), &component)
+                .expect("write locked blob");
+            json!({
+                "source": format!("ghcr.io/example/{provider}:1.0.0"),
+                "resolvedVersion": "1.0.0",
+                "manifestDigest": format!("sha256:{}", "1".repeat(64)),
+                "componentDigest": format!("sha256:{digest}"),
+                "componentBytes": component.len(),
+                "providerId": provider,
+            })
+        })
+        .collect();
+    let lock = json!({
+        "apiVersion": ProviderLockApiVersion::V1Alpha1,
+        "providers": providers,
+    });
+    write_broker_fixture(
+        &root.join("providers.lock.yaml"),
+        &serde_yaml::to_string(&lock).expect("serialize fixture lock"),
+    );
+}
+
+fn managed_broker_diff_example(root: &std::path::Path, directory: bool) -> PathBuf {
+    let config = copy_broker_diff_example(root);
+    write_managed_diff_lock(root, &["http-probe"]);
+    std::fs::rename(
+        config.with_file_name("secret-map.yaml"),
+        config.with_file_name("secret-map.yaml.example"),
+    )
+    .expect("keep the secret map out of the fragment scan");
+    let mut document: serde_json::Value =
+        serde_yaml::from_str(&read("broker.yaml")).expect("example broker config");
+    let fields = document.as_object_mut().expect("config object");
+    fields.remove("providers");
+    if directory {
+        fields.remove("policiesPath");
+    }
+    document["providerSet"] = serde_json::json!({
+        "lockPath": "../providers.lock.yaml", "storePath": "../store"
+    });
+    document["secretMapPath"] = serde_json::json!("secret-map.yaml.example");
+    write_broker_fixture(&config, &document.to_string());
+    config
+}
+
+#[tokio::test]
+async fn broker_diff_compares_managed_sets_from_local_artifacts() {
+    use dekopon_brokerd::{BrokerdError, ConfigError};
+
     let temporary = tempfile::tempdir().expect("fixture root");
-    let previous = temporary.path().join("previous.yaml");
-    let proposed = temporary.path().join("proposed.yaml");
-    let secret_map = temporary.path().join("secret-map.yaml");
-    let config = "apiVersion: dekopon.dev/brokerd/v1alpha1\n\
-                  socketPath: broker.sock\n\
-                  providerSet: {lockPath: providers.lock.yaml, storePath: store}\n\
-                  secretMapPath: secret-map.yaml\n\
-                  strict: true\n";
-    write_broker_fixture(&previous, config);
-    write_broker_fixture(&proposed, &config.replace("strict: true", "strict: false"));
-    write_broker_fixture(&secret_map, &read("secret-map.yaml.example"));
+    let previous_root = temporary.path().join("previous");
+    let proposed_root = temporary.path().join("proposed");
+    let previous = managed_broker_diff_example(&previous_root, false);
+    let proposed = managed_broker_diff_example(&proposed_root, false);
+    let original = std::fs::read_to_string(&proposed).expect("proposed config");
+    write_broker_fixture(
+        &proposed,
+        &original.replace("\"strict\":true", "\"strict\":false"),
+    );
 
-    let swap = broker_diff(&proposed, &previous, &[]);
-    assert_eq!(swap.status.code(), Some(0), "{swap:?}");
-    assert_eq!(swap.stdout, b"swap\tstrict\n");
-    assert!(!temporary.path().join("store").exists());
+    let scratch = temporary.path().join("scratch");
+    write_broker_fixture(&scratch, "scratch cannot contain directories");
+    let output = broker_diff_command(&proposed, &previous)
+        .env("TMPDIR", &scratch)
+        .output()
+        .expect("run offline managed diff");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"swap\tstrict\n");
+    for root in [&previous_root, &proposed_root] {
+        assert!(!root.join("store/cwasm").exists());
+        assert!(!root.join("store/.provider-manager.lock").exists());
+    }
 
-    write_broker_fixture(&secret_map, "secrets: [");
-    let refusal = broker_diff(&proposed, &previous, &[]);
+    std::fs::remove_dir_all(proposed_root.join("store")).expect("remove the local provider store");
+    let error = dekopon_brokerd::check_diff(&proposed, &previous)
+        .await
+        .expect_err("diff requires existing local artifacts");
+    assert!(matches!(
+        error,
+        BrokerdError::Config(ConfigError::ResolvePath { path, source })
+            if path.ends_with("store") && source.kind() == std::io::ErrorKind::NotFound
+    ));
+    let refusal = broker_diff(&proposed, &previous, &["--output", "json"]);
     assert_eq!(refusal.status.code(), Some(1), "{refusal:?}");
     assert!(refusal.stdout.is_empty());
+    assert!(!proposed_root.join("store").exists());
+}
+
+#[test]
+fn broker_diff_sanitizes_invalid_local_provider_lock_diagnostics() {
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let config = managed_broker_diff_example(temporary.path(), false);
+    let lock = temporary.path().join("providers.lock.yaml");
+    let mut document: serde_json::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&lock).expect("read provider lock"))
+            .expect("decode provider lock");
+    let marker = "private-lock-fixture-text";
+    document["providers"][0]["source"] =
+        serde_json::json!(format!("https://{marker}@example.com/repository:1.0.0"));
+    write_broker_fixture(&lock, &document.to_string());
+
+    let output = broker_diff(&config, &config, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("providers.lock.yaml"));
+    assert!(diagnostic.contains("expected a bounded OCI reference rather than a URL"));
+    assert!(!diagnostic.contains(marker));
+}
+
+#[tokio::test]
+async fn broker_diff_rejects_managed_policy_and_constraint_errors_in_both_input_forms() {
+    use dekopon_broker::PolicyBuildError;
+    use dekopon_brokerd::{BrokerdError, capabilities::CapabilityProblem};
+
+    let temporary = tempfile::tempdir().expect("fixture root");
+    for (name, directory) in [("single", false), ("directory", true)] {
+        let root = temporary.path().join(name);
+        let previous = managed_broker_diff_example(&root.join("previous"), directory);
+        let invalid = managed_broker_diff_example(&root.join("invalid"), directory);
+        let policy = invalid.with_file_name("policies.cedar");
+        let path = |config: &std::path::Path| {
+            if directory {
+                config.parent().expect("config directory").to_path_buf()
+            } else {
+                config.to_path_buf()
+            }
+        };
+        let (previous, invalid_input) = (path(&previous), path(&invalid));
+        let pairs = [
+            (&invalid_input, &previous),
+            (&previous, &invalid_input),
+            (&invalid_input, &invalid_input),
+        ];
+        let marker = "private-managed-policy-fixture-text";
+        write_broker_fixture(&policy, &format!("permit({marker}"));
+        for (proposed, baseline) in pairs {
+            let output = broker_diff(proposed, baseline, &["--output", "json"]);
+            assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+            assert!(output.stdout.is_empty());
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(diagnostic.contains("could not be parsed (byte offsets "));
+            assert!(!diagnostic.contains(marker));
+        }
+        let error = dekopon_brokerd::check_diff(&invalid_input, &previous)
+            .await
+            .expect_err("malformed managed policy is a load failure");
+        assert!(matches!(
+            error,
+            BrokerdError::Policy {
+                source: PolicyBuildError::Parse { .. },
+                ..
+            }
+        ));
+
+        write_broker_fixture(&policy, &read("policies.cedar"));
+        let mut document: serde_json::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&invalid).expect("invalid config"))
+                .expect("example config");
+        document["capabilities"]["http-probe"]["capabilities"]["http-probe.fetch"]["constraints"]
+            .as_object_mut()
+            .expect("fetch constraints")
+            .remove("timeoutMs")
+            .expect("fixture has required timeout");
+        write_broker_fixture(&invalid, &document.to_string());
+        for (proposed, baseline) in pairs {
+            let output = broker_diff(proposed, baseline, &["--output", "json"]);
+            assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+            assert!(output.stdout.is_empty());
+        }
+        let error = dekopon_brokerd::check_diff(&invalid_input, &previous)
+            .await
+            .expect_err("missing managed constraint is a load failure");
+        assert!(matches!(
+            error,
+            BrokerdError::Capabilities { problems }
+                if problems.iter().any(|problem| matches!(
+                    problem,
+                    CapabilityProblem::MissingField { capability, field: "timeoutMs", .. }
+                        if capability.as_str() == "http-probe.fetch"
+                ))
+        ));
+    }
 }
 
 #[test]
@@ -520,38 +704,53 @@ fn broker_diff_leaves_storage_and_scratch_paths_untouched() {
         },
         "capabilities": {"storage-probe.run": {}}
     });
-    config["storage"] = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
         .expect("default storage limits");
-    config["storage"]["rootPath"] = serde_json::json!("state");
-    write_broker_fixture(&previous, &config.to_string());
-    config["strict"] = serde_json::json!(false);
-    write_broker_fixture(&proposed, &config.to_string());
+    storage["rootPath"] = serde_json::json!("state");
     let scratch = temporary.path().join("scratch");
     write_broker_fixture(&scratch, "scratch cannot contain directories");
 
-    let output = broker_diff_command(&proposed, &previous)
-        .env("TMPDIR", &scratch)
-        .output()
-        .expect("run storage diff");
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(output.stdout, b"swap\tstrict\n");
-    assert!(!previous.with_file_name("state").exists());
-    assert_eq!(
-        std::fs::read_to_string(&scratch).expect("scratch marker"),
-        "scratch cannot contain directories"
-    );
+    for managed in [false, true] {
+        if managed {
+            write_managed_diff_lock(temporary.path(), &["http-probe", "storage-probe"]);
+            config
+                .as_object_mut()
+                .expect("config object")
+                .remove("providers");
+            config["providerSet"] = serde_json::json!({
+                "lockPath": "../providers.lock.yaml", "storePath": "../store"
+            });
+        }
+        config["storage"] = storage.clone();
+        config["strict"] = serde_json::json!(true);
+        write_broker_fixture(&previous, &config.to_string());
+        config["strict"] = serde_json::json!(false);
+        write_broker_fixture(&proposed, &config.to_string());
 
-    config["storage"]["maxRootBytes"] = serde_json::json!(3);
-    config["storage"]["maxNamespaceBytes"] = serde_json::json!(2);
-    config["storage"]["maxFileBytes"] = serde_json::json!(1);
-    write_broker_fixture(&proposed, &config.to_string());
-    let invalid = broker_diff_command(&proposed, &previous)
-        .env("TMPDIR", &scratch)
-        .output()
-        .expect("run diff with invalid storage limits");
-    assert_eq!(invalid.status.code(), Some(1), "{invalid:?}");
-    assert!(invalid.stdout.is_empty());
-    assert!(!previous.with_file_name("state").exists());
+        let output = broker_diff_command(&proposed, &previous)
+            .env("TMPDIR", &scratch)
+            .output()
+            .expect("run storage diff");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"swap\tstrict\n");
+        assert!(!previous.with_file_name("state").exists());
+        assert_eq!(
+            std::fs::read_to_string(&scratch).expect("scratch marker"),
+            "scratch cannot contain directories"
+        );
+
+        config["storage"]["maxRootBytes"] = serde_json::json!(3);
+        config["storage"]["maxNamespaceBytes"] = serde_json::json!(2);
+        config["storage"]["maxFileBytes"] = serde_json::json!(1);
+        write_broker_fixture(&proposed, &config.to_string());
+        let invalid = broker_diff_command(&proposed, &previous)
+            .env("TMPDIR", &scratch)
+            .output()
+            .expect("run diff with invalid storage limits");
+        assert_eq!(invalid.status.code(), Some(1), "{invalid:?}");
+        assert!(invalid.stdout.is_empty());
+        assert!(!previous.with_file_name("state").exists());
+    }
 }
 
 #[test]

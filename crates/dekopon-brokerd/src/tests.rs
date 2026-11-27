@@ -78,7 +78,9 @@ pub(crate) async fn candidate_or_refusal(
     let (loaded, report) = super::load_candidate(config_path, mode).await;
     let candidate = match loaded {
         Some(super::Loaded::Candidate(candidate)) => Some(*candidate),
-        Some(super::Loaded::Unchanged) => panic!("this load expects a candidate or a refusal"),
+        Some(super::Loaded::Unchanged | super::Loaded::Diff(_)) => {
+            panic!("this load expects a candidate or a refusal")
+        }
         None => None,
     };
     (candidate, report)
