@@ -7,7 +7,6 @@ async fn dm_message_steer_and_follow_keep_authenticated_attribution_in_prompt_an
         crate::config::Steering::Boundary,
     ] {
         let directory = temporary();
-        let journal_dir = temporary();
         let (broker, _observed) =
             stub_broker(directory.path(), principal_listings(&["pascal", "pascal"])).await;
         let turns = match steering {
@@ -19,15 +18,11 @@ async fn dm_message_steer_and_follow_keep_authenticated_attribution_in_prompt_an
         let models = InterruptibleModel::new(turns);
         let mut runner = Arc::into_inner(runner_with(broker, Arc::new(Arc::clone(&models)), 1))
             .expect("runner is uniquely owned");
-        let journal = Arc::new(
-            crate::journal::Journal::open(
-                journal_dir.path(),
-                Duration::from_secs(86400),
-                Duration::from_secs(86400),
-            )
-            .unwrap(),
-        );
-        let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+        let table = Arc::new(crate::follow::FollowTable::restored(
+            None,
+            Vec::new(),
+            SystemTime::now(),
+        ));
         let mut route = persistent_route(model_config(), window());
         route.steering = steering;
         route.follow = true;
@@ -37,7 +32,9 @@ async fn dm_message_steer_and_follow_keep_authenticated_attribution_in_prompt_an
             &route.conversation,
             "dev",
         );
-        table.stay_and_write(&key, SystemTime::now()).unwrap();
+        table
+            .stay_and_write(&key, crate::follow::FollowHome::Memory, SystemTime::now())
+            .unwrap();
         runner.follow = Some(table);
         let runner = Arc::new(runner);
         let driver = Arc::new(RecordingDriver::default());

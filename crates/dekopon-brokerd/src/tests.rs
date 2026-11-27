@@ -233,10 +233,126 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
     .expect("replace config fixture");
     assert!(matches!(
         config::load(&path, uid).await,
-        Err(config::ConfigError::Decode { source })
-            if source.to_string().contains("unknown field")
-                && source.to_string().contains("principal")
+        Err(config::ConfigError::Decode {
+            line: Some(1),
+            column: Some(_),
+        })
     ));
+}
+
+#[tokio::test]
+async fn config_decode_errors_and_broker_exit_never_expose_document_bytes() {
+    let sentinel = "Bearer-config-redaction-sentinel-7b4e926a";
+    let binary = std::env::current_exe()
+        .expect("test executable")
+        .parent()
+        .expect("deps directory")
+        .parent()
+        .expect("profile directory")
+        .join("dekopon-brokerd");
+    let root = tempfile::tempdir().expect("create configuration fixture");
+    let path = root.path().join("broker.yaml");
+    let directory = root.path().join("broker.d");
+    fs::create_dir(&directory).expect("create fragment directory");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .expect("secure fragment directory");
+    for document in [sentinel.to_owned(), format!("{sentinel}: true\n")] {
+        write_owner_only(&path, document.as_bytes());
+        write_owner_only(&directory.join("broker.yaml"), document.as_bytes());
+        for input in [&path, &directory] {
+            let error = config::load(input, current_uid())
+                .await
+                .expect_err("secret-bearing document refuses startup");
+            match (&error, input == &directory, document == sentinel) {
+                (
+                    config::ConfigError::Decode {
+                        line: Some(1),
+                        column: Some(1),
+                    },
+                    false,
+                    _,
+                )
+                | (
+                    config::ConfigError::DecodeFragment {
+                        line: Some(1),
+                        column: Some(1),
+                    },
+                    true,
+                    true,
+                )
+                | (
+                    config::ConfigError::Decode {
+                        line: None,
+                        column: None,
+                    },
+                    true,
+                    false,
+                ) => {}
+                _ => panic!("unexpected decode refusal: {error:?}"),
+            }
+            for rendered in [
+                error.to_string(),
+                format!("{error:?}"),
+                dekopon_core::error_chain(&error),
+            ] {
+                assert!(!rendered.contains(sentinel), "{rendered}");
+            }
+            assert!(std::error::Error::source(&error).is_none());
+            let output = std::process::Command::new(&binary)
+                .arg("--config")
+                .arg(input)
+                .output()
+                .expect("run built brokerd");
+            assert_eq!(output.status.code(), Some(1));
+            let event: serde_json::Value = serde_json::from_slice(&output.stderr)
+                .expect("observed.rs emits one broker_exit JSON event");
+            assert_eq!(event["event"], "broker_exit");
+            assert_eq!(event["message"], "broker.exit");
+            assert!(
+                !event["error"]
+                    .as_str()
+                    .expect("error field")
+                    .contains(sentinel)
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(sentinel));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(sentinel));
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_set_and_lock_decode_errors_never_expose_document_bytes() {
+    use super::provider_manager::{ProviderManagerError, load_lock, probe_provider_set};
+
+    let sentinel = "Bearer-provider-config-redaction-sentinel-6c7f";
+    let directory = tempfile::tempdir().expect("create provider configuration fixture");
+    let path = directory.path().join("providers.yaml");
+    for document in [sentinel.to_owned(), format!("{sentinel}: true\n")] {
+        write_owner_only(&path, document.as_bytes());
+        let errors = [
+            load_lock(&path, current_uid()).await.unwrap_err(),
+            probe_provider_set(&path, std::num::NonZeroUsize::MIN, None)
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(matches!(
+                &error,
+                ProviderManagerError::Configuration {
+                    detail: Some(_),
+                    source: None,
+                    ..
+                }
+            ));
+            for rendered in [
+                error.to_string(),
+                format!("{error:?}"),
+                dekopon_core::error_chain(&error),
+            ] {
+                assert!(!rendered.contains(sentinel), "{rendered}");
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -343,7 +459,13 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
         .await
         .expect_err("retired cache setting is not ignored");
     assert!(
-        format!("{error:?}").contains("compileCachePath"),
+        matches!(
+            error,
+            config::ConfigError::Decode {
+                line: Some(1),
+                column: Some(_),
+            }
+        ),
         "{error:?}"
     );
 
@@ -661,9 +783,13 @@ async fn plaintext_hosts_are_validated_at_startup() {
         .await
         .expect_err("a misspelled field inside http is unknown");
     assert!(
-        matches!(&error, config::ConfigError::Decode { source }
-            if source.to_string().contains("unknown field")
-                && source.to_string().contains("plainTextHosts")),
+        matches!(
+            &error,
+            config::ConfigError::Decode {
+                line: Some(1),
+                column: Some(_),
+            }
+        ),
         "unexpected error: {error}"
     );
 }
@@ -1014,9 +1140,10 @@ async fn aggregate_memory_defaults_and_partial_limits_are_resolved_and_validated
     write_config(&path, &document);
     assert!(matches!(
         config::load(&path, uid).await,
-        Err(config::ConfigError::Decode { source })
-            if source.to_string().contains("unknown field")
-                && source.to_string().contains("typo")
+        Err(config::ConfigError::Decode {
+            line: Some(1),
+            column: Some(_),
+        })
     ));
 }
 
@@ -1398,6 +1525,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     let catalog = ConstraintCatalog::new([(
         capability,
         ConstraintSet {
+            egress_profile: None,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "cli-probe".parse().expect("valid provider fixture"),

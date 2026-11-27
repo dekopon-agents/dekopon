@@ -61,7 +61,7 @@ pub use dekopon_http_host::{
     reachable_destination_settings,
 };
 pub use http::{
-    BoundCredential, HttpCallEvidence, HttpConfigurationError, HttpInvocation,
+    BoundCredential, EgressPushHeaders, HttpCallEvidence, HttpConfigurationError, HttpInvocation,
     NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts, destinations_cover,
 };
 use http::{HttpCeilings, HttpState};

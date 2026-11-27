@@ -304,8 +304,8 @@ pub(crate) struct ConfigSnapshot(BTreeMap<String, (Disposition, serde_yaml::Valu
 
 impl ConfigSnapshot {
     fn from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
-        let mapping = serde_yaml::from_slice::<serde_yaml::Mapping>(bytes)
-            .map_err(|source| ConfigError::Decode { source })?;
+        let mapping =
+            serde_yaml::from_slice::<serde_yaml::Mapping>(bytes).map_err(ConfigError::decode)?;
         Ok(Self::from_mapping(&mapping))
     }
 
@@ -633,8 +633,7 @@ pub async fn load_in(
         return load_directory(path, expected_uid, mode).await;
     }
     let bytes = read_owner_only(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
-    let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes)
-        .map_err(|source| ConfigError::Decode { source })?;
+    let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes).map_err(ConfigError::decode)?;
     if !config.capabilities.is_empty() && config.policies_path.is_none() {
         return Err(ConfigError::MissingPoliciesPath);
     }
@@ -690,9 +689,10 @@ async fn load_directory(
     for path in fragments {
         let bytes = read_owner_only(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
         let mapping = serde_yaml::from_slice::<serde_yaml::Mapping>(&bytes).map_err(|source| {
+            let location = source.location();
             ConfigError::DecodeFragment {
-                path: path.clone(),
-                source,
+                line: location.as_ref().map(serde_yaml::Location::line),
+                column: location.as_ref().map(serde_yaml::Location::column),
             }
         })?;
         parsed.push((path, mapping));
@@ -707,7 +707,7 @@ async fn load_directory(
     let snapshot = ConfigSnapshot::from_mapping(&merged);
     let config = match serde_yaml::from_value::<BrokerdConfig>(serde_yaml::Value::Mapping(merged)) {
         Ok(config) => config,
-        Err(source) => return Err(later(ConfigError::Decode { source }, refusal)),
+        Err(source) => return Err(later(ConfigError::decode(source), refusal)),
     };
     if config.policies_path.is_some() {
         return Err(later(ConfigError::PoliciesPathInDirectory, refusal));
@@ -1368,10 +1368,14 @@ pub enum ConfigError {
     },
     #[error("broker configuration is {length} bytes; maximum is {maximum}")]
     TooLarge { length: u64, maximum: usize },
-    #[error("broker configuration is not strict valid YAML/JSON")]
+    #[error(
+        "broker configuration is not strict valid YAML/JSON (line {}, column {})",
+        line.map_or_else(|| "unknown".to_owned(), |line| line.to_string()),
+        column.map_or_else(|| "unknown".to_owned(), |column| column.to_string())
+    )]
     Decode {
-        #[source]
-        source: serde_yaml::Error,
+        line: Option<usize>,
+        column: Option<usize>,
     },
     #[error("secret map references could not be decoded: {diagnostic}")]
     SecretMapDecode { diagnostic: String },
@@ -1429,11 +1433,14 @@ pub enum ConfigError {
     PoliciesPathInDirectory,
     #[error("configuration directory {path} holds no *.yaml fragment")]
     EmptyConfigDirectory { path: PathBuf },
-    #[error("configuration fragment {path} is not strict valid YAML")]
+    #[error(
+        "broker configuration is not strict valid YAML/JSON (line {}, column {})",
+        line.map_or_else(|| "unknown".to_owned(), |line| line.to_string()),
+        column.map_or_else(|| "unknown".to_owned(), |column| column.to_string())
+    )]
     DecodeFragment {
-        path: PathBuf,
-        #[source]
-        source: serde_yaml::Error,
+        line: Option<usize>,
+        column: Option<usize>,
     },
     #[error(transparent)]
     Fragments(#[from] FragmentError),
@@ -1506,6 +1513,16 @@ pub enum ConfigError {
     },
 }
 
+impl ConfigError {
+    fn decode(source: serde_yaml::Error) -> Self {
+        let location = source.location();
+        Self::Decode {
+            line: location.as_ref().map(serde_yaml::Location::line),
+            column: location.as_ref().map(serde_yaml::Location::column),
+        }
+    }
+}
+
 #[cfg(test)]
 mod secret_map_reference_tests {
     use super::*;
@@ -1533,52 +1550,59 @@ mod decode_diagnostic_tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
     }
 
-    async fn refusal(path: &Path, root: &Path) -> String {
-        let error = load_in(path, crate::socket::current_uid(), LoadMode::Check)
+    async fn refusal(path: &Path) -> ConfigError {
+        load_in(path, crate::socket::current_uid(), LoadMode::Check)
             .await
-            .expect_err("malformed configuration");
-        dekopon_core::error_chain(&error).replace(&root.display().to_string(), "<dir>")
+            .expect_err("malformed configuration")
     }
 
-    async fn single_file(contents: &str) -> String {
+    async fn single_file(contents: &str) -> ConfigError {
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory.path().join("brokerd.yaml");
         owner_only(&path, contents);
-        refusal(&path, directory.path()).await
+        refusal(&path).await
     }
 
-    async fn directory(fragments: &[(&str, &str)]) -> String {
+    async fn directory(fragments: &[(&str, &str)]) -> ConfigError {
         let directory = tempfile::tempdir().expect("temp dir");
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
             .expect("secure directory");
         for (name, contents) in fragments {
             owner_only(&directory.path().join(name), contents);
         }
-        refusal(directory.path(), directory.path()).await
+        refusal(directory.path()).await
     }
 
     #[tokio::test]
-    async fn decode_refusals_keep_their_location_and_wording() {
+    async fn decode_refusals_keep_only_their_location() {
         let base = "apiVersion: dekopon.dev/brokerd/v1alpha1\nsocketPath: /run/broker.sock\n";
-        assert_eq!(
+        assert!(matches!(
             single_file(&format!("{base}strict: \"open\n")).await,
-            "broker configuration is not strict valid YAML/JSON: found unexpected end of stream \
-             at line 4 column 1, while scanning a quoted scalar at line 3 column 9"
-        );
-        assert_eq!(
+            ConfigError::Decode {
+                line: Some(4),
+                column: Some(1)
+            }
+        ));
+        assert!(matches!(
             single_file(&format!("{base}strict: maybe\n")).await,
-            "broker configuration is not strict valid YAML/JSON: strict: invalid type: string \
-             \"maybe\", expected a boolean at line 3 column 9"
-        );
-        assert_eq!(
+            ConfigError::Decode {
+                line: Some(3),
+                column: Some(9)
+            }
+        ));
+        assert!(matches!(
             directory(&[("00-base.yaml", base), ("10-bad.yaml", "strict: \"open\n")]).await,
-            "configuration fragment <dir>/10-bad.yaml is not strict valid YAML: found unexpected end \
-             of stream at line 2 column 1, while scanning a quoted scalar at line 1 column 9"
-        );
-        assert_eq!(
+            ConfigError::DecodeFragment {
+                line: Some(2),
+                column: Some(1)
+            }
+        ));
+        assert!(matches!(
             directory(&[("00-base.yaml", base), ("10-bad.yaml", "strict: maybe\n")]).await,
-            "broker configuration is not strict valid YAML/JSON: invalid type: string \"maybe\", \
-             expected a boolean"
-        );
+            ConfigError::Decode {
+                line: None,
+                column: None
+            }
+        ));
     }
 }

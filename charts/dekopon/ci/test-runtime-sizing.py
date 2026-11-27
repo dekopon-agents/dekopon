@@ -13,9 +13,12 @@ FLAGS = {
 }
 
 
-def render(*args):
+def render(*args, values=DIRECTORY):
+    command = ["helm", "template", "dekopon", str(CHART)]
+    if values is not None:
+        command.extend(["-f", str(values)])
     rendered = subprocess.run(
-        ["helm", "template", "dekopon", str(CHART), "-f", str(DIRECTORY), *args],
+        [*command, *args],
         text=True, capture_output=True, check=False,
     )
     assert rendered.returncode == 0, rendered.stderr
@@ -91,7 +94,46 @@ def test_runtime_values_reach_every_daemon_invocation():
         assert all(argument.startswith("--") for argument in arguments[:arguments.index(command)])
 
 
+def test_only_broker_declares_file_termination_policy():
+    with_gateway_and_config_check = render(
+        "--set", "configCheck.enabled=true",
+        "--set", "configCheck.broker.configMap=check-broker",
+        "--set", "configCheck.gateway.configMap=check-gateway",
+        "--set", "configCheck.gateway.catalogConfigMap=check-agents",
+    )
+    for rendered in (render(values=None), with_gateway_and_config_check):
+        policies = {
+            name: container["terminationMessagePolicy"]
+            for name, container in containers(rendered).items()
+            if "terminationMessagePolicy" in container
+        }
+        assert policies == {"broker": "File"}, policies
+
+
+def test_broker_reads_the_selected_secret_key_as_the_complete_config_file():
+    for key, args in (
+        ("broker.yaml", ()),
+        ("complete-config.yaml", ("--set", "broker.config.existingSecretKey=complete-config.yaml")),
+    ):
+        docs = render(
+            "--set", "broker.config.inline=",
+            "--set", "broker.config.existingSecret=broker-config",
+            *args, values=None,
+        )
+        deployment = next(doc for doc in docs if doc["kind"] == "Deployment")
+        pod = deployment["spec"]["template"]["spec"]
+        source = next(volume for volume in pod["volumes"] if volume["name"] == "config-source")
+        assert source["projected"]["sources"] == [
+            {"secret": {"name": "broker-config", "items": [{"key": key, "path": "broker.yaml"}]}}
+        ]
+        rendered = containers(docs)
+        assert '"/dekopon-source/broker.yaml" "/etc/dekopon/broker.yaml"' in rendered["prepare-files"]["args"][0]
+        assert rendered["broker"]["args"] == ["--config", "/etc/dekopon/broker.yaml"]
+
+
 if __name__ == "__main__":
     test_each_optional_value_and_unset_defaults()
     test_runtime_values_reach_every_daemon_invocation()
+    test_only_broker_declares_file_termination_policy()
+    test_broker_reads_the_selected_secret_key_as_the_complete_config_file()
     print("Runtime values render their flags; unset values preserve arguments.")

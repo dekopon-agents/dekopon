@@ -120,6 +120,23 @@ fn assert_space_read(audit: &Audit, capability: &str, trigger: &str, root: &str)
     }
 }
 
+async fn wait_restored(audit: &Audit) {
+    tokio::time::timeout(WAIT, async {
+        while audit
+            .capture
+            .events_where(
+                "dekopon_gatewayd",
+                &[("event", "gateway_store_restored"), ("store.skipped", "1")],
+            )
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the unrouted digest is left in the store");
+}
+
 async fn wait_digest(audit: &Audit, operation: &str, previous: usize) {
     tokio::time::timeout(WAIT, async {
         loop {
@@ -189,7 +206,8 @@ async fn a_channel_digest_stores_space_ownership_and_fires_in_its_thread_with_no
     assert_eq!(baseline[0].field("space.id"), Some("team"));
     assert_eq!(baseline[0].field("asker.allowed"), Some("true"));
     assert_eq!(baseline[0].field("space.allowed"), Some("true"));
-    let mut rows = stored(&fixture);
+    let directory = fixture.shutdown().await;
+    let mut rows = stored(directory.path());
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["run_as"], "space");
     assert_eq!(rows[0]["subject"], "drn:fauxlack:channel:acme:cteam");
@@ -199,7 +217,6 @@ async fn a_channel_digest_stores_space_ownership_and_fires_in_its_thread_with_no
         rows[0]["watch"]["untilMs"].as_u64().unwrap() - rows[0]["nextAtMs"].as_u64().unwrap(),
         DAY * 1000
     );
-    let directory = fixture.shutdown().await;
     due(&mut rows[0]);
     let fixture = boot_digests(
         &chat,
@@ -221,12 +238,16 @@ async fn a_channel_digest_stores_space_ownership_and_fires_in_its_thread_with_no
     let reason: Value = serde_json::from_str(&fixture.tool_result("reason")).unwrap();
     assert!(reason["scheduledBy"].is_null());
     assert_eq!(reason["trigger"], "wake");
-    assert_eq!(stored(&fixture).len(), 1, "a digest survives a fire");
     assert_eq!(
         root.thread().transcript().authors(),
         ["ualice", "udekopon", "udekopon"]
     );
-    fixture.shutdown().await;
+    let directory = fixture.shutdown().await;
+    assert_eq!(
+        stored(directory.path()).len(),
+        1,
+        "a digest survives a fire"
+    );
     let calls = api.recorded();
     assert_eq!(calls.len(), 3);
     for call in calls {
@@ -279,16 +300,17 @@ async fn channel_schedule_and_watch_wakes_run_as_space_while_dm_wakes_remain_per
             .await
             .unwrap();
         assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, "Set.");
-        let mut rows = stored(&fixture);
+        let personal = (container != "cteam").then(|| fixture.tool_result("personal-list"));
+        let directory = fixture.shutdown().await;
+        let mut rows = stored(directory.path());
         if container == "cteam" {
             assert_eq!(rows[0]["run_as"], "space");
             assert_eq!(rows[0]["subject"], "drn:fauxlack:channel:acme:cteam");
         } else {
             assert!(rows[0].get("run_as").is_none());
             assert_eq!(rows[0]["subject"], "drn:fauxlack:user:acme:ualice");
-            assert!(fixture.tool_result("personal-list").contains("wake 1:"));
+            assert!(personal.unwrap().contains("wake 1:"));
         }
-        let directory = fixture.shutdown().await;
         due(&mut rows[0]);
         let fixture = boot_digests(
             &chat,
@@ -323,11 +345,11 @@ async fn channel_schedule_and_watch_wakes_run_as_space_while_dm_wakes_remain_per
             );
             assert_eq!(decisions.last().unwrap().field("space.id"), None);
         }
+        let directory = fixture.shutdown().await;
         assert!(
-            stored(&fixture).is_empty(),
+            stored(directory.path()).is_empty(),
             "ordinary watches retire on fire"
         );
-        fixture.shutdown().await;
     }
 }
 
@@ -382,12 +404,6 @@ async fn another_mapped_participant_manages_all_channel_wake_actions_but_other_c
         root.thread().next_from("udekopon", WAIT).await.text,
         "Three set."
     );
-    let rows = stored(&fixture);
-    assert_eq!(rows.len(), 3);
-    assert_eq!(
-        rows[1]["watch"]["everyMs"], 600_000,
-        "D4 does not constrain an ordinary watch"
-    );
     let outside = server
         .user("ualice")
         .post("crandom", "<@udekopon> list and cancel")
@@ -398,7 +414,10 @@ async fn another_mapped_participant_manages_all_channel_wake_actions_but_other_c
         "Outside."
     );
     assert_eq!(fixture.tool_result("outside-list"), "No pending wakes.");
-    assert_eq!(stored(&fixture).len(), 3);
+    assert_eq!(
+        fixture.tool_result("outside-cancel"),
+        "Not done: no pending wake has that id in this scope."
+    );
     let dm = server
         .user("ualice")
         .post("dalice", "list and cancel")
@@ -409,7 +428,10 @@ async fn another_mapped_participant_manages_all_channel_wake_actions_but_other_c
         "Private."
     );
     assert_eq!(fixture.tool_result("dm-list"), "No pending wakes.");
-    assert_eq!(stored(&fixture).len(), 3);
+    assert_eq!(
+        fixture.tool_result("dm-cancel"),
+        "Not done: no pending wake has that id in this scope."
+    );
     let bob = server
         .user("ubob")
         .post("cteam", "<@udekopon> list and cancel")
@@ -422,7 +444,6 @@ async fn another_mapped_participant_manages_all_channel_wake_actions_but_other_c
     assert!(fixture.tool_result("bob-list").contains("wake 1:"));
     assert!(fixture.tool_result("bob-list").contains("wake 2:"));
     assert!(fixture.tool_result("bob-list").contains("wake 3:"));
-    assert!(stored(&fixture).is_empty());
     assert_eq!(
         audit
             .capture
@@ -443,7 +464,8 @@ async fn another_mapped_participant_manages_all_channel_wake_actions_but_other_c
             .len(),
         1
     );
-    fixture.shutdown().await;
+    let directory = fixture.shutdown().await;
+    assert!(stored(directory.path()).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -476,7 +498,6 @@ async fn a_digest_in_a_dm_and_a_second_digest_in_one_space_are_refused_before_pe
         dm.thread().next_from("udekopon", WAIT).await.text,
         "Channel required."
     );
-    assert!(stored(&fixture).is_empty());
     for (user, answer) in [("ualice", "Set."), ("ubob", "Already set.")] {
         let root = server
             .user(user)
@@ -485,7 +506,6 @@ async fn a_digest_in_a_dm_and_a_second_digest_in_one_space_are_refused_before_pe
             .unwrap();
         assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, answer);
     }
-    assert_eq!(stored(&fixture).len(), 1);
     for reason in ["mapped-channel-required", "digest-exists"] {
         assert_eq!(
             audit
@@ -498,7 +518,8 @@ async fn a_digest_in_a_dm_and_a_second_digest_in_one_space_are_refused_before_pe
             1
         );
     }
-    fixture.shutdown().await;
+    let directory = fixture.shutdown().await;
+    assert_eq!(stored(directory.path()).len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -529,26 +550,31 @@ async fn unchanged_empty_and_unrouted_digest_probes_start_no_model_turn_and_post
             .await
             .unwrap();
         assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, "Set.");
-        let mut rows = stored(&fixture);
         let directory = fixture.shutdown().await;
-        rows[0]["nextAtMs"] = json!(0);
+        let mut rows = stored(directory.path());
+        rows[0]["nextAtMs"] = json!(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        );
         if case == "unrouted" {
             rows[0]["agent"] = json!("absent-agent");
         }
-        let operation = if case == "unrouted" {
-            "failed"
-        } else {
-            "declined"
-        };
+        let operation = "declined";
         let previous = audit
             .capture
             .events_where("dekopon_gatewayd", &[("digest.operation", operation)])
             .len();
         let fixture = boot_digests(&chat, directory, vec![], rows, None).await;
-        wait_digest(&audit, operation, previous).await;
+        if case == "unrouted" {
+            wait_restored(&audit).await;
+        } else {
+            wait_digest(&audit, operation, previous).await;
+        }
         assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 0);
-        assert_eq!(stored(&fixture).len(), usize::from(case != "unrouted"));
-        fixture.shutdown().await;
+        let directory = fixture.shutdown().await;
+        assert_eq!(stored(directory.path()).len(), 1);
         assert_eq!(root.thread().transcript().authors(), ["ualice", "udekopon"]);
     }
 }
@@ -573,9 +599,9 @@ async fn an_unattended_digest_cannot_cancel_itself_and_renew_its_fixed_horizon()
         .await
         .unwrap();
     assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, "Set.");
-    let mut rows = stored(&fixture);
-    let expiry = rows[0]["watch"]["untilMs"].clone();
     let directory = fixture.shutdown().await;
+    let mut rows = stored(directory.path());
+    let expiry = rows[0]["watch"]["untilMs"].clone();
     due(&mut rows[0]);
     let fixture = boot_digests(
         &chat,
@@ -593,9 +619,6 @@ async fn an_unattended_digest_cannot_cancel_itself_and_renew_its_fixed_horizon()
         root.thread().next_from("udekopon", WAIT).await.text,
         "The horizon remains fixed."
     );
-    let rows = stored(&fixture);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["watch"]["untilMs"], expiry);
     for reason in ["not-found", "mapped-channel-required"] {
         assert_eq!(
             audit
@@ -608,7 +631,10 @@ async fn an_unattended_digest_cannot_cancel_itself_and_renew_its_fixed_horizon()
             1
         );
     }
-    fixture.shutdown().await;
+    let directory = fixture.shutdown().await;
+    let rows = stored(directory.path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["watch"]["untilMs"], expiry);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -660,8 +686,8 @@ async fn a_queued_digest_is_dropped_when_a_reload_disables_wakes_or_changes_its_
             .await
             .unwrap();
         assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, "Set.");
-        let mut rows = stored(&fixture);
         let directory = fixture.shutdown().await;
+        let mut rows = stored(directory.path());
         due(&mut rows[0]);
         rows[0]["nextAtMs"] = json!(rows[0]["nextAtMs"].as_u64().unwrap() + 5_000);
         let hold = ModelHold::new();
@@ -762,8 +788,8 @@ async fn a_fired_digest_cannot_write_and_can_decline_after_reads() {
         .await
         .unwrap();
     assert_eq!(root.thread().next_from("udekopon", WAIT).await.text, "Set.");
-    let mut rows = stored(&fixture);
     let directory = fixture.shutdown().await;
+    let mut rows = stored(directory.path());
     due(&mut rows[0]);
     let row = rows[0].clone();
     let fixture = boot_digests(

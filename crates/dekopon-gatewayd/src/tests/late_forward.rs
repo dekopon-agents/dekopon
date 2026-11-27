@@ -456,9 +456,11 @@ async fn a_late_forward_is_refused_by_a_full_mailbox_which_keeps_its_requests() 
     for index in 0..MAILBOX_CAPACITY {
         let queued = other_sender("queued", &format!("1700000001.{index:06}"));
         assert!(matches!(
-            runner
-                .gate
-                .admit(&route, queued, crate::collection::Dispositions(Vec::new())),
+            runner.gate.admit(
+                &route,
+                queued,
+                crate::collection::Dispositions::new(Vec::new())
+            ),
             crate::session::Admit::Queued
         ));
     }
@@ -468,7 +470,7 @@ async fn a_late_forward_is_refused_by_a_full_mailbox_which_keeps_its_requests() 
         runner.gate.admit(
             &route,
             other_sender("one more", "1700000002.000000"),
-            crate::collection::Dispositions(Vec::new())
+            crate::collection::Dispositions::new(Vec::new())
         ),
         crate::session::Admit::Full(..)
     ));
@@ -545,16 +547,22 @@ fn a_turn_remembers_at_most_a_mailbox_of_ids_and_the_next_turn_starts_over() {
     let route = route(model_config());
     let first = original("what is this?");
     let key = (first.transport.clone(), first.conversation.key());
-    let crate::session::Admit::Admitted(admission, ..) =
-        gate.admit(&route, first, crate::collection::Dispositions(Vec::new()))
-    else {
+    let crate::session::Admit::Admitted(admission, ..) = gate.admit(
+        &route,
+        first,
+        crate::collection::Dispositions::new(Vec::new()),
+    ) else {
         panic!("the first message starts a turn");
     };
     for index in 0..=MAILBOX_CAPACITY {
         let mut steer = original("more");
         steer.message_id = MessageId::Native(format!("1700000001.{index:06}"));
         assert!(matches!(
-            gate.admit(&route, steer, crate::collection::Dispositions(Vec::new())),
+            gate.admit(
+                &route,
+                steer,
+                crate::collection::Dispositions::new(Vec::new())
+            ),
             crate::session::Admit::Steered(_)
         ));
         gate.take_steers(&key);
@@ -572,7 +580,7 @@ fn a_turn_remembers_at_most_a_mailbox_of_ids_and_the_next_turn_starts_over() {
         gate.admit(
             &route,
             other_sender("next", "1700000009.000000"),
-            crate::collection::Dispositions(Vec::new())
+            crate::collection::Dispositions::new(Vec::new())
         ),
         crate::session::Admit::Queued
     ));

@@ -659,6 +659,38 @@ impl fmt::Debug for MapResolver {
 
 #[async_trait]
 impl SecretResolver for MapResolver {
+    async fn egress_profile(
+        &self,
+        profile: &SecretDrn,
+    ) -> Result<dekopon_broker::EgressProfileMaterial, SecretResolutionError> {
+        let entry = self.entries.get(profile).ok_or(SecretResolutionError {
+            category: "missing",
+        })?;
+        let source = match entry.minted.as_deref() {
+            Some(Minted::Chatgpt(source)) => source,
+            Some(Minted::GithubApp(_) | Minted::SignedJwt(_)) | None => {
+                return Err(SecretResolutionError {
+                    category: "egress-profile-unsupported",
+                });
+            }
+        };
+        let token = source.pushed_token().await.map_err(|error| {
+            tracing::warn!(
+                event = "secret_source_resolution_failed",
+                source_kind = "chatgpt-subscription",
+                category = error.category(),
+                "secret.source.resolution.failed"
+            );
+            SecretResolutionError {
+                category: error.category(),
+            }
+        })?;
+        Ok(dekopon_broker::EgressProfileMaterial {
+            cookies: dekopon_broker::CookieSet::default(),
+            tokens: vec![token],
+        })
+    }
+
     async fn resolve(&self, secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError> {
         let Some(entry) = self.entries.get(secret) else {
             return Err(SecretResolutionError {
@@ -3215,6 +3247,8 @@ fn secret_map_conflict_text(problems: &[String], jwt_problems: &[SignedJwtProble
 
 #[cfg(test)]
 mod oauth2_tests;
+#[cfg(test)]
+mod push_token_tests;
 #[cfg(test)]
 mod record_path_exclusivity;
 #[cfg(test)]

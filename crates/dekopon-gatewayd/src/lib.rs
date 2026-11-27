@@ -29,6 +29,7 @@ mod proxy;
 mod pull_request_links;
 mod routes;
 mod session;
+mod store;
 mod threads;
 mod transport;
 mod wake;
@@ -40,7 +41,7 @@ use std::{
     future::Future,
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use dekopon_broker_protocol::BrokerClient;
@@ -62,8 +63,8 @@ pub use config::{
 pub use probe::{NotProbed, ProbeError, ProbeProblem, ProbeScope};
 pub use routes::{RouteError, RouteProblem};
 pub use session::SessionError;
+pub use store::{ConversationKey, StoreError, SyncMode};
 pub use transport::TransportError;
-pub use wake::WakeStoreError;
 
 use crate::{
     asset::AssetStore,
@@ -198,6 +199,7 @@ where
         },
     ) = boot_candidate_with_service(config_path, service).await?;
     let config = &candidate.config;
+    let (durable, store_fatal, restored) = acquire_store(config, &generation.load().routes).await?;
 
     let broker_client = BrokerClient::new(
         &config.broker.socket_path,
@@ -225,8 +227,12 @@ where
         Some((journal, boot)) => (Some(journal), Some(boot)),
         None => (None, None),
     };
-    let follow =
-        load_follow_table(&journal, config.routes.iter().any(|route| route.follow)).await?;
+    let follow = follow_table(
+        config.routes.iter().any(|route| route.follow),
+        config.journal.is_some(),
+        durable.clone(),
+        restored.follows,
+    );
     generation.set_follow(follow.clone());
     let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
@@ -242,6 +248,14 @@ where
         );
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
+    for (key, claim) in restored.ownership {
+        if let Some(ownership) = key
+            .transport()
+            .and_then(|transport| thread_ownership.get(transport.as_str()))
+        {
+            ownership.claim(claim);
+        }
+    }
 
     let journal_dir = config.journal.as_ref().map(|journal| journal.dir.clone());
     let cache_keys = offload(move || match journal_dir {
@@ -255,16 +269,25 @@ where
             memory::generation::report_policy(route);
         }
     }
-    let wakes = match config.wakes.clone() {
-        Some(wakes) => Some(Arc::new(
-            offload(move || wake::WakeStore::open(&wakes))
-                .await
-                .map_err(|source| {
-                    GatewaydError::TransportTask(dekopon_core::TaskOutcome::from(source))
-                })??,
-        )),
-        None => None,
+    let bounds = match (config.wakes.as_ref(), &durable) {
+        (Some(wakes), _) => Some(wakes.bounds),
+        (None, Some(_)) => Some(config::WakeBounds::default()),
+        (None, None) => None,
     };
+    let (wakes, replay) = match bounds {
+        Some(bounds) => {
+            let (store, replay) = wake::WakeStore::restored(
+                durable.as_ref(),
+                restored.wakes,
+                restored.reserved,
+                restored.jobs,
+                bounds,
+            );
+            (Some(store), Some(replay))
+        }
+        None => (None, None),
+    };
+    let reserved_jobs = wakes.as_ref().and_then(|store| store.reserved_job_ids());
     let configured = Arc::new(ConfiguredModels::default());
     let metering = Arc::new(metering::build(
         &config.metering,
@@ -330,10 +353,11 @@ where
         asset_fetchers,
         thread_ownership,
         wakes,
-        jobs: Arc::new(jobs::Jobs::new(
-            config.sessions.max_jobs,
-            Arc::clone(&thread_owner),
-        )),
+        durable: durable.clone(),
+        jobs: Arc::new(
+            jobs::Jobs::new(config.sessions.max_jobs, Arc::clone(&thread_owner))
+                .with_durable(durable.clone(), reserved_jobs),
+        ),
         metering: Arc::clone(&metering),
         shell_threads: ShellThreads::new(shell_threads, tokio::runtime::Handle::current()),
         thread_owner: Arc::clone(&thread_owner),
@@ -363,6 +387,7 @@ where
         Arc::new(BTreeMap::new()),
         Arc::new(drivers),
     )
+    .with_durable(durable, store_fatal, replay)
     .with_reload_owners(
         config_path.to_path_buf(),
         candidate,
@@ -459,7 +484,167 @@ where
             );
             Err(GatewaydError::ReloadTask(failure))
         }
+        ServeOutcome::StoreFailed(cause) => {
+            tracing::error!(
+                event = "gateway_stopped",
+                reason = "store-failed",
+                error.category = cause.category(),
+                "gateway.stopped"
+            );
+            Err(GatewaydError::Store(cause))
+        }
     }
+}
+
+struct RestoredState {
+    wakes: Vec<store::WakeRow>,
+    reserved: Option<dekopon_agent::wake::WakeId>,
+    jobs: Vec<(store::ConversationKey, store::JobRow)>,
+    follows: Vec<(follow::FollowHome, store::FollowRow)>,
+    ownership: Vec<(store::ConversationKey, transport::ThreadClaim)>,
+}
+
+async fn acquire_store(
+    config: &ResolvedConfig,
+    routes: &RoutingTable,
+) -> Result<
+    (
+        Option<Arc<store::DurableStore>>,
+        Option<store::FatalWatch>,
+        RestoredState,
+    ),
+    GatewaydError,
+> {
+    let task = |source| GatewaydError::TransportTask(dekopon_core::TaskOutcome::from(source));
+    let settings = config.durable.clone();
+    let legacy = store::LegacyInputs {
+        wakes: settings
+            .as_ref()
+            .and_then(|settings| settings.path.parent())
+            .map(|directory| directory.join(LEGACY_WAKES)),
+        journal: config.journal.as_ref().map(|journal| journal.dir.clone()),
+    };
+    let persistence = offload(move || store::Persistence::at_boot(settings.as_ref(), &legacy))
+        .await
+        .map_err(task)??;
+    let mut restored = RestoredState {
+        wakes: Vec::new(),
+        reserved: None,
+        jobs: Vec::new(),
+        follows: Vec::new(),
+        ownership: Vec::new(),
+    };
+    let acquired = match persistence {
+        store::Persistence::Memory => {
+            if config.wakes.is_some() || config.routes.iter().any(|route| route.follow) {
+                tracing::warn!(
+                    event = "gateway_store_memory",
+                    warning = "waits-lost-on-restart",
+                    "gateway.store.memory"
+                );
+            }
+            return Ok((None, None, restored));
+        }
+        store::Persistence::Durable(acquired) => *acquired,
+    };
+    let store::Acquired {
+        store,
+        report,
+        fatal,
+    } = acquired;
+    tracing::info!(
+        event = "gateway_store_acquired",
+        store.schema = %report.schema,
+        store.migrated.from = report.migration.as_ref().map(|migrated| migrated.from.to_string()),
+        store.backup = report.migration.as_ref().map(|migrated| migrated.backup.display().to_string()),
+        store.converted = report.conversion.is_some(),
+        "gateway.store.acquired"
+    );
+    let reading = Arc::clone(&store);
+    let rows = offload(move || reading.restore(SystemTime::now()))
+        .await
+        .map_err(task)??;
+    let durable_route = |anchor: &store::AnchorRow| {
+        routes
+            .find(
+                anchor.transport.as_str(),
+                &anchor.conversation,
+                &anchor.subject,
+            )
+            .is_some_and(|(_, route)| {
+                route.agent == anchor.agent
+                    && store::Durability::of(route.memory) == store::Durability::Durable
+            })
+    };
+    let mut skipped = 0usize;
+    for (_, row) in rows.wakes {
+        restored.reserved = restored.reserved.max(Some(row.id));
+        if durable_route(&row.anchor) {
+            restored.wakes.push(row);
+        } else {
+            skipped += 1;
+        }
+    }
+    for (key, row) in rows.interrupted_jobs {
+        if durable_route(&row.anchor) {
+            restored.jobs.push((key, row));
+        } else {
+            skipped += 1;
+        }
+    }
+    for (key, row) in rows.follows {
+        let durable = key.as_ref().is_some_and(|key| {
+            let (Some(transport), Some(conversation)) = (key.transport(), key.conversation_id())
+            else {
+                return false;
+            };
+            routes.routes().iter().any(|route| {
+                route.follow
+                    && route.transport == transport.as_str()
+                    && store::Durability::of(route.memory) == store::Durability::Durable
+                    && follow::follow_key(
+                        &route.transport,
+                        route.agent.as_str(),
+                        &route.conversation,
+                        &conversation,
+                    ) == row.key
+            })
+        });
+        match key {
+            Some(key) if durable => restored
+                .follows
+                .push((follow::FollowHome::Conversation(key), row)),
+            Some(_) => skipped += 1,
+            None => restored.follows.push((follow::FollowHome::Retained, row)),
+        }
+    }
+    for (key, claim) in rows.ownership {
+        let durable = key
+            .transport()
+            .zip(claim.subject())
+            .is_some_and(|(transport, subject)| {
+                routes
+                    .find(transport.as_str(), &claim.conversation(), &subject)
+                    .is_some_and(|(_, route)| {
+                        store::Durability::of(route.memory) == store::Durability::Durable
+                    })
+            });
+        if durable {
+            restored.ownership.push((key, claim));
+        } else {
+            skipped += 1;
+        }
+    }
+    tracing::info!(
+        event = "gateway_store_restored",
+        store.wakes = restored.wakes.len(),
+        store.jobs.interrupted = restored.jobs.len(),
+        store.follows = restored.follows.len(),
+        store.ownership = restored.ownership.len(),
+        store.skipped = skipped,
+        "gateway.store.restored"
+    );
+    Ok((Some(store), Some(fatal), restored))
 }
 
 async fn enqueue_boot(sender: &memory::engine::Sender, boot: memory::journal::records::Boot) {
@@ -505,7 +690,7 @@ async fn open_journal(
             config.retention,
             config.seal_retention,
             queue,
-            std::time::SystemTime::now(),
+            SystemTime::now(),
         )?;
         journal.agent_ages = agent_ages;
         journal.agent_bytes = agent_bytes;
@@ -524,26 +709,21 @@ async fn open_journal(
     Ok(Some((Arc::new(journal.0), journal.1)))
 }
 
-async fn load_follow_table(
-    journal: &Option<Arc<journal::Journal>>,
+const LEGACY_WAKES: &str = "wakes.jsonl";
+
+fn follow_table(
     enabled: bool,
-) -> Result<Option<Arc<follow::FollowTable>>, GatewaydError> {
-    if !enabled && journal.is_none() {
-        return Ok(None);
-    }
-    let journal = Arc::clone(journal.as_ref().ok_or(GatewaydError::Journal {
-        kind: std::io::ErrorKind::InvalidInput,
-    })?);
-    let table = offload(move || follow::FollowTable::load(journal))
-        .await
-        .map_err(|source| GatewaydError::TransportTask(dekopon_core::TaskOutcome::from(source)))?
-        .map_err(|error| GatewaydError::Journal {
-            kind: match error {
-                journal::JournalError::Io { kind } => kind,
-                journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
-            },
-        })?;
-    Ok(Some(Arc::new(table)))
+    journal: bool,
+    durable: Option<Arc<store::DurableStore>>,
+    follows: Vec<(follow::FollowHome, store::FollowRow)>,
+) -> Option<Arc<follow::FollowTable>> {
+    (enabled || journal).then(|| {
+        Arc::new(follow::FollowTable::restored(
+            durable,
+            follows,
+            SystemTime::now(),
+        ))
+    })
 }
 
 fn start_metering_tasks(
@@ -914,13 +1094,17 @@ enum ServeOutcome {
     TransportsLost,
     ReloadStopped(Box<GatewaydError>),
     ReloadPanicked(dekopon_core::TaskOutcome),
+    StoreFailed(StoreError),
 }
 
 impl ServeOutcome {
     const fn is_clean(&self) -> bool {
         match self {
             Self::Shutdown => true,
-            Self::TransportsLost | Self::ReloadStopped(_) | Self::ReloadPanicked(_) => false,
+            Self::TransportsLost
+            | Self::ReloadStopped(_)
+            | Self::ReloadPanicked(_)
+            | Self::StoreFailed(_) => false,
         }
     }
 }
@@ -945,10 +1129,11 @@ fn spawn_tick(
     runner: &Arc<SessionRunner>,
     routes: &RoutingTable,
     store: &Arc<wake::WakeStore>,
-    ticks: &mut JoinSet<Option<wake::Fired>>,
+    ticks: &mut JoinSet<wake::TickEnd>,
     tick: wake::Tick,
 ) -> Result<(), threads::Failure> {
     let store = Arc::clone(store);
+    let wake = tick.id();
     // No transport is named "wake", so a tick's admission key never collides with a session's.
     let Some(admission) = runner
         .gate
@@ -1012,14 +1197,14 @@ fn spawn_tick(
     })?;
     ticks.spawn(async move {
         match result.await {
-            Ok(Ok(fired)) => fired,
+            Ok(Ok(end)) => end,
             Ok(Err(failure)) => {
                 tracing::error!(event = "gateway_wake_task_failed", failure = failure.category(), error = %failure, "gateway.wake.task.failed");
-                None
+                wake::TickEnd { wake, result: wake::TickResult::Panicked }
             }
             Err(_closed) => {
                 tracing::error!(event = "gateway_wake_task_failed", failure = "cancelled", "gateway.wake.task.failed");
-                None
+                wake::TickEnd { wake, result: wake::TickResult::Gone }
             }
         }
     });
@@ -1431,7 +1616,7 @@ pub enum GatewaydError {
     #[error(transparent)]
     CacheKeySecret(#[from] cache_key::CacheKeySecretError),
     #[error(transparent)]
-    WakeStore(#[from] WakeStoreError),
+    Store(#[from] StoreError),
     #[error("guest model proxy could not start")]
     Proxy(#[source] proxy::ProxyStartError),
     #[error(transparent)]

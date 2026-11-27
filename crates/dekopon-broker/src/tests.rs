@@ -72,6 +72,7 @@ async fn desired_pin_without_a_loaded_artifact_is_not_an_execution_digest() {
     let world = PolicyWorld::new([broker.clone()], []).expect("world");
     let policy = PolicyEngine::new("", &world).expect("policy");
     let set = ConstraintSet {
+        egress_profile: None,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: pin.provider_id().clone(),
@@ -585,6 +586,7 @@ fn capability_authority_commits_exactly_these_fields() {
     }
 
     let set = ConstraintSet {
+        egress_profile: None,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "cli-probe".parse().expect("valid provider fixture"),
@@ -975,6 +977,7 @@ async fn in_memory_audit_fails_closed_at_its_bound() {
 fn policy_http_scope_values_are_bounded() {
     fn constrain(http: dekopon_capability::HttpConstraints) -> ConstraintSet {
         ConstraintSet {
+            egress_profile: None,
             default_secret_use: None,
             route: CapabilityRoute::Generic,
             provider: "cli-probe".parse().expect("provider"),
@@ -1073,6 +1076,7 @@ fn an_agent_swaps_only_the_default_its_set_already_names() {
     let named =
         serde_json::from_str::<super::ConstraintSet>(document).expect("authored set decodes");
     let unnamed = super::ConstraintSet {
+        egress_profile: None,
         default_secret_use: None,
         ..named.clone()
     };
@@ -1333,6 +1337,7 @@ async fn a_provider_exit_status_is_recorded_on_the_execution_record() {
         ConstraintCatalog::new([(
             capability.clone(),
             ConstraintSet {
+                egress_profile: None,
                 default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider: provider_id,
@@ -1434,6 +1439,7 @@ fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
         StorageScope,
     };
     let mut set = ConstraintSet {
+        egress_profile: None,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "probe".parse().unwrap(),
@@ -1493,6 +1499,7 @@ fn storage_retention_policy_rejects_conflicts_for_one_resource_family() {
     use super::{BrokerBuildError, ConstraintCatalog};
     use dekopon_capability::{EffectKind, StorageRetention};
     let make = |retention| ConstraintSet {
+        egress_profile: None,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "storage-probe".parse().unwrap(),
@@ -1641,6 +1648,7 @@ fn storage_set(
     namespace: Option<&str>,
 ) -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: provider.parse().unwrap(),
@@ -1936,6 +1944,7 @@ fn a_host_redirect_refusal_records_no_provider_exit_code() {
     )
     .unwrap();
     let set = ConstraintSet {
+        egress_profile: None,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "gh".parse().unwrap(),
@@ -2249,6 +2258,7 @@ fn a_chat_route_needs_each_storage_attribute_to_match() {
     use dekopon_capability::StorageRetention;
 
     let route_set = |interface, scope, access| ConstraintSet {
+        egress_profile: None,
         route: CapabilityRoute::ChatMemoryRecord,
         ..storage_set(
             "memory",
@@ -2518,6 +2528,7 @@ fn memory_route_sets() -> Vec<(CapabilityId, ConstraintSet)> {
         (
             name.parse().expect("capability"),
             ConstraintSet {
+                egress_profile: None,
                 route,
                 provider: "memory".parse().expect("provider"),
                 effect,
@@ -2538,6 +2549,7 @@ fn memory_route_sets() -> Vec<(CapabilityId, ConstraintSet)> {
 
 fn http_probe_set() -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "http-probe".parse().expect("provider"),
@@ -2565,6 +2577,7 @@ fn cli_probe_set(
     risk: dekopon_core::RiskLevel,
 ) -> ConstraintSet {
     ConstraintSet {
+        egress_profile: None,
         default_secret_use: None,
         route: CapabilityRoute::Generic,
         provider: "cli-probe".parse().expect("provider"),
@@ -2632,6 +2645,7 @@ impl<'a> SurfaceBroker<'a> {
                 (
                     "storage-probe.run".parse().expect("capability"),
                     ConstraintSet {
+                        egress_profile: None,
                         risk: dekopon_core::RiskLevel::Medium,
                         ..storage_set(
                             "storage-probe",
@@ -2856,6 +2870,7 @@ async fn the_authority_generation_covers_exactly_the_effective_capabilities_and_
 
     let mut space_scoped = broker(4, &[upper[0], ("cli-probe.count", "cli-probe")]);
     space_scoped.constraints[1].1 = ConstraintSet {
+        egress_profile: None,
         constraints: ExecutionConstraints {
             storage: Some(StorageConstraints {
                 interface: StorageInterface::Jsonl,
@@ -3030,6 +3045,7 @@ fn validate_set_constraints_refuses_each_inconsistent_constraint_set() {
 
     let valid = |set: &ConstraintSet| validate_set_constraints(set);
     let with = |constraints: ExecutionConstraints, effect| ConstraintSet {
+        egress_profile: None,
         effect,
         constraints,
         ..cli_probe_set(EffectKind::ReadOnly, dekopon_core::RiskLevel::Low)
@@ -3843,6 +3859,7 @@ async fn an_authorized_failure_before_the_provider_names_the_loaded_artifact() {
                 uri: None,
             },
             "storage-io",
+            None,
         )
         .await
         .expect("the failure is recorded");
@@ -3881,6 +3898,7 @@ async fn a_successful_provider_that_wrote_stderr_carries_it_as_detail() {
         ConstraintCatalog::new([(
             capability.clone(),
             ConstraintSet {
+                egress_profile: None,
                 default_secret_use: None,
                 route: CapabilityRoute::Generic,
                 provider: provider_id,
@@ -4846,6 +4864,7 @@ fn probe_admission_is_the_only_effect_authority_in_the_paranoid_fingerprint() {
             &mut encoded,
             &"cli-probe.upper".parse().expect("capability"),
             &ConstraintSet {
+                egress_profile: None,
                 effect,
                 ..cli_probe_set(
                     dekopon_capability::EffectKind::ReadOnly,

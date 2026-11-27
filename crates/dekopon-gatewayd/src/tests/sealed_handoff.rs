@@ -14,7 +14,7 @@ use dekopon_agent::prompt::{
 use std::sync::Barrier;
 
 fn admit(gate: &SessionGate, route: &BoundRoute, message: InboundMessage) -> Admit {
-    let receipts = Dispositions(message.constituents.clone());
+    let receipts = Dispositions::new(message.constituents.clone());
     gate.admit(route, message, receipts)
 }
 

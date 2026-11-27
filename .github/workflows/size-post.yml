@@ -1,0 +1,15 @@
+name: Size report
+
+on:
+  workflow_run:
+    workflows: [Size measure]
+    types: [completed]
+
+jobs:
+  post:
+    permissions:
+      actions: read
+      pull-requests: write
+    uses: dekopon-agents/provider-workflows/.github/workflows/size-post.yml@main
+    with:
+      kind: core

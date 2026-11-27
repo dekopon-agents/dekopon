@@ -1,0 +1,15 @@
+name: Size measure
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    uses: dekopon-agents/provider-workflows/.github/workflows/size-measure.yml@main
+    with:
+      kind: core

@@ -342,6 +342,7 @@ async fn broker() -> Arc<Broker> {
                     .parse::<CapabilityId>()
                     .expect("capability"),
                 ConstraintSet {
+                    egress_profile: None,
                     default_secret_use: None,
                     route: CapabilityRoute::Generic,
                     provider: "cli-probe".parse::<ProviderId>().expect("provider"),

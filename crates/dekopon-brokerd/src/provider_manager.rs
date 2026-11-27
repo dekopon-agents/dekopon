@@ -780,7 +780,7 @@ async fn load_provider_set(
 ) -> Result<ProviderSet, ProviderManagerError> {
     let bytes = read_secure_file(path, expected_uid, HARD_MAX_PROVIDER_STATE_BYTES).await?;
     let mut set = serde_yaml::from_slice::<ProviderSet>(&bytes).map_err(|source| {
-        ProviderManagerError::config_source("provider set is not strict valid YAML", source)
+        ProviderManagerError::config_decode("provider set is not strict valid YAML", source)
     })?;
     if set.providers.is_empty() {
         return Err(ProviderManagerError::config(
@@ -840,7 +840,7 @@ pub(crate) async fn load_lock(
 
 fn decode_lock(bytes: &[u8]) -> Result<ProviderLock, ProviderManagerError> {
     let mut lock = serde_yaml::from_slice::<ProviderLock>(bytes).map_err(|source| {
-        ProviderManagerError::config_source("provider lock is not strict valid YAML", source)
+        ProviderManagerError::config_decode("provider lock is not strict valid YAML", source)
     })?;
     lock.providers
         .sort_by(|left, right| left.source.cmp(&right.source));
@@ -933,7 +933,7 @@ fn encode_lock(lock: &ProviderLock) -> Result<Vec<u8>, ProviderManagerError> {
     validate_lock_shape(&lock)?;
     let mut bytes = serde_yaml::to_string(&lock)
         .map_err(|source| {
-            ProviderManagerError::config_source("could not encode provider lock", source)
+            ProviderManagerError::config_decode("could not encode provider lock", source)
         })?
         .into_bytes();
     if !bytes.ends_with(b"\n") {
@@ -2790,14 +2790,13 @@ impl ProviderManagerError {
         }
     }
 
-    fn config_source(
-        reason: &'static str,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
+    fn config_decode(reason: &'static str, source: serde_yaml::Error) -> Self {
         Self::Configuration {
             reason,
-            detail: None,
-            source: Some(Box::new(source)),
+            detail: source
+                .location()
+                .map(|location| format!("line {}, column {}", location.line(), location.column())),
+            source: None,
         }
     }
 

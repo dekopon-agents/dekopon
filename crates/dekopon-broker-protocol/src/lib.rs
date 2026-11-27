@@ -23,6 +23,7 @@ pub use dekopon_core::ProviderFailureDetail;
 mod conversation;
 #[cfg(unix)]
 mod descriptor;
+mod grant;
 #[cfg(unix)]
 pub use descriptor::DescriptorStream;
 #[cfg(unix)]
@@ -42,6 +43,7 @@ use dekopon_core::{
 };
 use dekopon_provider_sdk::ProviderCapability;
 pub use dekopon_provider_sdk::{CommandRunOutcome, ComponentFailure};
+pub use grant::{Grant, GrantId, PlanReading, Tally, UsageClasses};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use thiserror::Error;

@@ -1284,13 +1284,13 @@ mod generation_tests {
         let uid = client.peer_cred().unwrap().uid();
         let identities = BTreeMap::from([(uid, mapped), (uid + 1, other)]);
         let limits = FrameLimits::default();
-        let serve = handle(
+        let serve = Box::pin(handle(
             server,
             &active.ready.broker,
             &identities,
             limits,
             Some(coordination),
-        );
+        ));
         let transact = async {
             write_frame(
                 &mut client,

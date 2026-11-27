@@ -7,6 +7,64 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.100.0] - 2026-11-27
+
+### Changed
+
+- gatewayd: `sessions.durable.path` (with `sync`) replaces `sessions.wakes.path`; wakes, follows, Slack thread ownership and job records persist in one SQLite store, and `wakes.jsonl` beside it converts once at first boot.
+
+  **Breaking Rust API.** `dekopon_gatewayd::WakeStoreError` is removed and `GatewaydError::WakeStore` becomes `GatewaydError::Store(StoreError)`. The wakes configuration loses `path` (`WakesConfig.path`, `ResolvedWakes.path`); the store path is `DurableConfig.path`.
+  The conversion is one-way: `wakes.jsonl` becomes `wakes.jsonl.converted`, and gatewayd 0.99.0 reads neither the store nor `sessions.durable`, so a downgrade needs the pre-upgrade `wakes.jsonl` and `sessions.wakes.path` restored.
+
+### Fixed
+
+- gatewayd: sealing a journal conversation fsyncs the directory after the rename.
+
+## [dekopon-chart-0.87.0] - 2026-11-27
+
+### Changed
+
+- Chart 0.87.0 targets core v0.100.0 and renders the `v0.100.0` image tag.
+
+## [0.99.0] - 2026-11-27
+
+### Added
+
+- A capability's egressProfile pushes the profile's short-lived tokens to the VM runner in a broker-owned header on every call, after a Cedar secret.use decision on the vmEgressProfile sink.
+
+### Fixed
+
+- Broker configuration and provider state YAML errors no longer expose document contents.
+
+  **Breaking Rust API.** `dekopon_brokerd::ConfigError::Decode` replaces `source`
+  with `line` and `column`. `dekopon_brokerd::ConfigError::DecodeFragment` replaces
+  `path` and `source` with `line` and `column`.
+
+- Keep macOS descriptor tests on pull requests so merge-queue runs do not wait for macOS runners.
+
+## [dekopon-chart-0.86.0] - 2026-11-27
+
+### Changed
+
+- Chart 0.86.0 targets core v0.99.0 and renders the `v0.99.0` image tag.
+
+## [0.98.0] - 2026-11-25
+
+### Added
+
+- Report core Rust line-count changes on same-repository pull requests.
+
+### Changed
+
+- The Helm chart explicitly keeps broker logs out of pod termination messages.
+
+## [dekopon-chart-0.85.0] - 2026-11-25
+
+### Changed
+
+- Chart 0.85.0 targets core v0.98.0 and renders the `v0.98.0` image tag.
+- The Helm chart explicitly keeps broker logs out of pod termination messages.
+
 ## [0.97.0] - 2026-11-25
 
 ### Added

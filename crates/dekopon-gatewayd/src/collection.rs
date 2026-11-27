@@ -300,11 +300,26 @@ impl Batch {
     }
 }
 
-pub(crate) struct Dispositions(pub(crate) Vec<tracing::Span>);
+pub(crate) struct Dispositions {
+    pub(crate) spans: Vec<tracing::Span>,
+    pub(crate) deliveries: Vec<crate::wake::DeliveryTicket>,
+}
 
 impl Dispositions {
+    pub(crate) const fn new(spans: Vec<tracing::Span>) -> Self {
+        Self {
+            spans,
+            deliveries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn absorb(&mut self, other: &mut Self) {
+        self.spans.append(&mut other.spans);
+        self.deliveries.append(&mut other.deliveries);
+    }
+
     pub(crate) fn finish(mut self, outcome: MessageOutcome) {
-        for receipt in self.0.drain(..) {
+        for receipt in self.spans.drain(..) {
             disposition(&receipt, outcome.label());
         }
     }
@@ -312,7 +327,7 @@ impl Dispositions {
 
 impl Drop for Dispositions {
     fn drop(&mut self) {
-        for receipt in &self.0 {
+        for receipt in &self.spans {
             disposition(receipt, "abandoned");
         }
     }

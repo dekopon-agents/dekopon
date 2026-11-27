@@ -497,7 +497,7 @@ fn other_speakers_stay_queued_before_and_after_pr_link_mapping_resolves() {
         let mut first = owned_slack_message(PR, false);
         first.pull_request_links = PullRequestLinkContext::parse(PR);
         let key = (first.transport.clone(), first.conversation.key());
-        let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions(vec![]))
+        let Admit::Admitted(admission, _, _) = gate.admit(&route, first, Dispositions::new(vec![]))
         else {
             panic!("PR link admitted")
         };
@@ -509,7 +509,7 @@ fn other_speakers_stay_queued_before_and_after_pr_link_mapping_resolves() {
             dekopon_core::AttestedSubject::one(Subject::slack_user(TEAM, "u8other").unwrap())
                 .expect("one-form subject");
         assert!(matches!(
-            gate.admit(&route, other.clone(), Dispositions(vec![])),
+            gate.admit(&route, other.clone(), Dispositions::new(vec![])),
             Admit::Queued
         ));
         if !resolved_first {
