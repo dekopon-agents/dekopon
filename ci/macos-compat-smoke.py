@@ -19,6 +19,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
+from model_fixture import bash_call, completion, latest_user_lines, read_messages
 from slack_socket_fixture import SlackSocketFixture
 
 
@@ -385,19 +386,14 @@ def fixture_handler(requests, failures, tool_commands, replay, stop_started, sto
 
         def do_POST(self):
             requests.append("model")
-            data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if self.path != "/v1/chat/completions" or self.headers.get_all("Authorization") != [f"Bearer {MODEL_KEY}"]:
-                failures.append("Unexpected model endpoint or fake credential")
+            try:
+                messages = read_messages(self, MODEL_KEY, contains_credential)
+                _, lines = latest_user_lines(messages)
+                prompt = lines[-1]
+            except ValueError as error:
+                failures.append(str(error))
                 self.respond({"error": failures[-1]}, 400)
                 return
-            other_headers = json.dumps([(key, value) for key, value in self.headers.items() if key.lower() != "authorization"])
-            if contains_credential(other_headers + json.dumps(data)):
-                failures.append("A credential reached model input or the wrong HTTP client")
-                self.respond({"error": failures[-1]}, 400)
-                return
-            user = next(message for message in reversed(data["messages"]) if message["role"] == "user")
-            prompt = user["content"].splitlines()[-1]
-            prompt = re.sub(r"<@[A-Za-z0-9]+>\s*", "", prompt).strip()
             if prompt not in ("Read post 7.", "Read post 8.", "Review PR 7.", "Wait for Stop."):
                 failures.append("Model received an unexpected fixture prompt")
                 self.respond({"error": failures[-1]}, 400)
@@ -407,22 +403,18 @@ def fixture_handler(requests, failures, tool_commands, replay, stop_started, sto
                 if not stop_release.wait(15):
                     failures.append("Held model request was not released after Stop")
                 try:
-                    self.respond({"choices": [{"message": {"role": "assistant", "content": "Cancelled answer must not be delivered."}}],
-                                  "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}, allow_disconnect=True)
+                    self.respond(completion({"role": "assistant", "content": "Cancelled answer must not be delivered."}, 1, 1),
+                                 allow_disconnect=True)
                 finally:
                     stop_finished.set()
                 return
             blocked = prompt == "Read post 8."
             pull_request = prompt == "Review PR 7."
-            tool_messages = [message for message in data["messages"] if message["role"] == "tool"]
+            tool_messages = [message for message in messages if message["role"] == "tool"]
             if not tool_messages:
                 tool_command = "gh pr view 7 -R fixture-owner/fixture-repo --json title,state" if pull_request else f"placeholder posts get --post-id {8 if blocked else 7}"
                 tool_commands.append(tool_command)
-                message = {"role": "assistant", "content": None, "tool_calls": [{
-                    "id": "call-1", "type": "function", "function": {
-                        "name": "bash", "arguments": json.dumps({"command": tool_command}),
-                    },
-                }]}
+                message = bash_call(tool_command)
             elif pull_request and "Synthetic PR fixture" in json.dumps(tool_messages) and "OPEN" in json.dumps(tool_messages):
                 message = {"role": "assistant", "content": PR_REPLY, "tool_calls": []}
             elif not pull_request and not blocked and "bounded-test-post" in json.dumps(tool_messages):
@@ -433,9 +425,7 @@ def fixture_handler(requests, failures, tool_commands, replay, stop_started, sto
                 failures.append("Model did not receive the expected provider result")
                 self.respond({"error": failures[-1]}, 400)
                 return
-            self.respond({"choices": [{"message": message}], "usage": {
-                "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
-            }})
+            self.respond(completion(message))
     return Handler
 
 

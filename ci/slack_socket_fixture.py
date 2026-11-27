@@ -244,6 +244,9 @@ class SlackSocketFixture:
     def wait_connected(self, timeout=15):
         return self._wait(lambda: self.connection, "connection", timeout)
 
+    def wait_disconnected(self, timeout=15):
+        self._wait(lambda: self.connection is None, "disconnection", timeout)
+
     def _emit(self, event, timeout=15):
         connection = self.wait_connected(timeout)
         with self.condition:
