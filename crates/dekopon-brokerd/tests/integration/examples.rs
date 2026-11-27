@@ -616,6 +616,80 @@ fn broker_diff_reports_skipped_validation_for_absent_managed_artifacts() {
 }
 
 #[tokio::test]
+async fn broker_diff_validates_policy_source_without_managed_artifacts() {
+    use dekopon_broker::PolicyBuildError;
+    use dekopon_brokerd::BrokerdError;
+
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = managed_broker_diff_config(&temporary.path().join("previous"), false);
+    let proposed = managed_broker_diff_config(&temporary.path().join("proposed"), false);
+    let policy_path = proposed
+        .with_file_name("policies.cedar")
+        .canonicalize()
+        .expect("canonical policy path");
+
+    for (policy, expected) in [
+        (
+            r#"@id("invalid policy id") permit(principal, action, resource);"#,
+            PolicyBuildError::InvalidPolicyId {
+                policy: "policy0".to_owned(),
+            },
+        ),
+        (
+            r#"@id("subject-fence") forbid(principal, action, resource)
+               when { context has subject && context.subject == "drn:slack:user:T0123:U0456" };"#,
+            PolicyBuildError::NonCanonicalDrn {
+                policy: "subject-fence".to_owned(),
+                value: "drn:slack:user:T0123:U0456".to_owned(),
+            },
+        ),
+        (
+            r#"@id("dekopon-broker-default-secret-use") forbid(principal, action, resource);"#,
+            PolicyBuildError::ReservedPolicyId {
+                policy: "dekopon-broker-default-secret-use".to_owned(),
+            },
+        ),
+        (
+            r#"@id("request-permit") permit(principal, action, resource)
+               when { context.request.method == "POST" };"#,
+            PolicyBuildError::InvalidRequestShapes {
+                policies: vec!["request-permit".to_owned()],
+            },
+        ),
+    ] {
+        write_broker_fixture(&policy_path, policy);
+        let output = broker_diff(&proposed, &previous, &["--output", "json"]);
+        assert_eq!(output.status.code(), Some(1), "{expected:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+
+        let error = dekopon_brokerd::check_diff(&proposed, &previous)
+            .await
+            .expect_err("invalid policy must fail with both managed artifacts absent");
+        let BrokerdError::Policy {
+            path: Some(path),
+            source,
+        } = error
+        else {
+            panic!("expected a policy error, got {error:?}");
+        };
+        assert_eq!(path.as_ref(), policy_path);
+        assert_eq!(source, expected);
+    }
+
+    write_broker_fixture(&policy_path, &read("policies.cedar"));
+    let valid = broker_diff(&proposed, &previous, &["--output", "json"]);
+    assert_eq!(valid.status.code(), Some(0), "{valid:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&valid.stdout).expect("diff JSON"),
+        serde_json::json!({
+            "restart_required": [],
+            "swap": [],
+            "managed_set_validation_skipped": ["previous", "proposed"],
+        })
+    );
+}
+
+#[tokio::test]
 async fn broker_diff_compares_managed_sets_from_local_artifacts() {
     use dekopon_brokerd::{BrokerdError, ConfigError};
 

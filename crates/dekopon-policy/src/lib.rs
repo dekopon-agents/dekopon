@@ -580,6 +580,12 @@ impl fmt::Debug for PolicyEngine {
     }
 }
 
+struct PreparedPolicies {
+    policies: PolicySet,
+    ordinary_policies: PolicySet,
+    policy_count: usize,
+}
+
 impl PolicyEngine {
     pub fn new(policy_text: &str, world: &PolicyWorld) -> Result<Self, PolicyBuildError> {
         let (engine, unresolved) = Self::build(policy_text, world, Handling::Refuse)?;
@@ -598,10 +604,10 @@ impl PolicyEngine {
     }
 
     pub fn validate_source(policy_text: &str) -> Result<(), PolicyBuildError> {
-        Self::parse_source(policy_text).map(drop)
+        Self::prepare_source(policy_text).map(drop)
     }
 
-    fn parse_source(policy_text: &str) -> Result<PolicySet, PolicyBuildError> {
+    fn prepare_source(policy_text: &str) -> Result<PreparedPolicies, PolicyBuildError> {
         if policy_text.len() > MAX_POLICY_BYTES {
             return Err(PolicyBuildError::PolicyTooLarge {
                 length: policy_text.len(),
@@ -628,15 +634,6 @@ impl PolicyEngine {
                 maximum: MAX_POLICIES,
             });
         }
-        Ok(policies)
-    }
-
-    fn build(
-        policy_text: &str,
-        world: &PolicyWorld,
-        handling: Handling,
-    ) -> Result<(Self, Vec<UnresolvedName>), PolicyBuildError> {
-        let policies = Self::parse_source(policy_text)?;
         let mut policies = apply_annotated_ids(&policies)?;
         refuse_non_canonical_literals(&policies)?;
         let policy_count = policies.num_of_policies();
@@ -647,6 +644,23 @@ impl PolicyEngine {
                 policies: invalid_request_shapes,
             });
         }
+        Ok(PreparedPolicies {
+            policies,
+            ordinary_policies,
+            policy_count,
+        })
+    }
+
+    fn build(
+        policy_text: &str,
+        world: &PolicyWorld,
+        handling: Handling,
+    ) -> Result<(Self, Vec<UnresolvedName>), PolicyBuildError> {
+        let PreparedPolicies {
+            policies,
+            ordinary_policies,
+            policy_count,
+        } = Self::prepare_source(policy_text)?;
 
         // Classification must run before schema generation; a tolerated name needs to already be in
         // the schema before Cedar's strict validator runs.
