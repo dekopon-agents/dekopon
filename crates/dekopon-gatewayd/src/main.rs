@@ -328,7 +328,7 @@ fn diff_problem(problem: &dekopon_gatewayd::GatewaydError) -> String {
         | GatewaydError::TransportsLost
         | GatewaydError::Journal { .. }
         | GatewaydError::CacheKeySecret(_)
-        | GatewaydError::WakeStore(_)
+        | GatewaydError::Store(_)
         | GatewaydError::Proxy(_)
         | GatewaydError::Probe(_)
         | GatewaydError::Problems { .. }

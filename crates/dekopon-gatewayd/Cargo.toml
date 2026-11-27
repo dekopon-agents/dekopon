@@ -44,6 +44,7 @@ hyper-util.workspace = true
 libc.workspace = true
 mime = "0.3.17"
 reqwest = { workspace = true, features = ["multipart"] }
+rusqlite.workspace = true
 rustix.workspace = true
 rustls.workspace = true
 serde.workspace = true

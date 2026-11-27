@@ -213,7 +213,12 @@ pub(crate) struct CancelRequest {
     pub via: dekopon_agent::CancelVia,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum ThreadClaim {
     Slack {
         team_id: String,
@@ -221,6 +226,72 @@ pub(crate) enum ThreadClaim {
         thread_ts: String,
         user_id: String,
     },
+}
+
+impl ThreadClaim {
+    pub(crate) fn normalized(&self) -> Self {
+        match self {
+            Self::Slack {
+                team_id,
+                channel_id,
+                thread_ts,
+                user_id,
+            } => Self::Slack {
+                team_id: team_id.to_ascii_lowercase(),
+                channel_id: channel_id.to_ascii_lowercase(),
+                thread_ts: thread_ts.clone(),
+                user_id: user_id.to_ascii_lowercase(),
+            },
+        }
+    }
+
+    pub(crate) fn conversation(&self) -> dekopon_broker_protocol::Conversation {
+        match self {
+            Self::Slack {
+                team_id,
+                channel_id,
+                thread_ts,
+                ..
+            } => dekopon_broker_protocol::Conversation {
+                kind: dekopon_broker_protocol::ConversationKind::Thread,
+                container: Some(team_id.to_ascii_lowercase()),
+                id: channel_id.to_ascii_lowercase(),
+                thread: Some(thread_ts.clone()),
+            },
+        }
+    }
+
+    pub(crate) fn subject(&self) -> Option<dekopon_core::Subject> {
+        match self {
+            Self::Slack {
+                team_id, user_id, ..
+            } => dekopon_core::Subject::new(dekopon_core::SubjectKind::SlackUser, team_id, user_id)
+                .ok(),
+        }
+    }
+
+    pub(crate) fn same_thread(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Slack {
+                    team_id,
+                    channel_id,
+                    thread_ts,
+                    ..
+                },
+                Self::Slack {
+                    team_id: other_team,
+                    channel_id: other_channel,
+                    thread_ts: other_thread,
+                    ..
+                },
+            ) => {
+                team_id.eq_ignore_ascii_case(other_team)
+                    && channel_id.eq_ignore_ascii_case(other_channel)
+                    && thread_ts == other_thread
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

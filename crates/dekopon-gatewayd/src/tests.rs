@@ -2176,9 +2176,11 @@ async fn authorize_github_fixture(
     use dekopon_broker_protocol::{
         Attestation, BrokerClient, ChatScopeClaim, FrameLimits, RequestEnvelope,
     };
-    let crate::session::Admit::Admitted(admission, inbound, _) =
-        gate.admit(route, *inbound, crate::collection::Dispositions(vec![]))
-    else {
+    let crate::session::Admit::Admitted(admission, inbound, _) = gate.admit(
+        route,
+        *inbound,
+        crate::collection::Dispositions::new(vec![]),
+    ) else {
         panic!("the delivery must start a new authorized session, not steer or queue");
     };
     let claim = Attestation::for_chat(
@@ -2473,7 +2475,7 @@ async fn a_wake_interval_can_be_shorter_than_the_default_script_timeout() {
     let directory = temporary();
     let mut config = document(directory.path());
     config["routes"][0]["wakes"] = json!(true);
-    config["sessions"]["wakes"] = json!({"path": "wakes.jsonl", "minIntervalMs": 1000});
+    config["sessions"]["wakes"] = json!({"minIntervalMs": 1000});
     load(directory.path(), &config).await.unwrap();
 }
 
@@ -2483,7 +2485,7 @@ async fn a_wake_interval_shorter_than_an_explicit_script_timeout_is_refused() {
     let mut config = document(directory.path());
     config["routes"][0]["wakes"] = json!(true);
     config["routes"][0]["limits"] = json!({"scriptTimeoutMs": 330_000});
-    config["sessions"]["wakes"] = json!({"path": "wakes.jsonl", "minIntervalMs": 300_000});
+    config["sessions"]["wakes"] = json!({"minIntervalMs": 300_000});
     let error = load(directory.path(), &config).await.unwrap_err();
     assert!(reports(&error, |problem| matches!(
         problem,
@@ -2501,7 +2503,7 @@ async fn a_wake_store_interval_must_exceed_the_routed_script_timeout() {
     let mut config = document(directory.path());
     config["routes"][0]["wakes"] = json!(true);
     config["routes"][0]["limits"]["scriptTimeoutMs"] = json!(300_000);
-    config["sessions"]["wakes"] = json!({"path": "wakes.jsonl", "minIntervalMs": 300_000});
+    config["sessions"]["wakes"] = json!({"minIntervalMs": 300_000});
     let error = load(directory.path(), &config)
         .await
         .expect_err("equal intervals overlap");
@@ -2689,15 +2691,15 @@ async fn invalid_configurations_fail_closed_at_startup() {
             matches!(problem, ConfigProblem::WakesWithoutStore { .. })
         }),
         (
-            json!({"/sessions": {"wakes": {"path": "wakes.jsonl", "maxPerSubject": 0}}}),
+            json!({"/sessions": {"wakes": {"maxPerSubject": 0}}}),
             |problem| matches!(problem, ConfigProblem::InvalidWakeBounds),
         ),
         (
-            json!({"/sessions": {"wakes": {"path": "wakes.jsonl", "maxSubscriptionsPerAgent": 0, "subscriptionExpiryMs": 0}}}),
+            json!({"/sessions": {"wakes": {"maxSubscriptionsPerAgent": 0, "subscriptionExpiryMs": 0}}}),
             |problem| matches!(problem, ConfigProblem::InvalidWakeBounds),
         ),
         (
-            json!({"/sessions": {"wakes": {"path": "wakes.jsonl", "minIntervalMs": 1000}},
+            json!({"/sessions": {"wakes": {"minIntervalMs": 1000}},
             "/routes/0/wakes": true, "/routes/0/limits": {"scriptTimeoutMs": 30_000}}),
             |problem| {
                 matches!(
@@ -4614,6 +4616,58 @@ async fn stub_broker_assets(
     )
 }
 
+pub(crate) fn durable_store(directory: &Path) -> Arc<crate::store::DurableStore> {
+    crate::store::DurableStore::acquire(
+        &crate::store::DurableSettings {
+            path: directory.join("state").join("state.sqlite"),
+            sync: crate::store::SyncMode::Normal,
+        },
+        &crate::store::LegacyInputs::default(),
+    )
+    .expect("the durable store opens")
+    .store
+}
+
+fn follow_home(message: &InboundMessage) -> crate::follow::FollowHome {
+    crate::follow::FollowHome::Conversation(crate::store::ConversationKey::of(
+        &message.transport.parse().unwrap(),
+        &message.conversation,
+    ))
+}
+
+fn slack_follow_conversation() -> crate::store::ConversationKey {
+    crate::store::ConversationKey::of(
+        &"scientist-slack".parse().unwrap(),
+        &dekopon_broker_protocol::Conversation {
+            kind: ConversationKind::Thread,
+            container: None,
+            id: "c0123abc".to_owned(),
+            thread: Some("1700000000.000001".to_owned()),
+        },
+    )
+}
+
+pub(crate) fn journal_route() -> crate::routes::BoundRoute {
+    let mut route = route(model_config());
+    route.memory = MemoryPolicy::Persistent(MemoryWindow {
+        scope: MemoryScope::PrivateConversation,
+        idle_timeout: Duration::from_secs(900),
+        limits: HistoryLimits {
+            max_turns: 12,
+            max_bytes: 64 * 1024,
+        },
+        recall: RecallSource::Journal,
+        forget_after: crate::config::DEFAULT_FORGET_AFTER,
+    });
+    route
+}
+
+pub(crate) fn journal_route_for(agent: &dekopon_core::AgentId) -> crate::routes::BoundRoute {
+    let mut route = journal_route();
+    route.agent = agent.clone();
+    route
+}
+
 fn route(model: ModelConfig) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         route_index: 0,
@@ -5053,6 +5107,7 @@ fn runner_tracking(
         asset_fetchers: HashMap::new(),
         thread_ownership: HashMap::new(),
         wakes: None,
+        durable: None,
         jobs: Arc::new(crate::jobs::Jobs::new(
             crate::config::DEFAULT_MAX_JOBS,
             Arc::clone(&thread_owner),
@@ -7556,7 +7611,7 @@ fn a_fired_follow_from_the_running_speaker_queues_without_interruption() {
     let first = gate.admit(
         &route,
         message("addressed"),
-        crate::collection::Dispositions(vec![]),
+        crate::collection::Dispositions::new(vec![]),
     );
     let crate::session::Admit::Admitted(admission, _, _) = first else {
         panic!("first turn admitted")
@@ -7564,7 +7619,7 @@ fn a_fired_follow_from_the_running_speaker_queues_without_interruption() {
     let mut follow = message("ambient");
     follow.message_id = MessageId::Follow("next".into());
     assert!(matches!(
-        gate.admit(&route, follow, crate::collection::Dispositions(vec![])),
+        gate.admit(&route, follow, crate::collection::Dispositions::new(vec![])),
         crate::session::Admit::Queued
     ));
     assert!(
@@ -9620,15 +9675,11 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         &route.conversation,
         "c0123abc",
     );
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            &directory.path().join("journal"),
-            Duration::from_secs(604800),
-            Duration::from_secs(604800),
-        )
-        .unwrap(),
-    );
-    let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        None,
+        Vec::new(),
+        SystemTime::now(),
+    ));
     let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
     let mut runner = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
     runner.follow = Some(Arc::clone(&table));
@@ -9649,14 +9700,9 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
         dispatcher.pending.deadline().is_none(),
         "without a ticket the not-addressed filter drops it"
     );
-    table.stay_and_write(&key, SystemTime::now()).unwrap();
-    std::fs::remove_file(
-        directory
-            .path()
-            .join("journal")
-            .join(format!("{key}.followed")),
-    )
-    .unwrap();
+    table
+        .stay_and_write(&key, crate::follow::FollowHome::Memory, SystemTime::now())
+        .unwrap();
     dispatcher.dispatch(NO_STOP_WORDS, incoming.clone());
     assert!(
         dispatcher.pending.deadline().is_some(),
@@ -9686,7 +9732,7 @@ async fn unmentioned_follow_uses_the_dispatch_filter_only_with_a_resident_ticket
     let active = runner.gate.admit(
         routes.route(&incoming).unwrap(),
         incoming.clone(),
-        crate::collection::Dispositions(vec![]),
+        crate::collection::Dispositions::new(vec![]),
     );
     let crate::session::Admit::Admitted(admission, _, _) = active else {
         panic!("active session admitted")
@@ -9722,15 +9768,12 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
     config["sessions"] = json!({"journal": {"path": directory.path().join("journal")}, "assets": {"path": directory.path().join("assets")}});
     let config = resolved(directory.path(), &config).await;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            &directory.path().join("journal"),
-            Duration::from_secs(604800),
-            Duration::from_secs(604800),
-        )
-        .unwrap(),
-    );
-    let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
+    let store = durable_store(directory.path());
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        Some(Arc::clone(&store)),
+        Vec::new(),
+        SystemTime::now(),
+    ));
     let (broker, _) = stub_broker(directory.path(), Vec::new()).await;
     let mut runner = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
     runner.follow = Some(Arc::clone(&table));
@@ -9752,17 +9795,16 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
         &route.conversation,
         &stop.conversation.key(),
     );
-    table.stay_and_write(&key, SystemTime::now()).unwrap();
-    let path = directory
-        .path()
-        .join("journal")
-        .join(format!("{key}.followed"));
+    let stop_home = follow_home(&stop);
+    table
+        .stay_and_write(&key, stop_home.clone(), SystemTime::now())
+        .unwrap();
 
     let (locked, ready) = tokio::sync::oneshot::channel();
     let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
-    let held_journal = Arc::clone(&journal);
+    let held_store = Arc::clone(&store);
     let blocker = tokio::task::spawn_blocking(move || {
-        let _held = held_journal.hold_io_for_test();
+        let _held = held_store.hold_for_test();
         locked.send(()).unwrap();
         unblock
             .recv_timeout(Duration::from_secs(8))
@@ -9821,12 +9863,10 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
     );
     assert!(absent, "banish hides the resident ticket immediately");
     // The disk lock is taken one statement before the writer check, so the banish can land on
-    // either side of it: NotFound before, PermissionDenied after the marker write.
+    // either side of it: absent before, leaving after the marker write.
     assert!(matches!(
         result,
-        Err(crate::journal::JournalError::Io {
-            kind: std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-        })
+        Err(crate::follow::FollowError::Absent | crate::follow::FollowError::Leaving)
     ));
     while let Some(done) = tokio::time::timeout(Duration::from_secs(3), sessions.join_next())
         .await
@@ -9838,8 +9878,13 @@ async fn a_stop_word_dispatch_banishes_during_a_stalled_follow_write() {
         table.ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Absent
     ));
+    let crate::follow::FollowHome::Conversation(home) = stop_home else {
+        unreachable!("a parsed transport has a conversation home")
+    };
     assert!(
-        !path.exists(),
+        store
+            .snapshot_for_test(&home)
+            .is_none_or(|snapshot| snapshot.follows.is_empty()),
         "the spawned leave removes the marker after the stalled write"
     );
 }
@@ -16026,15 +16071,11 @@ async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
         4,
     ))
     .expect("one runner owner");
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            &directory.path().join("journal"),
-            Duration::from_secs(7 * 86400),
-            Duration::from_secs(7 * 86400),
-        )
-        .unwrap(),
-    );
-    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        None,
+        Vec::new(),
+        SystemTime::now(),
+    ));
     let mut route = route(model_config());
     route.follow = true;
     let mut inbound = message("ambient");
@@ -16050,7 +16091,9 @@ async fn a_follow_delta_then_model_failure_never_reaches_the_chat_surface() {
         &route.conversation,
         &inbound.conversation.key(),
     );
-    table.stay_and_write(&key, SystemTime::now()).unwrap();
+    table
+        .stay_and_write(&key, crate::follow::FollowHome::Memory, SystemTime::now())
+        .unwrap();
     runner.follow = Some(table);
     let driver = Arc::new(
         RecordingDriver::default()
@@ -18095,6 +18138,8 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 
 #[path = "tests/attribution.rs"]
 mod attribution;
+#[path = "tests/durable_store.rs"]
+mod durable_store;
 mod github_burst;
 #[path = "tests/github_http_invocation.rs"]
 mod github_http_invocation;
@@ -18163,6 +18208,7 @@ fn journaled_runner(
         asset_fetchers: HashMap::new(),
         thread_ownership: HashMap::new(),
         wakes: None,
+        durable: None,
         jobs: Arc::new(crate::jobs::Jobs::new(
             crate::config::DEFAULT_MAX_JOBS,
             Arc::clone(&thread_owner),
@@ -18179,7 +18225,11 @@ async fn a_slack_mention_resumes_with_authorized_stay_and_survives_restart() {
     let fixture = SlackFollowFixture::new().await;
     fixture
         .table
-        .stay_and_write(&fixture.key, SystemTime::now())
+        .stay_and_write(
+            &fixture.key,
+            crate::follow::FollowHome::Memory,
+            SystemTime::now(),
+        )
         .unwrap();
     fixture.table.leave(&fixture.key).unwrap();
     let directory = &fixture.directory;
@@ -18233,14 +18283,6 @@ async fn a_slack_mention_resumes_with_authorized_stay_and_survives_restart() {
     let leg = dekopon_agent::BrokerLeg::connect(client, Some(claim.clone()))
         .await
         .unwrap();
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            &fixture.directory.path().join("journal"),
-            Duration::from_secs(7 * 86400),
-            Duration::from_secs(7 * 86400),
-        )
-        .unwrap(),
-    );
     let table = Arc::clone(&fixture.table);
     let key = crate::follow::follow_key(
         &route.transport,
@@ -18248,8 +18290,11 @@ async fn a_slack_mention_resumes_with_authorized_stay_and_survives_restart() {
         &route.conversation,
         &message.conversation.key(),
     );
-    let invoker =
-        crate::follow::FollowInvoker::new(leg, Some((Arc::clone(&table), key.clone(), 0)));
+    let home = follow_home(&message);
+    let invoker = crate::follow::FollowInvoker::new(
+        leg,
+        Some((Arc::clone(&table), key.clone(), home.clone(), 0)),
+    );
     let pending = invoker.pending_follows();
     let result = tokio::task::spawn_blocking(move || {
         let (stdout, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -18299,9 +18344,20 @@ async fn a_slack_mention_resumes_with_authorized_stay_and_survives_restart() {
     for follow in std::mem::take(&mut *pending.lock()) {
         follow.write();
     }
+    let crate::follow::FollowHome::Conversation(home) = home else {
+        unreachable!("a parsed transport has a conversation home")
+    };
+    let persisted = fixture
+        .store
+        .snapshot_for_test(&home)
+        .expect("the follow persisted");
+    let follows = persisted
+        .follows
+        .into_iter()
+        .map(|row| (crate::follow::FollowHome::Conversation(home.clone()), row))
+        .collect();
     assert!(matches!(
-        crate::follow::FollowTable::load(journal)
-            .unwrap()
+        crate::follow::FollowTable::restored(None, follows, SystemTime::now())
             .ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Active { .. }
     ));
@@ -18314,7 +18370,6 @@ async fn a_slack_mention_resumes_with_authorized_stay_and_survives_restart() {
 )]
 async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
     let directory = temporary();
-    let journal_dir = temporary();
     let mut broker = dekopon_test_support::BrokerFixture::answering(
         directory.path(),
         [
@@ -18355,15 +18410,11 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         4,
     ))
     .unwrap();
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            journal_dir.path(),
-            Duration::from_secs(7 * 86400),
-            Duration::from_secs(7 * 86400),
-        )
-        .unwrap(),
-    );
-    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        None,
+        Vec::new(),
+        SystemTime::now(),
+    ));
     let mut route = route(model_config());
     route.follow = true;
     let mut inbound = message_from("drn:tel:number::16034700183", "check hello");
@@ -18374,7 +18425,9 @@ async fn a_followed_non_owner_invokes_only_its_fresh_named_capability() {
         &route.conversation,
         &inbound.conversation.key(),
     );
-    table.stay_and_write(&key, SystemTime::now()).unwrap();
+    table
+        .stay_and_write(&key, crate::follow::FollowHome::Memory, SystemTime::now())
+        .unwrap();
     runner.follow = Some(table);
     let driver = Arc::new(RecordingDriver::default());
     let runner = Arc::new(runner);
@@ -18492,7 +18545,6 @@ async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts(
         ),
     ] {
         let directory = temporary();
-        let journal_dir = temporary();
         let mut broker =
             dekopon_test_support::BrokerFixture::answering(directory.path(), [response]);
         let resolved = ResolvedBroker {
@@ -18502,15 +18554,11 @@ async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts(
         };
         let models = ModelScript::forbidden();
         let mut runner = Arc::into_inner(runner(resolved, Arc::clone(&models), 4)).unwrap();
-        let journal = Arc::new(
-            crate::journal::Journal::open(
-                journal_dir.path(),
-                Duration::from_secs(7 * 86400),
-                Duration::from_secs(7 * 86400),
-            )
-            .unwrap(),
-        );
-        let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+        let table = Arc::new(crate::follow::FollowTable::restored(
+            None,
+            Vec::new(),
+            SystemTime::now(),
+        ));
         let mut route = route(model_config());
         route.follow = true;
         let mut inbound = message_from("drn:tel:number::16034700183", "ambient sentinel");
@@ -18521,7 +18569,9 @@ async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts(
             &route.conversation,
             &inbound.conversation.key(),
         );
-        table.stay_and_write(&key, SystemTime::now()).unwrap();
+        table
+            .stay_and_write(&key, crate::follow::FollowHome::Memory, SystemTime::now())
+            .unwrap();
         runner.follow = Some(table);
         let driver = Arc::new(RecordingDriver::default());
         tokio::time::timeout(
@@ -18554,7 +18604,6 @@ async fn a_follow_refused_or_empty_fresh_leg_never_spends_a_model_call_or_posts(
 #[tokio::test(flavor = "current_thread")]
 async fn an_inactive_follow_turn_records_only_category_metadata() {
     let directory = temporary();
-    let journal_dir = temporary();
     let (capture, _guard) = capture_spans();
     let mut broker = dekopon_test_support::BrokerFixture::answering(directory.path(), []);
     let resolved = ResolvedBroker {
@@ -18564,15 +18613,11 @@ async fn an_inactive_follow_turn_records_only_category_metadata() {
     };
     let models = ModelScript::forbidden();
     let mut runner = Arc::into_inner(runner(resolved, Arc::clone(&models), 4)).unwrap();
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            journal_dir.path(),
-            Duration::from_secs(7 * 86400),
-            Duration::from_secs(7 * 86400),
-        )
-        .unwrap(),
-    );
-    runner.follow = Some(Arc::new(crate::follow::FollowTable::load(journal).unwrap()));
+    runner.follow = Some(Arc::new(crate::follow::FollowTable::restored(
+        None,
+        Vec::new(),
+        SystemTime::now(),
+    )));
     let mut route = route(model_config());
     route.follow = true;
     let mut inbound = message_from("drn:tel:number::16034700183", "private payload sentinel");
@@ -18641,15 +18686,12 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
         decline_reply(),
     ]);
     let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            journal_dir.path(),
-            Duration::from_secs(7 * 86400),
-            Duration::from_secs(7 * 86400),
-        )
-        .unwrap(),
-    );
-    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let store = durable_store(journal_dir.path());
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        Some(Arc::clone(&store)),
+        Vec::new(),
+        SystemTime::now(),
+    ));
     let mut route = route(model_config());
     route.follow = true;
     route.limits.max_steps = 2;
@@ -18661,11 +18703,23 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
         &route.conversation,
         &inbound.conversation.key(),
     );
+    let home = follow_home(&inbound);
     table
-        .stay_and_write(&key, SystemTime::now() - Duration::from_secs(3600))
+        .stay_and_write(
+            &key,
+            home.clone(),
+            SystemTime::now() - Duration::from_secs(3600),
+        )
         .unwrap();
-    let marker = journal_dir.path().join(format!("{key}.followed"));
-    let original = fs::read(&marker).unwrap();
+    let crate::follow::FollowHome::Conversation(home) = home else {
+        unreachable!("a parsed transport has a conversation home")
+    };
+    let persisted = |store: &crate::store::DurableStore| {
+        store
+            .snapshot_for_test(&home)
+            .map(|snapshot| serde_json::to_value(snapshot.follows).unwrap())
+    };
+    let original = persisted(&store);
     runner.follow = Some(Arc::clone(&table));
     let driver = Arc::new(FarewellOrderDriver {
         table: Arc::clone(&table),
@@ -18692,7 +18746,7 @@ async fn worked_follow_final_step_decline_warns_without_leaving_or_refreshing() 
         );
     }
     assert_eq!(
-        fs::read(&marker).unwrap(),
+        persisted(&store),
         original,
         "a failed turn cannot refresh its ticket"
     );
@@ -18779,15 +18833,11 @@ async fn successful_leave_removes_the_ticket_only_after_the_farewell_is_delivere
     .await;
     let models = ModelScript::new([script_call("follow leave"), answer("Farewell.")]);
     let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            journal_dir.path(),
-            Duration::from_secs(7 * 86400),
-            Duration::from_secs(7 * 86400),
-        )
-        .unwrap(),
-    );
-    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        None,
+        Vec::new(),
+        SystemTime::now(),
+    ));
     let mut route = route(model_config());
     route.follow = true;
     let mut inbound = message("leaving");
@@ -18798,7 +18848,9 @@ async fn successful_leave_removes_the_ticket_only_after_the_farewell_is_delivere
         &route.conversation,
         &inbound.conversation.key(),
     );
-    table.stay_and_write(&key, SystemTime::now()).unwrap();
+    table
+        .stay_and_write(&key, crate::follow::FollowHome::Memory, SystemTime::now())
+        .unwrap();
     runner.follow = Some(Arc::clone(&table));
     let driver = Arc::new(FarewellOrderDriver {
         table: Arc::clone(&table),
@@ -18861,8 +18913,11 @@ async fn sealing_one_private_speaker_ends_the_shared_follow_marker() {
         Arc::new(ModelScript::new([answer("unused")])),
         journal_dir.path(),
     );
-    let journal = Arc::clone(runner.journal.as_ref().unwrap());
-    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        None,
+        Vec::new(),
+        SystemTime::now(),
+    ));
     Arc::get_mut(&mut runner).unwrap().follow = Some(Arc::clone(&table));
     let mut route = route(model_config());
     route.follow = true;
@@ -18877,7 +18932,9 @@ async fn sealing_one_private_speaker_ends_the_shared_follow_marker() {
         &route.conversation,
         &first.conversation.key(),
     );
-    table.stay_and_write(&key, SystemTime::now()).unwrap();
+    table
+        .stay_and_write(&key, crate::follow::FollowHome::Memory, SystemTime::now())
+        .unwrap();
     assert!(matches!(
         table.ticket(&key, SystemTime::now()),
         crate::follow::FollowTicket::Active { .. }
@@ -20398,7 +20455,7 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         message("first"),
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
-        (String::new(), None),
+        (String::new(), None, None),
         move |_, _queued| Some(((*selected.load_full()).clone(), String::new())),
     ));
     model.wait_until_entered().await;
@@ -20408,7 +20465,7 @@ async fn queued_new_speaker_reconnects_for_its_own_grant_after_route_publication
         old.clone(),
         queued,
         Arc::clone(&driver) as Arc<dyn ChatDriver>,
-        (String::new(), None),
+        (String::new(), None, None),
         move |_, _queued| None,
     );
     second.await;
@@ -20599,7 +20656,7 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
     let mut document = document(root.path());
     document["catalogPath"] = json!(catalog);
     document["broker"]["serverUid"] = json!(crate::current_uid());
-    document["sessions"]["wakes"] = json!({"path":"wakes.jsonl", "minIntervalMs":300_000});
+    document["sessions"]["wakes"] = json!({"minIntervalMs":300_000});
     document["routes"][0]["wakes"] = json!(true);
     let mut other_route = document["routes"][0].clone();
     other_route["agent"] = json!("other");
@@ -20624,8 +20681,8 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
         Arc::clone(&configured) as Arc<dyn ModelFactory>,
         4,
     );
-    Arc::get_mut(&mut runner).unwrap().wakes = Some(Arc::new(
-        crate::wake::WakeStore::open(candidate.config.wakes.as_ref().unwrap()).unwrap(),
+    Arc::get_mut(&mut runner).unwrap().wakes = Some(crate::wake::WakeStore::in_memory(
+        candidate.config.wakes.as_ref().unwrap().bounds,
     ));
     let private = private_conversation_key("dev", "dev", SUBJECT);
     let shared = ConversationKey::shared(&"reviewer".parse().unwrap(), "dev", "dev");
@@ -20650,7 +20707,7 @@ async fn model_edits_keep_the_resident_history_wakes_jobs_assets_and_other_route
     let first = gateway.route_for_test(&message("first")).unwrap();
     let job_capacity = runner.jobs.free_permits();
     let owner = crate::jobs::JobOwner::of(&message("job"));
-    let anchor = crate::wake::Anchor::for_job(&message("job"), &first.agent).unwrap();
+    let anchor = crate::wake::Anchor::for_job(&message("job"), &first).unwrap();
     let (running_job, _signal) = runner
         .jobs
         .admit(
@@ -23208,6 +23265,7 @@ struct SlackFollowFixture {
     routes: Arc<RoutingTable>,
     generation: crate::gateway::CurrentGeneration,
     table: Arc<crate::follow::FollowTable>,
+    store: Arc<crate::store::DurableStore>,
     key: String,
 }
 
@@ -23234,12 +23292,17 @@ impl SlackFollowFixture {
         let journal = Arc::new(
             crate::journal::Journal::open(
                 &directory.path().join("journal"),
-                Duration::from_secs(604800),
-                Duration::from_secs(604800),
+                Duration::from_secs(7 * 86400),
+                Duration::from_secs(7 * 86400),
             )
             .unwrap(),
         );
-        let table = Arc::new(crate::follow::FollowTable::load(Arc::clone(&journal)).unwrap());
+        let store = durable_store(directory.path());
+        let table = Arc::new(crate::follow::FollowTable::restored(
+            Some(Arc::clone(&store)),
+            Vec::new(),
+            SystemTime::now(),
+        ));
         let route = &config.routes[0];
         let key = crate::follow::follow_key(
             &route.transport,
@@ -23253,6 +23316,7 @@ impl SlackFollowFixture {
         Self {
             directory,
             journal,
+            store,
             routes,
             generation,
             table,
@@ -23267,7 +23331,11 @@ async fn a_slack_follow_batch_keeps_both_speakers_and_authorizes_only_the_newest
         let fixture = SlackFollowFixture::new().await;
         fixture
             .table
-            .stay_and_write(&fixture.key, SystemTime::now())
+            .stay_and_write(
+                &fixture.key,
+                crate::follow::FollowHome::Memory,
+                SystemTime::now(),
+            )
             .unwrap();
         let socket = spawn_socket_mock(vec![
             events_envelope(
@@ -23415,7 +23483,11 @@ async fn a_slack_follow_route_admits_an_owned_unmentioned_continuation_without_a
         if ticket {
             fixture
                 .table
-                .stay_and_write(&fixture.key, SystemTime::now())
+                .stay_and_write(
+                    &fixture.key,
+                    crate::follow::FollowHome::Memory,
+                    SystemTime::now(),
+                )
                 .unwrap();
         }
         let socket = spawn_socket_mock(vec![
@@ -23576,7 +23648,11 @@ async fn slack_follow_mute_and_lapse_close_the_ticket_without_a_model_call() {
         let fixture = SlackFollowFixture::new().await;
         fixture
             .table
-            .stay_and_write(&fixture.key, SystemTime::now() - Duration::from_secs(age))
+            .stay_and_write(
+                &fixture.key,
+                crate::follow::FollowHome::Memory,
+                SystemTime::now() - Duration::from_secs(age),
+            )
             .unwrap();
         let socket = spawn_socket_mock(vec![events_envelope(
             "signal",
@@ -23649,7 +23725,11 @@ async fn slack_follow_human_thumbs_down_leaves_once_ignoring_bots_and_other_auth
     let fixture = SlackFollowFixture::new().await;
     fixture
         .table
-        .stay_and_write(&fixture.key, SystemTime::now())
+        .stay_and_write(
+            &fixture.key,
+            crate::follow::FollowHome::Memory,
+            SystemTime::now(),
+        )
         .unwrap();
     let reaction = |user: &str, author: &str, name: &str| {
         json!({
@@ -23756,7 +23836,6 @@ async fn slack_follow_human_thumbs_down_leaves_once_ignoring_bots_and_other_auth
 #[tokio::test(flavor = "multi_thread")]
 async fn a_successful_leave_releases_the_agent_thread_for_every_sender() {
     let directory = temporary();
-    let journal_dir = temporary();
     let leaving: AvailableCapability = serde_json::from_value(json!({
         "provider": "dekopon-provider-follow",
         "capability": {
@@ -23780,15 +23859,11 @@ async fn a_successful_leave_releases_the_agent_thread_for_every_sender() {
     .await;
     let models = ModelScript::new([script_call("follow leave"), answer("Bye.")]);
     let mut runner = Arc::into_inner(runner(broker, Arc::clone(&models), 4)).unwrap();
-    let journal = Arc::new(
-        crate::journal::Journal::open(
-            journal_dir.path(),
-            Duration::from_secs(7 * 86400),
-            Duration::from_secs(7 * 86400),
-        )
-        .unwrap(),
-    );
-    let table = Arc::new(crate::follow::FollowTable::load(journal).unwrap());
+    let table = Arc::new(crate::follow::FollowTable::restored(
+        None,
+        Vec::new(),
+        SystemTime::now(),
+    ));
     let mut route = route(model_config());
     route.follow = true;
     let message = owned_slack_message("<@u0botbot> leave", false);
@@ -23804,7 +23879,9 @@ async fn a_successful_leave_releases_the_agent_thread_for_every_sender() {
         &route.conversation,
         &message.conversation.key(),
     );
-    table.stay_and_write(&key, SystemTime::now()).unwrap();
+    table
+        .stay_and_write(&key, crate::follow::FollowHome::Memory, SystemTime::now())
+        .unwrap();
     runner.follow = Some(Arc::clone(&table));
     let ownership = Arc::new(RecordingThreadOwnership::default());
     runner.thread_ownership.insert(
@@ -23839,7 +23916,11 @@ async fn dispatch_racing_an_expiry_sweep_records_exactly_one_follow_leave() {
     let fixture = SlackFollowFixture::new().await;
     fixture
         .table
-        .stay_and_write(&fixture.key, SystemTime::now() - Duration::from_secs(86400))
+        .stay_and_write(
+            &fixture.key,
+            crate::follow::FollowHome::Conversation(slack_follow_conversation()),
+            SystemTime::now() - Duration::from_secs(86400),
+        )
         .unwrap();
     let (broker, _) = stub_broker(fixture.directory.path(), vec![]).await;
     let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
@@ -23854,9 +23935,9 @@ async fn dispatch_racing_an_expiry_sweep_records_exactly_one_follow_leave() {
     let (capture, _guard) = capture_spans();
     let (locked, ready) = tokio::sync::oneshot::channel();
     let (release, unblock) = std::sync::mpsc::sync_channel::<()>(1);
-    let held = Arc::clone(&fixture.journal);
+    let held = Arc::clone(&fixture.store);
     let blocker = tokio::task::spawn_blocking(move || {
-        let _lock = held.hold_io_for_test();
+        let _lock = held.hold_for_test();
         locked.send(()).unwrap();
         unblock
             .recv_timeout(Duration::from_secs(8))
@@ -23867,7 +23948,11 @@ async fn dispatch_racing_an_expiry_sweep_records_exactly_one_follow_leave() {
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let sweep = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || {
-            sweeping.stay_and_write(&"f".repeat(64), SystemTime::now())
+            sweeping.stay_and_write(
+                &"f".repeat(64),
+                crate::follow::FollowHome::Memory,
+                SystemTime::now(),
+            )
         })
     });
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -23912,7 +23997,11 @@ async fn recall_then_dispatch_records_exactly_one_follow_leave() {
     let fixture = SlackFollowFixture::new().await;
     fixture
         .table
-        .stay_and_write(&fixture.key, SystemTime::now() - Duration::from_secs(86400))
+        .stay_and_write(
+            &fixture.key,
+            crate::follow::FollowHome::Memory,
+            SystemTime::now() - Duration::from_secs(86400),
+        )
         .unwrap();
     let (broker, _) = stub_broker(fixture.directory.path(), vec![]).await;
     let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
@@ -23928,7 +24017,6 @@ async fn recall_then_dispatch_records_exactly_one_follow_leave() {
     fixture
         .journal
         .maintain(&"e".repeat(64), SystemTime::now(), 1);
-    assert!(fixture.journal.load_follow(1024).unwrap().is_empty());
     assert_eq!(
         fixture.table.ticket(&fixture.key, SystemTime::now()),
         crate::follow::FollowTicket::Lapsed
@@ -23972,7 +24060,11 @@ async fn a_debounce_expiry_records_the_leave_on_the_originating_message_trace() 
     let fixture = SlackFollowFixture::new().await;
     fixture
         .table
-        .stay_and_write(&fixture.key, SystemTime::now())
+        .stay_and_write(
+            &fixture.key,
+            crate::follow::FollowHome::Memory,
+            SystemTime::now(),
+        )
         .unwrap();
     let (broker, _) = stub_broker(fixture.directory.path(), vec![]).await;
     let mut running = Arc::into_inner(runner(broker, ModelScript::forbidden(), 4)).unwrap();
@@ -23995,7 +24087,11 @@ async fn a_debounce_expiry_records_the_leave_on_the_originating_message_trace() 
         }
         fixture
             .table
-            .stay_and_write(&fixture.key, SystemTime::now() - Duration::from_secs(86400))
+            .stay_and_write(
+                &fixture.key,
+                crate::follow::FollowHome::Memory,
+                SystemTime::now() - Duration::from_secs(86400),
+            )
             .unwrap();
         tokio::time::sleep(Duration::from_secs(31)).await;
         assert_eq!(
@@ -24039,58 +24135,17 @@ async fn a_debounce_expiry_records_the_leave_on_the_originating_message_trace() 
     provider.shutdown().unwrap();
 }
 
-#[test]
-fn startup_expiry_records_a_follow_lapse_once() {
-    let directory = temporary();
-    let now = SystemTime::now();
-    let journal = crate::journal::Journal::open(
-        directory.path(),
-        Duration::from_secs(604800),
-        Duration::from_secs(604800),
-    )
-    .unwrap();
-    let key = "f".repeat(64);
-    journal
-        .write_follow(
-            &key,
-            crate::journal::FollowMarker {
-                at_ms: 1,
-                until_ms: 2,
-            },
-        )
-        .unwrap();
-    drop(journal);
-    let (capture, _guard) = capture_spans();
-    for _ in 0..2 {
-        let journal = crate::journal::Journal::open_at(
-            directory.path(),
-            Duration::from_secs(604800),
-            Duration::from_secs(604800),
-            now,
-        )
-        .unwrap();
-        assert!(journal.load_follow(1024).unwrap().is_empty());
-    }
-    assert_eq!(
-        capture
-            .events_where(
-                "dekopon_gatewayd",
-                &[("audit.event", "gateway.follow"), ("cause", "lapse")]
-            )
-            .len(),
-        1
-    );
-}
-
 #[tokio::test]
 async fn a_journal_initializes_follow_state_before_the_first_route_is_enabled() {
     let fixture = SlackFollowFixture::new().await;
-    let table = crate::load_follow_table(&Some(Arc::clone(&fixture.journal)), false)
-        .await
-        .unwrap()
+    let table = crate::follow_table(false, true, None, Vec::new())
         .expect("journal-backed gateways retain follow state even when all routes start disabled");
     table
-        .stay_and_write(&fixture.key, SystemTime::now())
+        .stay_and_write(
+            &fixture.key,
+            crate::follow::FollowHome::Memory,
+            SystemTime::now(),
+        )
         .unwrap();
     assert!(matches!(
         table.ticket(&fixture.key, SystemTime::now()),

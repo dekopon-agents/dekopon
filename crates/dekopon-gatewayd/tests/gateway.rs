@@ -2118,17 +2118,94 @@ mod subscriptions;
 
 #[cfg(feature = "fauxlack")]
 fn configure_wakes(directory: &Path, rows: &[Value], config: &mut Value) {
-    config["sessions"]["wakes"] = json!({"path":directory.join("wakes.jsonl")});
+    let state = directory.join("state");
+    config["sessions"]["wakes"] = json!({});
+    config["sessions"]["durable"] = json!({"path": state.join("state.sqlite")});
+    config["sessions"]["journal"] = json!({"path": directory.join("journal")});
+    config["sessions"]["assets"] = json!({"path": directory.join("assets")});
     for route in config["routes"].as_array_mut().unwrap() {
         route["wakes"] = json!(true);
+        route["memory"] = json!({"mode": "persistent", "recall": "journal", "summaries": "off"});
+    }
+    fs::create_dir_all(&state).unwrap();
+    for name in [
+        "state.sqlite",
+        "state.sqlite-wal",
+        "state.sqlite-shm",
+        "wakes.jsonl.converted",
+    ] {
+        match fs::remove_file(state.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("reset {name}: {error}"),
+        }
     }
     let encoded = rows
         .iter()
         .map(|row| format!("{row}\n"))
         .collect::<String>();
-    write_owner_only(&directory.join("wakes.jsonl"), encoded.as_bytes());
+    write_owner_only(&state.join("wakes.jsonl"), encoded.as_bytes());
 }
 
+#[cfg(feature = "fauxlack")]
+fn stored_wakes(directory: &Path) -> Vec<Value> {
+    let path = directory.join("state").join("state.sqlite");
+    let connection = rusqlite::Connection::open(&path).expect("the stopped gateway's store opens");
+    let mut statement = connection
+        .prepare("SELECT snapshot FROM conversations ORDER BY key")
+        .unwrap();
+    let snapshots: Vec<String> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut rows: Vec<Value> = snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            serde_json::from_str::<Value>(snapshot).unwrap()["wakes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(legacy_row)
+        .collect();
+    rows.sort_by_key(|row| row["id"].as_u64());
+    rows
+}
+
+#[cfg(feature = "fauxlack")]
+fn legacy_row(row: Value) -> Value {
+    let mut legacy = row["anchor"].clone();
+    for field in ["id", "note", "nextAtMs"] {
+        legacy[field] = row[field].clone();
+    }
+    let space = legacy["subject"]
+        .as_str()
+        .is_some_and(|subject| subject.contains(":channel:"));
+    let kind = &row["kind"];
+    match kind["type"].as_str() {
+        Some("watch") => {
+            let mut watch = kind.clone();
+            watch.as_object_mut().unwrap().remove("type");
+            legacy["watch"] = watch;
+        }
+        Some("digest") => {
+            let mut watch = kind.clone();
+            watch.as_object_mut().unwrap().remove("type");
+            watch["script"] = json!(format!(
+                "# dekopon: daily-digest\n{}",
+                watch["script"].as_str().unwrap()
+            ));
+            legacy["watch"] = watch;
+        }
+        Some("subscription") => legacy["subscription"] = kind["target"].clone(),
+        _ => {}
+    }
+    if space && legacy.get("subscription").is_none() {
+        legacy["run_as"] = json!("space");
+    }
+    legacy
+}
 #[cfg(feature = "fauxlack")]
 #[path = "gateway/digests.rs"]
 mod digests;

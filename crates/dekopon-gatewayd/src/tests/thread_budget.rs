@@ -49,7 +49,7 @@ async fn a_job_at_the_shell_thread_cap_is_refused_without_a_row_or_permit() {
     let runner = with_thread_cap(runner(broker, ModelScript::new([]), 1), 1);
     let inbound = message("job");
     let owner = crate::jobs::JobOwner::of(&inbound);
-    let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let anchor = crate::wake::Anchor::for_job(&inbound, &journal_route()).unwrap();
     let mut notices = runner.jobs.take_notices();
     let held = runner.shell_threads.reserve::<1>().unwrap();
     let refusal = runner.jobs.admit(
@@ -83,7 +83,7 @@ async fn a_tick_at_the_shell_thread_cap_is_refused_without_holding_admission() {
     let store = wakes::wake_store(directory.path());
     let now = std::time::SystemTime::now();
     let inbound = wakes::slack_message("tick");
-    let anchor = crate::wake::Anchor::from_inbound(&inbound, &route(model_config()).agent).unwrap();
+    let anchor = crate::wake::Anchor::from_inbound(&inbound, &journal_route()).unwrap();
     let id = store
         .register(
             anchor,
@@ -149,7 +149,7 @@ async fn a_panicking_job_returns_its_thread_permit_and_its_owner_observes_panick
     let runner = with_thread_cap(runner(broker, ModelScript::new([]), 1), 1);
     let inbound = message("panic");
     let owner = crate::jobs::JobOwner::of(&inbound);
-    let anchor = crate::wake::Anchor::for_job(&inbound, &route(model_config()).agent).unwrap();
+    let anchor = crate::wake::Anchor::for_job(&inbound, &journal_route()).unwrap();
     let mut notices = runner.jobs.take_notices();
     let crate::jobs::Admitted { run, thread, .. } = runner
         .jobs

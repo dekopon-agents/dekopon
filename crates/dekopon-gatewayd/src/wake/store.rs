@@ -1,51 +1,35 @@
 use parking_lot::Mutex;
 use std::{
-    fs::{DirBuilder, File},
-    io::{self, BufRead, BufReader},
-    os::unix::fs::DirBuilderExt,
-    path::{Path, PathBuf},
+    collections::BTreeMap,
+    sync::{Arc, Weak},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use dekopon_agent::wake::{WakeId, WakeRefusal, WakeSummary, WatchSummary};
-use dekopon_broker_protocol::{ChatTransportKind, Conversation, TraceParent};
 use dekopon_core::github::{GithubEvent, GithubEventName, GithubThread};
-use dekopon_core::private_file::{TemporarySweep, replace_private_file, sweep_stale_temporaries};
 use dekopon_core::{AgentId, AttestedSubject, Subject};
+use dekopon_process::JobId;
 use dekopon_shell::{CapabilityInvoker, Interpreter};
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use super::{
-    Anchor, Probe, Verdict, WakeOperation, WakeOrigin, WatchPurpose, fired_text, record_digest,
+    Anchor, Probe, Verdict, WakeOperation, WakeOrigin, WatchPurpose,
+    delivery::{Delivered, Delivery, DeliveryDisposition, DeliveryTicket, JobNotice, Replay},
+    fired_text, record_digest,
 };
 use crate::{
-    config::{ResolvedWakes, WakeBounds},
+    config::WakeBounds,
     pull_request_links::PullRequestLinkTarget,
+    store::{
+        AnchorRow, Change, ConversationKey, Durability, DurableStore, JobRow, PendingDelivery,
+        StoreFailed, WakeRow, WakeRowKind, WatchRow, millis,
+    },
     transport::{InboundMessage, ReplyTarget},
 };
 
-#[derive(Debug, Error)]
-pub enum WakeStoreError {
-    #[error("could not read or write the wake store")]
-    Io { kind: io::ErrorKind },
-    #[error("wake store line {line} did not parse; remove the file to reset every pending wake")]
-    Corrupt { line: usize },
-}
+const REOFFER: Duration = Duration::from_secs(30);
 
-impl From<io::Error> for WakeStoreError {
-    fn from(error: io::Error) -> Self {
-        Self::Io { kind: error.kind() }
-    }
-}
-
-impl From<WakeStoreError> for WakeRefusal {
-    fn from(error: WakeStoreError) -> Self {
-        tracing::error!(
-            event = "gateway_wake_store_failed",
-            error = %error,
-            "gateway.wake.store.failed"
-        );
+impl From<StoreFailed> for WakeRefusal {
+    fn from(StoreFailed: StoreFailed) -> Self {
         Self::Store
     }
 }
@@ -69,10 +53,38 @@ struct Wake {
     next_at: SystemTime,
     kind: WakeKind,
     run_as: Option<RunAs>,
+    pending: Option<Pending>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug)]
+struct Pending {
+    delivery: PendingDelivery,
+    offer: Offer,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Offer {
+    InFlight,
+    At(SystemTime),
+}
+
+impl Offer {
+    fn due(self, now: SystemTime) -> bool {
+        match self {
+            Self::InFlight => false,
+            Self::At(at) => at <= now,
+        }
+    }
+
+    const fn at(self) -> Option<SystemTime> {
+        match self {
+            Self::InFlight => None,
+            Self::At(at) => Some(at),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum RunAs {
     Space,
 }
@@ -103,11 +115,27 @@ impl Wake {
     }
 
     fn expired_digest(&self, now: SystemTime) -> bool {
-        self.is_digest()
+        self.pending.is_none()
+            && self.is_digest()
             && match &self.kind {
                 WakeKind::Watch { until, .. } => *until <= now,
                 WakeKind::Once | WakeKind::Subscription { .. } => false,
             }
+    }
+
+    fn durable(&self) -> bool {
+        match self.anchor.durability {
+            Durability::Durable => true,
+            Durability::Memory => false,
+        }
+    }
+
+    fn removed_once_delivered(&self) -> bool {
+        match &self.kind {
+            WakeKind::Once => true,
+            WakeKind::Watch { .. } => !self.is_digest(),
+            WakeKind::Subscription { .. } => false,
+        }
     }
 
     fn summary(&self, now: SystemTime) -> WakeSummary {
@@ -131,21 +159,38 @@ impl Wake {
         }
     }
 
-    fn fired(&self, reason: &str, output: Option<&str>) -> Fired {
-        Fired {
-            anchor: self.anchor.clone(),
-            id: self.id,
+    fn origin(&self) -> WakeOrigin {
+        match &self.kind {
+            WakeKind::Subscription { target } => WakeOrigin::Subscription(target.clone()),
+            WakeKind::Watch { .. } if self.is_digest() => WakeOrigin::Digest,
+            WakeKind::Once | WakeKind::Watch { .. } => WakeOrigin::Scheduled,
+        }
+    }
+
+    fn fire(&mut self, reason: &str, output: Option<&str>) -> WakeId {
+        let delivery = PendingDelivery {
             text: fired_text(self.id, &self.note, reason, output),
             notice: match output {
                 Some(output) => format!("{}\n\n{output}", self.note),
                 None => self.note.clone(),
             },
-            origin: match &self.kind {
-                WakeKind::Subscription { target } => WakeOrigin::Subscription(target.clone()),
-                WakeKind::Watch { .. } if self.is_digest() => WakeOrigin::Digest,
-                WakeKind::Once | WakeKind::Watch { .. } => WakeOrigin::Scheduled,
-            },
-        }
+        };
+        self.pending = Some(Pending {
+            delivery,
+            offer: Offer::InFlight,
+        });
+        self.id
+    }
+
+    fn fired(&self) -> Option<Fired> {
+        let pending = self.pending.as_ref()?;
+        Some(Fired {
+            anchor: self.anchor.clone(),
+            id: self.id,
+            text: pending.delivery.text.clone(),
+            notice: pending.delivery.notice.clone(),
+            origin: self.origin(),
+        })
     }
 
     fn record_lifecycle(&self, operation: WakeOperation) {
@@ -164,6 +209,135 @@ impl Wake {
             };
             record_digest(self.id, operation, cause);
         }
+    }
+
+    fn row(&self) -> WakeRow {
+        WakeRow {
+            id: self.id,
+            anchor: self.anchor.row(),
+            note: self.note.clone(),
+            next_at_ms: millis(self.next_at),
+            kind: match &self.kind {
+                WakeKind::Once => WakeRowKind::Once,
+                WakeKind::Subscription { target } => WakeRowKind::Subscription {
+                    target: target.clone(),
+                },
+                WakeKind::Watch {
+                    probe,
+                    every,
+                    until,
+                } => {
+                    let watch = WatchRow {
+                        script: probe.script.clone(),
+                        prev: probe.prev.clone(),
+                        every_ms: u64::try_from(every.as_millis()).unwrap_or(u64::MAX),
+                        until_ms: millis(*until),
+                    };
+                    match probe.purpose {
+                        WatchPurpose::Ordinary => WakeRowKind::Watch(watch),
+                        WatchPurpose::Digest => WakeRowKind::Digest(watch),
+                    }
+                }
+            },
+            pending: self
+                .pending
+                .as_ref()
+                .map(|pending| pending.delivery.clone()),
+        }
+    }
+
+    fn from_row(row: WakeRow, offer: Offer) -> Option<Self> {
+        let anchor = Anchor::restored(row.anchor)?;
+        let space = anchor.subject().principal_kind() == dekopon_core::PrincipalKind::Space;
+        let run_as = space.then_some(RunAs::Space);
+        let watch = |watch: WatchRow, purpose: WatchPurpose| WakeKind::Watch {
+            probe: Probe {
+                script: watch.script,
+                prev: watch.prev,
+                purpose,
+            },
+            every: Duration::from_millis(watch.every_ms),
+            until: at(watch.until_ms),
+        };
+        let kind = match row.kind {
+            WakeRowKind::Once => WakeKind::Once,
+            WakeRowKind::Watch(row) => watch(row, WatchPurpose::Ordinary),
+            WakeRowKind::Digest(row) if space => watch(row, WatchPurpose::Digest),
+            WakeRowKind::Digest(_) => return None,
+            WakeRowKind::Subscription { .. } if !space => return None,
+            WakeRowKind::Subscription { target } => WakeKind::Subscription { target },
+        };
+        let wake = Self {
+            id: row.id,
+            anchor,
+            note: row.note,
+            next_at: at(row.next_at_ms),
+            kind,
+            run_as,
+            pending: row.pending.map(|delivery| Pending { delivery, offer }),
+        };
+        if wake.run_as.is_some() {
+            let space = wake.anchor.as_space()?;
+            if space.subject() != wake.anchor.subject()
+                || !wake
+                    .anchor
+                    .conversation
+                    .is_canonical_for(wake.anchor.kind, wake.anchor.subject())
+            {
+                return None;
+            }
+            if let WakeKind::Watch { probe, every, .. } = &wake.kind
+                && (every.is_zero()
+                    || (probe.purpose == WatchPurpose::Digest && *every < Probe::DIGEST_INTERVAL))
+            {
+                return None;
+            }
+        }
+        Some(wake)
+    }
+}
+
+impl Anchor {
+    pub(crate) fn restored(row: AnchorRow) -> Option<Self> {
+        Some(Self {
+            transport: row.transport,
+            reply: match row.reply {
+                ReplyTarget::Local { .. } => return None,
+                reply @ (ReplyTarget::Slack { .. }
+                | ReplyTarget::Fauxlack { .. }
+                | ReplyTarget::Discord { .. }
+                | ReplyTarget::Telegram { .. }
+                | ReplyTarget::WhatsApp { .. }
+                | ReplyTarget::GithubTrace) => reply,
+            },
+            kind: row.kind,
+            subject: match row.subject_id {
+                Some(id) => AttestedSubject::paired(row.subject, id),
+                None => AttestedSubject::one(row.subject),
+            }
+            .ok()?,
+            conversation: row.conversation,
+            agent: row.agent,
+            scheduled_in: row.scheduled_in,
+            durability: Durability::Durable,
+        })
+    }
+
+    pub(crate) fn row(&self) -> AnchorRow {
+        AnchorRow {
+            transport: self.transport.clone(),
+            kind: self.kind,
+            subject: self.subject.name().clone(),
+            subject_id: self.subject.id_form().cloned(),
+            conversation: self.conversation.clone(),
+            reply: self.reply.clone(),
+            agent: self.agent.clone(),
+            scheduled_in: self.scheduled_in,
+        }
+    }
+
+    pub(crate) fn key(&self) -> ConversationKey {
+        ConversationKey::of(&self.transport, &self.conversation)
     }
 }
 
@@ -212,11 +386,20 @@ pub(crate) struct Tick {
 
 pub(crate) enum Resolved {
     Rearmed,
-    Fired(Box<Fired>),
+    Fired(Box<Delivery>),
     Gone,
 }
 
 impl Tick {
+    #[cfg(test)]
+    pub(crate) fn for_test(id: WakeId, anchor: Anchor) -> Self {
+        Self {
+            id,
+            anchor,
+            probe: Probe::scripted_for_test("echo"),
+        }
+    }
+
     pub(crate) const fn id(&self) -> WakeId {
         self.id
     }
@@ -234,29 +417,30 @@ impl Tick {
         store: &WakeStore,
         verdict: Verdict,
         now: SystemTime,
-    ) -> Result<Resolved, WakeStoreError> {
+    ) -> Result<Resolved, StoreFailed> {
         let digest = self.probe.purpose == WatchPurpose::Digest;
         let operation = match &verdict {
             Verdict::Failed { .. } => WakeOperation::Failed,
             Verdict::Fire { .. } | Verdict::Wait { .. } => WakeOperation::Expired,
         };
-        let result = store.mutate(
+        let fired = store.mutate(
             |_| operation,
             |wakes| {
-                let Some(index) = wakes.iter().position(|wake| wake.id == self.id) else {
-                    return Ok(Resolved::Gone);
-                };
+                let index = wakes.iter().position(|wake| wake.id == self.id)?;
+                if wakes[index].pending.is_some() {
+                    return None;
+                }
                 if wakes[index].is_digest() {
                     if wakes[index].expired_digest(now) {
                         wakes.remove(index);
-                        return Ok(Resolved::Gone);
+                        return None;
                     }
                     let (output, fire) = match verdict {
                         Verdict::Fire { output } => (output, true),
                         Verdict::Wait { output } => (output, false),
                         Verdict::Failed { .. } => {
                             wakes.remove(index);
-                            return Ok(Resolved::Gone);
+                            return None;
                         }
                     };
                     let changed = match &wakes[index].kind {
@@ -266,7 +450,7 @@ impl Tick {
                         WakeKind::Once | WakeKind::Subscription { .. } => false,
                     };
                     let fired =
-                        (fire && changed).then(|| wakes[index].fired("fired", Some(&output)));
+                        (fire && changed).then(|| wakes[index].fire("fired", Some(&output)));
                     if let WakeKind::Watch {
                         probe,
                         every,
@@ -276,32 +460,33 @@ impl Tick {
                         probe.prev = output;
                         wakes[index].next_at = (now + *every).min(*until);
                     }
-                    return Ok(match fired {
-                        Some(fired) => Resolved::Fired(Box::new(fired)),
-                        None => Resolved::Rearmed,
-                    });
+                    return Some(fired);
                 }
                 let WakeKind::Watch { probe, until, .. } = &mut wakes[index].kind else {
-                    return Ok(Resolved::Gone);
+                    return None;
                 };
-                let fired = match verdict {
+                Some(Some(match verdict {
                     Verdict::Wait { output } if now < *until => {
                         probe.prev = output;
-                        return Ok(Resolved::Rearmed);
+                        return Some(None);
                     }
-                    Verdict::Wait { output } => {
-                        wakes[index].fired("gave up waiting", Some(&output))
-                    }
-                    Verdict::Fire { output } => wakes[index].fired("fired", Some(&output)),
-                    Verdict::Failed { exit, output } => wakes[index].fired(
+                    Verdict::Wait { output } => wakes[index].fire("gave up waiting", Some(&output)),
+                    Verdict::Fire { output } => wakes[index].fire("fired", Some(&output)),
+                    Verdict::Failed { exit, output } => wakes[index].fire(
                         &format!("stopped because its probe exited {}", exit.get()),
                         Some(&output),
                     ),
-                };
-                wakes.remove(index);
-                Ok(Resolved::Fired(Box::new(fired)))
+                }))
             },
         )?;
+        let result = match fired {
+            None => Resolved::Gone,
+            Some(None) => Resolved::Rearmed,
+            Some(Some(id)) => match store.delivery(id) {
+                Some(delivery) => Resolved::Fired(Box::new(delivery)),
+                None => Resolved::Gone,
+            },
+        };
         if digest {
             match &result {
                 Resolved::Fired(_) => record_digest(self.id, WakeOperation::Fired, None),
@@ -315,28 +500,133 @@ impl Tick {
 
 #[derive(Default)]
 pub(crate) struct Due {
-    pub fired: Vec<Fired>,
+    pub fired: Vec<Delivery>,
     pub ticks: Vec<Tick>,
+    pub jobs: Vec<JobNotice>,
 }
 
 #[derive(Default)]
 pub(crate) struct SubscriptionDelivery {
     pub(crate) matched: bool,
-    pub(crate) fired: Vec<Fired>,
+    pub(crate) fired: Vec<Delivery>,
+}
+
+struct Interrupted {
+    key: ConversationKey,
+    row: JobRow,
+    offer: Offer,
 }
 
 struct State {
     wakes: Vec<Wake>,
+    jobs: Vec<Interrupted>,
     next_id: u32,
 }
 
 pub(crate) struct WakeStore {
-    path: PathBuf,
+    durable: Option<Arc<DurableStore>>,
     bounds: WakeBounds,
     state: Mutex<State>,
+    me: Weak<Self>,
 }
 
 impl WakeStore {
+    #[cfg(test)]
+    pub(crate) fn durable_for_test(&self) -> Option<&Arc<DurableStore>> {
+        self.durable.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory(bounds: WakeBounds) -> Arc<Self> {
+        Self::restored(None, Vec::new(), None, Vec::new(), bounds).0
+    }
+
+    pub(crate) fn restored(
+        durable: Option<&Arc<DurableStore>>,
+        rows: Vec<WakeRow>,
+        reserved: Option<WakeId>,
+        jobs: Vec<(ConversationKey, JobRow)>,
+        bounds: WakeBounds,
+    ) -> (Arc<Self>, Replay) {
+        let mut wakes = Vec::new();
+        for row in rows {
+            let id = row.id;
+            match Wake::from_row(row, Offer::InFlight) {
+                Some(wake) => wakes.push(wake),
+                None => tracing::warn!(
+                    event = "gateway_wake_restore_skipped",
+                    wake.id = %id,
+                    reason = "invalid",
+                    "gateway.wake.restore.skipped"
+                ),
+            }
+        }
+        let next_id = wakes
+            .iter()
+            .map(|wake| wake.id.0)
+            .chain(reserved.map(|id| id.0))
+            .max()
+            .map_or(1, |id| id.wrapping_add(1));
+        let jobs = jobs
+            .into_iter()
+            .map(|(key, row)| Interrupted {
+                key,
+                row,
+                offer: Offer::InFlight,
+            })
+            .collect();
+        let store = Arc::new_cyclic(|me| Self {
+            durable: durable.cloned(),
+            bounds,
+            state: Mutex::new(State {
+                wakes,
+                jobs,
+                next_id,
+            }),
+            me: Weak::clone(me),
+        });
+        let replay = {
+            let state = store.state.lock();
+            Replay {
+                wakes: state
+                    .wakes
+                    .iter()
+                    .filter_map(|wake| store.issue(wake))
+                    .collect(),
+                jobs: state.jobs.iter().map(|job| store.job_notice(job)).collect(),
+            }
+        };
+        (store, replay)
+    }
+
+    fn issue(&self, wake: &Wake) -> Option<Delivery> {
+        Some(Delivery {
+            fired: wake.fired()?,
+            ticket: DeliveryTicket::issue(
+                wake.anchor.key(),
+                Delivered::Wake(wake.id),
+                self.me.upgrade(),
+            ),
+        })
+    }
+
+    fn job_notice(&self, job: &Interrupted) -> JobNotice {
+        JobNotice {
+            row: job.row.clone(),
+            ticket: DeliveryTicket::issue(
+                job.key.clone(),
+                Delivered::Job(job.row.id),
+                self.me.upgrade(),
+            ),
+        }
+    }
+
+    fn delivery(&self, id: WakeId) -> Option<Delivery> {
+        let state = self.state.lock();
+        let wake = state.wakes.iter().find(|wake| wake.id == id)?;
+        self.issue(wake)
+    }
+
     pub(crate) fn subscribe(
         &self,
         anchor: Anchor,
@@ -349,55 +639,59 @@ impl WakeStore {
         {
             return Err(WakeRefusal::MappedChannelRequired);
         }
-        let mut state = self.state.lock();
-        let mut wakes = state.wakes.clone();
-        expire_subscriptions(&mut wakes, now);
-        if let Some(wake) = wakes.iter().find(|wake| {
-            wake.anchor.same_thread(&anchor)
-                && match &wake.kind {
-                    WakeKind::Subscription { target: existing } => existing == &target,
-                    WakeKind::Once | WakeKind::Watch { .. } => false,
-                }
-        }) {
-            return Ok(wake.summary(now));
-        }
         let maximum = self.bounds.max_subscriptions_per_agent;
-        let pending = wakes
-            .iter()
-            .filter(|wake| {
-                wake.anchor.agent() == anchor.agent()
-                    && match wake.kind {
-                        WakeKind::Subscription { .. } => true,
-                        WakeKind::Once | WakeKind::Watch { .. } => false,
-                    }
-            })
-            .count();
-        if pending >= maximum {
-            return Err(WakeRefusal::SubscriptionsFull { maximum });
+        let expiry = self.bounds.subscription_expiry;
+        let created = self.mutate_with_id(
+            |_| WakeOperation::Expired,
+            |wakes, next_id| {
+                expire_subscriptions(wakes, now);
+                if let Some(wake) = wakes.iter().find(|wake| {
+                    wake.anchor.same_thread(&anchor)
+                        && match &wake.kind {
+                            WakeKind::Subscription { target: existing } => existing == &target,
+                            WakeKind::Once | WakeKind::Watch { .. } => false,
+                        }
+                }) {
+                    return Ok((wake.summary(now), false));
+                }
+                let pending = wakes
+                    .iter()
+                    .filter(|wake| {
+                        wake.anchor.agent() == anchor.agent()
+                            && match wake.kind {
+                                WakeKind::Subscription { .. } => true,
+                                WakeKind::Once | WakeKind::Watch { .. } => false,
+                            }
+                    })
+                    .count();
+                if pending >= maximum {
+                    return Err(WakeRefusal::SubscriptionsFull { maximum });
+                }
+                let wake = Wake {
+                    id: next_id.take(),
+                    anchor,
+                    note: format!("PR subscription {}#{}", target.repository, target.number),
+                    next_at: now + expiry,
+                    kind: WakeKind::Subscription { target },
+                    run_as: Some(RunAs::Space),
+                    pending: None,
+                };
+                let summary = wake.summary(now);
+                wakes.push(wake);
+                Ok((summary, true))
+            },
+        )??;
+        let (summary, created) = created;
+        if created {
+            self.record_created(summary.id);
         }
-        let wake = Wake {
-            id: WakeId(state.next_id),
-            anchor,
-            note: format!("PR subscription {}#{}", target.repository, target.number),
-            next_at: now + self.bounds.subscription_expiry,
-            kind: WakeKind::Subscription { target },
-            run_as: Some(RunAs::Space),
-        };
-        let summary = wake.summary(now);
-        wakes.push(wake);
-        write(&self.path, &wakes)?;
-        let retained: std::collections::BTreeSet<_> = wakes.iter().map(|wake| wake.id).collect();
-        for removed in &state.wakes {
-            if !retained.contains(&removed.id) {
-                removed.record_lifecycle(WakeOperation::Expired);
-            }
-        }
-        if let Some(wake) = wakes.last() {
+        Ok(summary)
+    }
+
+    fn record_created(&self, id: WakeId) {
+        if let Some(wake) = self.state.lock().wakes.iter().find(|wake| wake.id == id) {
             wake.record_lifecycle(WakeOperation::Created);
         }
-        state.wakes = wakes;
-        state.next_id = state.next_id.wrapping_add(1);
-        Ok(summary)
     }
 
     pub(crate) fn list_subscriptions(
@@ -409,7 +703,7 @@ impl WakeStore {
             |_| WakeOperation::Expired,
             |wakes| {
                 expire_subscriptions(wakes, now);
-                Ok(wakes
+                wakes
                     .iter()
                     .filter(|wake| {
                         wake.anchor.same_channel(anchor)
@@ -419,7 +713,7 @@ impl WakeStore {
                             }
                     })
                     .map(|wake| wake.summary(now))
-                    .collect())
+                    .collect()
             },
         )?)
     }
@@ -442,7 +736,7 @@ impl WakeStore {
                         };
                     !remove
                 });
-                Ok(before != wakes.len())
+                before != wakes.len()
             },
         )?;
         if found {
@@ -465,8 +759,8 @@ impl WakeStore {
         agent: &AgentId,
         event: &GithubEvent,
         now: SystemTime,
-    ) -> Result<SubscriptionDelivery, WakeStoreError> {
-        let delivery = self.mutate(
+    ) -> Result<SubscriptionDelivery, StoreFailed> {
+        let (matched, fired) = self.mutate(
             |wake| {
                 if wake.next_at > now
                     && subscription_matches(wake, agent, event)
@@ -482,59 +776,49 @@ impl WakeStore {
             },
             |wakes| {
                 expire_subscriptions(wakes, now);
-                let mut delivery = SubscriptionDelivery::default();
-                wakes.retain(|wake| {
+                let mut matched = false;
+                let mut fired = Vec::new();
+                wakes.retain_mut(|wake| {
                     if !subscription_matches(wake, agent, event) {
                         return true;
                     }
-                    delivery.matched = true;
+                    matched = true;
                     match event.action.as_ref().map(|action| action.as_str()) {
                         Some("closed") => false,
                         Some("synchronize") => {
-                            delivery.fired.push(wake.fired("fired", None));
+                            match &mut wake.pending {
+                                None => fired.push(wake.fire("fired", None)),
+                                Some(pending) => match pending.offer {
+                                    Offer::InFlight => {}
+                                    Offer::At(_) => {
+                                        pending.offer = Offer::InFlight;
+                                        fired.push(wake.id);
+                                    }
+                                },
+                            }
                             true
                         }
                         _ => true,
                     }
                 });
-                Ok(delivery)
+                (matched, fired)
             },
         )?;
-        for fired in &delivery.fired {
-            if let WakeOrigin::Subscription(target) = &fired.origin {
-                record_subscription(fired.id, &fired.anchor, target, WakeOperation::Fired);
+        let fired: Vec<Delivery> = fired
+            .into_iter()
+            .filter_map(|id| self.delivery(id))
+            .collect();
+        for delivery in &fired {
+            if let WakeOrigin::Subscription(target) = &delivery.fired.origin {
+                record_subscription(
+                    delivery.fired.id,
+                    &delivery.fired.anchor,
+                    target,
+                    WakeOperation::Fired,
+                );
             }
         }
-        Ok(delivery)
-    }
-    pub(crate) fn open(config: &ResolvedWakes) -> Result<Self, WakeStoreError> {
-        if let Some(parent) = config.path.parent() {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-        }
-        let wakes = match File::open(&config.path) {
-            Ok(file) => read(file)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
-        for outcome in sweep_stale_temporaries(&config.path, None) {
-            match outcome {
-                TemporarySweep::Removed { .. } => {}
-                TemporarySweep::Failed { source, .. } => return Err(source.into()),
-            }
-        }
-        let next_id = wakes
-            .iter()
-            .map(|wake| wake.id.0)
-            .max()
-            .map_or(1, |id| id.wrapping_add(1));
-        Ok(Self {
-            path: config.path.clone(),
-            bounds: config.bounds,
-            state: Mutex::new(State { wakes, next_id }),
-        })
+        Ok(SubscriptionDelivery { matched, fired })
     }
 
     pub(crate) const fn bounds(&self) -> WakeBounds {
@@ -597,54 +881,49 @@ impl WakeStore {
             ),
         };
         let maximum = self.bounds.max_per_subject;
-        let mut state = self.state.lock();
-        let mut wakes = state.wakes.clone();
-        wakes.retain(|wake| !wake.expired_digest(now));
-        let digest = match &kind {
-            WakeKind::Watch { probe, .. } => probe.purpose == WatchPurpose::Digest,
-            WakeKind::Once | WakeKind::Subscription { .. } => false,
-        };
-        if digest
-            && wakes
-                .iter()
-                .any(|wake| wake.is_digest() && wake.anchor.subject() == anchor.subject())
-        {
-            return Err(WakeRefusal::DigestExists);
-        }
-        let pending = wakes
-            .iter()
-            .filter(|wake| {
-                wake.anchor.subject() == anchor.subject()
-                    && match wake.kind {
-                        WakeKind::Subscription { .. } => false,
-                        WakeKind::Once | WakeKind::Watch { .. } => true,
-                    }
-            })
-            .count();
-        if pending >= maximum {
-            return Err(WakeRefusal::Full { maximum });
-        }
-        let wake = Wake {
-            id: WakeId(state.next_id),
-            anchor,
-            note,
-            next_at,
-            kind,
-            run_as,
-        };
-        let summary = wake.summary(now);
-        wakes.push(wake);
-        write(&self.path, &wakes)?;
-        for removed in &state.wakes {
-            if removed.expired_digest(now) {
-                removed.record_lifecycle(WakeOperation::Expired);
-            }
-        }
-        if let Some(created) = wakes.last() {
-            created.record_lifecycle(WakeOperation::Created);
-        }
-        state.wakes = wakes;
-        state.next_id = state.next_id.wrapping_add(1);
+        let summary = self.mutate_with_id(
+            |_| WakeOperation::Expired,
+            |wakes, next_id| {
+                wakes.retain(|wake| !wake.expired_digest(now));
+                let digest = match &kind {
+                    WakeKind::Watch { probe, .. } => probe.purpose == WatchPurpose::Digest,
+                    WakeKind::Once | WakeKind::Subscription { .. } => false,
+                };
+                if digest
+                    && wakes
+                        .iter()
+                        .any(|wake| wake.is_digest() && wake.anchor.subject() == anchor.subject())
+                {
+                    return Err(WakeRefusal::DigestExists);
+                }
+                let pending = wakes
+                    .iter()
+                    .filter(|wake| {
+                        wake.anchor.subject() == anchor.subject()
+                            && match wake.kind {
+                                WakeKind::Subscription { .. } => false,
+                                WakeKind::Once | WakeKind::Watch { .. } => true,
+                            }
+                    })
+                    .count();
+                if pending >= maximum {
+                    return Err(WakeRefusal::Full { maximum });
+                }
+                let wake = Wake {
+                    id: next_id.take(),
+                    anchor,
+                    note,
+                    next_at,
+                    kind,
+                    run_as,
+                    pending: None,
+                };
+                let summary = wake.summary(now);
+                wakes.push(wake);
+                Ok(summary)
+            },
+        )??;
+        self.record_created(summary.id);
         Ok(summary)
     }
 
@@ -662,7 +941,7 @@ impl WakeStore {
                             WakeKind::Once | WakeKind::Watch { .. } => false,
                         }
                 });
-                Ok(wakes.len() != before)
+                wakes.len() != before
             },
         )?;
         if found {
@@ -679,6 +958,7 @@ impl WakeStore {
             .iter()
             .filter(|wake| {
                 wake.anchor.subject() == subject
+                    && (wake.pending.is_none() || !wake.removed_once_delivered())
                     && wake.run_as.is_none()
                     && match wake.kind {
                         WakeKind::Subscription { .. } => false,
@@ -706,6 +986,7 @@ impl WakeStore {
                         wake.run_as.is_some()
                             && wake.anchor.same_channel(space)
                             && !wake.expired_digest(now)
+                            && (wake.pending.is_none() || !wake.removed_once_delivered())
                             && match wake.kind {
                                 WakeKind::Once | WakeKind::Watch { .. } => true,
                                 WakeKind::Subscription { .. } => false,
@@ -741,7 +1022,7 @@ impl WakeStore {
                     };
                     !(wake.id == id && owned && scheduled)
                 });
-                Ok(before != wakes.len())
+                before != wakes.len()
             },
         )?;
         if found {
@@ -753,15 +1034,28 @@ impl WakeStore {
 
     pub(crate) fn next_at(&self) -> Option<SystemTime> {
         let state = self.state.lock();
-        state.wakes.iter().map(|wake| wake.next_at).min()
+        let wakes = state.wakes.iter().filter_map(|wake| match &wake.pending {
+            Some(pending) => pending.offer.at(),
+            None => Some(wake.next_at),
+        });
+        let jobs = state.jobs.iter().filter_map(|job| job.offer.at());
+        wakes.chain(jobs).min()
     }
 
-    pub(crate) fn take_due(&self, now: SystemTime) -> Result<Due, WakeStoreError> {
-        self.mutate(
+    pub(crate) fn take_due(&self, now: SystemTime) -> Result<Due, StoreFailed> {
+        let (fired, ticks) = self.mutate(
             |_| WakeOperation::Expired,
             |wakes| {
-                let mut due = Due::default();
+                let mut fired = Vec::new();
+                let mut ticks = Vec::new();
                 wakes.retain_mut(|wake| {
+                    if let Some(pending) = &mut wake.pending {
+                        if pending.offer.due(now) {
+                            pending.offer = Offer::InFlight;
+                            fired.push(wake.id);
+                        }
+                        return true;
+                    }
                     if wake.expired_digest(now) {
                         return false;
                     }
@@ -771,8 +1065,8 @@ impl WakeStore {
                     match &wake.kind {
                         WakeKind::Subscription { .. } => false,
                         WakeKind::Once => {
-                            due.fired.push(wake.fired("fired", None));
-                            false
+                            fired.push(wake.fire("fired", None));
+                            true
                         }
                         WakeKind::Watch {
                             probe,
@@ -783,7 +1077,7 @@ impl WakeStore {
                                 WatchPurpose::Digest => (now + *every).min(*until),
                                 WatchPurpose::Ordinary => now + *every,
                             };
-                            due.ticks.push(Tick {
+                            ticks.push(Tick {
                                 id: wake.id,
                                 anchor: wake.anchor.clone(),
                                 probe: probe.clone(),
@@ -792,20 +1086,125 @@ impl WakeStore {
                         }
                     }
                 });
-                Ok(due)
+                (fired, ticks)
             },
-        )
+        )?;
+        let jobs = {
+            let mut state = self.state.lock();
+            let mut due = Vec::new();
+            for job in &mut state.jobs {
+                if job.offer.due(now) {
+                    job.offer = Offer::InFlight;
+                    due.push(self.job_notice(job));
+                }
+            }
+            due
+        };
+        Ok(Due {
+            fired: fired
+                .into_iter()
+                .filter_map(|id| self.delivery(id))
+                .collect(),
+            ticks,
+            jobs,
+        })
+    }
+
+    pub(crate) fn settle(
+        &self,
+        ticket: DeliveryTicket,
+        disposition: DeliveryDisposition,
+    ) -> Result<(), StoreFailed> {
+        let (conversation, delivered) = ticket.settled();
+        let done = match disposition {
+            DeliveryDisposition::Handled | DeliveryDisposition::Orphaned => true,
+            DeliveryDisposition::Rejected => false,
+        };
+        if !done {
+            self.reoffer(delivered, SystemTime::now());
+            return Ok(());
+        }
+        match delivered {
+            Delivered::Wake(id) => self.mutate(
+                |_| WakeOperation::Fired,
+                |wakes| {
+                    if let Some(index) = wakes.iter().position(|wake| wake.id == id) {
+                        if wakes[index].removed_once_delivered() {
+                            wakes.remove(index);
+                        } else {
+                            wakes[index].pending = None;
+                        }
+                    }
+                },
+            ),
+            Delivered::Job(id) => {
+                let mut state = self.state.lock();
+                let durable = state
+                    .jobs
+                    .iter()
+                    .any(|job| job.row.id == id && job.key == conversation);
+                if durable && let Some(store) = &self.durable {
+                    store.commit(vec![(conversation.clone(), Change::JobEnded(id))])?;
+                }
+                state
+                    .jobs
+                    .retain(|job| !(job.row.id == id && job.key == conversation));
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn reoffer(&self, delivered: Delivered, now: SystemTime) {
+        let at = Offer::At(now + REOFFER);
+        let mut state = self.state.lock();
+        match delivered {
+            Delivered::Wake(id) => {
+                if let Some(pending) = state
+                    .wakes
+                    .iter_mut()
+                    .find(|wake| wake.id == id)
+                    .and_then(|wake| wake.pending.as_mut())
+                {
+                    pending.offer = at;
+                }
+            }
+            Delivered::Job(id) => {
+                for job in state.jobs.iter_mut().filter(|job| job.row.id == id) {
+                    job.offer = at;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn reserved_job_ids(&self) -> Option<JobId> {
+        self.state
+            .lock()
+            .jobs
+            .iter()
+            .map(|job| job.row.id)
+            .max_by_key(|id| id.get())
     }
 
     fn mutate<T>(
         &self,
         operation: impl Fn(&Wake) -> WakeOperation,
-        change: impl FnOnce(&mut Vec<Wake>) -> Result<T, WakeStoreError>,
-    ) -> Result<T, WakeStoreError> {
+        change: impl FnOnce(&mut Vec<Wake>) -> T,
+    ) -> Result<T, StoreFailed> {
+        self.mutate_with_id(operation, |wakes, _| change(wakes))
+    }
+
+    fn mutate_with_id<T>(
+        &self,
+        operation: impl Fn(&Wake) -> WakeOperation,
+        change: impl FnOnce(&mut Vec<Wake>, &mut NextId) -> T,
+    ) -> Result<T, StoreFailed> {
         let mut state = self.state.lock();
         let mut wakes = state.wakes.clone();
-        let result = change(&mut wakes)?;
-        write(&self.path, &wakes)?;
+        let mut next_id = NextId(state.next_id);
+        let result = change(&mut wakes, &mut next_id);
+        if let Some(store) = &self.durable {
+            store.commit(changes(&state.wakes, &wakes))?;
+        }
         let retained: std::collections::BTreeSet<_> = wakes.iter().map(|wake| wake.id).collect();
         for wake in &state.wakes {
             if !retained.contains(&wake.id) {
@@ -813,153 +1212,50 @@ impl WakeStore {
             }
         }
         state.wakes = wakes;
+        state.next_id = next_id.0;
         Ok(result)
     }
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct Line {
-    id: u32,
-    transport: String,
-    kind: ChatTransportKind,
-    subject: Subject,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    subject_id: Option<Subject>,
-    conversation: Conversation,
-    reply: ReplyTarget,
-    agent: AgentId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    scheduled_in: Option<TraceParent>,
-    note: String,
-    next_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    watch: Option<WatchLine>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    subscription: Option<PullRequestLinkTarget>,
-    #[serde(default, rename = "run_as", skip_serializing_if = "Option::is_none")]
-    run_as: Option<RunAs>,
+struct NextId(u32);
+
+impl NextId {
+    fn take(&mut self) -> WakeId {
+        let id = WakeId(self.0);
+        self.0 = self.0.wrapping_add(1);
+        id
+    }
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct WatchLine {
-    script: String,
-    prev: String,
-    every_ms: u64,
-    until_ms: u64,
-}
-
-fn millis(at: SystemTime) -> u64 {
-    at.duration_since(UNIX_EPOCH).map_or(0, |since| {
-        u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-    })
+fn changes(before: &[Wake], after: &[Wake]) -> Vec<(ConversationKey, Change)> {
+    let encoded = |wake: &Wake| serde_json::to_value(wake.row()).ok();
+    let previous: BTreeMap<WakeId, (&Wake, Option<serde_json::Value>)> = before
+        .iter()
+        .filter(|wake| wake.durable())
+        .map(|wake| (wake.id, (wake, encoded(wake))))
+        .collect();
+    let mut changes = Vec::new();
+    let mut kept = std::collections::BTreeSet::new();
+    for wake in after.iter().filter(|wake| wake.durable()) {
+        kept.insert(wake.id);
+        let row = wake.row();
+        let unchanged = previous
+            .get(&wake.id)
+            .is_some_and(|(_, old)| old.is_some() && *old == serde_json::to_value(&row).ok());
+        if !unchanged {
+            changes.push((wake.anchor.key(), Change::PutWake(row)));
+        }
+    }
+    for (id, (wake, _)) in previous {
+        if !kept.contains(&id) {
+            changes.push((wake.anchor.key(), Change::RemoveWake(id)));
+        }
+    }
+    changes
 }
 
 fn at(millis: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(millis)
-}
-
-impl From<&Wake> for Line {
-    fn from(wake: &Wake) -> Self {
-        let anchor = &wake.anchor;
-        Self {
-            id: wake.id.0,
-            transport: anchor.transport.to_string(),
-            kind: anchor.kind,
-            subject: anchor.subject.name().clone(),
-            subject_id: anchor.subject.id_form().cloned(),
-            conversation: anchor.conversation.clone(),
-            reply: anchor.reply.clone(),
-            agent: anchor.agent.clone(),
-            scheduled_in: anchor.scheduled_in,
-            note: wake.note.clone(),
-            next_at_ms: millis(wake.next_at),
-            run_as: wake.run_as,
-            watch: match &wake.kind {
-                WakeKind::Once | WakeKind::Subscription { .. } => None,
-                WakeKind::Watch {
-                    probe,
-                    every,
-                    until,
-                } => Some(WatchLine {
-                    script: probe.encoded_script(),
-                    prev: probe.prev.clone(),
-                    every_ms: u64::try_from(every.as_millis()).unwrap_or(u64::MAX),
-                    until_ms: millis(*until),
-                }),
-            },
-            subscription: match &wake.kind {
-                WakeKind::Subscription { target } => Some(target.clone()),
-                WakeKind::Once | WakeKind::Watch { .. } => None,
-            },
-        }
-    }
-}
-
-impl Line {
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "reshaped by the unit that next rewrites this"
-    )]
-    fn wake(self) -> Option<Wake> {
-        if self.subscription.is_some() && self.watch.is_some() {
-            return None;
-        }
-        let run_as = self
-            .run_as
-            .or_else(|| self.subscription.as_ref().map(|_| RunAs::Space));
-        let wake = Wake {
-            run_as,
-            id: WakeId(self.id),
-            anchor: Anchor {
-                transport: self.transport.parse().ok()?,
-                reply: match self.reply {
-                    ReplyTarget::Local { .. } => return None,
-                    reply => reply,
-                },
-                kind: self.kind,
-                subject: match self.subject_id {
-                    Some(id) => AttestedSubject::paired(self.subject, id),
-                    None => AttestedSubject::one(self.subject),
-                }
-                .ok()?,
-                conversation: self.conversation,
-                agent: self.agent,
-                scheduled_in: self.scheduled_in,
-            },
-            note: self.note,
-            next_at: at(self.next_at_ms),
-            kind: match (self.watch, self.subscription) {
-                (None, None) => WakeKind::Once,
-                (None, Some(target)) => WakeKind::Subscription { target },
-                (Some(_), Some(_)) => return None,
-                (Some(watch), None) => WakeKind::Watch {
-                    probe: Probe::decode(watch.script, watch.prev, run_as.is_some()),
-                    every: Duration::from_millis(watch.every_ms),
-                    until: at(watch.until_ms),
-                },
-            },
-        };
-        if wake.run_as.is_some() {
-            let space = wake.anchor.as_space()?;
-            if space.subject() != wake.anchor.subject()
-                || !wake
-                    .anchor
-                    .conversation
-                    .is_canonical_for(wake.anchor.kind, wake.anchor.subject())
-            {
-                return None;
-            }
-            if let WakeKind::Watch { probe, every, .. } = &wake.kind
-                && (every.is_zero()
-                    || (probe.purpose == WatchPurpose::Digest && *every < Probe::DIGEST_INTERVAL))
-            {
-                return None;
-            }
-        }
-        Some(wake)
-    }
 }
 
 fn record_subscription(
@@ -979,7 +1275,7 @@ fn record_subscription(
 
 fn expire_subscriptions(wakes: &mut Vec<Wake>, now: SystemTime) {
     wakes.retain(|wake| match wake.kind {
-        WakeKind::Subscription { .. } if wake.next_at <= now => false,
+        WakeKind::Subscription { .. } if wake.next_at <= now && wake.pending.is_none() => false,
         WakeKind::Subscription { .. } | WakeKind::Once | WakeKind::Watch { .. } => true,
     });
 }
@@ -994,64 +1290,5 @@ fn subscription_matches(wake: &Wake, agent: &AgentId, event: &GithubEvent) -> bo
         }
         (WakeKind::Subscription { .. }, GithubThread::Repository)
         | (WakeKind::Once | WakeKind::Watch { .. }, _) => false,
-    }
-}
-
-fn read(file: File) -> Result<Vec<Wake>, WakeStoreError> {
-    let mut wakes = Vec::new();
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let wake = serde_json::from_str::<Line>(&line?)
-            .ok()
-            .and_then(Line::wake)
-            .ok_or(WakeStoreError::Corrupt { line: index + 1 })?;
-        wakes.push(wake);
-    }
-    Ok(wakes)
-}
-
-fn write(path: &Path, wakes: &[Wake]) -> Result<(), WakeStoreError> {
-    let mut bytes = Vec::new();
-    for wake in wakes {
-        serde_json::to_writer(&mut bytes, &Line::from(wake)).map_err(io::Error::from)?;
-        bytes.push(b'\n');
-    }
-    replace_private_file(path, &bytes).map_err(|error| error.source.into())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{fs, time::Duration};
-
-    use tempfile::TempDir;
-
-    use dekopon_core::private_file::temporary_path;
-
-    use super::{WakeOperation, WakeStore};
-    use crate::config::{ResolvedWakes, WakeBounds};
-
-    #[test]
-    fn a_stale_wake_temporary_does_not_block_the_first_write_after_open() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("wakes.jsonl");
-        let stale = temporary_path(&path);
-        fs::write(&stale, b"partial").unwrap();
-        let store = WakeStore::open(&ResolvedWakes {
-            path: path.clone(),
-            bounds: WakeBounds {
-                max_per_subject: 20,
-                min_interval: Duration::ZERO,
-                max_horizon: Duration::ZERO,
-                max_subscriptions_per_agent: 1,
-                subscription_expiry: Duration::ZERO,
-            },
-        })
-        .unwrap();
-
-        store
-            .mutate(|_| WakeOperation::Created, |_| Ok(()))
-            .unwrap();
-
-        assert!(!stale.exists());
-        assert!(path.exists());
     }
 }

@@ -399,7 +399,7 @@ async fn the_same_person_in_two_conversations_sees_and_stops_only_that_conversat
     y.conversation.id = "other".to_owned();
     let route = job_route(Duration::from_secs(5), Duration::from_secs(30));
     tool_output_of(&runner, &models, route.clone(), x.clone()).await;
-    let anchor = crate::wake::Anchor::for_job(&x, &route.agent).unwrap();
+    let anchor = crate::wake::Anchor::for_job(&x, &route).unwrap();
     let (held, signal) = runner
         .jobs
         .admit(

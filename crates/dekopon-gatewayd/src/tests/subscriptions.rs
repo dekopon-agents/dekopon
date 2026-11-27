@@ -1,14 +1,11 @@
 use super::*;
 use crate::{pull_request_links::PullRequestLinkContext, wake::Anchor};
 
-fn subscription_anchor() -> Anchor {
-    Anchor::from_inbound(
-        &owned_slack_message("review", false),
-        &route(model_config()).agent,
-    )
-    .unwrap()
-    .as_space()
-    .unwrap()
+pub(super) fn subscription_anchor() -> Anchor {
+    Anchor::from_inbound(&owned_slack_message("review", false), &journal_route())
+        .unwrap()
+        .as_space()
+        .unwrap()
 }
 
 #[test]
@@ -41,7 +38,7 @@ fn the_sixty_fifth_subscription_is_refused_per_agent_across_channels() {
             channel: message.conversation.id.clone(),
             thread_ts: message.conversation.thread.clone(),
         };
-        let channel = Anchor::from_inbound(&message, anchor.agent())
+        let channel = Anchor::from_inbound(&message, &journal_route_for(anchor.agent()))
             .unwrap()
             .as_space()
             .unwrap();
@@ -55,13 +52,7 @@ fn the_sixty_fifth_subscription_is_refused_per_agent_across_channels() {
         store.subscribe(anchor.clone(), target, now),
         Err(dekopon_agent::wake::WakeRefusal::SubscriptionsFull { maximum: 64 })
     );
-    assert_eq!(
-        fs::read_to_string(directory.path().join("wakes/wakes.jsonl"))
-            .unwrap()
-            .lines()
-            .count(),
-        64
-    );
+    assert_eq!(wakes::stored_wakes(&store).len(), 64);
 }
 
 #[test]
@@ -132,11 +123,14 @@ fn only_a_confirmed_review_of_a_link_target_creates_a_space_subscription() {
         ),
         CapabilityCallResult::Succeeded
     ));
-    let rows = fs::read_to_string(directory.path().join("wakes/wakes.jsonl")).unwrap();
-    let row: Value = serde_json::from_str(rows.trim()).unwrap();
-    assert_eq!(row["subject"], subscription_anchor().subject().canonical());
+    let rows = wakes::stored_wakes(&store);
+    assert_eq!(rows.len(), 1);
     assert_eq!(
-        row["subscription"],
+        rows[0]["anchor"]["subject"],
+        subscription_anchor().subject().canonical()
+    );
+    assert_eq!(
+        rows[0]["kind"]["target"],
         json!({"repository":"acme/widget","number":17})
     );
     assert_eq!(
@@ -560,4 +554,16 @@ fn a_subscription_close_is_recorded_separately_from_deadline_expiry() {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].field("github.number"), Some(number));
     }
+}
+
+pub(super) fn synchronize_event(
+    repository: &str,
+    number: u64,
+) -> dekopon_core::github::GithubEvent {
+    serde_json::from_value(json!({
+        "delivery":"synchronize", "event":"pull_request", "action":"synchronize", "number":number,
+        "repository":{"id":10,"fullName":repository}, "actor":{"id":1},
+        "kind":"none", "authorSet":{"actorLogin":"alice"},
+    }))
+    .unwrap()
 }

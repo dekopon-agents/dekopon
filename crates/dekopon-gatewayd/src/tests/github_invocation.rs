@@ -74,7 +74,13 @@ fn github_admission_keys_separate_repositories_and_numbers() {
         other_owner_same_repo,
     ]
     .into_iter()
-    .map(|inbound| gate.admit(&route, inbound, crate::collection::Dispositions(vec![])))
+    .map(|inbound| {
+        gate.admit(
+            &route,
+            inbound,
+            crate::collection::Dispositions::new(vec![]),
+        )
+    })
     .collect::<Vec<_>>();
     assert!(
         admissions

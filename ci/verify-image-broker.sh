@@ -62,16 +62,18 @@ PY
 #   current     accepts neither `auditPath` nor `brokerPrincipal`.
 # The first is read off the command surface. The second and third share it, so a strict decode
 # of a field neither knows tells them apart: the refusal names every field the binary accepts.
+# A current binary reports only the line and column of the refusal, never field names.
 help=$(docker run --rm "$image" dekopon-brokerd --help)
 tier=current
 if ! grep -Eq '^[[:space:]]+probe[[:space:]]' <<<"$help"; then
   tier=checkpoint
 else
   write_config current x-dekopon-image-proof
+  status=0
   refusal=$(docker run --rm --mount "type=bind,src=$work,dst=/proof" \
-    "$image" dekopon-brokerd --config /proof/broker.json 2>&1 || true)
-  if ! grep -q 'x-dekopon-image-proof' <<<"$refusal"; then
-    echo "error: the broker did not refuse an unknown configuration field by name:" >&2
+    "$image" dekopon-brokerd --config /proof/broker.json 2>&1) || status=$?
+  if [ "$status" -eq 0 ] || ! grep -Eq 'x-dekopon-image-proof|not strict valid YAML/JSON \(line [0-9]+, column [0-9]+\)' <<<"$refusal"; then
+    echo "error: the broker did not refuse an unknown configuration field as a strict decode error:" >&2
     echo "$refusal" >&2
     exit 1
   fi

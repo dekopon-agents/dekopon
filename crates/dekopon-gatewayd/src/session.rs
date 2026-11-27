@@ -692,7 +692,7 @@ impl SessionGate {
                 && let MessageId::Github(batch) = &mut tail.message.message_id
                 && batch.append(incoming)
             {
-                tail.receipts.0.extend(std::mem::take(&mut receipts.0));
+                tail.receipts.absorb(&mut receipts);
                 record_admission(&tail.message, "queued", depth, None);
                 return Admit::Queued;
             }
@@ -725,7 +725,7 @@ impl SessionGate {
             if message.subject.name() == &running.subject
                 && match message.message_id {
                     MessageId::Native(_) => participants::native_chat(&message),
-                    MessageId::Job { .. } => true,
+                    MessageId::Job { .. } => receipts.deliveries.is_empty(),
                     MessageId::Github(_) | MessageId::Wake { .. } | MessageId::Follow(_) => false,
                 }
                 && running.cancellation.state.load(Ordering::Acquire) == SESSION_RUNNING
@@ -912,7 +912,7 @@ impl SessionGate {
         running.follow_ups.retain_mut(|followup| {
             let keep = followup.message.subject.name().canonical() != request.subject;
             if !keep {
-                for receipt in followup.receipts.0.drain(..) {
+                for receipt in followup.receipts.spans.drain(..) {
                     crate::collection::disposition(&receipt, "stopped");
                 }
             }
@@ -1047,7 +1047,7 @@ impl SessionAdmission {
                 leftovers.push(FollowUp {
                     kind: FollowUpKind::Turn,
                     route: (*self.route).clone(),
-                    receipts: crate::collection::Dispositions(message.constituents.clone()),
+                    receipts: crate::collection::Dispositions::new(message.constituents.clone()),
                     message,
                 });
             }
@@ -1071,7 +1071,7 @@ impl SessionAdmission {
                     while let Some(mut same) = running.follow_ups.pop_front_if(|queued| {
                         folds_in(&queued.message) && queued.message.subject == next.message.subject
                     }) {
-                        next.receipts.0.append(&mut same.receipts.0);
+                        next.receipts.absorb(&mut same.receipts);
                         grouped.push(same.message);
                     }
                     if !grouped.is_empty() {
@@ -1302,6 +1302,7 @@ pub(crate) struct SessionRunner {
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     pub wakes: Option<Arc<crate::wake::WakeStore>>,
+    pub durable: Option<Arc<crate::store::DurableStore>>,
     pub jobs: Arc<crate::jobs::Jobs>,
     pub metering: Arc<dekopon_model_token_governor::Metering>,
     pub shell_threads: ShellThreads,
@@ -1819,9 +1820,9 @@ fn message_span(
         outcome = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         busy.cause = tracing::field::Empty,
-        batch.members = receipts.0.len(),
+        batch.members = receipts.spans.len(),
     );
-    for receipt in &receipts.0 {
+    for receipt in &receipts.spans {
         dekopon_telemetry::link_span(&span, receipt);
     }
     span
@@ -1839,7 +1840,7 @@ pub(crate) fn run_session(
         route,
         message,
         driver,
-        (String::new(), None),
+        (String::new(), None, None),
         |_, queued| Some((queued.clone(), String::new())),
     )
 }
@@ -1849,16 +1850,21 @@ pub(crate) fn run_session_resolving(
     route: BoundRoute,
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
-    (digest, ticket): (String, Option<crate::transport::github::AdmissionTicket>),
+    (digest, ticket, delivery): (
+        String,
+        Option<crate::transport::github::AdmissionTicket>,
+        Option<crate::wake::DeliveryTicket>,
+    ),
     resolve: impl Fn(&InboundMessage, &BoundRoute) -> Option<(BoundRoute, String)> + Send + 'static,
 ) -> impl std::future::Future<Output = ()> + Send {
     let receipts = match &message.message_id {
-        MessageId::Github(_) => Dispositions(vec![message.receive_span.clone()]),
+        MessageId::Github(_) => Dispositions::new(vec![message.receive_span.clone()]),
         MessageId::Native(_)
         | MessageId::Follow(_)
         | MessageId::Wake { .. }
-        | MessageId::Job { .. } => Dispositions(message.constituents.clone()),
-    };
+        | MessageId::Job { .. } => Dispositions::new(message.constituents.clone()),
+    }
+    .with_delivery(delivery);
     // Admission runs before the task is spawned, so a later event for this message finds it in
     // the gate instead of racing the task's first poll.
     let span = message_span(&route, &message, &receipts);
@@ -1995,10 +2001,13 @@ async fn execute(
             }
             None
         }
-        Admit::Full(message, receipts) | Admit::Saturated(message, receipts) => {
+        Admit::Full(message, mut receipts) | Admit::Saturated(message, mut receipts) => {
             if let Some(notice) = &notice {
                 notice.record("dropped");
             }
+            receipts
+                .settle(crate::wake::DeliveryDisposition::Rejected)
+                .await;
             tracing::info!(
                 event = "gateway_session_rejected",
                 reason = "busy",
@@ -2044,7 +2053,7 @@ async fn run_admitted(
     route: &BoundRoute,
     mut message: InboundMessage,
     driver: &Arc<dyn ChatDriver>,
-    receipts: Dispositions,
+    mut receipts: Dispositions,
     (admission, digest): (SessionAdmission, &str),
 ) -> SessionAdmission {
     if let MessageId::Github(batch) = &message.message_id {
@@ -2087,6 +2096,9 @@ async fn run_admitted(
     if outcome.is_error() {
         span.record("otel.status_code", "error");
     }
+    receipts
+        .settle(crate::wake::DeliveryDisposition::Handled)
+        .await;
     receipts.finish(outcome);
     crate::memory::generation::drain(runner, deferred).await;
     admission
@@ -2381,7 +2393,7 @@ async fn session_turn(
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::SessionRefused(
             refusal,
         )))) => {
-            revoke_thread_ownership(runner, message);
+            revoke_thread_ownership(runner, message).await;
             let quiet = message.pull_request_links.is_some()
                 && match &refusal {
                     SessionRefusal::UnmappedSubject | SessionRefusal::AgentDenied { .. } => true,
@@ -2457,7 +2469,7 @@ async fn session_turn(
         Err(SessionError::BrokerLeg(BrokerLegError::Client(ClientError::Remote {
             code, ..
         }))) if code == ERROR_UNAUTHENTICATED => {
-            revoke_thread_ownership(runner, message);
+            revoke_thread_ownership(runner, message).await;
             tracing::info!(
                 event = "gateway_session_rejected",
                 reason = "attestation-refused",
@@ -2525,7 +2537,7 @@ async fn session_turn(
     // exchange left resident for its idle timeout would hold exactly the text the revocation was
     // about.
     if granted.is_empty() {
-        revoke_thread_ownership(runner, message);
+        revoke_thread_ownership(runner, message).await;
         if space_grants.is_none() {
             runner
                 .conversations
@@ -2569,7 +2581,7 @@ async fn session_turn(
     // A chat thread becomes a continuation surface only after this exact sender's fresh broker
     // grant succeeds; merely mentioning the bot or putting coordinates in model text cannot claim
     // one.
-    claim_thread_ownership(runner, message);
+    claim_thread_ownership(runner, route, message).await;
     let agent_config = agent_config_view(
         route.agent.as_str(),
         &route.description,
@@ -2960,10 +2972,7 @@ async fn session_turn(
     if progress_notes {
         leg = leg.with_progress_notes();
     }
-    if let Some((timeout, anchor)) = route
-        .job_timeout
-        .zip(Anchor::for_job(message, &route.agent))
-    {
+    if let Some((timeout, anchor)) = route.job_timeout.zip(Anchor::for_job(message, route)) {
         leg = leg.with_job_control(Arc::new(
             JobContext::for_turn(
                 Arc::clone(&runner.jobs),
@@ -3005,7 +3014,7 @@ async fn session_turn(
             .pull_request_links
             .as_ref()
             .zip(runner.wakes.as_ref())
-            .zip(Anchor::from_inbound(message, &route.agent).and_then(|anchor| anchor.as_space()))
+            .zip(Anchor::from_inbound(message, route).and_then(|anchor| anchor.as_space()))
             .map(
                 |((links, store), anchor)| crate::wake::ReviewSubscriptions::Subscribe {
                     anchor: Box::new(anchor),
@@ -3020,7 +3029,7 @@ async fn session_turn(
         .wakes
         .then_some(runner.wakes.as_ref())
         .flatten()
-        .zip(Anchor::from_inbound(message, &route.agent))
+        .zip(Anchor::from_inbound(message, route))
         .map(|(store, anchor)| {
             SessionWakes::new(
                 anchor,
@@ -3052,6 +3061,10 @@ async fn session_turn(
                         route.agent.as_str(),
                         &route.conversation,
                         &message.conversation.key(),
+                    ),
+                    durable_home(route, message).map_or(
+                        crate::follow::FollowHome::Memory,
+                        crate::follow::FollowHome::Conversation,
                     ),
                     route.route_index,
                 )
@@ -3721,7 +3734,7 @@ async fn session_turn(
             && leave_request.load(std::sync::atomic::Ordering::Acquire)
             && let Some(table) = runner.follow.as_ref()
         {
-            release_thread_ownership(runner, message);
+            release_thread_ownership(runner, message).await;
             let table = Arc::clone(table);
             let follow_key = crate::follow::follow_key(
                 &route.transport,
@@ -3812,7 +3825,7 @@ async fn reject_sealed_thread(
 ) -> bool {
     match message.conversation.kind {
         ConversationKind::Thread if sealed.is_some() => {
-            revoke_thread_ownership(runner, message);
+            revoke_thread_ownership(runner, message).await;
             tracing::info!(
                 event = "gateway_session_rejected",
                 reason = "sealed",
@@ -3963,7 +3976,7 @@ async fn stopped(
         CancelSource::User { .. } | CancelSource::Operator => false,
     };
     let terminal = if seals && message.conversation.kind == ConversationKind::Thread {
-        revoke_thread_ownership(runner, message);
+        revoke_thread_ownership(runner, message).await;
         Terminal::Stopped(StopCause::Cancelled(by))
     } else {
         remember_stop(runner, key, StopCause::Cancelled(by))
@@ -3989,31 +4002,91 @@ pub(crate) fn reply_delivered(outcome: MessageOutcome) {
     );
 }
 
-fn claim_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
+pub(crate) fn durable_home(
+    route: &BoundRoute,
+    message: &InboundMessage,
+) -> Option<crate::store::ConversationKey> {
+    match crate::store::Durability::of(route.memory) {
+        crate::store::Durability::Durable => {
+            message.transport.parse().ok().map(|transport| {
+                crate::store::ConversationKey::of(&transport, &message.conversation)
+            })
+        }
+        crate::store::Durability::Memory => None,
+    }
+}
+
+async fn claim_thread_ownership(
+    runner: &SessionRunner,
+    route: &BoundRoute,
+    message: &InboundMessage,
+) {
     let Some(continuation) = &message.thread_continuation else {
         return;
     };
     if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
         ownership.claim(continuation.claim.clone());
     }
+    if let Some(key) = durable_home(route, message) {
+        persist_ownership(
+            runner,
+            key,
+            crate::store::Change::Claim(continuation.claim.clone()),
+        )
+        .await;
+    }
 }
 
 // A leave ends continuation for every sender in the thread, so only a fresh mention wakes the agent.
-fn release_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
+async fn release_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
     let Some(continuation) = &message.thread_continuation else {
         return;
     };
     if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
         ownership.release_thread(&continuation.claim);
     }
+    if let Some(key) = store_key(message) {
+        persist_ownership(
+            runner,
+            key,
+            crate::store::Change::Release(continuation.claim.clone()),
+        )
+        .await;
+    }
 }
 
-fn revoke_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
+async fn revoke_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
     let Some(continuation) = &message.thread_continuation else {
         return;
     };
     if let Some(ownership) = runner.thread_ownership.get(&message.transport) {
         ownership.revoke(&continuation.claim);
+    }
+    if let Some(key) = store_key(message) {
+        persist_ownership(
+            runner,
+            key,
+            crate::store::Change::Revoke(continuation.claim.clone()),
+        )
+        .await;
+    }
+}
+
+fn store_key(message: &InboundMessage) -> Option<crate::store::ConversationKey> {
+    message
+        .transport
+        .parse()
+        .ok()
+        .map(|transport| crate::store::ConversationKey::of(&transport, &message.conversation))
+}
+
+async fn persist_ownership(
+    runner: &SessionRunner,
+    key: crate::store::ConversationKey,
+    change: crate::store::Change,
+) {
+    if let Some(store) = runner.durable.as_ref().map(Arc::clone) {
+        drop(offload(move || store.commit(vec![(key, change)])).await);
     }
 }
 

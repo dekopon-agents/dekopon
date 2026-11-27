@@ -134,6 +134,7 @@ pub(crate) struct Jobs {
     pub(crate) thread_owner: Arc<crate::threads::Owner>,
     notices: mpsc::Sender<InboundMessage>,
     notice_receiver: Mutex<Option<mpsc::Receiver<InboundMessage>>>,
+    durable: Option<Arc<crate::store::DurableStore>>,
 }
 
 impl Jobs {
@@ -155,6 +156,34 @@ impl Jobs {
             thread_owner,
             notices,
             notice_receiver: Mutex::new(Some(receiver)),
+            durable: None,
+        }
+    }
+
+    pub(crate) fn with_durable(
+        mut self,
+        durable: Option<Arc<crate::store::DurableStore>>,
+        after: Option<JobId>,
+    ) -> Self {
+        self.durable = durable;
+        if let Some(after) = after {
+            self.table.get_mut().next = after.get().saturating_add(1);
+        }
+        self
+    }
+
+    fn record(&self, anchor: &Anchor, change: impl FnOnce() -> crate::store::Change) {
+        let durable = match anchor.durability() {
+            crate::store::Durability::Durable => self.durable.as_ref(),
+            crate::store::Durability::Memory => None,
+        };
+        if let Some(store) = durable
+            && let Err(crate::store::StoreFailed) = store.commit(vec![(anchor.key(), change())])
+        {
+            tracing::warn!(
+                event = "gateway_job_record_failed",
+                "gateway.job.record.failed"
+            );
         }
     }
 
@@ -268,6 +297,7 @@ impl Jobs {
         });
         drop(permit);
         drop(table);
+        self.record(&run.anchor, || crate::store::Change::JobEnded(id));
         self.ended.notify_all();
         if let Some((outcome, waited, text, after)) = finished {
             let record = || {
@@ -774,6 +804,14 @@ impl JobControl for JobContext {
         let id = run.id;
         let tree = self.tree(&seed);
         let text = seed.text();
+        self.jobs.record(&self.anchor, || {
+            crate::store::Change::JobStarted(crate::store::JobRow {
+                id,
+                anchor: self.anchor.row(),
+                script_head: dekopon_core::bounded_display(text).text().to_owned(),
+                deadline_ms: crate::store::millis(std::time::SystemTime::now() + tree.remaining()),
+            })
+        });
         tracing::info!(name: "job.started", target: "job", {
             job.id = %id,
             job.deadline_ms = tree.remaining().as_millis() as u64,

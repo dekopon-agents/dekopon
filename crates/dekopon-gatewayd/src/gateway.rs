@@ -40,11 +40,33 @@ pub(crate) struct Gateway {
     reloading: JoinSet<GatewaydError>,
     identities: Arc<BTreeMap<String, TransportIdentity>>,
     drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
+    durable: Option<Arc<crate::store::DurableStore>>,
+    store_fatal: Option<crate::store::FatalWatch>,
+    replay: Option<wake::Replay>,
 }
 
-fn observe_tick<T>(result: Result<Option<T>, tokio::task::JoinError>) -> Option<T> {
+fn observe_tick(result: Result<wake::TickEnd, tokio::task::JoinError>) -> Option<wake::Delivery> {
     match result {
-        Ok(fired) => fired,
+        Ok(wake::TickEnd {
+            result: wake::TickResult::Fired(delivery),
+            ..
+        }) => Some(*delivery),
+        Ok(wake::TickEnd {
+            wake,
+            result: wake::TickResult::Panicked,
+        }) => {
+            tracing::error!(
+                event = "gateway_wake_task_failed",
+                wake.id = %wake,
+                failure = "panicked",
+                "gateway.wake.task.failed"
+            );
+            None
+        }
+        Ok(wake::TickEnd {
+            result: wake::TickResult::Rearmed | wake::TickResult::Gone,
+            ..
+        }) => None,
         Err(error) => {
             tracing::error!(
                 event = "gateway_wake_task_failed",
@@ -258,7 +280,22 @@ impl Gateway {
             reloading: JoinSet::new(),
             identities,
             drivers,
+            durable: None,
+            store_fatal: None,
+            replay: None,
         }
+    }
+
+    pub(crate) fn with_durable(
+        mut self,
+        durable: Option<Arc<crate::store::DurableStore>>,
+        store_fatal: Option<crate::store::FatalWatch>,
+        replay: Option<wake::Replay>,
+    ) -> Self {
+        self.durable = durable;
+        self.store_fatal = store_fatal;
+        self.replay = replay;
+        self
     }
 
     #[cfg(test)]
@@ -412,6 +449,21 @@ impl Gateway {
         let mut notices = self.runner.jobs.take_notices();
         tokio::pin!(shutdown);
         let mut outcome = ServeOutcome::Shutdown;
+        let mut store_fatal = self.store_fatal.take();
+        if let Some(store) = self.durable.clone()
+            && let Ok(Err(crate::store::StoreFailed)) =
+                offload(move || store.first_served(SystemTime::now())).await
+        {
+            tracing::error!(event = "gateway_store_failed", "gateway.store.failed");
+        }
+        if let Some(replay) = self.replay.take() {
+            for delivery in replay.wakes {
+                self.start_wake(&mut sessions, delivery);
+            }
+            for notice in replay.jobs {
+                self.start_job_notice(&mut sessions, notice);
+            }
+        }
 
         loop {
             while let Some(result) = sessions.try_join_next() {
@@ -426,6 +478,15 @@ impl Gateway {
             tokio::select! {
                 biased;
                 () = &mut shutdown => break,
+                cause = async {
+                    match store_fatal.as_mut() {
+                        Some(fatal) => fatal.failed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    outcome = ServeOutcome::StoreFailed(cause);
+                    break;
+                },
                 ended = reload::reload_ended(&mut reloading) => {
                     outcome = ended;
                     break;
@@ -441,15 +502,18 @@ impl Gateway {
                     let due = offload(move || reading.take_due(SystemTime::now())).await;
                     match due {
                         Ok(Ok(due)) => {
-                            for fired in due.fired {
-                                self.start_wake(&mut sessions, fired);
+                            for delivery in due.fired {
+                                self.start_wake(&mut sessions, delivery);
+                            }
+                            for notice in due.jobs {
+                                self.start_job_notice(&mut sessions, notice);
                             }
                             for tick in due.ticks {
                                 drop(spawn_tick(&self.runner, &self.active.load().routes, &store, &mut ticks, tick));
                             }
                         }
-                        Ok(Err(error)) => {
-                            tracing::error!(event = "gateway_wake_store_failed", error = %error, wakes = "stopped", "gateway.wake.store.failed");
+                        Ok(Err(crate::store::StoreFailed)) => {
+                            tracing::error!(event = "gateway_wake_store_failed", wakes = "stopped", "gateway.wake.store.failed");
                             wakes = None;
                         }
                         Err(error) => {
@@ -464,8 +528,8 @@ impl Gateway {
                     }
                 },
                 Some(result) = ticks.join_next() => {
-                    if let Some(fired) = observe_tick(result) {
-                        self.start_wake(&mut sessions, fired);
+                    if let Some(delivery) = observe_tick(result) {
+                        self.start_wake(&mut sessions, delivery);
                     }
                 },
                 () = async {
@@ -994,8 +1058,8 @@ impl Gateway {
                 let delivery = offload(move || store_span.in_scope(|| store.deliver_subscriptions(&agent, &event, SystemTime::now()))).await;
                 let delivery = match delivery {
                     Ok(Ok(delivery)) => delivery,
-                    Ok(Err(error)) => {
-                        tracing::error!(event = "gateway_wake_store_failed", error = %error, "gateway.wake.store.failed");
+                    Ok(Err(crate::store::StoreFailed)) => {
+                        tracing::error!(event = "gateway_wake_store_failed", "gateway.wake.store.failed");
                         ticket.answer(transport::github::Acked::Busy);
                         return;
                     }
@@ -1013,11 +1077,11 @@ impl Gateway {
                     return;
                 }
                 if !delivery.matched {
-                    run_routed_delivery(runner, active, drivers, message, Some(ticket)).await;
+                    run_routed_delivery(runner, active, drivers, message, (Some(ticket), None)).await;
                     return;
                 }
                 let (tickets, answer) = ticket.split(delivery.fired.len());
-                let wakes = delivery.fired.into_iter().zip(tickets).map(|(fired, ticket)| {
+                let wakes = delivery.fired.into_iter().zip(tickets).map(|(wake::Delivery { fired, ticket: delivered }, ticket)| {
                     let runner = Arc::clone(&runner);
                     let active = Arc::clone(&active);
                     let drivers = Arc::clone(&drivers);
@@ -1032,7 +1096,7 @@ impl Gateway {
                             ticket.answer(transport::github::Acked::Ignored);
                             return;
                         }
-                        run_routed_delivery(runner, active, drivers, wake, Some(ticket)).await;
+                        run_routed_delivery(runner, active, drivers, wake, (Some(ticket), Some(delivered))).await;
                     }
                 });
                 tokio::join!(answer, futures_util::future::join_all(wakes));
@@ -1051,7 +1115,7 @@ impl Gateway {
             ticket.answer(transport::github::Acked::Ignored);
             return;
         }
-        self.start_session_with_ticket(sessions, &generation, message, Some(ticket));
+        self.start_session_with_ticket(sessions, &generation, message, Some(ticket), None);
     }
 
     fn start_session(
@@ -1060,7 +1124,7 @@ impl Gateway {
         generation: &ServingGeneration,
         message: InboundMessage,
     ) {
-        self.start_session_with_ticket(sessions, generation, message, None);
+        self.start_session_with_ticket(sessions, generation, message, None, None);
     }
 
     fn start_session_with_ticket(
@@ -1069,6 +1133,7 @@ impl Gateway {
         generation: &ServingGeneration,
         message: InboundMessage,
         ticket: Option<crate::transport::github::AdmissionTicket>,
+        delivery: Option<wake::DeliveryTicket>,
     ) {
         let Some(route) = generation.routes.route(&message) else {
             collection::disposition(&message.receive_span, "route-lost");
@@ -1091,7 +1156,7 @@ impl Gateway {
             route.clone(),
             message,
             driver,
-            (generation._digest.clone(), ticket),
+            (generation._digest.clone(), ticket, delivery),
             move |message, queued| {
                 let generation = active.load();
                 let route = generation.routes.route(message)?;
@@ -1102,7 +1167,8 @@ impl Gateway {
         ));
     }
 
-    fn start_wake(&self, sessions: &mut JoinSet<()>, fired: wake::Fired) {
+    fn start_wake(&self, sessions: &mut JoinSet<()>, delivery: wake::Delivery) {
+        let wake::Delivery { fired, ticket } = delivery;
         let space = fired.is_space();
         let agent = fired.agent().clone();
         let id = fired.id();
@@ -1117,7 +1183,7 @@ impl Gateway {
             || tracing::info!(event = "gateway_wake_fired", wake.id = %id, "gateway.wake.fired"),
         );
         if answering {
-            self.start_session(sessions, &generation, message);
+            self.start_session_with_ticket(sessions, &generation, message, None, Some(ticket));
             return;
         }
         receipt.in_scope(|| {
@@ -1126,17 +1192,57 @@ impl Gateway {
             wake.id = %id,
             "gateway.wake.orphaned")
         });
-        if !space
-            && let Some(driver) = self.drivers.get(&message.transport).cloned()
-            && let MessageId::Wake { notice, .. } = &message.message_id
-        {
-            let notice = notice.clone();
-            sessions.spawn(
-                async move {
-                    session::answer(&driver, &message, &notice).await;
+        let driver = if space {
+            None
+        } else {
+            self.drivers.get(&message.transport).cloned()
+        };
+        sessions.spawn(
+            async move {
+                if let Some(driver) = driver
+                    && let MessageId::Wake { notice, .. } = &message.message_id
+                {
+                    session::answer(&driver, &message, notice).await;
                 }
-                .instrument(receipt),
-            );
+                drop(offload(move || ticket.settle(wake::DeliveryDisposition::Orphaned)).await);
+            }
+            .instrument(receipt),
+        );
+    }
+
+    fn start_job_notice(&self, sessions: &mut JoinSet<()>, notice: wake::JobNotice) {
+        let wake::JobNotice { row, ticket } = notice;
+        let Some(anchor) = wake::Anchor::restored(row.anchor) else {
+            sessions.spawn(async move {
+                drop(offload(move || ticket.settle(wake::DeliveryDisposition::Orphaned)).await);
+            });
+            return;
+        };
+        let deadline = humantime::format_rfc3339_seconds(
+            std::time::UNIX_EPOCH + Duration::from_millis(row.deadline_ms),
+        );
+        let message = anchor.job_inbound(
+            row.id,
+            format!(
+                "[gateway: job {} was interrupted by a gateway restart before it finished; its deadline was {deadline}]\n{}",
+                row.id, row.script_head
+            ),
+            None,
+        );
+        let generation = self.active.load();
+        let answering = generation
+            .routes
+            .route(&message)
+            .is_some_and(|route| route.job_timeout.is_some() && &route.agent == anchor.agent());
+        if answering && self.drivers.contains_key(&message.transport) {
+            self.start_session_with_ticket(sessions, &generation, message, None, Some(ticket));
+        } else {
+            if let Some(notice) = jobs::Notice::of(&message) {
+                notice.record("dropped");
+            }
+            sessions.spawn(async move {
+                drop(offload(move || ticket.settle(wake::DeliveryDisposition::Orphaned)).await);
+            });
         }
     }
 }
@@ -1146,7 +1252,10 @@ async fn run_routed_delivery(
     active: Arc<ArcSwap<ServingGeneration>>,
     drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
     message: InboundMessage,
-    ticket: Option<transport::github::AdmissionTicket>,
+    (ticket, delivery): (
+        Option<transport::github::AdmissionTicket>,
+        Option<wake::DeliveryTicket>,
+    ),
 ) {
     let generation = active.load_full();
     let Some(route) = generation.routes.route(&message).cloned() else {
@@ -1169,7 +1278,7 @@ async fn run_routed_delivery(
         route,
         message,
         driver,
-        (generation._digest.clone(), ticket),
+        (generation._digest.clone(), ticket, delivery),
         move |message, queued| {
             let generation = active.load();
             let route = generation.routes.route(message)?;
@@ -1198,7 +1307,7 @@ fn reload_reason(problem: &GatewaydError) -> &'static str {
         | GatewaydError::AssetStore { .. }
         | GatewaydError::Journal { .. }
         | GatewaydError::CacheKeySecret(_)
-        | GatewaydError::WakeStore(_)
+        | GatewaydError::Store(_)
         | GatewaydError::Proxy(_)
         | GatewaydError::ReloadTask(_)
         | GatewaydError::Problems { .. } => "preparation",
@@ -1258,7 +1367,7 @@ pub(crate) fn reload_problem(problem: &GatewaydError) -> String {
         | GatewaydError::AssetStore { .. }
         | GatewaydError::Journal { .. }
         | GatewaydError::CacheKeySecret(_)
-        | GatewaydError::WakeStore(_)
+        | GatewaydError::Store(_)
         | GatewaydError::Proxy(_)
         | GatewaydError::ReloadTask(_)
         | GatewaydError::Problems { .. } => error_chain(problem),
@@ -1286,7 +1395,7 @@ fn reload_entries(problem: &GatewaydError) -> Vec<(&'static str, String)> {
         | GatewaydError::AssetStore { .. }
         | GatewaydError::Journal { .. }
         | GatewaydError::CacheKeySecret(_)
-        | GatewaydError::WakeStore(_)
+        | GatewaydError::Store(_)
         | GatewaydError::Proxy(_)
         | GatewaydError::ReloadTask(_)
         | GatewaydError::Probe(_)
