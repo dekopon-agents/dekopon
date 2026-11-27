@@ -2074,11 +2074,11 @@ where
     }
 
     pub fn with_chat_memory(mut self, config: ChatMemoryConfig) -> Result<Self, BrokerBuildError> {
-        let storage_host = self
+        let storage = self
             .registry
-            .storage_host()
+            .storage_limits()
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
-        config.validate(storage_host.limits())?;
+        config.validate(storage)?;
         config.validate_host_limits(self.registry.host_limits())?;
         let expected = [
             (
@@ -2145,7 +2145,7 @@ where
         self.chat_memory = Some(config);
         #[allow(
             clippy::map_err_ignore,
-            reason = "the only failure is a missing storage host, which this method refused above"
+            reason = "the only failure is missing storage limits, which this method refused above"
         )]
         let current = self
             .current_operational()
@@ -3276,9 +3276,8 @@ where
             host: self.registry.host_limits().clone(),
             storage: self
                 .registry
-                .storage_host()
+                .storage_limits()
                 .ok_or(BrokerError::MemoryUnavailable)?
-                .limits()
                 .clone(),
             memory: self.chat_memory.clone(),
         })

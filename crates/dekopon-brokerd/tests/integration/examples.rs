@@ -409,14 +409,23 @@ fn broker_diff(
     previous: &std::path::Path,
     options: &[&str],
 ) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_dekopon-brokerd"))
-        .arg("check")
-        .arg(proposed)
-        .arg("--diff")
-        .arg(previous)
+    broker_diff_command(proposed, previous)
         .args(options)
         .output()
         .expect("run broker diff")
+}
+
+fn broker_diff_command(
+    proposed: &std::path::Path,
+    previous: &std::path::Path,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_dekopon-brokerd"));
+    command
+        .arg("check")
+        .arg(proposed)
+        .arg("--diff")
+        .arg(previous);
+    command
 }
 
 fn copy_broker_diff_example(root: &std::path::Path) -> PathBuf {
@@ -485,27 +494,116 @@ fn broker_diff_compares_managed_sets_without_resolving_providers() {
 }
 
 #[test]
-fn broker_diff_refuses_unparseable_policy_in_the_proposed_input() {
+fn broker_diff_leaves_storage_and_scratch_paths_untouched() {
     let temporary = tempfile::tempdir().expect("fixture root");
     let previous = copy_broker_diff_example(temporary.path());
     let proposed = previous.with_file_name("proposed.yaml");
-    write_broker_fixture(
-        &previous.with_file_name("baseline.cedar"),
-        &read("policies.cedar"),
-    );
-    write_broker_fixture(
-        &previous,
-        &read("broker.yaml").replace(
-            "policiesPath: policies.cedar",
-            "policiesPath: baseline.cedar",
-        ),
-    );
-    write_broker_fixture(&proposed, &read("broker.yaml"));
-    write_broker_fixture(&proposed.with_file_name("policies.cedar"), "permit(");
+    std::fs::copy(
+        repository_root().join("examples/providers/storage-probe-provider.wasm"),
+        temporary
+            .path()
+            .join("providers/storage-probe-provider.wasm"),
+    )
+    .expect("copy storage provider");
+    let mut config: serde_json::Value =
+        serde_yaml::from_str(&read("broker.yaml")).expect("example broker config");
+    config["providers"]
+        .as_array_mut()
+        .expect("provider paths")
+        .push(serde_json::json!(
+            "../providers/storage-probe-provider.wasm"
+        ));
+    config["capabilities"]["storage-probe"] = serde_json::json!({
+        "constraints": {
+            "timeoutMs": 30_000,
+            "storage": {"interface": "durable-files", "access": "read-write", "scope": "agent"}
+        },
+        "capabilities": {"storage-probe.run": {}}
+    });
+    config["storage"] = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("default storage limits");
+    config["storage"]["rootPath"] = serde_json::json!("state");
+    write_broker_fixture(&previous, &config.to_string());
+    config["strict"] = serde_json::json!(false);
+    write_broker_fixture(&proposed, &config.to_string());
+    let scratch = temporary.path().join("scratch");
+    write_broker_fixture(&scratch, "scratch cannot contain directories");
 
-    let output = broker_diff(&proposed, &previous, &["--output", "json"]);
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(output.stdout.is_empty());
+    let output = broker_diff_command(&proposed, &previous)
+        .env("TMPDIR", &scratch)
+        .output()
+        .expect("run storage diff");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"swap\tstrict\n");
+    assert!(!previous.with_file_name("state").exists());
+    assert_eq!(
+        std::fs::read_to_string(&scratch).expect("scratch marker"),
+        "scratch cannot contain directories"
+    );
+
+    config["storage"]["maxRootBytes"] = serde_json::json!(3);
+    config["storage"]["maxNamespaceBytes"] = serde_json::json!(2);
+    config["storage"]["maxFileBytes"] = serde_json::json!(1);
+    write_broker_fixture(&proposed, &config.to_string());
+    let invalid = broker_diff_command(&proposed, &previous)
+        .env("TMPDIR", &scratch)
+        .output()
+        .expect("run diff with invalid storage limits");
+    assert_eq!(invalid.status.code(), Some(1), "{invalid:?}");
+    assert!(invalid.stdout.is_empty());
+    assert!(!previous.with_file_name("state").exists());
+}
+
+#[test]
+fn broker_diff_refuses_unparseable_policy_in_either_input() {
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = copy_broker_diff_example(&temporary.path().join("previous"));
+    let invalid = copy_broker_diff_example(&temporary.path().join("invalid"));
+    let policy_path = invalid.with_file_name("policies.cedar");
+    let marker = "private-policy-fixture-text";
+    write_broker_fixture(&policy_path, &format!("permit({marker}"));
+    let policy_path = policy_path.canonicalize().expect("canonical policy path");
+
+    for (proposed, baseline) in [
+        (&invalid, &previous),
+        (&previous, &invalid),
+        (&invalid, &invalid),
+    ] {
+        let output = broker_diff(proposed, baseline, &["--output", "json"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8(output.stderr).expect("policy diagnostic");
+        assert!(diagnostic.contains(policy_path.to_str().expect("policy path")));
+        assert!(diagnostic.contains("could not be parsed (byte offsets "));
+        assert!(!diagnostic.contains(marker));
+    }
+}
+
+#[test]
+fn broker_diff_refuses_invalid_wasm_in_either_input() {
+    let temporary = tempfile::tempdir().expect("fixture root");
+    let previous = copy_broker_diff_example(&temporary.path().join("previous"));
+    let invalid = copy_broker_diff_example(&temporary.path().join("invalid"));
+    let wasm_path = temporary
+        .path()
+        .join("invalid/providers/http-probe-provider.wasm");
+    let marker = "private-wasm-fixture-text";
+    write_broker_fixture(&wasm_path, marker);
+    let wasm_path = wasm_path.canonicalize().expect("canonical Wasm path");
+
+    for (proposed, baseline) in [
+        (&invalid, &previous),
+        (&previous, &invalid),
+        (&invalid, &invalid),
+    ] {
+        let output = broker_diff(proposed, baseline, &["--output", "json"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8(output.stderr).expect("Wasm diagnostic");
+        assert!(diagnostic.contains(wasm_path.to_str().expect("Wasm path")));
+        assert!(diagnostic.contains("could not compile"));
+        assert!(!diagnostic.contains(marker));
+    }
 }
 
 #[test]

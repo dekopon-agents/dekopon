@@ -488,10 +488,7 @@ impl StorageHost {
     pub fn open(root: impl AsRef<Path>, limits: StorageLimits) -> Result<Self, StorageHostError> {
         limits.validate()?;
         let root = resolve_storage_root_path(root.as_ref())?;
-        let minimum = Layout::minimum_usage(&root)?;
-        if minimum.bytes > limits.max_root_bytes || minimum.entries > limits.startup_max_entries {
-            return Err(StorageHostError::QuotaExceeded);
-        }
+        Self::validate_layout_capacity(&root, &limits)?;
         let layout = Layout::open(&root)?;
         let (usage, namespace_count) = scan_root_usage(&layout, limits.startup_max_entries)?;
         if usage.bytes > limits.max_root_bytes {
@@ -713,6 +710,17 @@ impl StorageHost {
             return Err(StorageHostError::GrantHostMismatch);
         }
         StorageHandle::begin(grant, Arc::clone(&self.inner.ledger))
+    }
+
+    pub fn validate_layout_capacity(
+        root: &Path,
+        limits: &StorageLimits,
+    ) -> Result<(), StorageHostError> {
+        let minimum = Layout::minimum_usage(root)?;
+        if minimum.bytes > limits.max_root_bytes || minimum.entries > limits.startup_max_entries {
+            return Err(StorageHostError::QuotaExceeded);
+        }
+        Ok(())
     }
 
     #[must_use]

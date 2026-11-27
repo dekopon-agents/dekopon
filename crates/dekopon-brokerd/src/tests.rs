@@ -2155,7 +2155,8 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
         BrokerdError::Policy {
-            source: PolicyBuildError::Parse { .. }
+            source: PolicyBuildError::Parse { .. },
+            ..
         }
     )));
 
@@ -2165,7 +2166,7 @@ async fn reload_refuses_resident_category_and_invalid_authority_without_replacin
     let (rejected, report) = candidate_or_refusal(&path, Mode::Reload(&active)).await;
     assert!(rejected.is_none());
     assert!(report.problems.iter().any(|problem| matches!(problem,
-        BrokerdError::Policy { source: PolicyBuildError::UnknownGroup { group, .. } } if group == "strangers")));
+        BrokerdError::Policy { source: PolicyBuildError::UnknownGroup { group, .. }, .. } if group == "strangers")));
     assert!(report.problems.iter().any(|problem| matches!(problem,
         BrokerdError::Capabilities { problems } if problems.iter().any(|problem| matches!(problem,
             super::capabilities::CapabilityProblem::MissingField { field: "timeoutMs", .. })) )));
@@ -3500,7 +3501,8 @@ async fn a_refused_policy_reload_keeps_the_live_asset() {
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
         BrokerdError::Policy {
-            source: PolicyBuildError::Parse { .. }
+            source: PolicyBuildError::Parse { .. },
+            ..
         }
     )));
 }
@@ -3561,7 +3563,7 @@ async fn check_distinguishes_an_unreadable_secret_map_from_an_unset_key() {
                 for report in [report, boot_report] {
                     assert!(
                         matches!(report.problems.as_slice(),
-                        [super::BrokerdError::Policy { source: dekopon_broker::PolicyBuildError::UnknownSecret { policy, secret: unknown } }]
+                        [super::BrokerdError::Policy { source: dekopon_broker::PolicyBuildError::UnknownSecret { policy, secret: unknown }, .. }]
                             if policy == "checkout-secret" && unknown == secret),
                         "{report:?}"
                     );
@@ -3798,7 +3800,8 @@ async fn check_and_boot_refuse_request_shapes_from_the_same_policy_file() {
                 report.problems.iter().any(|problem| matches!(
                     problem,
                     BrokerdError::Policy {
-                        source: PolicyBuildError::InvalidRequestShapes { policies }
+                        source: PolicyBuildError::InvalidRequestShapes { policies },
+                        ..
                     } if policies == &["request-forbid", "request-permit"]
                 )),
                 "{report:?}"
@@ -4024,7 +4027,7 @@ async fn check_reports_a_fragment_collision_an_unknown_group_and_a_missing_field
     )));
     assert!(report.problems.iter().any(|problem| matches!(
         problem,
-        BrokerdError::Policy { source: PolicyBuildError::UnknownGroup { group, .. } }
+        BrokerdError::Policy { source: PolicyBuildError::UnknownGroup { group, .. }, .. }
             if group == "strangers"
     )));
     assert!(report.problems.iter().any(|problem| matches!(

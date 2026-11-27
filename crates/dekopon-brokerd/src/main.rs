@@ -734,6 +734,128 @@ impl From<dekopon_broker::ContinuityReport> for ContinuityOutput {
 }
 
 #[cfg(unix)]
+fn diff_problem(problem: &dekopon_brokerd::BrokerdError) -> String {
+    use dekopon_broker_host::BrokerHostError;
+    use dekopon_brokerd::BrokerdError;
+
+    match problem {
+        BrokerdError::Config(_) | BrokerdError::Secrets(_) | BrokerdError::Socket(_) => {
+            error_chain(problem)
+        }
+        BrokerdError::Host(BrokerHostError::ArtifactMetadata { path, source }) => {
+            format!(
+                "{}: could not inspect provider artifact ({})",
+                path.display(),
+                source.kind()
+            )
+        }
+        BrokerdError::Host(BrokerHostError::InvalidManifest { path, source }) => {
+            format!(
+                "{}: invalid provider manifest (line {}, column {})",
+                path.display(),
+                source.line(),
+                source.column()
+            )
+        }
+        BrokerdError::Host(BrokerHostError::Manifest { path, .. }) => {
+            format!("{}: invalid provider manifest", path.display())
+        }
+        BrokerdError::Host(BrokerHostError::CommandExportSignature { path, .. }) => {
+            format!(
+                "{}: provider run-command export has an invalid signature",
+                path.display()
+            )
+        }
+        BrokerdError::Host(error) => error.to_string(),
+        BrokerdError::Policy { path, source } => {
+            let cause = diff_policy_cause(source);
+            match path {
+                Some(path) => format!("{}: {cause}", path.display()),
+                None => cause,
+            }
+        }
+        BrokerdError::Storage(error @ dekopon_storage_host::StorageHostError::QuotaExceeded) => {
+            format!("{problem}: {error}")
+        }
+        BrokerdError::Capabilities { .. }
+        | BrokerdError::Storage(_)
+        | BrokerdError::StorageReaper(_)
+        | BrokerdError::Assets(_)
+        | BrokerdError::Snapshot { .. }
+        | BrokerdError::ManifestMetadata { .. }
+        | BrokerdError::ManifestMetadataTooLarge { .. }
+        | BrokerdError::CapabilityResponse { .. }
+        | BrokerdError::CapabilityResponseTooLarge { .. }
+        | BrokerdError::CapabilityCeilingTooLarge { .. }
+        | BrokerdError::Broker(_)
+        | BrokerdError::Context(_)
+        | BrokerdError::UnreachablePeerUids { .. }
+        | BrokerdError::Server(_)
+        | BrokerdError::Startup { .. }
+        | BrokerdError::RestartRequired { .. }
+        | BrokerdError::ProviderSetRequired
+        | BrokerdError::ProviderSetUnused
+        | BrokerdError::ProviderSet(_)
+        | BrokerdError::ProviderLockUnsettled
+        | BrokerdError::ReloadTask(_)
+        | BrokerdError::CheckSkipped { .. }
+        | BrokerdError::RelaxedVerificationSkipped { .. }
+        | BrokerdError::DefaultSecretsUnchecked
+        | BrokerdError::CheckDirectory { .. }
+        | BrokerdError::WorkflowFile(_)
+        | BrokerdError::Workflow(_) => problem.to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn diff_policy_cause(error: &dekopon_broker::PolicyBuildError) -> String {
+    use dekopon_broker::PolicyBuildError;
+
+    let cause = match error {
+        PolicyBuildError::Parse { offsets, .. } if !offsets.is_empty() => {
+            let offsets = offsets
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("policy source could not be parsed (byte offsets {offsets})");
+        }
+        PolicyBuildError::Parse { .. } => "policy source could not be parsed",
+        PolicyBuildError::Schema { .. } => "policy schema could not be generated",
+        PolicyBuildError::Validation { .. } => "policy set failed strict validation",
+        PolicyBuildError::InvalidRequestShapes { .. } => "invalid request policy shape",
+        PolicyBuildError::UnknownPrincipal { .. } => "policy names an undeclared principal",
+        PolicyBuildError::MalformedPrincipal { .. } => "policy names a malformed principal",
+        PolicyBuildError::UnknownSecret { .. } => "policy names an undeclared secret",
+        PolicyBuildError::MalformedSecret { .. } => "policy names a malformed secret DRN",
+        PolicyBuildError::UnknownGroup { .. } => "policy names a group with no principal members",
+        PolicyBuildError::MalformedGroup { .. } => "policy names a malformed group",
+        PolicyBuildError::UnknownProvider { .. } => "policy names an undeclared provider",
+        PolicyBuildError::UnknownAction { .. } => "policy names an undeclared action",
+        PolicyBuildError::NonCanonicalDrn { .. } => "policy compares a non-canonical DRN",
+        PolicyBuildError::NonCanonicalPattern { .. } => "policy uses a non-canonical DRN pattern",
+        PolicyBuildError::NonCanonicalSecret { .. } => "policy names a non-canonical secret",
+        PolicyBuildError::IdFormSubject { .. } => {
+            "policy compares context.subject with the id form"
+        }
+        PolicyBuildError::ReservedPolicyId { .. } => "policy identifier uses a reserved prefix",
+        PolicyBuildError::UnknownEntityType { .. } => "policy names an unknown entity type",
+        PolicyBuildError::InvalidPolicyId { .. } => "policy has an invalid @id annotation",
+        PolicyBuildError::MissingPolicyId { .. } => "policy is missing an @id annotation",
+        PolicyBuildError::DuplicatePolicyId { .. } => "policy identifier is duplicated",
+        PolicyBuildError::WorldConflicts { .. } => {
+            "policy world has conflicting actions or capabilities"
+        }
+        PolicyBuildError::Entities { .. } => "policy entity store could not be built",
+        PolicyBuildError::Digest { .. } => "policy could not be canonicalized",
+        PolicyBuildError::PolicyTooLarge { .. }
+        | PolicyBuildError::TooManyPolicies { .. }
+        | PolicyBuildError::TemplateUnsupported => return error.to_string(),
+    };
+    cause.to_owned()
+}
+
+#[cfg(unix)]
 async fn execute_check_diff(
     config: &std::path::Path,
     previous: &std::path::Path,
@@ -750,11 +872,7 @@ async fn execute_check_diff(
                 std::slice::from_ref(&error)
             };
             for problem in problems {
-                if let BrokerdError::Config(_) | BrokerdError::Secrets(_) = problem {
-                    eprintln!("dekopon-brokerd: {}", error_chain(problem));
-                } else {
-                    eprintln!("dekopon-brokerd: {problem}");
-                }
+                eprintln!("dekopon-brokerd: {}", diff_problem(problem));
             }
             return ExitCode::FAILURE;
         }

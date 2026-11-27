@@ -451,9 +451,11 @@ pub async fn check<P: AsRef<Path>>(
 }
 
 pub async fn check_diff(config: &Path, previous: &Path) -> Result<BrokerChanges, BrokerdError> {
-    let mut problems = check(previous, None, None).await.problems;
-    problems.extend(check(config, None, None).await.problems);
-    problems.retain(|problem| !matches!(problem, BrokerdError::ProviderSetRequired));
+    let mut problems = Vec::new();
+    for path in [previous, config] {
+        let (_, report) = load_candidate(path, Mode::Diff).await;
+        problems.extend(report.problems);
+    }
     if !problems.is_empty() {
         return Err(BrokerdError::from_problems(problems));
     }
@@ -514,12 +516,19 @@ enum Mode<'a> {
         workflows: Option<&'a Path>,
         materialized: bool,
     },
+    Diff,
+}
+
+#[derive(Clone, Copy)]
+enum CheckStorage {
+    Scratch,
+    ReadOnly,
 }
 
 enum Residents<'a> {
     Open,
     Borrow(&'a Candidate),
-    Scratch,
+    Check(CheckStorage),
 }
 
 struct Candidate {
@@ -804,7 +813,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     let mut report = CheckReport {
         materialized: match &mode {
             Mode::Check { materialized, .. } => *materialized,
-            Mode::Boot | Mode::Reload(_) => false,
+            Mode::Boot | Mode::Reload(_) | Mode::Diff => false,
         },
         ..CheckReport::default()
     };
@@ -816,7 +825,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                 .as_ref()
                 .is_some_and(|providers| providers.verification == ProviderVerification::Relaxed)
         }
-        Mode::Boot | Mode::Reload(_) => false,
+        Mode::Boot | Mode::Reload(_) | Mode::Diff => false,
     };
     if relaxed {
         for stage in [Stage::Providers, Stage::Workflows] {
@@ -837,7 +846,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
             locked_providers: active.locked_providers.as_deref(),
             provider_lock: active.provider_lock.as_ref(),
         },
-        Mode::Check { .. } => LoadMode::Check,
+        Mode::Check { .. } | Mode::Diff => LoadMode::Check,
     };
     let essential = match &mode {
         Mode::Check {
@@ -850,7 +859,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                 None
             }
         },
-        Mode::Boot | Mode::Reload(_) | Mode::Check { .. } => None,
+        Mode::Boot | Mode::Reload(_) | Mode::Check { .. } | Mode::Diff => None,
     };
     let mut provider_lock_file = None;
     let Some(mut config) = (match config::load_in(config_path, uid, load_mode).await {
@@ -883,6 +892,10 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     let (providers_resolved, residents) = match mode {
         Mode::Boot => (true, Residents::Open),
         Mode::Reload(active) => (true, Residents::Borrow(active)),
+        Mode::Diff => (
+            !config.providers.is_empty(),
+            Residents::Check(CheckStorage::ReadOnly),
+        ),
         Mode::Check { providers, .. } => {
             if config.identities.is_empty() {
                 report.warnings.push(StartupWarning::IdentitiesRequired);
@@ -940,12 +953,12 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                 }
                 (false, None) => true,
             };
-            (resolved, Residents::Scratch)
+            (resolved, Residents::Check(CheckStorage::Scratch))
         }
     };
     let restart_categories = match residents {
         Residents::Borrow(active) => active.snapshot.restart_required(&config.snapshot),
-        Residents::Open | Residents::Scratch => Vec::new(),
+        Residents::Open | Residents::Check(_) => Vec::new(),
     };
     if !restart_categories.is_empty() {
         report.problems.push(BrokerdError::RestartRequired {
@@ -965,9 +978,21 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
         Residents::Borrow(active) => {
             reload_runtime(&mut config, uid, active, &mut scratch, &mut report.problems).await
         }
-        Residents::Scratch => {
+        Residents::Check(storage) => {
             let secrets = check_secrets(config.secret_map_path.as_deref(), uid, &mut report).await;
-            keep(&mut report.problems, scratch_host(&config, &mut scratch))
+            let storage = match (storage, &config.storage) {
+                (CheckStorage::Scratch, _) => scratch_host(&config, &mut scratch),
+                (CheckStorage::ReadOnly, Some(storage)) => {
+                    dekopon_storage_host::StorageHost::validate_layout_capacity(
+                        &storage.root_path,
+                        &storage.limits,
+                    )
+                    .map(|()| None)
+                    .map_err(BrokerdError::Storage)
+                }
+                (CheckStorage::ReadOnly, None) => Ok(None),
+            };
+            keep(&mut report.problems, storage)
                 .zip(secrets)
                 .map(|(storage, secrets)| Runtime {
                     secrets,
@@ -1006,7 +1031,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
                 }
             };
         }
-        Residents::Open | Residents::Borrow(_) | Residents::Scratch => {}
+        Residents::Open | Residents::Borrow(_) | Residents::Check(_) => {}
     }
     let limits = ServerLimits {
         frame: frame_limits,
@@ -1024,7 +1049,14 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
     let provider_count = config.providers.len();
     let resident_registry = match residents {
         Residents::Borrow(active) if reuse_registry => Some(active.ready.registry.clone()),
-        Residents::Open | Residents::Borrow(_) | Residents::Scratch => None,
+        Residents::Open | Residents::Borrow(_) | Residents::Check(_) => None,
+    };
+    let validation_storage = match residents {
+        Residents::Check(CheckStorage::ReadOnly) => config
+            .storage
+            .as_ref()
+            .map(|storage| storage.limits.clone()),
+        Residents::Open | Residents::Borrow(_) | Residents::Check(CheckStorage::Scratch) => None,
     };
     let prepared = prepare(
         config,
@@ -1032,6 +1064,7 @@ async fn load_candidate(config_path: &Path, mode: Mode<'_>) -> (Option<Loaded>, 
         runtime,
         &mut report,
         resident_registry,
+        validation_storage,
     )
     .await;
     drop(scratch);
@@ -1525,6 +1558,7 @@ async fn prepare(
     runtime: Runtime,
     report: &mut CheckReport,
     resident_registry: Option<BrokerProviderRegistry>,
+    validation_storage: Option<dekopon_storage_host::StorageLimits>,
 ) -> Result<Ready, Vec<BrokerdError>> {
     #[cfg(test)]
     let _hook_ran = BEFORE_BROKER_PREPARE.try_with(|hook| hook()).is_ok();
@@ -1535,8 +1569,8 @@ async fn prepare(
     let registry = if let Some(registry) = resident_registry {
         Ok(registry)
     } else {
-        match config.locked_providers {
-            Some(sources) => {
+        match (config.locked_providers, validation_storage) {
+            (Some(sources), _) => {
                 BrokerProviderRegistry::load_locked_with_options(
                     sources,
                     config.host_limits,
@@ -1545,7 +1579,16 @@ async fn prepare(
                 )
                 .await
             }
-            None => {
+            (None, Some(limits)) => {
+                BrokerProviderRegistry::load_for_validation(
+                    config.providers,
+                    config.host_limits,
+                    limits,
+                    &config.host_options,
+                )
+                .await
+            }
+            (None, None) => {
                 BrokerProviderRegistry::load_with_options(
                     config.providers,
                     config.host_limits,
@@ -1624,7 +1667,7 @@ async fn prepare(
                         .map(|(_, capability)| capability.id.clone()),
                 )
         })
-        .map_err(|source| BrokerdError::Policy { source }),
+        .map_err(|source| BrokerdError::Policy { path: None, source }),
     );
     let world = world.map(|world| match &runtime.secrets {
         Secrets::Loaded(catalog, _) | Secrets::Shapes(catalog) => {
@@ -1651,7 +1694,11 @@ async fn prepare(
                 config.strict,
                 secrets_unchecked,
                 &mut report.warnings,
-            ),
+            )
+            .map_err(|source| BrokerdError::Policy {
+                path: config.policies_path.map(PathBuf::into_boxed_path),
+                source,
+            }),
         )
     });
     report.identity_digest = identity_digest.clone();
@@ -1786,7 +1833,7 @@ fn build_policy(
     strict: bool,
     secrets_unchecked: bool,
     warnings: &mut Vec<StartupWarning>,
-) -> Result<PolicyEngine, BrokerdError> {
+) -> Result<PolicyEngine, PolicyBuildError> {
     let mut admitted = BTreeSet::new();
     loop {
         let built = if strict {
@@ -1808,11 +1855,11 @@ fn build_policy(
             Err(source) => source,
         };
         let PolicyBuildError::UnknownSecret { policy, secret } = &source else {
-            return Err(BrokerdError::Policy { source });
+            return Err(source);
         };
         let drn = match secret.parse::<SecretDrn>() {
             Ok(drn) if secrets_unchecked && admitted.insert(drn.clone()) => drn,
-            Ok(_) | Err(_) => return Err(BrokerdError::Policy { source }),
+            Ok(_) | Err(_) => return Err(source),
         };
         warnings.push(StartupWarning::SecretRequired {
             policy: policy.clone(),
@@ -2013,6 +2060,7 @@ pub enum BrokerdError {
     Broker(#[source] dekopon_broker::BrokerBuildError),
     #[error("broker policy set is invalid")]
     Policy {
+        path: Option<Box<Path>>,
         #[source]
         source: PolicyBuildError,
     },
