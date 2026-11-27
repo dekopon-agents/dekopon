@@ -20,7 +20,9 @@ use dekopon_core::{
     Actor, AgentId, FileHygieneError, FileTier, GroupId, PROVIDER_COMPONENT_EXTENSION, PrincipalId,
     ProviderId, SecretDrn, Subject,
     fragments::{self, FragmentError, MergeRules},
-    offload, read_trusted_file,
+    offload,
+    projection::{Projection, ProjectionError},
+    read_trusted_file,
 };
 use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
@@ -707,7 +709,7 @@ pub async fn load_in(
     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
         return load_directory(path, expected_uid, mode).await;
     }
-    let bytes = read_owner_only(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
+    let bytes = read_config_source(&path, expected_uid, HARD_MAX_CONFIG_BYTES).await?;
     let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes).map_err(ConfigError::decode)?;
     if !config.capabilities.is_empty() && config.policies_path.is_none() {
         return Err(ConfigError::MissingPoliciesPath);
@@ -716,7 +718,7 @@ pub async fn load_in(
     let mut resolved = resolve(config, path, expected_uid, mode).await?;
     resolved.snapshot = snapshot;
     if let Some(policies_path) = resolved.policies_path.clone() {
-        let bytes = read_owner_only(&policies_path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
+        let bytes = read_config_source(&policies_path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
         resolved.policies = String::from_utf8(bytes).map_err(|_| ConfigError::PolicyNotUtf8 {
             path: policies_path,
         })?;
@@ -822,6 +824,66 @@ async fn load_directory(
         .snapshot
         .record_lock(resolved.provider_lock.as_ref());
     Ok((resolved, refusal))
+}
+
+async fn read_config_source(
+    path: &Path,
+    expected_uid: u32,
+    maximum: usize,
+) -> Result<Vec<u8>, ConfigError> {
+    if let Some(bytes) =
+        read_broker_source(path, expected_uid, maximum, Projection::resolve).await?
+    {
+        return Ok(bytes);
+    }
+    read_owner_only(path, expected_uid, maximum).await
+}
+
+fn projected_entry(path: &Path) -> Option<PathBuf> {
+    let link = std::fs::read_link(path).ok()?;
+    let name = path.file_name()?;
+    let alias = Path::new(".@live").join(name);
+    if link == alias {
+        return Some(path.with_file_name(alias));
+    }
+    (link == Path::new("..data").join(name) || Projection::is_claimed(path))
+        .then(|| path.to_path_buf())
+}
+
+pub(crate) async fn read_broker_source(
+    path: &Path,
+    expected_uid: u32,
+    maximum: usize,
+    resolve: impl FnOnce(&Path, u32) -> Result<Projection, ProjectionError> + Send + 'static,
+) -> Result<Option<Vec<u8>>, ConfigError> {
+    let owned = path.to_path_buf();
+    offload(move || read_broker_source_with(&owned, expected_uid, maximum, resolve))
+        .await
+        .map_err(|join| ConfigError::Read {
+            path: path.to_path_buf(),
+            source: io::Error::other(dekopon_core::TaskOutcome::from(join)),
+        })?
+}
+
+fn read_broker_source_with(
+    path: &Path,
+    expected_uid: u32,
+    maximum: usize,
+    resolve: impl FnOnce(&Path, u32) -> Result<Projection, ProjectionError>,
+) -> Result<Option<Vec<u8>>, ConfigError> {
+    let Some(entry) = projected_entry(path) else {
+        return Ok(None);
+    };
+    let projection = resolve(&entry, expected_uid)?;
+    let bytes = read_trusted_file(
+        projection.target(),
+        projection.owner(),
+        FileTier::NotWorldWritable,
+        maximum,
+    )
+    .map_err(|error| trusted_read_error(path, error))?;
+    projection.confirm()?;
+    Ok(Some(bytes))
 }
 
 async fn read_owner_only(
@@ -980,24 +1042,24 @@ async fn resolve(
     };
     let source = resolve_future_path(source)?;
     let socket_path = mode.runtime_path(resolve_path(config.socket_path), resolve_future_path)?;
-    let canonical = |path: Option<PathBuf>| {
-        path.map(|path| {
+    // Preserve the leaf so the map loader can verify a projection or apply O_NOFOLLOW.
+    let secret_map_path = config
+        .secret_map_path
+        .map(|path| mode.runtime_path(resolve_path(path), resolve_future_path))
+        .transpose()?;
+    let policies_path = config
+        .policies_path
+        .map(|path| {
             let unresolved = resolve_path(path);
+            if projected_entry(&unresolved).is_some() {
+                return resolve_future_path(unresolved);
+            }
             std::fs::canonicalize(&unresolved).map_err(|source| ConfigError::ResolvePath {
                 path: unresolved,
                 source,
             })
         })
-        .transpose()
-    };
-    // The final path component is left uncanonicalized so the secret-map loader's O_NOFOLLOW check
-    // can actually reject a symlink, rather than being handed a target canonicalization already
-    // resolved away.
-    let secret_map_path = config
-        .secret_map_path
-        .map(|path| mode.runtime_path(resolve_path(path), resolve_future_path))
         .transpose()?;
-    let policies_path = canonical(config.policies_path)?;
     let storage = config
         .storage
         .map(|mut storage| {
@@ -1455,6 +1517,8 @@ fn managed_artifacts_absent(lock_path: &Path, store_path: &Path) -> Result<bool,
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error(transparent)]
+    Projection(#[from] ProjectionError),
     #[error("could not determine the current directory")]
     CurrentDirectory {
         #[source]

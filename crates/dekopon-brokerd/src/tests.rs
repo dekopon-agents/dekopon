@@ -2088,7 +2088,7 @@ async fn changed_ca_bytes_require_restart_even_with_the_same_http_path() {
 }
 
 #[tokio::test]
-async fn broker_projection_does_not_relax_owner_only_source_rules() {
+async fn broker_refuses_a_projection_on_a_writable_mount() {
     use super::{BrokerdError, Mode};
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("broker.yaml");
@@ -2107,8 +2107,9 @@ async fn broker_projection_does_not_relax_owner_only_source_rules() {
         assert!(
             report.problems.iter().any(|problem| matches!(
                 problem,
-                BrokerdError::Config(config::ConfigError::Read { path: refused, source })
-                    if refused == &path && source.raw_os_error() == Some(libc::ELOOP)
+                BrokerdError::Config(config::ConfigError::Projection(
+                    dekopon_core::projection::ProjectionError::Untrusted { path: refused }
+                )) if refused == &path
             )),
             "{report:?}"
         );

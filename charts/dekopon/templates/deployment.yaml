@@ -1,5 +1,6 @@
 {{- include "dekopon.validate" . -}}
-{{- $files := include "dekopon.managedFiles" . | fromYamlArray -}}
+{{- $projected := include "dekopon.brokerProjectedFiles" . | fromYamlArray -}}
+{{- $bootstrap := include "dekopon.bootstrapFiles" . | fromYamlArray -}}
 {{- $seed := include "dekopon.seedFiles" . | fromYamlArray -}}
 {{- $private := include "dekopon.privateFiles" . | fromYamlArray -}}
 {{- $chatgptDir := include "dekopon.chatgptDir" . -}}
@@ -17,7 +18,7 @@
 {{- if .Values.broker.configDirectory.configMap -}}
 {{- $configDirs = append $configDirs (dict "dest" (printf "%s/broker.d" $cfg) "src" "/dekopon-broker-d-source" "volume" "broker-config-directory" "configMap" .Values.broker.configDirectory.configMap "owner" "$uid" "group" "$gid" "globs" "*.yaml *.cedar" "peers" .Values.broker.configDirectory.peers) -}}
 {{- end -}}
-{{- $sources := concat $files $seed $private -}}
+{{- $sources := concat $bootstrap $seed $private -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -43,21 +44,16 @@ spec:
   template:
     metadata:
       annotations:
-        # Broker files still pass through init and need a roll when their inline source changes.
-        # Gateway sources are mounted directly and reconciled without a chart checksum.
-        {{- if include "dekopon.hasInlineConfig" . }}
+        {{- /*
+          Projected broker content is reloaded by gateway reconciliation, so a checksum would
+          bypass live reload. With the gateway disabled nothing drives that reconciliation, and
+          an inline source changes only through a pod roll.
+          Neither ChatGPT seed contributes a checksum because the Secret goes stale at the first
+          refresh. Reseed values change the init arguments and roll the pod themselves.
+        */}}
+        {{- if and (not .Values.gateway.enabled) (include "dekopon.hasInlineConfig" .) }}
         checksum/config: {{ include (print $.Template.BasePath "/secret-config.yaml") . | sha256sum }}
         {{- end }}
-        {{- /*
-          There is deliberately no checksum for either ChatGPT credential Secret. Every other
-          checksum here exists to push a changed file into a pod that only reads at startup; a
-          seed is the one file whose whole point is NOT to be pushed in, because the copy in the
-          volume is the live one and the copy in the Secret goes stale at the first refresh. An
-          annotation would restart a working daemon to achieve nothing. The values that do
-          change behaviour, gateway.chatgpt.reseed and broker.chatgpt.reseed, roll the pod by
-          themselves: they change the init container's arguments, which are part of this pod
-          template.
-        */}}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -76,8 +72,6 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
-        # Broker policy and credentials still require owner-only regular files. Gateway
-        # configuration, catalog and skills use separate read-only projections instead.
         - name: prepare-files
           image: {{ include "dekopon.initImage" . }}
           imagePullPolicy: {{ .Values.initImage.pullPolicy }}
@@ -117,11 +111,18 @@ spec:
               fi
 {{- end }}
               rm -f {{ $cfg }}/*
+{{- if $projected }}
+              # Keep paths used in authored broker configs while kubelet replaces the projected generation.
+              mkdir -p "{{ $cfg }}/.@live"
+{{- range $projected }}
+              ln -s ".@live/{{ .file }}" "{{ $cfg }}/{{ .file }}"
+{{- end }}
+{{- end }}
 
-              # Copy, never mount. Each of these becomes a fresh regular file: one link, mode
+              # Each credential becomes a fresh regular file: one link, mode
               # 0600, owner $uid — no symlink for O_NOFOLLOW to reject, no root ownership for the
               # euid comparison to reject, no group bits for `mode & 0o077` to reject.
-              {{- range $files }}
+              {{- range $bootstrap }}
               install -m 0600 -o "$uid" -g "$gid" "{{ $src }}/{{ .file }}" "{{ $cfg }}/{{ .file }}"
               {{- end }}
 
@@ -152,7 +153,7 @@ spec:
               # This runs BEFORE the directories are handed over, on purpose: once {{ $cfg }} is
               # 0700 and owned by $uid, root without CAP_DAC_OVERRIDE can no longer descend into
               # it, which is exactly the property being established.
-              {{- range $files }}
+              {{- range $bootstrap }}
               expected="$uid:$gid"
               got=$(stat -c '%u:%g:%a:%h:%F' "{{ $cfg }}/{{ .file }}")
               if [ "$got" != "$expected:600:1:regular file" ]; then
@@ -555,14 +556,27 @@ spec:
         {{- include "dekopon.brokerContainer" (dict "ctx" . "sidecar" false) | nindent 8 }}
         {{- end }}
       volumes:
+{{- if $projected }}
+        - name: {{ include "dekopon.brokerProjectionVolume" . }}
+          projected:
+            defaultMode: 292
+            sources:
+{{- range $projected }}
+              - secret:
+                  name: {{ .secret }}
+                  items:
+                    - key: {{ .key }}
+                      path: {{ .file }}
+{{- end }}
+{{- end }}
 {{- if $sources }}
-        # Broker-only copy source. Neither runtime container mounts it.
+        # Only init mounts the sources for copied credentials.
         - name: config-source
           projected:
             # Octal. Only the root init container reads these, and it reads them once.
             defaultMode: 0400
             sources:
-              {{- /* A managed file's projected path is its own name; a seed's is `source`, which
+              {{- /* A bootstrap file's projected path is its own name; a seed's is `source`, which
                      keeps two credential families that both default to chatgpt-auth.json from
                      claiming one path in this volume. */}}
               {{- range $sources }}

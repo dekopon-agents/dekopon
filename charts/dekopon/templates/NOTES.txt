@@ -17,11 +17,10 @@ Image: {{ include "dekopon.image" . }}
 
 The broker refuses to start rather than serving with a path it does not trust, so read the
 prepare-files and broker logs before assuming the image or the network is at fault.
-{{- if or .Values.broker.config.existingSecret .Values.broker.policies.existingSecret .Values.broker.secretMap.existingSecret }}
+{{- if or .Values.broker.configDirectory.configMap .Values.broker.secretBootstrapFiles .Values.broker.privateFiles (and (not .Values.gateway.enabled) (or .Values.broker.config.existingSecret .Values.broker.policies.existingSecret .Values.broker.secretMap.existingSecret)) }}
 
-Broker configuration is copied once, by the init container, at pod start. This release reads at
-least one existing broker Secret, whose contents the chart cannot checksum, so editing it changes
-nothing until you roll the pod:
+To apply edits to broker directory fragments, credential files copied by the init container, or
+existing broker Secrets while the gateway is disabled, restart the pod:
 
   kubectl -n {{ .Release.Namespace }} rollout restart deploy/{{ include "dekopon.fullname" . }}
 {{- end }}

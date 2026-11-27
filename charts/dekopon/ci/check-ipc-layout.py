@@ -78,7 +78,7 @@ def spawn(uid, action):
 
 def broker():
     for file in ("broker.yaml", "policies.cedar", "secret-map.yaml"):
-        owned_file("/etc/dekopon/" + file, 0o077)
+        read("/etc/dekopon/" + file)
     write("/var/lib/dekopon-provider-storage/private")
     write("/var/lib/dekopon-assets/private")
     owned_file("/var/lib/dekopon-assets/private", 0o022)
