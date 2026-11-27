@@ -7,6 +7,22 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.100.0] - 2026-11-27
+
+### Changed
+
+- gatewayd: `sessions.durable.path` (with `sync`) replaces `sessions.wakes.path`; wakes, follows, Slack thread ownership and job records persist in one SQLite store, and `wakes.jsonl` beside it converts once at first boot.
+
+### Fixed
+
+- gatewayd: sealing a journal conversation fsyncs the directory after the rename.
+
+## [dekopon-chart-0.87.0] - 2026-11-27
+
+### Changed
+
+- Chart 0.87.0 targets core v0.100.0 and renders the `v0.100.0` image tag.
+
 ## [0.99.0] - 2026-11-27
 
 ### Added
