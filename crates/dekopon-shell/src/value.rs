@@ -12,19 +12,6 @@ pub fn display(value: &Value) -> String {
 }
 
 #[must_use]
-#[cfg(test)]
-pub(crate) fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64().is_some_and(|number| number != 0.0),
-        Value::String(text) => !text.is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::Object(fields) => !fields.is_empty(),
-    }
-}
-
-#[must_use]
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "reshaped by the unit that next rewrites this"
@@ -104,7 +91,7 @@ pub fn scalar_from_token(token: &str) -> Value {
 mod tests {
     use serde_json::json;
 
-    use super::{Value, display, from_lines, index, scalar_from_token, to_lines, truthy};
+    use super::{Value, display, from_lines, index, scalar_from_token, to_lines};
 
     #[test]
     fn display_uses_documented_coercions() {
@@ -115,17 +102,6 @@ mod tests {
         assert_eq!(display(&Value::Null), "");
         assert_eq!(display(&json!([1, 2])), "[1,2]");
         assert_eq!(display(&json!({"a": 1})), r#"{"a":1}"#);
-    }
-
-    #[test]
-    fn truthiness_follows_the_value_model() {
-        assert!(!truthy(&Value::Null));
-        assert!(!truthy(&json!("")));
-        assert!(truthy(&json!("x")));
-        assert!(!truthy(&json!(0)));
-        assert!(truthy(&json!(3)));
-        assert!(!truthy(&json!([])));
-        assert!(truthy(&json!([1])));
     }
 
     #[test]
