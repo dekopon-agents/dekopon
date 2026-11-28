@@ -353,27 +353,70 @@ fn the_kid_is_the_rfc_7638_thumbprint() {
 }
 
 #[tokio::test]
-async fn a_configured_kid_is_refused_naming_its_removal() {
+async fn removed_signed_jwt_fields_are_refused_before_new_required_fields() {
     let directory = tempfile::tempdir().unwrap();
     let path = secret_map(directory.path(), 300, "https://alpha.example.test", 0o600).await;
     let document = tokio::fs::read_to_string(&path).await.unwrap();
-    let with_kid = document.replacen(
-        "      jwksUri:",
-        "      kid: receipt-key\n      jwksUri:",
-        1,
+    let document: serde_yaml::Value = serde_yaml::from_str(&document).unwrap();
+    let config = directory.path().join("broker.yaml");
+    let provider = directory.path().join("cli-probe.wasm");
+    write(
+        &provider,
+        include_bytes!("../../../../examples/providers/cli-probe-provider.wasm"),
+    )
+    .await;
+    crate::tests::write_config(
+        &config,
+        &json!({
+            "apiVersion": crate::config::CONFIG_API_VERSION,
+            "socketPath": "broker.sock",
+            "secretMapPath": path,
+            "providers": [provider],
+        }),
     );
-    write(&path, with_kid.as_bytes()).await;
-    let error = load(&path, rustix::process::geteuid().as_raw())
-        .await
-        .unwrap_err();
-    let SecretMapError::SignedJwtValidation { jwt_problems, .. } = error else {
-        panic!("expected a typed kid error: {error}");
+    let uid = rustix::process::geteuid().as_raw();
+    let reports_removal = |error: &SecretMapError| {
+        matches!(
+            error,
+            SecretMapError::SignedJwtValidation { jwt_problems, .. }
+                if matches!(jwt_problems.as_slice(),
+                    [
+                        super::SignedJwtProblem { secret: first, source: SignedJwtConfigError::KidRemoved },
+                        super::SignedJwtProblem { secret: second, source: SignedJwtConfigError::KidRemoved },
+                    ] if first.as_str() == PERSONA && second.as_str() == SECOND_PERSONA
+                )
+        )
     };
-    assert!(
-        jwt_problems
-            .iter()
-            .any(|problem| matches!(problem.source, SignedJwtConfigError::KidRemoved))
-    );
+
+    for kid in [
+        serde_yaml::Value::from("receipt-key"),
+        serde_yaml::Value::Null,
+    ] {
+        for missing in [&[][..], &["jwksUri"], &["helper"], &["jwksUri", "helper"]] {
+            let mut candidate = document.clone();
+            for persona in &mut candidate["secrets"].as_sequence_mut().unwrap()[1..] {
+                let source = persona["source"].as_mapping_mut().unwrap();
+                source.insert("kid".into(), kid.clone());
+                for field in missing {
+                    source.remove(*field);
+                }
+            }
+            let yaml = serde_yaml::to_string(&candidate).unwrap();
+            write(&path, yaml.as_bytes()).await;
+            let error = load(&path, uid).await.unwrap_err();
+            let report = crate::check(&config, None, None).await;
+            assert!(
+                reports_removal(&error),
+                "boot with kid {kid:?} and missing {missing:?}: {error}"
+            );
+            assert!(
+                report.problems.iter().any(|error| matches!(
+                    error, crate::BrokerdError::Secrets(source) if reports_removal(source)
+                )),
+                "check with kid {kid:?} and missing {missing:?}: {report:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -427,19 +470,47 @@ async fn an_unusable_jwks_uri_or_helper_pin_is_a_typed_config_error() {
 #[tokio::test]
 async fn signing_is_refused_while_the_jwks_is_unreachable() {
     let directory = tempfile::tempdir().unwrap();
+    let capture = CaptureLayer::new();
     let unreachable = issuer(directory.path(), UNREACHABLE_JWKS).await;
-    assert!(matches!(
-        unreachable.issue().await,
-        Err(IssueError::JwksUnreachable)
-    ));
+    let error = unreachable
+        .issue()
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+    assert!(matches!(error, Err(IssueError::JwksUnreachable)));
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_brokerd::secrets",
+                &[
+                    ("category", "jwks-unreachable"),
+                    ("error.connect", "true"),
+                    ("error.timeout", "false"),
+                ],
+            )
+            .len(),
+        1
+    );
     let missing = LoopbackServer::once(
         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
     let not_found = issuer(directory.path(), &format!("{}/jwks", missing.url())).await;
-    assert!(matches!(
-        not_found.issue().await,
-        Err(IssueError::JwksUnreachable)
-    ));
+    let error = not_found
+        .issue()
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+    assert!(matches!(error, Err(IssueError::JwksUnreachable)));
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_brokerd::token_issuer",
+                &[
+                    ("category", "jwks-unreachable"),
+                    ("http.response.status_code", "404"),
+                ],
+            )
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -477,10 +548,21 @@ async fn signing_is_refused_on_a_malformed_jwks() {
     let directory = tempfile::tempdir().unwrap();
     let server = LoopbackServer::once(&http_json(&json!({"not": "a key set"})));
     let issuer = issuer(directory.path(), &format!("{}/jwks", server.url())).await;
-    assert!(matches!(
-        issuer.issue().await,
-        Err(IssueError::JwksMalformed)
-    ));
+    let capture = CaptureLayer::new();
+    let error = issuer
+        .issue()
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+    assert!(matches!(error, Err(IssueError::JwksMalformed)));
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_brokerd::secrets",
+                &[("category", "jwks-malformed"), ("error.class", "Data")],
+            )
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -515,12 +597,26 @@ async fn signing_is_refused_when_the_helper_changes_or_disappears() {
         Err(IssueError::HelperMismatch)
     ));
     std::fs::remove_file(&helper).unwrap();
+    let capture = CaptureLayer::new();
+    let error = issuer
+        .issue()
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
     assert!(matches!(
-        issuer.issue().await,
+        error,
         Err(IssueError::HelperRead {
             kind: std::io::ErrorKind::NotFound
         })
     ));
+    assert_eq!(
+        capture
+            .events_where(
+                "dekopon_brokerd::secrets",
+                &[("category", "helper-pin"), ("error.kind", "NotFound")],
+            )
+            .len(),
+        1
+    );
 }
 
 fn assert_jwt(token: &str, aud: &str, iss: &str, kid: &str) -> String {

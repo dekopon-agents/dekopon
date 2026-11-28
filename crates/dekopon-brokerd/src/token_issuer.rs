@@ -6,7 +6,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dekopon_core::{
-    FileHygieneError, FileTier, SecretBytes, SecretDrn, offload, read_trusted_file,
+    FileHygieneError, FileTier, SecretBytes, SecretDrn, TaskOutcome, offload, read_trusted_file,
 };
 use dekopon_telemetry::egress::{Timeout, client_builder};
 use reqwest::Url;
@@ -18,7 +18,7 @@ use url::Host;
 
 use crate::{
     github_app::{GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES},
-    secrets::REFRESH_TIMEOUT,
+    secrets::{REFRESH_TIMEOUT, trace_source_cause},
 };
 
 const MAX_TTL_SECONDS: u32 = 300;
@@ -29,7 +29,6 @@ const MAX_JWKS_BYTES: usize = 64 * 1024;
 pub(crate) struct SignedJwtConfig {
     pub(crate) private_key: PathBuf,
     pub(crate) runner_secret: SecretDrn,
-    kid: Option<serde::de::IgnoredAny>,
     jwks_uri: String,
     helper: HelperPin,
     iss: String,
@@ -66,6 +65,8 @@ pub enum SignedJwtConfigError {
     KidRemoved,
     #[error("signedJwt jwksUri must be an absolute HTTPS URL or a loopback HTTP URL")]
     JwksUri,
+    #[error("signedJwt JWKS HTTP client could not be built")]
+    JwksClient,
     #[error("signedJwt helper needs an absolute path and a lowercase hex sha256 digest")]
     Helper,
     #[error("signedJwt claims must be nonempty")]
@@ -103,8 +104,10 @@ pub(crate) enum IssueError {
     Signing,
     #[error("signedJwt helper does not match its pinned digest")]
     HelperMismatch,
-    #[error("signedJwt helper could not be read")]
+    #[error("signedJwt helper could not be read ({kind:?})")]
     HelperRead { kind: io::ErrorKind },
+    #[error("signedJwt helper read task {0}")]
+    HelperTask(TaskOutcome),
     #[error("the JWKS could not be fetched")]
     JwksUnreachable,
     #[error("the JWKS response is not a key set")]
@@ -119,11 +122,16 @@ impl IssueError {
             Self::Clock(_) | Self::Expiry => "clock",
             Self::Random => "random",
             Self::Signing => "signing",
-            Self::HelperMismatch | Self::HelperRead { .. } => "helper-pin",
+            Self::HelperMismatch | Self::HelperRead { .. } | Self::HelperTask(_) => "helper-pin",
             Self::JwksUnreachable => "jwks-unreachable",
             Self::JwksMalformed => "jwks-malformed",
             Self::JwksKidNotServed => "jwks-kid-not-served",
         }
+    }
+
+    fn with_cause(self, cause: &(impl std::fmt::Debug + 'static)) -> Self {
+        trace_source_cause(self.category(), cause);
+        self
     }
 }
 
@@ -172,9 +180,6 @@ impl SelfSignedIssuer {
             url.scheme() == "https" && url.origin().ascii_serialization() == config.aud
         }) {
             errors.push(SignedJwtConfigError::Audience);
-        }
-        if config.kid.is_some() {
-            errors.push(SignedJwtConfigError::KidRemoved);
         }
         if !Url::parse(&config.jwks_uri).is_ok_and(|url| {
             url.scheme() == "https"
@@ -232,15 +237,19 @@ impl SelfSignedIssuer {
         if !errors.is_empty() {
             return Err(errors);
         }
-        let Ok(client) = client_builder(
+        let client = match client_builder(
             reqwest::Client::builder(),
             Timeout::Request(REFRESH_TIMEOUT),
             crate::EGRESS_USER_AGENT,
             [],
         )
-        .build() else {
-            errors.push(SignedJwtConfigError::JwksUri);
-            return Err(errors);
+        .build()
+        {
+            Ok(client) => client,
+            Err(cause) => {
+                trace_source_cause("configuration", &cause);
+                return Err(vec![SignedJwtConfigError::JwksClient]);
+            }
         };
         digest.update([2]);
         digest.update(pem.len().to_le_bytes());
@@ -264,23 +273,30 @@ impl SelfSignedIssuer {
             .get(&self.config.jwks_uri)
             .send()
             .await
-            .map_err(|_unreachable| IssueError::JwksUnreachable)?;
-        if response.status() != reqwest::StatusCode::OK {
-            return Err(IssueError::JwksUnreachable);
+            .map_err(|cause| IssueError::JwksUnreachable.with_cause(&cause))?;
+        let status = response.status();
+        if status != reqwest::StatusCode::OK {
+            let error = IssueError::JwksUnreachable;
+            tracing::debug!(
+                category = error.category(),
+                http.response.status_code = status.as_u16(),
+                "signedJwt JWKS request refused"
+            );
+            return Err(error);
         }
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_unreachable| IssueError::JwksUnreachable)?
+            .map_err(|cause| IssueError::JwksUnreachable.with_cause(&cause))?
         {
             if body.len() + chunk.len() > MAX_JWKS_BYTES {
                 return Err(IssueError::JwksMalformed);
             }
             body.extend_from_slice(&chunk);
         }
-        let set: KeySet =
-            serde_json::from_slice(&body).map_err(|_malformed| IssueError::JwksMalformed)?;
+        let set: KeySet = serde_json::from_slice(&body)
+            .map_err(|cause| IssueError::JwksMalformed.with_cause(&cause))?;
         let served = set.keys.iter().any(|key| {
             key.kty == "RSA"
                 && key.kid.as_deref() == Some(self.kid.as_str())
@@ -309,10 +325,18 @@ impl SelfSignedIssuer {
             Ok::<_, io::Error>(hasher.finalize())
         })
         .await
-        .map_err(|_cancelled| IssueError::HelperRead {
-            kind: io::ErrorKind::Other,
+        .map_err(|cause| {
+            let outcome = TaskOutcome::from(cause);
+            let kind = outcome.category();
+            let error = IssueError::HelperTask(outcome);
+            tracing::debug!(
+                category = error.category(),
+                error.task = kind,
+                "signedJwt helper read task failed"
+            );
+            error
         })?
-        .map_err(|error| IssueError::HelperRead { kind: error.kind() })?;
+        .map_err(|cause| IssueError::HelperRead { kind: cause.kind() }.with_cause(&cause))?;
         if digest
             .iter()
             .map(|byte| format!("{byte:02x}"))
