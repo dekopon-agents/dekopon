@@ -1790,7 +1790,7 @@ pub(crate) async fn load_with_bytes(
     path: &Path,
     expected_uid: u32,
 ) -> Result<LoadedMap, SecretMapError> {
-    let (file, bytes) = read_map(path, expected_uid).await?;
+    let (file, bytes) = read_map::<SecretMapFile>(path, expected_uid).await?;
     let validated = validate_map(file, path, expected_uid).await?;
     Ok(LoadedMap {
         catalog: validated.catalog,
@@ -1806,7 +1806,7 @@ pub(crate) async fn load_shapes(
     expected_uid: u32,
     mut material_problems: Option<&mut Vec<SecretMapError>>,
 ) -> Result<(SecretCatalog, Vec<u8>), SecretMapError> {
-    let (file, bytes) = read_map(path, expected_uid).await?;
+    let (file, bytes) = read_map::<SecretMapFile>(path, expected_uid).await?;
     let mut problems = Vec::new();
     let runners =
         signed_jwt_runners(file.secrets.iter().map(|entry| (&entry.drn, &entry.source))).collect();
@@ -1984,37 +1984,29 @@ fn valid_destination(value: &str) -> bool {
         && !value.contains(['/', '?', '#', '@', '*'])
 }
 
-async fn read_map(
+async fn read_map<T: serde::de::DeserializeOwned>(
     path: &Path,
     expected_uid: u32,
-) -> Result<(SecretMapFile, Vec<u8>), SecretMapError> {
+) -> Result<(T, Vec<u8>), SecretMapError> {
     let bytes = read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
         .await
         .map_err(|source| SecretMapError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-    if let Ok(document) = serde_yaml::from_slice(&bytes) {
-        let jwt_problems = removed_signed_jwt_fields(&document);
-        if !jwt_problems.is_empty() {
-            return Err(SecretMapError::SignedJwtValidation {
-                problems: Vec::new(),
-                jwt_problems,
-            });
-        }
-    }
-    let file = serde_yaml::from_slice(&bytes).map_err(|source| SecretMapError::Decode {
+    let file = serde_yaml::from_slice::<T>(&bytes).map_err(|source| SecretMapError::Decode {
         diagnostic: sanitized_yaml_diagnostic(&source, &bytes),
-    })?;
+    });
+    let file = file.map_err(|error| removed_signed_jwt_field_error(&bytes).unwrap_or(error))?;
     Ok((file, bytes))
 }
 
-fn removed_signed_jwt_fields(document: &serde_yaml::Value) -> Vec<SignedJwtProblem> {
-    document
-        .get("secrets")
-        .and_then(serde_yaml::Value::as_sequence)
-        .into_iter()
-        .flatten()
+fn removed_signed_jwt_field_error(bytes: &[u8]) -> Option<SecretMapError> {
+    let document: serde_yaml::Value = serde_yaml::from_slice(bytes).ok()?;
+    let jwt_problems: Vec<_> = document
+        .get("secrets")?
+        .as_sequence()?
+        .iter()
         .filter_map(|entry| {
             let source = entry.get("source")?;
             if source.get("kind")?.as_str()? != "signedJwt" {
@@ -2026,7 +2018,11 @@ fn removed_signed_jwt_fields(document: &serde_yaml::Value) -> Vec<SignedJwtProbl
                 source: SignedJwtConfigError::KidRemoved,
             })
         })
-        .collect()
+        .collect();
+    (!jwt_problems.is_empty()).then_some(SecretMapError::SignedJwtValidation {
+        problems: Vec::new(),
+        jwt_problems,
+    })
 }
 
 #[expect(
