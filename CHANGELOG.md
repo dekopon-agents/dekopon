@@ -7,6 +7,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.102.0] - 2026-11-28
+
+### Changed
+
+- Kubernetes brokers reload projected configuration, policy, and secret-map edits without restarting the pod.
+
+## [dekopon-chart-0.89.0] - 2026-11-28
+
+### Changed
+
+- Chart 0.89.0 targets core v0.102.0 and renders the `v0.102.0` image tag.
+- Kubernetes brokers reload projected configuration, policy, and secret-map edits without restarting the pod.
+
 ## [0.101.0] - 2026-11-27
 
 ### Added
