@@ -67,6 +67,10 @@ impl GithubAppKey {
         self.0.public().as_ref()
     }
 
+    pub(crate) fn components(&self) -> ring::rsa::PublicKeyComponents<Vec<u8>> {
+        ring::rsa::PublicKeyComponents::from(self.0.public())
+    }
+
     pub(crate) fn sign_rs256(&self, input: &[u8]) -> Result<Vec<u8>, ring::error::Unspecified> {
         let mut signature = vec![0; self.0.public().modulus_len()];
         self.0.sign(

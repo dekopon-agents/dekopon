@@ -19,6 +19,7 @@ pub(super) struct VmExecStdin {
     pub(super) token: SecretBytes,
     jti: String,
     exp: u64,
+    helper_path: String,
     phase: Phase,
 }
 
@@ -51,12 +52,19 @@ struct ExecWithStdin<'a> {
 }
 
 impl VmExecStdin {
-    pub(super) fn new(grant: SecretUseGrant, token: SecretBytes, jti: String, exp: u64) -> Self {
+    pub(super) fn new(
+        grant: SecretUseGrant,
+        token: SecretBytes,
+        jti: String,
+        exp: u64,
+        helper_path: String,
+    ) -> Self {
         Self {
             grant,
             token,
             jti,
             exp,
+            helper_path,
             phase: Phase::Create,
         }
     }
@@ -83,7 +91,7 @@ impl VmExecStdin {
                 if now.as_secs() >= self.exp {
                     return Err(http_error(ErrorCode::Protocol, "signed exec token expired"));
                 }
-                let body = exec_body(&request.body, &self.token)?;
+                let body = exec_body(&request.body, &self.token, &self.helper_path)?;
                 let request_bytes =
                     request.request_bytes - request.body.len() as u64 + body.len() as u64;
                 if request_bytes > max_request_bytes {
@@ -124,7 +132,7 @@ impl VmExecStdin {
     }
 }
 
-fn exec_body(body: &[u8], token: &SecretBytes) -> Result<Vec<u8>, HttpError> {
+fn exec_body(body: &[u8], token: &SecretBytes, helper_path: &str) -> Result<Vec<u8>, HttpError> {
     let exec: Exec = serde_json::from_slice(body).map_err(|error| {
         http_error(
             ErrorCode::Protocol,
@@ -138,6 +146,12 @@ fn exec_body(body: &[u8], token: &SecretBytes) -> Result<Vec<u8>, HttpError> {
         return Err(http_error(
             ErrorCode::Protocol,
             "signed exec requires a command",
+        ));
+    }
+    if exec.argv.first().map(String::as_str) != Some(helper_path) {
+        return Err(http_error(
+            ErrorCode::Denied,
+            "signed exec command does not match the configured helper path",
         ));
     }
     let argv_bytes = exec.argv.iter().map(String::len).sum::<usize>();
@@ -177,12 +191,21 @@ mod tests {
         let token = SecretBytes::new(vec![b'x'; 1_024]);
         let over_budget =
             json!({"argv": ["login-fixture", "é".repeat(12_000)], "deadlineMs": 25_000});
-        let invalid = exec_body(over_budget.to_string().as_bytes(), &token).unwrap_err();
+        let invalid =
+            exec_body(over_budget.to_string().as_bytes(), &token, "login-fixture").unwrap_err();
         assert_eq!(invalid.code, ErrorCode::RequestTooLarge);
 
         let piped =
             json!({"argv": ["login-fixture"], "deadlineMs": 25_000, "stdin": "caller-data"});
-        let invalid = exec_body(piped.to_string().as_bytes(), &token).unwrap_err();
+        let invalid = exec_body(piped.to_string().as_bytes(), &token, "login-fixture").unwrap_err();
         assert_eq!(invalid.code, ErrorCode::Protocol);
+    }
+
+    #[test]
+    fn signed_exec_refuses_a_command_other_than_the_pinned_helper() {
+        let token = SecretBytes::new(vec![b'x'; 16]);
+        let other = json!({"argv": ["other-helper"], "deadlineMs": 25_000});
+        let denied = exec_body(other.to_string().as_bytes(), &token, "login-fixture").unwrap_err();
+        assert_eq!(denied.code, ErrorCode::Denied);
     }
 }

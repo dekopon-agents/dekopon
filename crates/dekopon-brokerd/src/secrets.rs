@@ -385,7 +385,15 @@ impl Minted {
                 .map(|token| SecretMaterial::new(token.into_inner().into_bytes())),
             Self::SignedJwt(source) => source
                 .issue()
-                .map(|issued| SecretMaterial::issued_jwt(issued.token, issued.jti, issued.exp))
+                .await
+                .map(|issued| {
+                    SecretMaterial::issued_jwt(
+                        issued.token,
+                        issued.jti,
+                        issued.exp,
+                        issued.helper_path,
+                    )
+                })
                 .map_err(|error| RefreshError::Unavailable {
                     category: error.category(),
                 }),
@@ -1720,6 +1728,8 @@ fn sanitized_yaml_diagnostic(error: &serde_yaml::Error, bytes: &[u8]) -> String 
         "bindings",
         "projection",
         "iss",
+        "jwksUri",
+        "helper",
     ];
     let named_field = message
         .split_once("unknown field `")
@@ -2024,8 +2034,33 @@ fn decode_map<T: serde::de::DeserializeOwned>(
 ) -> Result<(T, Vec<u8>), SecretMapError> {
     let file = serde_yaml::from_slice::<T>(&bytes).map_err(|source| SecretMapError::Decode {
         diagnostic: sanitized_yaml_diagnostic(&source, &bytes),
-    })?;
+    });
+    let file = file.map_err(|error| removed_signed_jwt_field_error(&bytes).unwrap_or(error))?;
     Ok((file, bytes))
+}
+
+fn removed_signed_jwt_field_error(bytes: &[u8]) -> Option<SecretMapError> {
+    let document: serde_yaml::Value = serde_yaml::from_slice(bytes).ok()?;
+    let jwt_problems: Vec<_> = document
+        .get("secrets")?
+        .as_sequence()?
+        .iter()
+        .filter_map(|entry| {
+            let source = entry.get("source")?;
+            if source.get("kind")?.as_str()? != "signedJwt" {
+                return None;
+            }
+            source.get("kid")?;
+            Some(SignedJwtProblem {
+                secret: entry.get("drn")?.as_str()?.parse().ok()?,
+                source: SignedJwtConfigError::KidRemoved,
+            })
+        })
+        .collect();
+    (!jwt_problems.is_empty()).then_some(SecretMapError::SignedJwtValidation {
+        problems: Vec::new(),
+        jwt_problems,
+    })
 }
 
 #[expect(
@@ -3139,11 +3174,16 @@ fn classify_http_failure(source: &reqwest::Error) -> SourceError {
 }
 
 fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> SourceError {
+    trace_source_cause(error.category(), source);
+    error
+}
+
+pub(crate) fn trace_source_cause<E: fmt::Debug + 'static>(category: &str, source: &E) {
     let any = source as &dyn std::any::Any;
     if let Some(source) = any.downcast_ref::<std::io::Error>() {
         tracing::debug!(
             event = "secret_source_cause_classified",
-            category = error.category(),
+            category,
             cause_type = "io",
             error.kind = ?source.kind(),
             error.errno = source.raw_os_error(),
@@ -3152,7 +3192,7 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
     } else if let Some(source) = any.downcast_ref::<reqwest::Error>() {
         tracing::debug!(
             event = "secret_source_cause_classified",
-            category = error.category(),
+            category,
             cause_type = "http",
             error.timeout = source.is_timeout(),
             error.connect = source.is_connect(),
@@ -3165,7 +3205,7 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
         let cause = io_cause(source);
         tracing::debug!(
             event = "secret_source_cause_classified",
-            category = error.category(),
+            category,
             cause_type = "file-hygiene",
             error.check = source.category(),
             error.kind = ?cause.map(std::io::Error::kind),
@@ -3175,7 +3215,7 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
     } else if let Some(source) = any.downcast_ref::<serde_json::Error>() {
         tracing::debug!(
             event = "secret_source_cause_classified",
-            category = error.category(),
+            category,
             cause_type = "json",
             error.class = ?source.classify(),
             error.line = source.line(),
@@ -3187,12 +3227,11 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
         // rendering them directly could leak secret-derived byte offsets.
         tracing::debug!(
             event = "secret_source_cause_classified",
-            category = error.category(),
+            category,
             cause_type = std::any::type_name::<E>(),
             "secret.source.cause.classified"
         );
     }
-    error
 }
 
 impl SourceError {

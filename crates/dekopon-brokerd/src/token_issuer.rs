@@ -5,26 +5,40 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dekopon_core::{FileHygieneError, FileTier, SecretBytes, SecretDrn, read_trusted_file};
+use dekopon_telemetry::egress::{Timeout, client_builder};
 use reqwest::Url;
 use ring::rand::{SecureRandom as _, SystemRandom};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use url::Host;
 
-use crate::github_app::{GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES};
+use crate::{
+    github_app::{GithubAppKey, HARD_MAX_GITHUB_APP_KEY_BYTES},
+    secrets::{REFRESH_TIMEOUT, trace_source_cause},
+};
 
 const MAX_TTL_SECONDS: u32 = 300;
+const MAX_JWKS_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct SignedJwtConfig {
     pub(crate) private_key: PathBuf,
     pub(crate) runner_secret: SecretDrn,
-    kid: String,
+    jwks_uri: String,
+    helper: HelperPin,
     iss: String,
     aud: String,
     ttl: u32,
     claims: PersonaClaims,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct HelperPin {
+    path: PathBuf,
+    sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -44,8 +58,14 @@ pub enum SignedJwtConfigError {
     Issuer,
     #[error("signedJwt aud must be one exact HTTPS origin")]
     Audience,
-    #[error("signedJwt kid must be nonempty")]
-    Kid,
+    #[error("signedJwt kid is derived from privateKey; remove the kid field")]
+    KidRemoved,
+    #[error("signedJwt jwksUri must be an absolute HTTPS URL or a loopback HTTP URL")]
+    JwksUri,
+    #[error("signedJwt JWKS HTTP client could not be built")]
+    JwksClient,
+    #[error("signedJwt helper needs an absolute path and a lowercase hex sha256 digest")]
+    Helper,
     #[error("signedJwt claims must be nonempty")]
     Claims,
     #[error("signedJwt privateKey must be absolute")]
@@ -66,6 +86,7 @@ pub(crate) struct IssuedToken {
     pub(crate) token: SecretBytes,
     pub(crate) jti: String,
     pub(crate) exp: u64,
+    pub(crate) helper_path: String,
 }
 
 #[derive(Debug, Error)]
@@ -78,6 +99,14 @@ pub(crate) enum IssueError {
     Random,
     #[error("signedJwt could not sign the token")]
     Signing,
+    #[error("signedJwt requires a runner-attested helper digest")]
+    RunnerHelperUnattested,
+    #[error("the JWKS could not be fetched")]
+    JwksUnreachable,
+    #[error("the JWKS response is not a key set")]
+    JwksMalformed,
+    #[error("the published JWKS does not serve the signing key's kid")]
+    JwksKidNotServed,
 }
 
 impl IssueError {
@@ -86,13 +115,45 @@ impl IssueError {
             Self::Clock(_) | Self::Expiry => "clock",
             Self::Random => "random",
             Self::Signing => "signing",
+            Self::RunnerHelperUnattested => "runner-helper-unattested",
+            Self::JwksUnreachable => "jwks-unreachable",
+            Self::JwksMalformed => "jwks-malformed",
+            Self::JwksKidNotServed => "jwks-kid-not-served",
         }
+    }
+
+    fn with_cause(self, cause: &(impl std::fmt::Debug + 'static)) -> Self {
+        trace_source_cause(self.category(), cause);
+        self
     }
 }
 
 pub(crate) struct SelfSignedIssuer {
     key: GithubAppKey,
+    kid: String,
+    n: String,
+    e: String,
+    client: reqwest::Client,
     config: SignedJwtConfig,
+}
+
+pub(crate) fn thumbprint(n: &str, e: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(format!(
+        r#"{{"e":"{e}","kty":"RSA","n":"{n}"}}"#
+    )))
+}
+
+#[derive(Deserialize)]
+struct KeySet {
+    keys: Vec<PublishedKey>,
+}
+
+#[derive(Deserialize)]
+struct PublishedKey {
+    kty: String,
+    kid: Option<String>,
+    n: Option<String>,
+    e: Option<String>,
 }
 
 impl SelfSignedIssuer {
@@ -113,8 +174,22 @@ impl SelfSignedIssuer {
         }) {
             errors.push(SignedJwtConfigError::Audience);
         }
-        if config.kid.trim().is_empty() {
-            errors.push(SignedJwtConfigError::Kid);
+        if !Url::parse(&config.jwks_uri).is_ok_and(|url| {
+            url.scheme() == "https"
+                || url.scheme() == "http"
+                    && matches!(url.host(), Some(Host::Ipv4(ip)) if ip.is_loopback())
+        }) {
+            errors.push(SignedJwtConfigError::JwksUri);
+        }
+        if !config.helper.path.is_absolute()
+            || config.helper.sha256.len() != 64
+            || !config
+                .helper
+                .sha256
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            errors.push(SignedJwtConfigError::Helper);
         }
         if [
             &config.claims.sub,
@@ -155,17 +230,101 @@ impl SelfSignedIssuer {
         if !errors.is_empty() {
             return Err(errors);
         }
+        let client = match client_builder(
+            reqwest::Client::builder(),
+            Timeout::Request(REFRESH_TIMEOUT),
+            crate::EGRESS_USER_AGENT,
+            [],
+        )
+        .build()
+        {
+            Ok(client) => client,
+            Err(cause) => {
+                trace_source_cause("configuration", &cause);
+                return Err(vec![SignedJwtConfigError::JwksClient]);
+            }
+        };
         digest.update([2]);
         digest.update(pem.len().to_le_bytes());
         digest.update(&pem);
-        Ok(Self { key, config })
+        let components = key.components();
+        let n = URL_SAFE_NO_PAD.encode(&components.n);
+        let e = URL_SAFE_NO_PAD.encode(&components.e);
+        Ok(Self {
+            key,
+            kid: thumbprint(&n, &e),
+            n,
+            e,
+            client,
+            config,
+        })
+    }
+
+    async fn confirm_published(&self) -> Result<(), IssueError> {
+        let mut response = self
+            .client
+            .get(&self.config.jwks_uri)
+            .send()
+            .await
+            .map_err(|cause| IssueError::JwksUnreachable.with_cause(&cause))?;
+        let status = response.status();
+        if status != reqwest::StatusCode::OK {
+            let error = IssueError::JwksUnreachable;
+            tracing::debug!(
+                category = error.category(),
+                http.response.status_code = status.as_u16(),
+                "signedJwt JWKS request refused"
+            );
+            return Err(error);
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|cause| IssueError::JwksUnreachable.with_cause(&cause))?
+        {
+            if body.len() + chunk.len() > MAX_JWKS_BYTES {
+                return Err(IssueError::JwksMalformed);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let set: KeySet = serde_json::from_slice(&body)
+            .map_err(|cause| IssueError::JwksMalformed.with_cause(&cause))?;
+        let served = set.keys.iter().any(|key| {
+            key.kty == "RSA"
+                && key.kid.as_deref() == Some(self.kid.as_str())
+                && key.n.as_deref() == Some(self.n.as_str())
+                && key.e.as_deref() == Some(self.e.as_str())
+        });
+        if served {
+            Ok(())
+        } else {
+            Err(IssueError::JwksKidNotServed)
+        }
+    }
+
+    pub(crate) async fn issue(&self) -> Result<IssuedToken, IssueError> {
+        self.issue_after_runner_attestation(Err(IssueError::RunnerHelperUnattested))
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn issue_with_verified_helper_for_test(
+        &self,
+    ) -> Result<IssuedToken, IssueError> {
+        self.issue_after_runner_attestation(Ok(())).await
     }
 
     #[expect(
         clippy::map_err_ignore,
         reason = "ring errors have no diagnostic detail"
     )]
-    pub(crate) fn issue(&self) -> Result<IssuedToken, IssueError> {
+    async fn issue_after_runner_attestation(
+        &self,
+        runner_attestation: Result<(), IssueError>,
+    ) -> Result<IssuedToken, IssueError> {
+        runner_attestation?;
+        self.confirm_published().await?;
         let iat = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let exp = iat
             .checked_add(u64::from(self.config.ttl))
@@ -175,9 +334,8 @@ impl SelfSignedIssuer {
             .fill(&mut id)
             .map_err(|_| IssueError::Random)?;
         let jti = URL_SAFE_NO_PAD.encode(id);
-        let header = URL_SAFE_NO_PAD.encode(
-            serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": self.config.kid}).to_string(),
-        );
+        let header = URL_SAFE_NO_PAD
+            .encode(serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": self.kid}).to_string());
         let claims = URL_SAFE_NO_PAD.encode(
             serde_json::json!({
                 "iss": self.config.iss,
@@ -199,6 +357,11 @@ impl SelfSignedIssuer {
             .map_err(|_| IssueError::Signing)?;
         let token =
             SecretBytes::new(format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature)).into_bytes());
-        Ok(IssuedToken { token, jti, exp })
+        Ok(IssuedToken {
+            token,
+            jti,
+            exp,
+            helper_path: self.config.helper.path.to_string_lossy().into_owned(),
+        })
     }
 }
