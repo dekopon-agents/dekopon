@@ -386,7 +386,12 @@ impl Minted {
                 .issue()
                 .await
                 .map(|issued| {
-                    SecretMaterial::issued_jwt(issued.token, issued.jti, issued.exp, issued.helper)
+                    SecretMaterial::issued_jwt(
+                        issued.token,
+                        issued.jti,
+                        issued.exp,
+                        issued.helper_path,
+                    )
                 })
                 .map_err(|error| RefreshError::Unavailable {
                     category: error.category(),

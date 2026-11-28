@@ -19,7 +19,7 @@ pub(super) struct VmExecStdin {
     pub(super) token: SecretBytes,
     jti: String,
     exp: u64,
-    helper: String,
+    helper_path: String,
     phase: Phase,
 }
 
@@ -57,14 +57,14 @@ impl VmExecStdin {
         token: SecretBytes,
         jti: String,
         exp: u64,
-        helper: String,
+        helper_path: String,
     ) -> Self {
         Self {
             grant,
             token,
             jti,
             exp,
-            helper,
+            helper_path,
             phase: Phase::Create,
         }
     }
@@ -91,7 +91,7 @@ impl VmExecStdin {
                 if now.as_secs() >= self.exp {
                     return Err(http_error(ErrorCode::Protocol, "signed exec token expired"));
                 }
-                let body = exec_body(&request.body, &self.token, &self.helper)?;
+                let body = exec_body(&request.body, &self.token, &self.helper_path)?;
                 let request_bytes =
                     request.request_bytes - request.body.len() as u64 + body.len() as u64;
                 if request_bytes > max_request_bytes {
@@ -132,7 +132,7 @@ impl VmExecStdin {
     }
 }
 
-fn exec_body(body: &[u8], token: &SecretBytes, helper: &str) -> Result<Vec<u8>, HttpError> {
+fn exec_body(body: &[u8], token: &SecretBytes, helper_path: &str) -> Result<Vec<u8>, HttpError> {
     let exec: Exec = serde_json::from_slice(body).map_err(|error| {
         http_error(
             ErrorCode::Protocol,
@@ -148,10 +148,10 @@ fn exec_body(body: &[u8], token: &SecretBytes, helper: &str) -> Result<Vec<u8>, 
             "signed exec requires a command",
         ));
     }
-    if exec.argv.first().map(String::as_str) != Some(helper) {
+    if exec.argv.first().map(String::as_str) != Some(helper_path) {
         return Err(http_error(
             ErrorCode::Denied,
-            "signed exec command is not the pinned helper",
+            "signed exec command does not match the configured helper path",
         ));
     }
     let argv_bytes = exec.argv.iter().map(String::len).sum::<usize>();

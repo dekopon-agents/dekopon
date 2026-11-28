@@ -9,15 +9,11 @@ use dekopon_broker::{
 use dekopon_broker_host::{
     BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome, Streams, asset::AssetInputs,
 };
-use dekopon_broker_protocol::{
-    BrokerResponse, InvocationRequest, ProtocolVersion, ResponseEnvelope, RunOutcome,
-};
+use dekopon_broker_protocol::InvocationRequest;
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, InvocationOutcome};
-use dekopon_core::{
-    Actor, AttestedSubject, FileHygieneError, FileTier, RiskLevel, SecretUseProposal,
-};
+use dekopon_core::{Actor, AttestedSubject, FileHygieneError, FileTier, RiskLevel};
 use dekopon_http_host::{Response, test_transport::Transport};
-use dekopon_test_support::{CaptureLayer, LoopbackServer, Record};
+use dekopon_test_support::{CaptureLayer, LoopbackServer};
 use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -326,7 +322,7 @@ async fn issuer(directory: &Path, jwks_uri: &str) -> SelfSignedIssuer {
         "privateKey": key, "runnerSecret": RUNNER_DRN, "jwksUri": jwks_uri,
         "helper": {"path": helper, "sha256": sha256_hex(HELPER_BYTES)},
         "iss": ISSUER, "aud": "https://alpha.example.test", "ttl": 300,
-        "claims": {"sub": "s", "org": "o", "role": "r", "email": "e@example.test"},
+        "claims": {"sub": "user-fixture", "org": "org-fixture", "role": "reviewer-fixture", "email": "email-fixture@example.test"},
     }))
     .unwrap();
     SelfSignedIssuer::open(
@@ -335,12 +331,6 @@ async fn issuer(directory: &Path, jwks_uri: &str) -> SelfSignedIssuer {
         &mut Sha256::new(),
     )
     .unwrap()
-}
-
-fn header_kid(token: &str) -> String {
-    let header = token.split('.').next().unwrap();
-    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).unwrap()).unwrap();
-    header["kid"].as_str().unwrap().to_owned()
 }
 
 #[test]
@@ -473,7 +463,7 @@ async fn signing_is_refused_while_the_jwks_is_unreachable() {
     let capture = CaptureLayer::new();
     let unreachable = issuer(directory.path(), UNREACHABLE_JWKS).await;
     let error = unreachable
-        .issue()
+        .issue_with_verified_helper_for_test()
         .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
         .await;
     assert!(matches!(error, Err(IssueError::JwksUnreachable)));
@@ -495,7 +485,7 @@ async fn signing_is_refused_while_the_jwks_is_unreachable() {
     );
     let not_found = issuer(directory.path(), &format!("{}/jwks", missing.url())).await;
     let error = not_found
-        .issue()
+        .issue_with_verified_helper_for_test()
         .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
         .await;
     assert!(matches!(error, Err(IssueError::JwksUnreachable)));
@@ -522,7 +512,7 @@ async fn signing_is_refused_while_the_jwks_serves_another_kid() {
     let stale = LoopbackServer::once(&http_json(&jwks));
     let issuer_stale = issuer(directory.path(), &format!("{}/jwks", stale.url())).await;
     assert!(matches!(
-        issuer_stale.issue().await,
+        issuer_stale.issue_with_verified_helper_for_test().await,
         Err(IssueError::JwksKidNotServed)
     ));
 
@@ -531,14 +521,14 @@ async fn signing_is_refused_while_the_jwks_serves_another_kid() {
     let forged = LoopbackServer::once(&http_json(&forged));
     let issuer_forged = issuer(directory.path(), &format!("{}/jwks", forged.url())).await;
     assert!(matches!(
-        issuer_forged.issue().await,
+        issuer_forged.issue_with_verified_helper_for_test().await,
         Err(IssueError::JwksKidNotServed)
     ));
 
     let empty = LoopbackServer::once(&http_json(&json!({"keys": []})));
     let issuer_empty = issuer(directory.path(), &format!("{}/jwks", empty.url())).await;
     assert!(matches!(
-        issuer_empty.issue().await,
+        issuer_empty.issue_with_verified_helper_for_test().await,
         Err(IssueError::JwksKidNotServed)
     ));
 }
@@ -550,7 +540,7 @@ async fn signing_is_refused_on_a_malformed_jwks() {
     let issuer = issuer(directory.path(), &format!("{}/jwks", server.url())).await;
     let capture = CaptureLayer::new();
     let error = issuer
-        .issue()
+        .issue_with_verified_helper_for_test()
         .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
         .await;
     assert!(matches!(error, Err(IssueError::JwksMalformed)));
@@ -574,52 +564,23 @@ async fn a_rotation_signs_only_after_the_new_kid_is_published() {
     let server = LoopbackServer::sequence([http_json(&previous), http_json(&jwks)]);
     let issuer = issuer(directory.path(), &format!("{}/jwks", server.url())).await;
     assert!(matches!(
-        issuer.issue().await,
+        issuer.issue_with_verified_helper_for_test().await,
         Err(IssueError::JwksKidNotServed)
     ));
-    let issued = issuer.issue().await.ok().unwrap();
-    assert_eq!(
-        header_kid(std::str::from_utf8(issued.token.expose()).unwrap()),
-        kid
+    let issued = issuer
+        .issue_with_verified_helper_for_test()
+        .await
+        .ok()
+        .unwrap();
+    assert_jwt(
+        std::str::from_utf8(issued.token.expose()).unwrap(),
+        "https://alpha.example.test",
+        ISSUER,
+        &kid,
     );
 }
 
-#[tokio::test]
-async fn signing_is_refused_when_the_helper_changes_or_disappears() {
-    let directory = tempfile::tempdir().unwrap();
-    let (_, jwks) = published();
-    let server = LoopbackServer::serving(&http_json(&jwks), 2);
-    let issuer = issuer(directory.path(), &format!("{}/jwks", server.url())).await;
-    let helper = directory.path().join("login-fixture");
-    write(&helper, b"a different helper").await;
-    assert!(matches!(
-        issuer.issue().await,
-        Err(IssueError::HelperMismatch)
-    ));
-    std::fs::remove_file(&helper).unwrap();
-    let capture = CaptureLayer::new();
-    let error = issuer
-        .issue()
-        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-        .await;
-    assert!(matches!(
-        error,
-        Err(IssueError::HelperRead {
-            kind: std::io::ErrorKind::NotFound
-        })
-    ));
-    assert_eq!(
-        capture
-            .events_where(
-                "dekopon_brokerd::secrets",
-                &[("category", "helper-pin"), ("error.kind", "NotFound")],
-            )
-            .len(),
-        1
-    );
-}
-
-fn assert_jwt(token: &str, aud: &str, iss: &str, kid: &str) -> String {
+fn assert_jwt(token: &str, aud: &str, iss: &str, kid: &str) {
     let (input, signature) = token.rsplit_once('.').expect("JWT signature");
     let key = GithubAppKey::from_pem(KEY).expect("fixture key");
     UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, key.public_key())
@@ -646,28 +607,30 @@ fn assert_jwt(token: &str, aud: &str, iss: &str, kid: &str) -> String {
             "sub": "user-fixture", "org": "org-fixture", "role": "reviewer-fixture", "email": "email-fixture@example.test"
         })
     );
-    jti.to_owned()
 }
 
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
-    reason = "one broker-to-fake-exec round trip exercises two audiences and the trace"
+    reason = "one family test follows the real broker and HTTP host to the runner transport"
 )]
-async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
+async fn signed_jwt_refuses_unattested_runner_before_jwks_or_exec() {
     let captured = CaptureLayer::workspace();
     let subscriber = tracing_subscriber::registry().with(captured.clone());
     async {
         let directory = tempfile::tempdir().unwrap();
-        let (kid, jwks) = published();
-        let server = LoopbackServer::serving(&http_json(&jwks), 2);
+        let (_, jwks) = published();
+        let server = LoopbackServer::pooled(&http_json(&jwks), 2);
+        let jwks_uri = format!("{}/jwks", server.url());
+        let issuer = issuer(directory.path(), &jwks_uri).await;
+        let issuance = issuer.issue().await;
         let helper = helper_path(directory.path());
         let map = secret_map_with(
             directory.path(),
             300,
             "https://alpha.example.test",
             0o600,
-            &format!("{}/jwks", server.url()),
+            &jwks_uri,
         )
         .await;
         let catalog = load(&map, rustix::process::geteuid().as_raw())
@@ -686,12 +649,9 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             },
         ];
         let transport = Transport::new(
-            (
-                RUNNER.to_owned(),
-                replies.iter().cycle().take(4).cloned().collect(),
-            ),
+            (RUNNER.to_owned(), replies.to_vec()),
             ("unused.example.test".to_owned(), replies[0].clone()),
-            4,
+            2,
         );
         let component = directory.path().join("vm.wasm");
         std::fs::write(&component, vm_component(&helper)).unwrap();
@@ -774,188 +734,91 @@ async fn the_broker_delivers_a_verified_persona_jwt_only_in_exec_stdin() {
             AttestedSubject::one(subject).unwrap(),
             "agent".parse().unwrap(),
         );
-        let argv = vec![helper.clone()];
-        let propose = async |broker: &Broker| {
-            broker
-                .run_command(
-                    &actor,
-                    Some(&attestor),
-                    Some(&attestation),
-                    "ssh",
-                    &argv,
-                    false,
-                )
-                .await
-                .unwrap()
-        };
-        let unmapped = propose(&broker).await;
         let broker = broker.with_secret_catalog(catalog).unwrap();
-        let outcome = propose(&broker).await;
-        assert_eq!(unmapped, outcome);
-        let wire = serde_json::to_vec(&ResponseEnvelope::command_run(outcome)).unwrap();
         let CommandRunOutcome::Proposed {
             capability,
             input,
             secret_use: Some(secret_use),
-        } = decode_command_proposal(&wire)
+        } = broker
+            .run_command(
+                &actor,
+                Some(&attestor),
+                Some(&attestation),
+                "ssh",
+                &[helper],
+                false,
+            )
+            .await
+            .unwrap()
         else {
             panic!("expected the vm proposal")
         };
-        assert_eq!(secret_use.secret().as_str(), PERSONA);
-        assert_eq!(input["argv"], json!([helper]));
+        let (host, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        let invocation = "unattested-helper"
+            .parse::<dekopon_core::InvocationId>()
+            .unwrap();
+        let claim = attestation.bound_to(invocation.clone());
+        let request = InvocationRequest {
+            id: invocation,
+            capability,
+            trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
+                .parse()
+                .unwrap(),
+            input,
+            secret_use: Some(secret_use),
+        };
+        let outcome = broker
+            .invoke(
+                &actor,
+                Some(&attestor),
+                Some(&claim),
+                request,
+                AssetInputs {
+                    streams: Some(Streams {
+                        stdin: None,
+                        stdout: host.into(),
+                    }),
+                    ..AssetInputs::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut stdout = Vec::new();
+        reader.read_to_end(&mut stdout).unwrap();
 
-        let mut execs = Vec::new();
-        for (id, secret) in [
-            ("jwt-alpha", secret_use),
-            (
-                "jwt-beta",
-                SecretUseProposal::VmExecStdin {
-                    secret: SECOND_PERSONA.parse().unwrap(),
-                },
-            ),
-            (
-                "jwt-unmapped",
-                SecretUseProposal::VmExecStdin {
-                    secret: "drn:secret:login/missing".parse().unwrap(),
-                },
-            ),
-            (
-                "jwt-reserved-runner",
-                SecretUseProposal::HttpBearer {
-                    secret: RUNNER_DRN.parse().unwrap(),
-                },
-            ),
-        ] {
-            let (host, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
-            let invocation = id.parse::<dekopon_core::InvocationId>().unwrap();
-            let claim = attestation.clone().bound_to(invocation.clone());
-            let request = InvocationRequest {
-                id: invocation,
-                capability: capability.clone(),
-                trace_parent: "00-0000000000000000000000000000f1c7-00000000000000f1-00"
-                    .parse()
-                    .unwrap(),
-                input: input.clone(),
-                secret_use: Some(secret.clone()),
-            };
-            let request = serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
-            let outcome = broker
-                .invoke(
-                    &actor,
-                    Some(&attestor),
-                    Some(&claim),
-                    request,
-                    AssetInputs {
-                        streams: Some(Streams {
-                            stdin: None,
-                            stdout: host.into(),
-                        }),
-                        ..AssetInputs::default()
-                    },
-                )
-                .await
-                .unwrap();
-            let mut stdout = Vec::new();
-            reader.read_to_end(&mut stdout).unwrap();
-            if matches!(id, "jwt-unmapped" | "jwt-reserved-runner") {
-                assert_eq!(outcome.result.outcome, InvocationOutcome::Denied);
-                continue;
-            }
-            assert_eq!(outcome.result.outcome, InvocationOutcome::Succeeded);
-            assert_eq!(stdout, OK.as_bytes());
-            let ran = ResponseEnvelope {
-                api_version: ProtocolVersion::V1Alpha2,
-                response: BrokerResponse::Ran {
-                    outcome: RunOutcome::Invoked {
-                        capability: capability.clone(),
-                        input: input.clone(),
-                        secret_use: Some(secret),
-                        result: outcome.result,
-                        attached: Vec::new(),
-                        removed: Vec::new(),
-                        sent: Vec::new(),
-                    },
-                },
-            };
-            let frame = serde_json::to_string(&ran).unwrap();
-            let decoded: ResponseEnvelope = serde_json::from_str(&frame).unwrap();
-            assert_eq!(decoded, ran);
-            execs.push((frame, stdout));
-        }
-        let observed = transport.requests();
-        assert_eq!(observed.len(), 4);
-        let mut jtis = Vec::new();
-        for ((calls, (frame, stdout)), (aud, iss)) in
-            observed.as_chunks::<2>().0.iter().zip(execs).zip([
-                ("https://alpha.example.test", ISSUER),
-                ("https://beta.example.test", SECOND_ISSUER),
-            ])
-        {
-            let [create, exec] = calls;
-            assert_eq!(create.sent.body, create.guest.body);
-            let bearer = format!("Bearer {RUNNER_BEARER}");
-            for request in [&create.sent, &exec.sent] {
-                let authorization = request
-                    .headers
-                    .iter()
-                    .find(|header| header.name == "authorization")
-                    .unwrap();
-                assert_eq!(authorization.value, bearer.as_bytes());
-            }
-            assert_eq!(
-                exec.sent.uri,
-                format!("https://{RUNNER}/prefix/v1/sessions/{SESSION}/exec")
-            );
-            assert_eq!(exec.sent.method, "POST");
-            let guest: Value = serde_json::from_slice(&exec.guest.body).unwrap();
-            let sent: Value = serde_json::from_slice(&exec.sent.body).unwrap();
-            assert_eq!(guest, json!({"argv": [helper], "deadlineMs": 25000}));
-            assert_eq!(sent["argv"], guest["argv"]);
-            assert_eq!(sent["deadlineMs"], guest["deadlineMs"]);
-            let jwt = sent["stdin"].as_str().unwrap();
-            assert!(!frame.contains(jwt) && !String::from_utf8(stdout).unwrap().contains(jwt));
-            let jti = assert_jwt(jwt, aud, iss, &kid);
-            for record in captured.records() {
-                let (Record::Event { fields, .. } | Record::Span { fields, .. }) = &record;
-                for attribute in fields.values() {
-                    for hidden in jwt.split('.').chain([
-                        aud,
-                        "user-fixture",
-                        "org-fixture",
-                        "reviewer-fixture",
-                        "email-fixture@example.test",
-                        iss,
-                    ]) {
-                        assert!(
-                            !attribute.contains(hidden),
-                            "JWT data exposed in a trace attribute"
-                        );
-                    }
-                }
-            }
-            jtis.push(jti);
-        }
-        assert_ne!(jtis[0], jtis[1]);
-        let records = captured.records();
-        let observed_jtis = records
-            .iter()
-            .filter_map(|record| record.field("secret.jti"))
-            .collect::<Vec<_>>();
         assert_eq!(
-            observed_jtis,
-            jtis.iter().map(String::as_str).collect::<Vec<_>>()
+            (
+                issuance.err().map(|cause| cause.category()),
+                outcome.result.outcome,
+                outcome.result.error.as_deref(),
+                server.recorded().len(),
+                transport.requests().len(),
+                stdout.len(),
+            ),
+            (
+                Some("runner-helper-unattested"),
+                InvocationOutcome::Failed,
+                Some("secret-resolution"),
+                0,
+                0,
+                0,
+            )
+        );
+        assert_eq!(
+            captured
+                .events_where(
+                    "dekopon_broker",
+                    &[
+                        ("event", "broker_secret_resolution_failed"),
+                        ("category", "runner-helper-unattested"),
+                    ],
+                )
+                .len(),
+            1
         );
     }
     .with_subscriber(subscriber)
     .await;
-}
-
-fn decode_command_proposal(bytes: &[u8]) -> CommandRunOutcome {
-    let wire: ResponseEnvelope = serde_json::from_slice(bytes).unwrap();
-    let BrokerResponse::CommandRun { result } = wire.response else {
-        panic!("expected a command response")
-    };
-    result
 }
 
 fn vm_component(helper: &str) -> Vec<u8> {

@@ -1,13 +1,10 @@
 use std::{
-    io::{self, Read as _},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use dekopon_core::{
-    FileHygieneError, FileTier, SecretBytes, SecretDrn, TaskOutcome, offload, read_trusted_file,
-};
+use dekopon_core::{FileHygieneError, FileTier, SecretBytes, SecretDrn, read_trusted_file};
 use dekopon_telemetry::egress::{Timeout, client_builder};
 use reqwest::Url;
 use ring::rand::{SecureRandom as _, SystemRandom};
@@ -89,7 +86,7 @@ pub(crate) struct IssuedToken {
     pub(crate) token: SecretBytes,
     pub(crate) jti: String,
     pub(crate) exp: u64,
-    pub(crate) helper: String,
+    pub(crate) helper_path: String,
 }
 
 #[derive(Debug, Error)]
@@ -102,12 +99,8 @@ pub(crate) enum IssueError {
     Random,
     #[error("signedJwt could not sign the token")]
     Signing,
-    #[error("signedJwt helper does not match its pinned digest")]
-    HelperMismatch,
-    #[error("signedJwt helper could not be read ({kind:?})")]
-    HelperRead { kind: io::ErrorKind },
-    #[error("signedJwt helper read task {0}")]
-    HelperTask(TaskOutcome),
+    #[error("signedJwt requires a runner-attested helper digest")]
+    RunnerHelperUnattested,
     #[error("the JWKS could not be fetched")]
     JwksUnreachable,
     #[error("the JWKS response is not a key set")]
@@ -122,7 +115,7 @@ impl IssueError {
             Self::Clock(_) | Self::Expiry => "clock",
             Self::Random => "random",
             Self::Signing => "signing",
-            Self::HelperMismatch | Self::HelperRead { .. } | Self::HelperTask(_) => "helper-pin",
+            Self::RunnerHelperUnattested => "runner-helper-unattested",
             Self::JwksUnreachable => "jwks-unreachable",
             Self::JwksMalformed => "jwks-malformed",
             Self::JwksKidNotServed => "jwks-kid-not-served",
@@ -310,51 +303,27 @@ impl SelfSignedIssuer {
         }
     }
 
-    async fn confirm_helper(&self) -> Result<(), IssueError> {
-        let path = self.config.helper.path.clone();
-        let digest = offload(move || {
-            let mut file = std::fs::File::open(path)?;
-            let mut hasher = Sha256::new();
-            let mut chunk = [0; 8192];
-            loop {
-                match file.read(&mut chunk)? {
-                    0 => break,
-                    count => hasher.update(&chunk[..count]),
-                }
-            }
-            Ok::<_, io::Error>(hasher.finalize())
-        })
-        .await
-        .map_err(|cause| {
-            let outcome = TaskOutcome::from(cause);
-            let kind = outcome.category();
-            let error = IssueError::HelperTask(outcome);
-            tracing::debug!(
-                category = error.category(),
-                error.task = kind,
-                "signedJwt helper read task failed"
-            );
-            error
-        })?
-        .map_err(|cause| IssueError::HelperRead { kind: cause.kind() }.with_cause(&cause))?;
-        if digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-            == self.config.helper.sha256
-        {
-            Ok(())
-        } else {
-            Err(IssueError::HelperMismatch)
-        }
+    pub(crate) async fn issue(&self) -> Result<IssuedToken, IssueError> {
+        self.issue_after_runner_attestation(Err(IssueError::RunnerHelperUnattested))
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn issue_with_verified_helper_for_test(
+        &self,
+    ) -> Result<IssuedToken, IssueError> {
+        self.issue_after_runner_attestation(Ok(())).await
     }
 
     #[expect(
         clippy::map_err_ignore,
         reason = "ring errors have no diagnostic detail"
     )]
-    pub(crate) async fn issue(&self) -> Result<IssuedToken, IssueError> {
-        self.confirm_helper().await?;
+    async fn issue_after_runner_attestation(
+        &self,
+        runner_attestation: Result<(), IssueError>,
+    ) -> Result<IssuedToken, IssueError> {
+        runner_attestation?;
         self.confirm_published().await?;
         let iat = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let exp = iat
@@ -392,7 +361,7 @@ impl SelfSignedIssuer {
             token,
             jti,
             exp,
-            helper: self.config.helper.path.to_string_lossy().into_owned(),
+            helper_path: self.config.helper.path.to_string_lossy().into_owned(),
         })
     }
 }

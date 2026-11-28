@@ -119,8 +119,8 @@ API offers on a granted model. The budget bounds the spend.
 - Wasmtime bounds memory, fuel and time per invocation; it isn't claimed as a production sandbox.
 - Dependency or compiler compromise, side channels, and denial of service from model endpoints or
   component compilation are out of scope.
-- During key rotation, the broker refuses to sign until JWKS serves the new kid. The helper pin
-  covers broker-local bytes. Runner executable identity and session isolation are outside this guarantee.
+- The broker refuses `signedJwt` issuance until the runner attests the helper digest. Rotation also
+  requires JWKS to serve the new kid. Runner-session isolation is out of scope.
 - Audit lives in the trace and dies with the exporter ([trace as audit](design.md#trace-as-audit)).
 - Whoever reads the telemetry store reads every conversation.
 - If something hostile already runs as root or as the broker's user, you've lost.
